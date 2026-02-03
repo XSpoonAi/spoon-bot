@@ -16,6 +16,20 @@ from spoon_bot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
 )
+from spoon_bot.agent.tools.self_config import (
+    SelfConfigTool,
+    MemoryManagementTool,
+    SelfUpgradeTool,
+)
+from spoon_bot.agent.tools.web3 import (
+    BalanceCheckTool,
+    TransferTool,
+    SwapTool,
+    ContractCallTool,
+)
+from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
+from spoon_bot.services.spawn import SpawnTool
+from spoon_bot.toolkit.adapter import ToolkitAdapter
 from spoon_bot.llm.base import LLMProvider
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.memory.store import MemoryStore
@@ -108,6 +122,34 @@ class AgentLoop:
         self.tools.register(WriteFileTool())
         self.tools.register(EditFileTool())
         self.tools.register(ListDirTool())
+
+        # Self-management tools
+        self.tools.register(SelfConfigTool())
+        memory_tool = MemoryManagementTool()
+        memory_tool.set_memory_store(self.memory)
+        self.tools.register(memory_tool)
+        self.tools.register(SelfUpgradeTool(workspace=self.workspace))
+
+        # Background task tool
+        self.tools.register(SpawnTool())
+
+        # Web tools
+        self.tools.register(WebSearchTool())
+        self.tools.register(WebFetchTool())
+
+        # Web3 tools
+        self.tools.register(BalanceCheckTool())
+        self.tools.register(TransferTool())
+        self.tools.register(SwapTool())
+        self.tools.register(ContractCallTool())
+
+        # Toolkit tools (optional, lazy-loaded)
+        try:
+            toolkit = ToolkitAdapter()
+            for tool in toolkit.load_all():
+                self.tools.register(tool)
+        except ImportError:
+            logger.debug("spoon-toolkits not available, skipping toolkit tools")
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
 

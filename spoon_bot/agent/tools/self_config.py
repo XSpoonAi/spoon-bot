@@ -16,7 +16,16 @@ class SelfConfigTool(Tool):
     Tool for agent self-configuration.
 
     Allows the agent to read and modify its own configuration.
+
+    Destructive Operations:
+        - set: Modifies configuration values. Critical keys (model, provider,
+          max_iterations) affect agent behavior immediately.
+        - reset: Removes ALL custom configuration and reverts to defaults.
+          This action cannot be undone.
     """
+
+    # Critical keys that warrant extra warnings when modified
+    CRITICAL_KEYS = frozenset({"model", "provider", "max_iterations"})
 
     def __init__(self, config_path: Path | str | None = None):
         """
@@ -120,6 +129,14 @@ class SelfConfigTool(Tool):
             config[key] = value
             self._save_config(config)
             logger.info(f"Config updated: {key} = {value}")
+
+            # Add warning for critical configuration changes
+            if key in self.CRITICAL_KEYS:
+                old_display = old_value if old_value is not None else "(unset)"
+                return (
+                    f"Warning: Configuration change: {key} will be changed from "
+                    f"{old_display} to {value}. This takes effect immediately."
+                )
             return f"Updated {key} = {value}"
 
         elif action == "list":
@@ -131,7 +148,10 @@ class SelfConfigTool(Tool):
         elif action == "reset":
             config = self._get_defaults()
             self._save_config(config)
-            return "Configuration reset to defaults"
+            return (
+                "Warning: This will reset ALL configuration to defaults. "
+                "Configuration reset completed."
+            )
 
         return f"Unknown action: {action}"
 
@@ -141,6 +161,10 @@ class MemoryManagementTool(Tool):
     Tool for managing agent memory.
 
     Provides explicit control over long-term memory and notes.
+
+    Destructive Operations:
+        - forget: Permanently removes a memory entry. This action cannot be
+          undone and the memory content will be lost.
     """
 
     def __init__(self, memory_store: Any = None):
@@ -228,7 +252,8 @@ class MemoryManagementTool(Tool):
             if not content:
                 return "Error: 'content' is required for 'forget' action"
             if self._memory_store.remove_memory(content):
-                return f"Forgot: {content[:50]}..."
+                content_preview = content[:50] + "..." if len(content) > 50 else content
+                return f"Warning: Memory removed permanently: {content_preview}"
             return "Memory not found"
 
         elif action == "summary":
