@@ -31,9 +31,12 @@ from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.toolkit.adapter import ToolkitAdapter
 from spoon_bot.llm.base import LLMProvider
+from spoon_bot.llm.spoon_core_provider import SpoonCoreProvider, is_spoon_core_available
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.memory.store import MemoryStore
 from spoon_bot.skills.manager import SkillManager
+from spoon_bot.skills.spoon_core_skills import SpoonCoreSkillManager
+from spoon_bot.mcp.spoon_core_mcp import SpoonCoreMCPAdapter
 
 
 class AgentLoop:
@@ -60,6 +63,8 @@ class AgentLoop:
         max_output: int = 10000,
         session_key: str = "default",
         skill_paths: list[Path | str] | None = None,
+        mcp_config: dict | None = None,
+        use_spoon_core_skills: bool = True,
     ):
         """
         Initialize the agent loop.
@@ -73,6 +78,8 @@ class AgentLoop:
             max_output: Maximum output characters for shell.
             session_key: Session identifier for persistence.
             skill_paths: Additional paths to search for skills.
+            mcp_config: MCP server configurations (name -> config dict).
+            use_spoon_core_skills: Use spoon-core SkillManager if available.
         """
         self.provider = provider
         self.workspace = Path(workspace or Path.home() / ".spoon-bot" / "workspace")
@@ -90,11 +97,29 @@ class AgentLoop:
         self.sessions = SessionManager(self.workspace)
         self.memory = MemoryStore(self.workspace)
 
-        # Initialize skills
+        # Initialize skills (prefer spoon-core if available)
         default_skill_paths = [self.workspace / "skills"]
         if skill_paths:
             default_skill_paths.extend([Path(p) for p in skill_paths])
-        self.skills = SkillManager(skill_paths=default_skill_paths, auto_discover=True)
+
+        if use_spoon_core_skills:
+            self.skills = SpoonCoreSkillManager(
+                skill_paths=default_skill_paths,
+                llm=provider if is_spoon_core_available() else None,
+                auto_discover=True,
+            )
+            if self.skills.using_spoon_core:
+                logger.info("Using spoon-core SkillManager with LLM intent matching")
+        else:
+            self.skills = SkillManager(skill_paths=default_skill_paths, auto_discover=True)
+
+        # Initialize MCP adapter
+        self.mcp_adapter = SpoonCoreMCPAdapter()
+        if mcp_config:
+            for name, config in mcp_config.items():
+                self.mcp_adapter.add_server(name, config)
+            if self.mcp_adapter.uses_spoon_core:
+                logger.info(f"Using spoon-core MCP with {len(mcp_config)} servers configured")
 
         # Get or create session
         self._session = self.sessions.get_or_create(session_key)
@@ -152,6 +177,34 @@ class AgentLoop:
             logger.debug("spoon-toolkits not available, skipping toolkit tools")
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
+
+    async def load_mcp_tools(self) -> int:
+        """
+        Load tools from configured MCP servers.
+
+        Returns:
+            Number of MCP tools loaded.
+        """
+        mcp_tools = await self.mcp_adapter.load_tools()
+        for tool in mcp_tools:
+            self.tools.register(tool)
+        if mcp_tools:
+            logger.info(f"Loaded {len(mcp_tools)} MCP tools")
+        return len(mcp_tools)
+
+    def load_skill_tools(self) -> int:
+        """
+        Load tools from active skills.
+
+        Returns:
+            Number of skill tools loaded.
+        """
+        skill_tools = self.skills.get_active_tools()
+        for tool in skill_tools:
+            self.tools.register(tool)
+        if skill_tools:
+            logger.info(f"Loaded {len(skill_tools)} skill tools")
+        return len(skill_tools)
 
     async def process(
         self,
@@ -279,6 +332,9 @@ async def create_agent(
     workspace: Path | str | None = None,
     provider: str = "anthropic",
     session_key: str = "default",
+    use_spoon_core: bool = True,
+    base_url: str | None = None,
+    mcp_config: dict | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -288,23 +344,47 @@ async def create_agent(
         api_key: API key for the LLM provider.
         model: Model to use.
         workspace: Workspace directory path.
-        provider: LLM provider name ("anthropic", "openai").
+        provider: LLM provider name ("anthropic", "openai", "deepseek", "ollama", "gemini", "openrouter").
         session_key: Session identifier.
+        use_spoon_core: Use spoon-core providers if available.
+        base_url: Custom base URL for the provider (e.g., for Ollama).
+        mcp_config: MCP server configurations.
         **kwargs: Additional arguments for AgentLoop.
 
     Returns:
         Configured AgentLoop instance.
     """
-    if provider == "anthropic":
-        from spoon_bot.llm.anthropic import AnthropicProvider
-        llm_provider = AnthropicProvider(api_key=api_key, model=model)
+    # Try spoon-core provider first if available and requested
+    if use_spoon_core and is_spoon_core_available():
+        logger.info(f"Using spoon-core provider: {provider}")
+        llm_provider = SpoonCoreProvider(
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+        )
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        # Fallback to local providers
+        if provider == "anthropic":
+            from spoon_bot.llm.anthropic import AnthropicProvider
+            llm_provider = AnthropicProvider(api_key=api_key, model=model)
+        elif provider == "openai":
+            from spoon_bot.llm.openai import OpenAIProvider
+            llm_provider = OpenAIProvider(api_key=api_key, model=model)
+        else:
+            raise ValueError(f"Unknown provider: {provider}. Install spoon-core for more providers.")
 
-    return AgentLoop(
+    agent = AgentLoop(
         provider=llm_provider,
         workspace=workspace,
         model=model,
         session_key=session_key,
+        mcp_config=mcp_config,
         **kwargs,
     )
+
+    # Load MCP tools if configured
+    if mcp_config:
+        await agent.load_mcp_tools()
+
+    return agent

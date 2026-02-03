@@ -11,6 +11,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem
 - **Multi-mode**: Agent / Interactive / Gateway modes
+- **spoon-core Integration**: Optional deep integration with spoon-core for enhanced capabilities
 
 ## Installation
 
@@ -88,6 +89,43 @@ spoon-bot agent -m "msg"     # One-shot mode
 spoon-bot onboard            # Initialize workspace
 spoon-bot status             # Show status
 spoon-bot version            # Show version
+```
+
+## spoon-core Integration
+
+spoon-bot can optionally integrate with [spoon-core](https://github.com/XSpoonAi/core) for enhanced capabilities:
+
+### LLM Providers
+When spoon-core is installed, you get access to multiple LLM providers:
+- Anthropic Claude
+- OpenAI GPT
+- DeepSeek
+- Ollama (local)
+- Google Gemini
+- OpenRouter
+
+```python
+from spoon_bot.agent.loop import create_agent
+
+# Use spoon-core providers (auto-detected)
+agent = await create_agent(provider="deepseek", model="deepseek-chat")
+```
+
+### Skill System
+spoon-core enables advanced skill features:
+- LLM-powered intent matching
+- Script execution within skills
+- State persistence across sessions
+
+### MCP Integration
+spoon-core provides enhanced MCP support:
+- Multiple transport types (stdio, npx, uvx, SSE, HTTP, WebSocket)
+- Connection pooling and health checks
+- Automatic retry and recovery
+
+Install spoon-core for full features:
+```bash
+pip install spoon-ai
 ```
 
 ## Development
