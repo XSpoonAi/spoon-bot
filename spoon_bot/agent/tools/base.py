@@ -121,6 +121,14 @@ class Tool(ABC):
         """
         ...
 
+    async def __call__(self, *args: Any, **kwargs: Any) -> str:
+        """
+        Make the tool callable - compatibility with spoon-core SDK.
+
+        This allows the tool to be used as: `result = await tool(arg=value)`
+        """
+        return await self.execute(**kwargs)
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:
         """
@@ -202,6 +210,15 @@ class Tool(ABC):
                 "parameters": self.parameters,
             }
         }
+
+    def to_param(self) -> dict:
+        """
+        Alias for to_schema() - compatibility with spoon-core SDK.
+
+        Returns:
+            Tool definition in OpenAI function format.
+        """
+        return self.to_schema()
 
     def __repr__(self) -> str:
         return f"<Tool {self.name}>"

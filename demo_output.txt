@@ -1,0 +1,3 @@
+# Test file created by spoon-bot demo
+This demonstrates the filesystem tools.
+Created at: 2026-02-04
