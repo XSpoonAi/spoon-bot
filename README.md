@@ -13,11 +13,38 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **Multi-mode**: Agent / Interactive / Gateway modes
 - **spoon-core Integration**: Optional deep integration with spoon-core for enhanced capabilities
 
+## Requirements
+
+- **Python 3.12+** (required by spoon-ai-sdk)
+
 ## Installation
 
+### Using uv (Recommended)
+
 ```bash
-# Clone and install
+# Clone the repository
+git clone https://github.com/XSpoonAi/spoon-bot.git
 cd spoon-bot
+
+# Install with uv (creates .venv automatically)
+uv sync
+
+# Or with all extras
+uv sync --all-extras
+```
+
+### Using pip
+
+```bash
+# Clone the repository
+git clone https://github.com/XSpoonAi/spoon-bot.git
+cd spoon-bot
+
+# Create virtual environment (Python 3.12+ required)
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install
 pip install -e .
 
 # Or with all extras
@@ -143,7 +170,7 @@ See [docs/API_DESIGN.md](docs/API_DESIGN.md) for full API documentation.
 
 ## spoon-core Integration
 
-spoon-bot can optionally integrate with [spoon-core](https://github.com/XSpoonAi/core) for enhanced capabilities:
+spoon-bot is powered by [spoon-core](https://github.com/XSpoonAi/spoon-core) (spoon-ai-sdk) for its core capabilities:
 
 ### LLM Providers
 When spoon-core is installed, you get access to multiple LLM providers:
@@ -173,15 +200,15 @@ spoon-core provides enhanced MCP support:
 - Connection pooling and health checks
 - Automatic retry and recovery
 
-Install spoon-core for full features:
-```bash
-pip install spoon-ai
-```
+spoon-ai-sdk is included as a required dependency (v0.4.0+). It will be installed automatically when you run `uv sync` or `pip install -e .`.
 
 ## Development
 
 ```bash
-# Install dev dependencies
+# Install dev dependencies with uv
+uv sync --extra dev
+
+# Or with pip
 pip install -e ".[dev]"
 
 # Run tests
