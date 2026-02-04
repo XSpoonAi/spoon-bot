@@ -34,10 +34,18 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+from spoon_bot.exceptions import (
+    SkillNotFoundError,
+    SkillActivationError,
+    SkillPrerequisiteError,
+    DependencyError,
+)
+
 logger = logging.getLogger(__name__)
 
 # Flag to track which implementation is being used
 _USING_SPOON_CORE = False
+_SPOON_CORE_IMPORT_ERROR: str | None = None
 
 
 @runtime_checkable
@@ -58,11 +66,49 @@ try:
     from spoon_ai.skills import SkillManager as CoreSkillManager
     from spoon_ai.skills import Skill as CoreSkill
     _USING_SPOON_CORE = True
-    logger.info("Using spoon-core SkillManager")
-except ImportError:
+    logger.debug("Using spoon-core SkillManager")
+except ImportError as e:
+    _SPOON_CORE_IMPORT_ERROR = str(e)
     CoreSkillManager = None  # type: ignore
     CoreSkill = None  # type: ignore
-    logger.info("spoon-core not available, using local SkillManager")
+    logger.debug(f"spoon-core not available, using local SkillManager: {e}")
+
+
+class _StubSkillManager:
+    """Minimal stub manager when no skill manager is available."""
+
+    def list(self) -> List[str]:
+        return []
+
+    def get(self, name: str) -> None:
+        return None
+
+    def match_triggers(self, text: str) -> List[Any]:
+        return []
+
+    async def activate(self, name: str, context: Dict[str, Any] | None = None) -> None:
+        raise SkillNotFoundError(name, [])
+
+    async def deactivate(self, name: str) -> bool:
+        return False
+
+    async def deactivate_all(self) -> int:
+        return 0
+
+    def is_active(self, name: str) -> bool:
+        return False
+
+    def get_active_skill_names(self) -> List[str]:
+        return []
+
+    def get_active_context(self) -> str:
+        return ""
+
+    def get_active_tools(self) -> List[Any]:
+        return []
+
+    def add_skill_path(self, path: str) -> None:
+        pass
 
 
 class SpoonCoreSkillManager:
@@ -104,21 +150,34 @@ class SpoonCoreSkillManager:
         self._llm = llm
         self._scripts_enabled = scripts_enabled
         self._manager: Any = None
+        self._initialization_error: str | None = None
 
         # Convert paths to strings for spoon-core compatibility
         str_paths = [str(p) for p in self._skill_paths]
 
         if _USING_SPOON_CORE and CoreSkillManager is not None:
             # Use spoon-core's SkillManager
-            self._manager = CoreSkillManager(
-                skill_paths=str_paths if str_paths else None,
-                llm=llm,
-                auto_discover=auto_discover,
-                scripts_enabled=scripts_enabled,
-            )
-            self._using_core = True
+            try:
+                self._manager = CoreSkillManager(
+                    skill_paths=str_paths if str_paths else None,
+                    llm=llm,
+                    auto_discover=auto_discover,
+                    scripts_enabled=scripts_enabled,
+                )
+                self._using_core = True
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize spoon-core SkillManager, falling back: {e}"
+                )
+                self._initialization_error = str(e)
+                self._init_fallback_manager(auto_discover)
         else:
             # Fall back to local implementation
+            self._init_fallback_manager(auto_discover)
+
+    def _init_fallback_manager(self, auto_discover: bool) -> None:
+        """Initialize the fallback local skill manager."""
+        try:
             from spoon_bot.skills.manager import SkillManager as LocalSkillManager
 
             # Convert to Path objects for local implementation
@@ -130,12 +189,23 @@ class SpoonCoreSkillManager:
             self._using_core = False
 
             # Store LLM for potential future use
-            self._local_llm = llm
+            self._local_llm = self._llm
+        except Exception as e:
+            logger.error(f"Failed to initialize local SkillManager: {e}")
+            self._initialization_error = str(e)
+            self._using_core = False
+            # Create a minimal stub manager
+            self._manager = _StubSkillManager()
 
     @property
     def using_spoon_core(self) -> bool:
         """Check if spoon-core's SkillManager is being used."""
         return self._using_core
+
+    @property
+    def initialization_error(self) -> str | None:
+        """Get any initialization error that occurred."""
+        return self._initialization_error
 
     def list(self) -> List[str]:
         """
@@ -237,9 +307,26 @@ class SpoonCoreSkillManager:
             Activated skill instance.
 
         Raises:
-            ValueError: If skill not found or prerequisites not met.
+            SkillNotFoundError: If skill not found.
+            SkillActivationError: If activation fails.
+            SkillPrerequisiteError: If prerequisites not met.
         """
-        return await self._manager.activate(name, context=context)
+        try:
+            return await self._manager.activate(name, context=context)
+        except SkillNotFoundError:
+            # Re-raise our exception type
+            raise
+        except ValueError as e:
+            error_str = str(e).lower()
+            if "not found" in error_str:
+                raise SkillNotFoundError(name, self.list()) from e
+            if "prerequisite" in error_str or "requires" in error_str:
+                # Try to extract prerequisite info
+                raise SkillPrerequisiteError(name, [str(e)]) from e
+            raise SkillActivationError(name, str(e)) from e
+        except Exception as e:
+            logger.error(f"Failed to activate skill '{name}': {e}")
+            raise SkillActivationError(name, str(e)) from e
 
     async def deactivate(self, name: str) -> bool:
         """

@@ -1,32 +1,118 @@
 """MCP client adapter for connecting to MCP servers."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 from typing import Any
-from dataclasses import dataclass, field
 
 from loguru import logger
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-@dataclass
-class MCPServerConfig:
-    """Configuration for an MCP server."""
-    name: str
-    transport: str  # "stdio", "sse", "http-stream"
-    command: str | None = None
-    args: list[str] = field(default_factory=list)
-    url: str | None = None
-    env: dict[str, str] = field(default_factory=dict)
-    timeout: int = 30
+class MCPServerConfig(BaseModel):
+    """
+    Configuration for an MCP server with validation.
+
+    Attributes:
+        name: Unique server identifier.
+        transport: Transport type (stdio, sse, http-stream).
+        command: Command to run for stdio transport.
+        args: Command arguments.
+        url: URL for HTTP/SSE transports.
+        env: Environment variables for the server process.
+        timeout: Connection timeout in seconds.
+    """
+
+    name: str = Field(..., min_length=1, description="Unique server identifier")
+    transport: str = Field(
+        default="stdio",
+        description="Transport type (stdio, sse, http-stream)"
+    )
+    command: str | None = Field(
+        default=None,
+        description="Command to run for stdio transport"
+    )
+    args: list[str] = Field(
+        default_factory=list,
+        description="Command arguments"
+    )
+    url: str | None = Field(
+        default=None,
+        description="URL for HTTP/SSE transports"
+    )
+    env: dict[str, str] = Field(
+        default_factory=dict,
+        description="Environment variables"
+    )
+    timeout: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+        description="Connection timeout in seconds (1-3600)"
+    )
+
+    @field_validator("transport")
+    @classmethod
+    def validate_transport(cls, v: str) -> str:
+        """Validate transport type."""
+        valid = {"stdio", "sse", "http-stream", "http", "websocket", "npx", "uvx", "python"}
+        v = v.lower().strip()
+        if v not in valid:
+            raise ValueError(f"Invalid transport: {v}. Must be one of: {valid}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_transport_requirements(self) -> "MCPServerConfig":
+        """Validate that required fields are present for each transport type."""
+        if self.transport in ("stdio", "npx", "uvx", "python"):
+            if not self.command:
+                raise ValueError(
+                    f"Transport '{self.transport}' requires 'command' field"
+                )
+        elif self.transport in ("sse", "http-stream", "http", "websocket"):
+            if not self.url:
+                raise ValueError(
+                    f"Transport '{self.transport}' requires 'url' field"
+                )
+        return self
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str | None) -> str | None:
+        """Validate URL format if provided."""
+        if v is not None:
+            v = v.strip()
+            if not v.startswith(("http://", "https://", "ws://", "wss://")):
+                raise ValueError(
+                    "URL must start with http://, https://, ws://, or wss://"
+                )
+        return v
 
 
-@dataclass
-class MCPTool:
-    """Represents a tool from an MCP server."""
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    server_name: str
+class MCPTool(BaseModel):
+    """
+    Represents a tool from an MCP server.
+
+    Attributes:
+        name: Tool name (unique within server).
+        description: Tool description.
+        parameters: JSON Schema for tool parameters.
+        server_name: Name of the server this tool belongs to.
+    """
+
+    name: str = Field(..., min_length=1, description="Tool name")
+    description: str = Field(default="", description="Tool description")
+    parameters: dict[str, Any] = Field(
+        default_factory=lambda: {"type": "object", "properties": {}},
+        description="JSON Schema for parameters"
+    )
+    server_name: str = Field(..., min_length=1, description="Server name")
+
+    @property
+    def full_name(self) -> str:
+        """Get full tool name including server prefix."""
+        return f"{self.server_name}:{self.name}"
 
 
 class MCPClientAdapter:
@@ -197,19 +283,33 @@ class MCPClientAdapter:
         except Exception as e:
             logger.error(f"Error discovering tools from {server_name}: {e}")
 
-    def _parse_tools_response(self, server_name: str, tools_data: list[dict]) -> None:
-        """Parse tools response from MCP server."""
+    def _parse_tools_response(self, server_name: str, tools_data: list[dict[str, Any]]) -> None:
+        """
+        Parse tools response from MCP server.
+
+        Args:
+            server_name: Name of the server these tools belong to.
+            tools_data: List of tool definitions from the server.
+        """
         for tool_data in tools_data:
-            tool = MCPTool(
-                name=tool_data.get("name", ""),
-                description=tool_data.get("description", ""),
-                parameters=tool_data.get("inputSchema", {}),
-                server_name=server_name,
-            )
-            # Use server:tool_name as key to avoid conflicts
-            key = f"{server_name}:{tool.name}"
-            self._tools[key] = tool
-            logger.debug(f"Discovered MCP tool: {key}")
+            tool_name = tool_data.get("name", "")
+            if not tool_name:
+                logger.warning(f"Skipping tool with empty name from {server_name}")
+                continue
+
+            try:
+                tool = MCPTool(
+                    name=tool_name,
+                    description=tool_data.get("description", ""),
+                    parameters=tool_data.get("inputSchema", {"type": "object", "properties": {}}),
+                    server_name=server_name,
+                )
+                # Use server:tool_name as key to avoid conflicts
+                key = tool.full_name
+                self._tools[key] = tool
+                logger.debug(f"Discovered MCP tool: {key}")
+            except Exception as e:
+                logger.warning(f"Failed to parse tool '{tool_name}' from {server_name}: {e}")
 
     async def call_tool(
         self,

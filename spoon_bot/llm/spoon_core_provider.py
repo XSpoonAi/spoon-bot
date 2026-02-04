@@ -13,9 +13,18 @@ from typing import Any
 from loguru import logger
 
 from spoon_bot.llm.base import LLMProvider, LLMResponse, ToolCall
+from spoon_bot.exceptions import (
+    ProviderNotAvailableError,
+    LLMConnectionError,
+    LLMTimeoutError,
+    LLMResponseError,
+    DependencyError,
+    APIKeyMissingError,
+)
 
 # Flag to track if spoon-core is available
 _SPOON_CORE_AVAILABLE = False
+_SPOON_CORE_IMPORT_ERROR: str | None = None
 
 try:
     from spoon_ai.chat import ChatBot
@@ -23,9 +32,10 @@ try:
     from spoon_ai.llm.interface import LLMResponse as CoreLLMResponse
 
     _SPOON_CORE_AVAILABLE = True
-except ImportError:
-    logger.warning(
-        "spoon-core (spoon_ai) not installed. SpoonCoreProvider will use fallback mode."
+except ImportError as e:
+    _SPOON_CORE_IMPORT_ERROR = str(e)
+    logger.debug(
+        f"spoon-core (spoon_ai) not installed: {e}. SpoonCoreProvider will use fallback mode."
     )
     ChatBot = None
     CoreMessage = None
@@ -124,7 +134,13 @@ class SpoonCoreProvider(LLMProvider):
             self._initialize_chatbot()
 
     def _initialize_chatbot(self) -> None:
-        """Initialize the underlying ChatBot instance."""
+        """Initialize the underlying ChatBot instance.
+
+        Raises:
+            ProviderNotAvailableError: If spoon-core is not available.
+            APIKeyMissingError: If the API key is missing for the provider.
+            LLMConnectionError: If initialization fails for other reasons.
+        """
         if not _SPOON_CORE_AVAILABLE or ChatBot is None:
             return
 
@@ -154,9 +170,45 @@ class SpoonCoreProvider(LLMProvider):
                 f"model='{self.model}'"
             )
 
+        except ValueError as e:
+            # Usually indicates missing API key
+            error_str = str(e).lower()
+            if "api" in error_str and "key" in error_str:
+                env_var = self._get_env_var_for_provider()
+                raise APIKeyMissingError(
+                    provider=self.provider,
+                    env_var=env_var,
+                ) from e
+            logger.error(f"Failed to initialize ChatBot: {e}")
+            raise ProviderNotAvailableError(
+                provider=self.provider,
+                reason=str(e),
+            ) from e
+        except ImportError as e:
+            logger.error(f"Missing dependency for ChatBot: {e}")
+            raise DependencyError(
+                package="spoon-ai",
+                feature=f"{self.provider} provider",
+                install_command="pip install spoon-ai",
+            ) from e
         except Exception as e:
             logger.error(f"Failed to initialize ChatBot: {e}")
-            raise RuntimeError(f"Failed to initialize SpoonCoreProvider: {e}") from e
+            raise LLMConnectionError(
+                provider=self.provider,
+                status_code=None,
+                response_text=str(e),
+            ) from e
+
+    def _get_env_var_for_provider(self) -> str | None:
+        """Get the expected environment variable name for the current provider."""
+        env_vars = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "gemini": "GOOGLE_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }
+        return env_vars.get(self.provider)
 
     def get_default_model(self) -> str:
         """Get the default model for this provider.
@@ -185,12 +237,15 @@ class SpoonCoreProvider(LLMProvider):
             LLMResponse with content and/or tool calls.
 
         Raises:
-            RuntimeError: If spoon-core is not available.
-            Exception: If the chat request fails.
+            ProviderNotAvailableError: If spoon-core is not available.
+            LLMConnectionError: If the chat request fails.
+            LLMTimeoutError: If the request times out.
         """
         if not _SPOON_CORE_AVAILABLE or self._chatbot is None:
-            raise RuntimeError(
-                "spoon-core is not available. Install it with: pip install spoon-ai"
+            raise ProviderNotAvailableError(
+                provider=self.provider,
+                reason="spoon-core is not installed",
+                install_hint="Install it with: pip install spoon-ai",
             )
 
         # Convert messages to spoon-core format
@@ -220,9 +275,41 @@ class SpoonCoreProvider(LLMProvider):
                     usage=None,
                 )
 
+        except TimeoutError as e:
+            logger.error(f"SpoonCoreProvider timeout: {e}")
+            raise LLMTimeoutError(
+                provider=self.provider,
+                timeout_seconds=120.0,  # Default timeout
+            ) from e
+        except ConnectionError as e:
+            logger.error(f"SpoonCoreProvider connection error: {e}")
+            raise LLMConnectionError(
+                provider=self.provider,
+                status_code=None,
+                response_text=str(e),
+            ) from e
+        except ValueError as e:
+            # Could be API key issue or invalid request
+            error_str = str(e).lower()
+            if "api" in error_str and "key" in error_str:
+                raise APIKeyMissingError(
+                    provider=self.provider,
+                    env_var=self._get_env_var_for_provider(),
+                ) from e
+            logger.error(f"SpoonCoreProvider value error: {e}")
+            raise LLMResponseError(
+                f"Invalid request: {e}",
+                raw_response=None,
+            ) from e
         except Exception as e:
             logger.error(f"SpoonCoreProvider chat error: {e}")
-            raise
+            # Try to provide more context about the error
+            error_type = type(e).__name__
+            raise LLMConnectionError(
+                provider=self.provider,
+                status_code=None,
+                response_text=f"{error_type}: {e}",
+            ) from e
 
     def _convert_messages_to_core(
         self, messages: list[dict[str, Any]]

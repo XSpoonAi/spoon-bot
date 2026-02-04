@@ -1,4 +1,4 @@
-"""Anthropic Claude provider implementation."""
+"""Anthropic Claude provider implementation with rate limiting."""
 
 import json
 import os
@@ -8,6 +8,16 @@ import httpx
 from loguru import logger
 
 from spoon_bot.llm.base import LLMProvider, LLMResponse, ToolCall
+from spoon_bot.exceptions import (
+    APIKeyMissingError,
+    LLMConnectionError,
+    LLMTimeoutError,
+    LLMResponseError,
+)
+from spoon_bot.utils.rate_limit import (
+    RateLimitConfig,
+    get_rate_limiter,
+)
 
 
 class AnthropicProvider(LLMProvider):
@@ -26,6 +36,8 @@ class AnthropicProvider(LLMProvider):
         api_key: str | None = None,
         model: str | None = None,
         max_tokens: int = 4096,
+        timeout: float = 120.0,
+        rate_limit_config: RateLimitConfig | None = None,
     ):
         """
         Initialize Anthropic provider.
@@ -34,14 +46,38 @@ class AnthropicProvider(LLMProvider):
             api_key: Anthropic API key (defaults to ANTHROPIC_API_KEY env var).
             model: Default model to use.
             max_tokens: Maximum tokens in response.
+            timeout: Request timeout in seconds.
+            rate_limit_config: Configuration for rate limiting API calls.
+
+        Raises:
+            APIKeyMissingError: If no API key is provided or found in environment.
         """
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
-            raise ValueError("Anthropic API key required (set ANTHROPIC_API_KEY)")
+            raise APIKeyMissingError(
+                provider="Anthropic",
+                env_var="ANTHROPIC_API_KEY",
+            )
 
         self.model = model or self.DEFAULT_MODEL
         self.max_tokens = max_tokens
-        self._client = httpx.AsyncClient(timeout=120.0)
+        self._timeout = timeout
+        self._client: httpx.AsyncClient | None = None
+
+        # Initialize rate limiter
+        self._rate_limit_config = rate_limit_config or RateLimitConfig.for_llm_api()
+        self._rate_limiter = get_rate_limiter("anthropic_api", self._rate_limit_config)
+        logger.debug(
+            f"AnthropicProvider initialized with rate limit: "
+            f"{self._rate_limit_config.requests_per_second}/s, "
+            f"{self._rate_limit_config.requests_per_minute}/min"
+        )
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        """Lazily create the HTTP client."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
 
     def get_default_model(self) -> str:
         return self.model
@@ -53,7 +89,13 @@ class AnthropicProvider(LLMProvider):
         model: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Send a chat completion request to Anthropic."""
+        """Send a chat completion request to Anthropic with rate limiting."""
+        # Apply rate limiting
+        if self._rate_limit_config.enabled:
+            wait_time = await self._rate_limiter.wait_and_acquire()
+            if wait_time > 0.1:
+                logger.info(f"Anthropic API rate limited, waited {wait_time:.2f}s")
+
         model = model or self.model
 
         # Convert messages to Anthropic format
@@ -81,8 +123,10 @@ class AnthropicProvider(LLMProvider):
             "content-type": "application/json",
         }
 
+        client = self._ensure_client()
+
         try:
-            response = await self._client.post(
+            response = await client.post(
                 self.API_URL,
                 json=request_body,
                 headers=headers,
@@ -91,12 +135,40 @@ class AnthropicProvider(LLMProvider):
             data = response.json()
             return self._parse_response(data, model)
 
+        except httpx.TimeoutException as e:
+            logger.error(f"Anthropic API timeout: {e}")
+            raise LLMTimeoutError(
+                provider="Anthropic",
+                timeout_seconds=self._timeout,
+            ) from e
         except httpx.HTTPStatusError as e:
-            logger.error(f"Anthropic API error: {e.response.status_code} - {e.response.text}")
-            raise
+            error_text = e.response.text
+            logger.error(f"Anthropic API error: {e.response.status_code} - {error_text}")
+            raise LLMConnectionError(
+                provider="Anthropic",
+                status_code=e.response.status_code,
+                response_text=error_text,
+            ) from e
+        except httpx.RequestError as e:
+            logger.error(f"Anthropic API connection error: {e}")
+            raise LLMConnectionError(
+                provider="Anthropic",
+                status_code=None,
+                response_text=str(e),
+            ) from e
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Anthropic response: {e}")
+            raise LLMResponseError(
+                "Failed to parse API response",
+                raw_response=getattr(response, "text", None),
+            ) from e
         except Exception as e:
-            logger.error(f"Error calling Anthropic API: {e}")
-            raise
+            logger.error(f"Unexpected error calling Anthropic API: {e}")
+            raise LLMConnectionError(
+                provider="Anthropic",
+                status_code=None,
+                response_text=str(e),
+            ) from e
 
     def _convert_messages(
         self,
@@ -265,4 +337,6 @@ class AnthropicProvider(LLMProvider):
 
     async def close(self) -> None:
         """Close the HTTP client."""
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None

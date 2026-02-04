@@ -117,9 +117,13 @@ class SkillManager:
         Raises:
             ValueError: If skill not found.
         """
+        if not name or not name.strip():
+            raise ValueError("Skill name cannot be empty")
+
         skill = self._skills.get(name)
         if not skill:
-            raise ValueError(f"Skill '{name}' not found")
+            available = ", ".join(sorted(self._skills.keys())[:10])
+            raise ValueError(f"Skill '{name}' not found. Available: {available}")
 
         if name in self._active_skills:
             logger.debug(f"Skill '{name}' already active")
@@ -141,10 +145,8 @@ class SkillManager:
                 if composed_skill and composed_skill.metadata.composable:
                     await self.activate(composed)
 
-        # Update state
-        skill.state = SkillState.ACTIVE
-        if context:
-            skill.context.update(context)
+        # Use the Skill model's activate method
+        skill.activate(context)
 
         self._active_skills[name] = skill
         logger.info(f"Activated skill: {name}")
@@ -164,8 +166,8 @@ class SkillManager:
             return False
 
         skill = self._active_skills[name]
-        skill.state = SkillState.INACTIVE
-        skill.context.clear()
+        # Use the Skill model's deactivate method
+        skill.deactivate()
         del self._active_skills[name]
 
         logger.info(f"Deactivated skill: {name}")
@@ -180,8 +182,7 @@ class SkillManager:
         """
         count = len(self._active_skills)
         for skill in list(self._active_skills.values()):
-            skill.state = SkillState.INACTIVE
-            skill.context.clear()
+            skill.deactivate()
         self._active_skills.clear()
         return count
 

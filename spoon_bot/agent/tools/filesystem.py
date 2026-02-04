@@ -1,4 +1,7 @@
-"""File system tools: read, write, edit, list."""
+"""File system tools: read, write, edit, list.
+
+All tools enforce workspace boundary security to prevent path traversal attacks.
+"""
 
 from pathlib import Path
 from typing import Any
@@ -6,10 +9,35 @@ import aiofiles
 import aiofiles.os
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.path_validator import (
+    PathValidator,
+    validate_read_path,
+    validate_write_path,
+    validate_directory_path,
+    set_default_validator,
+)
 
 
 class ReadFileTool(Tool):
-    """Tool to read file contents with encoding fallback."""
+    """Tool to read file contents with encoding fallback and path traversal protection."""
+
+    def __init__(self, workspace: Path | str | None = None):
+        """
+        Initialize the read file tool.
+
+        Args:
+            workspace: The allowed workspace directory. Paths outside this
+                       directory will be rejected for security.
+        """
+        self._workspace = Path(workspace).resolve() if workspace else None
+        self._validator = PathValidator(workspace=workspace) if workspace else None
+
+    def set_workspace(self, workspace: Path | str) -> None:
+        """Set the workspace boundary for path validation."""
+        self._workspace = Path(workspace).resolve()
+        self._validator = PathValidator(workspace=self._workspace)
+        # Also update the global default
+        set_default_validator(self._validator)
 
     @property
     def name(self) -> str:
@@ -17,7 +45,10 @@ class ReadFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Read the contents of a file at the given path."
+        workspace_note = ""
+        if self._workspace:
+            workspace_note = f" Files must be within the workspace: {self._workspace}"
+        return f"Read the contents of a file at the given path.{workspace_note}"
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -26,7 +57,7 @@ class ReadFileTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The file path to read",
+                    "description": "The file path to read (must be within workspace)",
                 },
                 "encoding": {
                     "type": "string",
@@ -42,9 +73,15 @@ class ReadFileTool(Tool):
         encoding: str = "utf-8",
         **kwargs: Any,
     ) -> str:
-        """Read file contents."""
+        """Read file contents with path traversal protection."""
         try:
-            file_path = Path(path).expanduser().resolve()
+            # Validate the path
+            result = validate_read_path(path, workspace=self._workspace)
+            if not result.valid:
+                return f"Security Error: {result.error}"
+
+            file_path = result.resolved_path
+            assert file_path is not None  # Guaranteed by valid=True
 
             if not file_path.exists():
                 return f"Error: File not found: {path}"
@@ -68,7 +105,24 @@ class ReadFileTool(Tool):
 
 
 class WriteFileTool(Tool):
-    """Tool to write content to a file, creating parent directories."""
+    """Tool to write content to a file with path traversal protection."""
+
+    def __init__(self, workspace: Path | str | None = None):
+        """
+        Initialize the write file tool.
+
+        Args:
+            workspace: The allowed workspace directory. Writes outside this
+                       directory will be rejected for security.
+        """
+        self._workspace = Path(workspace).resolve() if workspace else None
+        self._validator = PathValidator(workspace=workspace) if workspace else None
+
+    def set_workspace(self, workspace: Path | str) -> None:
+        """Set the workspace boundary for path validation."""
+        self._workspace = Path(workspace).resolve()
+        self._validator = PathValidator(workspace=self._workspace)
+        set_default_validator(self._validator)
 
     @property
     def name(self) -> str:
@@ -76,7 +130,10 @@ class WriteFileTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Write content to a file at the given path. Creates parent directories if needed."
+        workspace_note = ""
+        if self._workspace:
+            workspace_note = f" Files must be within the workspace: {self._workspace}"
+        return f"Write content to a file at the given path. Creates parent directories if needed.{workspace_note}"
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -85,7 +142,7 @@ class WriteFileTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The file path to write to",
+                    "description": "The file path to write to (must be within workspace)",
                 },
                 "content": {
                     "type": "string",
@@ -101,11 +158,17 @@ class WriteFileTool(Tool):
         content: str,
         **kwargs: Any,
     ) -> str:
-        """Write content to file."""
+        """Write content to file with path traversal protection."""
         try:
-            file_path = Path(path).expanduser().resolve()
+            # Validate the path (write validation is stricter)
+            result = validate_write_path(path, workspace=self._workspace)
+            if not result.valid:
+                return f"Security Error: {result.error}"
 
-            # Create parent directories
+            file_path = result.resolved_path
+            assert file_path is not None  # Guaranteed by valid=True
+
+            # Create parent directories (already validated to be within workspace)
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
@@ -120,7 +183,24 @@ class WriteFileTool(Tool):
 
 
 class EditFileTool(Tool):
-    """Tool to edit a file by replacing text."""
+    """Tool to edit a file by replacing text with path traversal protection."""
+
+    def __init__(self, workspace: Path | str | None = None):
+        """
+        Initialize the edit file tool.
+
+        Args:
+            workspace: The allowed workspace directory. Edits outside this
+                       directory will be rejected for security.
+        """
+        self._workspace = Path(workspace).resolve() if workspace else None
+        self._validator = PathValidator(workspace=workspace) if workspace else None
+
+    def set_workspace(self, workspace: Path | str) -> None:
+        """Set the workspace boundary for path validation."""
+        self._workspace = Path(workspace).resolve()
+        self._validator = PathValidator(workspace=self._workspace)
+        set_default_validator(self._validator)
 
     @property
     def name(self) -> str:
@@ -128,9 +208,12 @@ class EditFileTool(Tool):
 
     @property
     def description(self) -> str:
+        workspace_note = ""
+        if self._workspace:
+            workspace_note = f" Files must be within the workspace: {self._workspace}"
         return (
             "Edit a file by replacing old_text with new_text. "
-            "The old_text must exist exactly once in the file."
+            f"The old_text must exist exactly once in the file.{workspace_note}"
         )
 
     @property
@@ -140,7 +223,7 @@ class EditFileTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The file path to edit",
+                    "description": "The file path to edit (must be within workspace)",
                 },
                 "old_text": {
                     "type": "string",
@@ -161,9 +244,15 @@ class EditFileTool(Tool):
         new_text: str,
         **kwargs: Any,
     ) -> str:
-        """Edit file by replacing text."""
+        """Edit file by replacing text with path traversal protection."""
         try:
-            file_path = Path(path).expanduser().resolve()
+            # Validate the path (use write validation since we're modifying)
+            result = validate_write_path(path, workspace=self._workspace)
+            if not result.valid:
+                return f"Security Error: {result.error}"
+
+            file_path = result.resolved_path
+            assert file_path is not None  # Guaranteed by valid=True
 
             if not file_path.exists():
                 return f"Error: File not found: {path}"
@@ -196,7 +285,24 @@ class EditFileTool(Tool):
 
 
 class ListDirTool(Tool):
-    """Tool to list directory contents with visual indicators."""
+    """Tool to list directory contents with path traversal protection."""
+
+    def __init__(self, workspace: Path | str | None = None):
+        """
+        Initialize the list directory tool.
+
+        Args:
+            workspace: The allowed workspace directory. Listing outside this
+                       directory will be rejected for security.
+        """
+        self._workspace = Path(workspace).resolve() if workspace else None
+        self._validator = PathValidator(workspace=workspace) if workspace else None
+
+    def set_workspace(self, workspace: Path | str) -> None:
+        """Set the workspace boundary for path validation."""
+        self._workspace = Path(workspace).resolve()
+        self._validator = PathValidator(workspace=self._workspace)
+        set_default_validator(self._validator)
 
     @property
     def name(self) -> str:
@@ -204,7 +310,10 @@ class ListDirTool(Tool):
 
     @property
     def description(self) -> str:
-        return "List the contents of a directory with file/folder indicators."
+        workspace_note = ""
+        if self._workspace:
+            workspace_note = f" Directory must be within the workspace: {self._workspace}"
+        return f"List the contents of a directory with file/folder indicators.{workspace_note}"
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -213,7 +322,7 @@ class ListDirTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The directory path to list",
+                    "description": "The directory path to list (must be within workspace)",
                 },
                 "show_hidden": {
                     "type": "boolean",
@@ -229,9 +338,15 @@ class ListDirTool(Tool):
         show_hidden: bool = False,
         **kwargs: Any,
     ) -> str:
-        """List directory contents."""
+        """List directory contents with path traversal protection."""
         try:
-            dir_path = Path(path).expanduser().resolve()
+            # Validate the path
+            result = validate_directory_path(path, workspace=self._workspace)
+            if not result.valid:
+                return f"Security Error: {result.error}"
+
+            dir_path = result.resolved_path
+            assert dir_path is not None  # Guaranteed by valid=True
 
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
@@ -247,7 +362,15 @@ class ListDirTool(Tool):
                 if item.is_dir():
                     items.append(f"[DIR]  {item.name}/")
                 elif item.is_symlink():
-                    items.append(f"[LINK] {item.name}")
+                    # Check if symlink target is safe to show
+                    try:
+                        target = item.resolve()
+                        if self._workspace and not self._is_within_workspace(target):
+                            items.append(f"[LINK] {item.name} -> (outside workspace)")
+                        else:
+                            items.append(f"[LINK] {item.name}")
+                    except OSError:
+                        items.append(f"[LINK] {item.name} -> (broken)")
                 else:
                     # Show file size
                     try:
@@ -271,3 +394,13 @@ class ListDirTool(Tool):
             return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error listing directory: {str(e)}"
+
+    def _is_within_workspace(self, path: Path) -> bool:
+        """Check if a path is within the workspace."""
+        if self._workspace is None:
+            return True
+        try:
+            path.relative_to(self._workspace)
+            return True
+        except ValueError:
+            return False

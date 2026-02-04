@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.exceptions import ToolExecutionError, ToolTimeoutError
 
 if TYPE_CHECKING:
     pass
@@ -49,29 +51,57 @@ class ToolkitToolWrapper(Tool):
         return {"type": "object", "properties": {}}
 
     async def execute(self, **kwargs: Any) -> str:
-        """Execute the toolkit tool."""
+        """Execute the toolkit tool.
+
+        Returns:
+            Tool execution result as string.
+            In case of error, returns a user-friendly error message.
+        """
         try:
             # Check if tool has async execute
             if hasattr(self._tool, "arun"):
                 result = await self._tool.arun(**kwargs)
             elif hasattr(self._tool, "execute"):
-                import asyncio
                 if asyncio.iscoroutinefunction(self._tool.execute):
                     result = await self._tool.execute(**kwargs)
                 else:
-                    result = self._tool.execute(**kwargs)
+                    # Run sync function in executor to avoid blocking
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self._tool.execute(**kwargs)
+                    )
             elif hasattr(self._tool, "run"):
-                result = self._tool.run(**kwargs)
+                # Run sync function in executor to avoid blocking
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self._tool.run(**kwargs)
+                )
             elif callable(self._tool):
-                result = self._tool(**kwargs)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self._tool(**kwargs)
+                )
             else:
-                return f"Error: Tool {self.name} is not callable"
+                return f"Error: Tool '{self.name}' is not callable"
 
             return str(result) if result is not None else "Success"
 
+        except asyncio.TimeoutError as e:
+            logger.error(f"Toolkit tool {self.name} timed out: {e}")
+            return f"Error: Tool '{self.name}' timed out"
+        except asyncio.CancelledError:
+            logger.warning(f"Toolkit tool {self.name} was cancelled")
+            return f"Error: Tool '{self.name}' was cancelled"
+        except ConnectionError as e:
+            logger.error(f"Toolkit tool {self.name} connection error: {e}")
+            return f"Error: Connection failed for tool '{self.name}'"
+        except PermissionError as e:
+            logger.error(f"Toolkit tool {self.name} permission error: {e}")
+            return f"Error: Permission denied for tool '{self.name}'"
+        except ValueError as e:
+            logger.error(f"Toolkit tool {self.name} value error: {e}")
+            return f"Error: Invalid arguments for tool '{self.name}': {e}"
         except Exception as e:
-            logger.error(f"Toolkit tool {self.name} error: {e}")
-            return f"Error: {str(e)}"
+            error_type = type(e).__name__
+            logger.error(f"Toolkit tool {self.name} error ({error_type}): {e}")
+            return f"Error executing '{self.name}': {str(e)}"
 
 
 class ToolkitAdapter:

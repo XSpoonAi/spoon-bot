@@ -12,10 +12,16 @@ from typing import Any
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.exceptions import (
+    MCPConnectionError,
+    MCPServerNotFoundError,
+    MCPToolExecutionError,
+)
 
 
 # Check if spoon-core is available
 _SPOON_CORE_AVAILABLE = False
+_SPOON_CORE_IMPORT_ERROR: str | None = None
 _SpoonCoreMCPTool = None
 _MCPClientMixin = None
 
@@ -26,8 +32,9 @@ try:
     _MCPClientMixin = MCPClientMixin
     _SPOON_CORE_AVAILABLE = True
     logger.debug("spoon-core MCP module available - using enhanced transport support")
-except ImportError:
-    logger.debug("spoon-core not available - using fallback MCP implementation")
+except ImportError as e:
+    _SPOON_CORE_IMPORT_ERROR = str(e)
+    logger.debug(f"spoon-core not available - using fallback MCP implementation: {e}")
 
 
 class SpoonCoreMCPToolWrapper(Tool):
@@ -63,15 +70,28 @@ class SpoonCoreMCPToolWrapper(Tool):
         return self._parameters
 
     async def execute(self, **kwargs: Any) -> str:
-        """Execute the MCP tool using spoon-core's implementation."""
+        """Execute the MCP tool using spoon-core's implementation.
+
+        Returns:
+            Tool execution result as string.
+            In case of error, returns a user-friendly error message.
+        """
         try:
             result = await self._mcp_tool.execute(**kwargs)
             if result is None:
                 return ""
             return str(result)
+        except asyncio.TimeoutError as e:
+            logger.error(f"MCP tool {self._name} timed out: {e}")
+            return f"Error: Tool '{self._name}' timed out. The MCP server may be unresponsive."
+        except ConnectionError as e:
+            logger.error(f"MCP connection error for {self._name}: {e}")
+            return f"Error: Could not connect to MCP server for tool '{self._name}'."
         except Exception as e:
-            logger.error(f"Error executing MCP tool {self._name}: {e}")
-            return f"Error: {str(e)}"
+            error_type = type(e).__name__
+            logger.error(f"Error executing MCP tool {self._name}: {error_type}: {e}")
+            # Provide a user-friendly message while logging the full error
+            return f"Error executing '{self._name}': {str(e)}"
 
 
 class SpoonCoreMCPAdapter:
@@ -109,12 +129,16 @@ class SpoonCoreMCPAdapter:
         self._mcp_tools: dict[str, Any] = {}  # server_name -> MCPTool instance
         self._loaded_tools: list[Tool] = []
         self._fallback_adapter = None
+        self._failed_servers: dict[str, str] = {}  # server_name -> error message
 
         if not self._use_spoon_core:
             # Import fallback adapter lazily
-            from spoon_bot.mcp.tool_adapter import MCPToolAdapter
-            self._fallback_adapter = MCPToolAdapter()
-            logger.info("SpoonCoreMCPAdapter initialized with fallback implementation")
+            try:
+                from spoon_bot.mcp.tool_adapter import MCPToolAdapter
+                self._fallback_adapter = MCPToolAdapter()
+                logger.info("SpoonCoreMCPAdapter initialized with fallback implementation")
+            except ImportError as e:
+                logger.warning(f"Could not initialize MCP fallback adapter: {e}")
         else:
             logger.info("SpoonCoreMCPAdapter initialized with spoon-core MCPTool")
 
@@ -123,9 +147,12 @@ class SpoonCoreMCPAdapter:
         """Check if the adapter is using spoon-core's implementation."""
         return self._use_spoon_core
 
-    def add_server(self, name: str, config: dict[str, Any]) -> None:
+    def add_server(self, name: str, config: dict[str, Any]) -> bool:
         """
         Add an MCP server configuration.
+
+        This method handles errors gracefully and will not raise exceptions.
+        Failed servers are tracked and can be queried via get_failed_servers().
 
         Args:
             name: Unique name for the server.
@@ -138,8 +165,14 @@ class SpoonCoreMCPAdapter:
                 - timeout: Connection timeout in seconds
                 - health_check_interval: Health check interval in seconds
                 - max_retries: Maximum retry attempts
+
+        Returns:
+            True if the server was added successfully, False otherwise.
         """
         self._server_configs[name] = config
+
+        # Clear any previous failure status
+        self._failed_servers.pop(name, None)
 
         if self._use_spoon_core:
             # Create MCPTool instance from config
@@ -151,13 +184,42 @@ class SpoonCoreMCPAdapter:
                 )
                 self._mcp_tools[name] = mcp_tool
                 logger.debug(f"Created spoon-core MCPTool for server: {name}")
+                return True
+            except FileNotFoundError as e:
+                error_msg = f"Command not found: {config.get('command', 'unknown')}"
+                self._failed_servers[name] = error_msg
+                logger.warning(f"Failed to create MCPTool for {name}: {error_msg}")
+                return False
+            except ValueError as e:
+                error_msg = f"Invalid configuration: {e}"
+                self._failed_servers[name] = error_msg
+                logger.warning(f"Failed to create MCPTool for {name}: {error_msg}")
+                return False
             except Exception as e:
-                logger.error(f"Failed to create MCPTool for {name}: {e}")
-                raise
+                error_msg = f"{type(e).__name__}: {e}"
+                self._failed_servers[name] = error_msg
+                logger.warning(f"Failed to create MCPTool for {name}: {error_msg}")
+                return False
         else:
             # Use fallback adapter
-            self._fallback_adapter.add_server(name, config)
-            logger.debug(f"Added server {name} to fallback adapter")
+            if self._fallback_adapter is None:
+                error_msg = "No MCP adapter available (spoon-core not installed)"
+                self._failed_servers[name] = error_msg
+                logger.warning(f"Cannot add server {name}: {error_msg}")
+                return False
+            try:
+                self._fallback_adapter.add_server(name, config)
+                logger.debug(f"Added server {name} to fallback adapter")
+                return True
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {e}"
+                self._failed_servers[name] = error_msg
+                logger.warning(f"Failed to add server {name} to fallback: {error_msg}")
+                return False
+
+    def get_failed_servers(self) -> dict[str, str]:
+        """Get a dictionary of failed server names and their error messages."""
+        return self._failed_servers.copy()
 
     def add_servers(self, servers: dict[str, dict[str, Any]]) -> None:
         """Add multiple MCP server configurations."""
@@ -261,22 +323,55 @@ class SpoonCoreMCPAdapter:
             server_name: Name of the server to connect to.
 
         Returns:
-            True if connection successful.
+            True if connection successful, False otherwise.
         """
+        # Check if server failed during add_server
+        if server_name in self._failed_servers:
+            logger.warning(
+                f"Cannot connect to {server_name}: previously failed with: "
+                f"{self._failed_servers[server_name]}"
+            )
+            return False
+
         if not self._use_spoon_core:
-            return await self._fallback_adapter.connect(server_name)
+            if self._fallback_adapter is None:
+                logger.error(f"Cannot connect to {server_name}: no MCP adapter available")
+                return False
+            try:
+                return await self._fallback_adapter.connect(server_name)
+            except Exception as e:
+                logger.error(f"Failed to connect to {server_name} via fallback: {e}")
+                return False
 
         mcp_tool = self._mcp_tools.get(server_name)
         if not mcp_tool:
-            logger.error(f"Unknown server: {server_name}")
+            # Check if server was configured but failed
+            if server_name in self._server_configs:
+                logger.error(
+                    f"Server {server_name} was configured but failed to initialize"
+                )
+            else:
+                logger.error(f"Unknown server: {server_name}")
             return False
 
         try:
             await mcp_tool.ensure_parameters_loaded()
             logger.info(f"Connected to MCP server: {server_name}")
             return True
+        except asyncio.TimeoutError:
+            error_msg = "Connection timed out"
+            self._failed_servers[server_name] = error_msg
+            logger.error(f"Failed to connect to {server_name}: {error_msg}")
+            return False
+        except ConnectionError as e:
+            error_msg = f"Connection error: {e}"
+            self._failed_servers[server_name] = error_msg
+            logger.error(f"Failed to connect to {server_name}: {error_msg}")
+            return False
         except Exception as e:
-            logger.error(f"Failed to connect to {server_name}: {e}")
+            error_msg = f"{type(e).__name__}: {e}"
+            self._failed_servers[server_name] = error_msg
+            logger.error(f"Failed to connect to {server_name}: {error_msg}")
             return False
 
     async def connect_all(self) -> dict[str, bool]:
@@ -305,22 +400,45 @@ class SpoonCoreMCPAdapter:
 
         Returns:
             Tool execution result as string.
+            Returns error message string if the call fails.
         """
-        if not self._use_spoon_core:
-            return await self._fallback_adapter._client.call_tool(
-                server_name, tool_name, arguments
+        # Check if server previously failed
+        if server_name in self._failed_servers:
+            return (
+                f"Error: Server '{server_name}' is not available: "
+                f"{self._failed_servers[server_name]}"
             )
+
+        if not self._use_spoon_core:
+            if self._fallback_adapter is None:
+                return "Error: No MCP adapter available (spoon-core not installed)"
+            try:
+                return await self._fallback_adapter._client.call_tool(
+                    server_name, tool_name, arguments
+                )
+            except Exception as e:
+                logger.error(f"Error calling tool {tool_name} via fallback: {e}")
+                return f"Error: {str(e)}"
 
         mcp_tool = self._mcp_tools.get(server_name)
         if not mcp_tool:
-            return f"Error: Unknown server {server_name}"
+            if server_name in self._server_configs:
+                return f"Error: Server '{server_name}' was configured but failed to initialize"
+            return f"Error: Unknown server '{server_name}'"
 
         try:
             result = await mcp_tool.execute(tool_name=tool_name, **arguments)
             return str(result) if result else ""
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout calling tool {tool_name} on {server_name}")
+            return f"Error: Tool '{tool_name}' timed out"
+        except ConnectionError as e:
+            logger.error(f"Connection error calling tool {tool_name} on {server_name}: {e}")
+            return f"Error: Could not connect to server '{server_name}'"
         except Exception as e:
-            logger.error(f"Error calling tool {tool_name} on {server_name}: {e}")
-            return f"Error: {str(e)}"
+            error_type = type(e).__name__
+            logger.error(f"Error calling tool {tool_name} on {server_name}: {error_type}: {e}")
+            return f"Error executing '{tool_name}': {str(e)}"
 
     async def disconnect(self, server_name: str) -> None:
         """
