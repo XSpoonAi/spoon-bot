@@ -180,7 +180,7 @@ async def _run_agent(
 
         # Show loaded tools count
         tool_count = len(agent.tools)
-        skill_count = len(agent.skills.list())
+        skill_count = len(agent.skills)
         print_info(f"Loaded {tool_count} tools, {skill_count} skills")
 
     except ValueError as e:
@@ -256,7 +256,7 @@ async def _run_agent(
                     status_table = Table.grid(padding=(0, 2))
                     status_table.add_row("[dim]Model:[/dim]", agent.model)
                     status_table.add_row("[dim]Tools:[/dim]", str(len(agent.tools)))
-                    status_table.add_row("[dim]Skills:[/dim]", str(len(agent.skills.list())))
+                    status_table.add_row("[dim]Skills:[/dim]", str(len(agent.skills)))
                     status_table.add_row("[dim]History:[/dim]", f"{len(agent.get_history())} messages")
                     console.print(Panel(status_table, title="[bold]Agent Status[/bold]"))
                     continue

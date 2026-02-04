@@ -458,56 +458,6 @@ class TestErrorHandling:
         assert any("connection" in s.lower() or "internet" in s.lower() for s in suggestions)
 
 
-class TestLLMProviderMocked:
-    """Tests for LLM providers using mocks (no API key required)."""
-
-    @pytest.mark.asyncio
-    async def test_anthropic_provider_rate_limiting(self):
-        """Test that Anthropic provider applies rate limiting."""
-        from spoon_bot.llm.anthropic import AnthropicProvider
-        from spoon_bot.utils.rate_limit import RateLimitConfig
-
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
-            provider = AnthropicProvider(
-                rate_limit_config=RateLimitConfig.unlimited()
-            )
-
-            # Mock the HTTP client
-            mock_response = MagicMock()
-            mock_response.json.return_value = {
-                "content": [{"type": "text", "text": "Hello!"}],
-                "model": "claude-sonnet-4-20250514",
-                "usage": {"input_tokens": 10, "output_tokens": 5},
-            }
-            mock_response.raise_for_status = MagicMock()
-
-            with patch.object(provider, "_ensure_client") as mock_client:
-                mock_async_client = AsyncMock()
-                mock_async_client.post.return_value = mock_response
-                mock_client.return_value = mock_async_client
-
-                response = await provider.chat([
-                    {"role": "user", "content": "Hello"}
-                ])
-
-                assert response.content == "Hello!"
-                mock_async_client.post.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_anthropic_provider_missing_key(self):
-        """Test that Anthropic provider raises error without API key."""
-        from spoon_bot.llm.anthropic import AnthropicProvider
-        from spoon_bot.exceptions import APIKeyMissingError
-
-        # Clear the environment variable
-        with patch.dict(os.environ, {}, clear=True):
-            if "ANTHROPIC_API_KEY" in os.environ:
-                del os.environ["ANTHROPIC_API_KEY"]
-
-            with pytest.raises(APIKeyMissingError):
-                AnthropicProvider()
-
-
 class TestToolBase:
     """Tests for the Tool base class."""
 

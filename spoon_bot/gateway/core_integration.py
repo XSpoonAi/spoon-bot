@@ -10,20 +10,17 @@ enabling reuse of:
 - X402PaymentService (payment gating)
 - Message/LLMResponse (standardized message types)
 
-When spoon-core is not installed, graceful fallbacks are provided.
+spoon-core is a required dependency - no fallbacks.
 """
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from loguru import logger
 
-# Track spoon-core availability
-_SPOON_CORE_AVAILABLE = False
-_SPOON_CORE_MODULES: dict[str, Any] = {}
-
+# Import spoon-core SDK (required)
 try:
     # Core chat and LLM
     from spoon_ai.chat import ChatBot
@@ -32,6 +29,7 @@ try:
     # Agents
     from spoon_ai.agents import SpoonReactAI
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
+    from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.agents.skill_mixin import SkillEnabledMixin
 
     # Tools
@@ -46,65 +44,52 @@ try:
     from spoon_ai.graph import StateGraph, CompiledGraph
     from spoon_ai.graph.config import ParallelGroupConfig
 
-    # Identity (optional)
-    try:
-        from spoon_ai.identity import ERC8004Client, DIDResolver
-        _SPOON_CORE_MODULES["identity"] = True
-    except ImportError:
-        ERC8004Client = None
-        DIDResolver = None
-        _SPOON_CORE_MODULES["identity"] = False
-
-    # Payments (optional)
-    try:
-        from spoon_ai.payments import X402PaymentService
-        _SPOON_CORE_MODULES["payments"] = True
-    except ImportError:
-        X402PaymentService = None
-        _SPOON_CORE_MODULES["payments"] = False
-
-    _SPOON_CORE_AVAILABLE = True
-    _SPOON_CORE_MODULES["core"] = True
     logger.info("spoon-core SDK loaded successfully")
 
 except ImportError as e:
-    logger.warning(f"spoon-core SDK not available: {e}. Using local implementations.")
-    ChatBot = None
-    Message = None
-    LLMResponse = None
-    CoreToolCall = None
-    SpoonReactAI = None
-    SpoonReactMCP = None
-    SkillEnabledMixin = None
-    CoreBaseTool = None
-    CoreToolManager = None
-    MCPTool = None
-    CoreSkillManager = None
-    StateGraph = None
-    CompiledGraph = None
-    ParallelGroupConfig = None
+    logger.error(f"spoon-core SDK is required: {e}")
+    raise ImportError(
+        "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
+    ) from e
+
+# Optional modules from spoon-core
+try:
+    from spoon_ai.identity import ERC8004Client, DIDResolver
+    _IDENTITY_AVAILABLE = True
+except ImportError:
     ERC8004Client = None
     DIDResolver = None
+    _IDENTITY_AVAILABLE = False
+    logger.debug("spoon-core identity module not available")
+
+try:
+    from spoon_ai.payments import X402PaymentService
+    _PAYMENTS_AVAILABLE = True
+except ImportError:
     X402PaymentService = None
-    _SPOON_CORE_MODULES["core"] = False
+    _PAYMENTS_AVAILABLE = False
+    logger.debug("spoon-core payments module not available")
 
 
 def is_spoon_core_available() -> bool:
-    """Check if spoon-core SDK is available."""
-    return _SPOON_CORE_AVAILABLE
+    """Check if spoon-core SDK is available. Always returns True since it's required."""
+    return True
 
 
 def get_available_modules() -> dict[str, bool]:
     """Get dictionary of available spoon-core modules."""
-    return _SPOON_CORE_MODULES.copy()
+    return {
+        "core": True,
+        "identity": _IDENTITY_AVAILABLE,
+        "payments": _PAYMENTS_AVAILABLE,
+    }
 
 
 class SpoonCoreAgent:
     """
     Wrapper around spoon-core's SpoonReactMCP agent.
 
-    Provides unified interface for agent execution whether spoon-core
-    is available or not.
+    Provides unified interface for agent execution using spoon-core SDK.
     """
 
     def __init__(
@@ -140,10 +125,10 @@ class SpoonCoreAgent:
         self._enable_skills = enable_skills
         self._skill_paths = skill_paths or []
 
-        self._agent: Any = None
-        self._chatbot: Any = None
-        self._tool_manager: Any = None
-        self._skill_manager: Any = None
+        self._agent: SpoonReactMCP | SpoonReactSkill | None = None
+        self._chatbot: ChatBot | None = None
+        self._tool_manager: CoreToolManager | None = None
+        self._skill_manager: CoreSkillManager | None = None
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -151,16 +136,6 @@ class SpoonCoreAgent:
         if self._initialized:
             return
 
-        if _SPOON_CORE_AVAILABLE:
-            await self._initialize_spoon_core()
-        else:
-            await self._initialize_fallback()
-
-        self._initialized = True
-        logger.info(f"SpoonCoreAgent initialized (spoon-core: {_SPOON_CORE_AVAILABLE})")
-
-    async def _initialize_spoon_core(self) -> None:
-        """Initialize using spoon-core SDK."""
         # Create ChatBot
         self._chatbot = ChatBot(
             model_name=self._model,
@@ -168,7 +143,7 @@ class SpoonCoreAgent:
             system_prompt=self._system_prompt,
         )
 
-        # Create ToolManager with MCP tools
+        # Create MCP tools
         mcp_tools = []
         for name, config in self._mcp_servers.items():
             mcp_tool = MCPTool(
@@ -183,33 +158,37 @@ class SpoonCoreAgent:
             self._tool_manager = CoreToolManager(all_tools)
 
         # Create SkillManager if enabled
-        if self._enable_skills and CoreSkillManager:
+        if self._enable_skills:
             self._skill_manager = CoreSkillManager(
                 skill_paths=self._skill_paths,
                 llm=self._chatbot,
                 auto_discover=True,
             )
 
-        # Create SpoonReactMCP agent
-        self._agent = SpoonReactMCP(
-            llm=self._chatbot,
-            tools=self._tool_manager,
-            max_steps=self._max_steps,
-        )
+            # Create SpoonReactSkill agent
+            self._agent = SpoonReactSkill(
+                llm=self._chatbot,
+                tools=self._tool_manager,
+                skill_manager=self._skill_manager,
+                max_steps=self._max_steps,
+            )
+        else:
+            # Create SpoonReactMCP agent
+            self._agent = SpoonReactMCP(
+                llm=self._chatbot,
+                tools=self._tool_manager,
+                max_steps=self._max_steps,
+            )
 
         # Initialize agent
         await self._agent.initialize()
 
-    async def _initialize_fallback(self) -> None:
-        """Initialize using local spoon-bot implementations."""
-        from spoon_bot.agent.loop import create_agent
-
-        # Use spoon-bot's local agent
-        self._agent = await create_agent(
-            provider=self._provider,
-            model=self._model,
-            mcp_config=self._mcp_servers,
-            use_spoon_core=False,
+        self._initialized = True
+        logger.info(
+            f"SpoonCoreAgent initialized: model={self._model}, "
+            f"provider={self._provider}, "
+            f"mcp_servers={len(mcp_tools)}, "
+            f"skills_enabled={self._enable_skills}"
         )
 
     async def run(
@@ -232,18 +211,13 @@ class SpoonCoreAgent:
         if not self._initialized:
             await self.initialize()
 
-        if _SPOON_CORE_AVAILABLE and self._agent:
-            # Use spoon-core agent
-            if stream:
-                return self._stream_spoon_core(message)
-            else:
-                result = await self._agent.run(message)
-                return result.content if hasattr(result, "content") else str(result)
+        if stream:
+            return self._stream(message)
         else:
-            # Use fallback
-            return await self._agent.process(message, session_key=session_key)
+            result = await self._agent.run(message)
+            return result.content if hasattr(result, "content") else str(result)
 
-    async def _stream_spoon_core(self, message: str) -> AsyncGenerator[str, None]:
+    async def _stream(self, message: str) -> AsyncGenerator[str, None]:
         """Stream response from spoon-core agent."""
         async for chunk in self._agent.stream(message):
             if hasattr(chunk, "content") and chunk.content:
@@ -269,7 +243,6 @@ class SpoonCoreAgent:
         """Get agent status."""
         return {
             "initialized": self._initialized,
-            "spoon_core": _SPOON_CORE_AVAILABLE,
             "model": self._model,
             "provider": self._provider,
             "tools_count": len(self.tools),
@@ -301,7 +274,7 @@ class SpoonCoreIdentity:
         self._private_key = private_key or os.environ.get("PRIVATE_KEY")
         self._client: Any = None
 
-        if _SPOON_CORE_MODULES.get("identity") and ERC8004Client:
+        if _IDENTITY_AVAILABLE and ERC8004Client:
             try:
                 self._client = ERC8004Client(
                     rpc_url=self._rpc_url,
@@ -373,7 +346,7 @@ class SpoonCorePayments:
         """Initialize payment service."""
         self._service: Any = None
 
-        if _SPOON_CORE_MODULES.get("payments") and X402PaymentService:
+        if _PAYMENTS_AVAILABLE and X402PaymentService:
             try:
                 self._service = X402PaymentService()
                 logger.info("X402 payment service initialized")
@@ -427,11 +400,12 @@ __all__ = [
     "SpoonCoreAgent",
     "SpoonCoreIdentity",
     "SpoonCorePayments",
-    # Re-export spoon-core types when available
+    # Re-export spoon-core types
     "ChatBot",
     "Message",
     "LLMResponse",
     "SpoonReactMCP",
+    "SpoonReactSkill",
     "CoreToolManager",
     "MCPTool",
     "CoreSkillManager",

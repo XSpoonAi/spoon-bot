@@ -1,15 +1,24 @@
-"""MCP integration for spoon-bot.
+"""
+MCP module - Uses spoon-core SDK directly.
 
-This module provides MCP (Model Context Protocol) integration with support for:
-- Local implementation (MCPClientAdapter, MCPToolAdapter)
-- spoon-core integration (SpoonCoreMCPAdapter) with enhanced transport support
-
-The SpoonCoreMCPAdapter automatically uses spoon-core's MCPTool if available,
-falling back to the local implementation otherwise.
+All MCP functionality is provided by spoon-core's MCPTool and MCPClientMixin.
+No local reimplementations - use spoon-core directly.
 """
 
-from spoon_bot.mcp.client import MCPClientAdapter
-from spoon_bot.mcp.tool_adapter import MCPToolAdapter
-from spoon_bot.mcp.spoon_core_mcp import SpoonCoreMCPAdapter
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    from spoon_ai.agents.mcp_client_mixin import MCPClientMixin
+    from spoon_ai.graph.mcp_integration import MCPIntegrationManager, MCPConfigManager
 
-__all__ = ["MCPClientAdapter", "MCPToolAdapter", "SpoonCoreMCPAdapter"]
+    __all__ = [
+        "MCPTool",
+        "MCPClientMixin",
+        "MCPIntegrationManager",
+        "MCPConfigManager",
+    ]
+
+except ImportError:
+    raise ImportError(
+        "spoon-bot requires spoon-core SDK for MCP functionality. "
+        "Install with: pip install spoon-ai"
+    )
