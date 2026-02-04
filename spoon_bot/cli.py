@@ -305,7 +305,10 @@ def onboard():
     Initialize spoon-bot configuration and workspace.
 
     Creates the default workspace directory and configuration files.
+    Initializes a git repository for version control.
     """
+    from spoon_bot.services.git import GitManager
+
     workspace = get_workspace()
     config_dir = Path.home() / ".spoon-bot"
 
@@ -359,6 +362,16 @@ The agent can add new memories here.
 (To be remembered)
 """)
         console.print(f"[green]✓[/green] Created memory/MEMORY.md")
+
+    # Initialize git repository
+    git_manager = GitManager(workspace)
+    if git_manager.is_git_available():
+        if git_manager.init():
+            console.print(f"[green]✓[/green] Initialized git repository")
+        else:
+            console.print(f"[yellow]![/yellow] Failed to initialize git repository")
+    else:
+        console.print(f"[dim]-[/dim] Git not available (optional)")
 
     console.print(f"""
 [bold green]Setup complete![/bold green]

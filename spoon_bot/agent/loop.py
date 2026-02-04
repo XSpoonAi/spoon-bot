@@ -67,6 +67,7 @@ from spoon_bot.exceptions import (
     SkillActivationError,
     user_friendly_error,
 )
+from spoon_bot.services.git import GitManager
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -99,6 +100,7 @@ class AgentLoop:
         mcp_config: dict[str, dict[str, Any]] | None = None,
         system_prompt: str | None = None,
         enable_skills: bool = True,
+        auto_commit: bool = True,
     ) -> None:
         """
         Initialize the agent loop.
@@ -117,6 +119,7 @@ class AgentLoop:
             mcp_config: MCP server configurations.
             system_prompt: Custom system prompt.
             enable_skills: Whether to enable skill system.
+            auto_commit: Whether to auto-commit workspace changes after each message.
         """
         # Validate parameters
         try:
@@ -145,6 +148,7 @@ class AgentLoop:
         self._enable_skills = enable_skills
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
+        self._auto_commit = auto_commit
 
         # spoon-core components (initialized later)
         self._chatbot: ChatBot | None = None
@@ -157,6 +161,7 @@ class AgentLoop:
         self.tools = ToolRegistry()
         self.sessions = SessionManager(self.workspace)
         self.memory = MemoryStore(self.workspace)
+        self._git = GitManager(self.workspace) if auto_commit else None
 
         # Skill paths
         self._skill_paths = [self.workspace / "skills"]
@@ -336,6 +341,14 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
+        # Auto-commit workspace changes
+        if self._auto_commit and self._git:
+            try:
+                if self._git.has_changes():
+                    self._git.commit(message)
+            except Exception as e:
+                logger.warning(f"Failed to auto-commit: {e}")
+
         return final_content
 
     async def stream(
@@ -411,6 +424,7 @@ async def create_agent(
     base_url: str | None = None,
     mcp_config: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
+    auto_commit: bool = True,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -427,6 +441,7 @@ async def create_agent(
         base_url: Custom base URL for the provider.
         mcp_config: MCP server configurations.
         enable_skills: Whether to enable skill system.
+        auto_commit: Whether to auto-commit workspace changes after each message.
         **kwargs: Additional arguments for AgentLoop.
 
     Returns:
@@ -449,6 +464,7 @@ async def create_agent(
         base_url=base_url,
         mcp_config=mcp_config,
         enable_skills=enable_skills,
+        auto_commit=auto_commit,
         **kwargs,
     )
 
