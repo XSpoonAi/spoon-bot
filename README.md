@@ -4,6 +4,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 
 ## Features
 
+- **Multi-Provider LLM**: Supports Anthropic, OpenAI, DeepSeek, Gemini, OpenRouter, and more
 - **Agent-centric**: Autonomous execution with safety rails
 - **OS-native**: Built-in shell/filesystem tools as priority
 - **Memory-first**: Four-layer memory system (file + short-term + Mem0 + checkpointer)
@@ -11,7 +12,6 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem
 - **Multi-mode**: Agent / Interactive / Gateway modes
-- **spoon-core Integration**: Optional deep integration with spoon-core for enhanced capabilities
 
 ## Requirements
 
@@ -51,10 +51,42 @@ pip install -e .
 pip install -e ".[all]"
 ```
 
-## Quick Start
+## Configuration
+
+### Environment Variables
+
+Copy `.env.example` to `.env` and configure your API keys:
 
 ```bash
-# Set your API key
+cp .env.example .env
+```
+
+**At least one LLM API key is required:**
+
+| Provider | Environment Variable | Get API Key |
+|----------|---------------------|-------------|
+| Anthropic | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/) |
+| OpenAI | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/) |
+| DeepSeek | `DEEPSEEK_API_KEY` | [platform.deepseek.com](https://platform.deepseek.com/) |
+| Google Gemini | `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/) |
+| OpenRouter | `OPENROUTER_API_KEY` | [openrouter.ai](https://openrouter.ai/) |
+
+Example `.env` file:
+
+```bash
+# Use any ONE of these (or multiple for fallback)
+ANTHROPIC_API_KEY=sk-ant-xxx
+OPENAI_API_KEY=sk-xxx
+DEEPSEEK_API_KEY=xxx
+GEMINI_API_KEY=xxx
+OPENROUTER_API_KEY=sk-or-xxx
+```
+
+## Quick Start
+
+### Using Anthropic Claude (Default)
+
+```bash
 export ANTHROPIC_API_KEY=your-key
 
 # Initialize workspace
@@ -65,6 +97,91 @@ spoon-bot agent
 
 # Run in one-shot mode
 spoon-bot agent -m "List files in the current directory"
+```
+
+### Using Other Providers
+
+```bash
+# OpenAI GPT
+export OPENAI_API_KEY=your-key
+spoon-bot agent --provider openai --model gpt-4o
+
+# DeepSeek
+export DEEPSEEK_API_KEY=your-key
+spoon-bot agent --provider deepseek --model deepseek-chat
+
+# Google Gemini
+export GEMINI_API_KEY=your-key
+spoon-bot agent --provider gemini --model gemini-2.0-flash
+```
+
+## LLM Providers
+
+spoon-bot supports multiple LLM providers through the spoon-ai-sdk. You can switch providers without code changes.
+
+### Supported Providers
+
+| Provider | Models | Notes |
+|----------|--------|-------|
+| **Anthropic** | `claude-sonnet-4-20250514`, `claude-opus-4-20250514`, `claude-3-5-haiku-20241022` | Default provider |
+| **OpenAI** | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o1-mini` | Full tool support |
+| **DeepSeek** | `deepseek-chat`, `deepseek-coder` | Cost-effective |
+| **Gemini** | `gemini-2.0-flash`, `gemini-2.0-pro`, `gemini-1.5-pro` | Google AI |
+| **OpenRouter** | 200+ models | Multi-model gateway |
+
+### Using Programmatically
+
+```python
+from spoon_bot.agent.loop import create_agent
+
+# Anthropic Claude (default)
+agent = await create_agent()
+
+# OpenAI GPT
+agent = await create_agent(provider="openai", model="gpt-4o")
+
+# DeepSeek
+agent = await create_agent(provider="deepseek", model="deepseek-chat")
+
+# Google Gemini
+agent = await create_agent(provider="gemini", model="gemini-2.0-flash")
+
+# OpenRouter (access any model)
+agent = await create_agent(
+    provider="openai",  # Use OpenAI-compatible API
+    model="anthropic/claude-sonnet-4",
+    base_url="https://openrouter.ai/api/v1"
+)
+```
+
+### OpenRouter Configuration
+
+OpenRouter provides access to 200+ models through a single API. Set your OpenRouter API key as `OPENAI_API_KEY` when using the `openai` provider with a custom base URL:
+
+```bash
+export OPENAI_API_KEY=sk-or-your-openrouter-key
+```
+
+```python
+agent = await create_agent(
+    provider="openai",
+    model="anthropic/claude-sonnet-4",  # Any OpenRouter model
+    base_url="https://openrouter.ai/api/v1"
+)
+```
+
+### Fallback and Load Balancing
+
+The underlying spoon-ai-sdk supports automatic fallback chains:
+
+```python
+from spoon_ai.llm import LLMManager, ConfigurationManager
+
+config_manager = ConfigurationManager()
+llm_manager = LLMManager(config_manager)
+
+# Set fallback chain: if OpenAI fails, try Anthropic, then Gemini
+llm_manager.set_fallback_chain(["openai", "anthropic", "gemini"])
 ```
 
 ## Architecture
@@ -80,7 +197,7 @@ spoon-bot agent -m "List files in the current directory"
 │  ├── edit_file      Edit file by replacing text                 │
 │  └── list_dir       List directory contents                     │
 ├─────────────────────────────────────────────────────────────────┤
-│  Self-Management Tools (Coming)                                 │
+│  Self-Management Tools                                          │
 │  ├── self_config    get/set/list agent configuration            │
 │  ├── self_upgrade   check updates, install/update skills        │
 │  └── memory         remember, note, search, forget, checkpoint  │
@@ -92,7 +209,7 @@ spoon-bot agent -m "List files in the current directory"
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Configuration
+## Workspace Structure
 
 Default workspace: `~/.spoon-bot/workspace/`
 
@@ -105,17 +222,19 @@ Default workspace: `~/.spoon-bot/workspace/`
 │   │   ├── MEMORY.md    # Long-term facts
 │   │   └── YYYY-MM-DD.md # Daily notes
 │   └── skills/          # Custom skills
-└── config.json          # Configuration (coming)
+└── config.json          # Configuration
 ```
 
-## Commands
+## CLI Commands
 
 ```bash
-spoon-bot agent              # Interactive mode
-spoon-bot agent -m "msg"     # One-shot mode
-spoon-bot onboard            # Initialize workspace
-spoon-bot status             # Show status
-spoon-bot version            # Show version
+spoon-bot agent                        # Interactive mode (default provider)
+spoon-bot agent --provider openai      # Use specific provider
+spoon-bot agent --model gpt-4o         # Use specific model
+spoon-bot agent -m "message"           # One-shot mode
+spoon-bot onboard                      # Initialize workspace
+spoon-bot status                       # Show status
+spoon-bot version                      # Show version
 ```
 
 ## Gateway API
@@ -125,7 +244,11 @@ spoon-bot includes a WebSocket and REST API gateway for remote agent control.
 ### Installation
 
 ```bash
-pip install spoon-bot[gateway]
+# With uv
+uv sync --extra gateway
+
+# With pip
+pip install -e ".[gateway]"
 ```
 
 ### Quick Start
@@ -138,8 +261,8 @@ from spoon_bot.agent.loop import create_agent
 from spoon_bot.gateway.app import set_agent
 
 async def main():
-    # Create agent
-    agent = await create_agent()
+    # Create agent with your preferred provider
+    agent = await create_agent(provider="openai", model="gpt-4o")
 
     # Create gateway app
     config = GatewayConfig(host="0.0.0.0", port=8080)
@@ -168,39 +291,46 @@ asyncio.run(main())
 
 See [docs/API_DESIGN.md](docs/API_DESIGN.md) for full API documentation.
 
-## spoon-core Integration
+## MCP Integration
 
-spoon-bot is powered by [spoon-core](https://github.com/XSpoonAi/spoon-core) (spoon-ai-sdk) for its core capabilities:
-
-### LLM Providers
-When spoon-core is installed, you get access to multiple LLM providers:
-- Anthropic Claude
-- OpenAI GPT
-- DeepSeek
-- Ollama (local)
-- Google Gemini
-- OpenRouter
+spoon-bot supports Model Context Protocol (MCP) servers for extended capabilities:
 
 ```python
-from spoon_bot.agent.loop import create_agent
-
-# Use spoon-core providers (auto-detected)
-agent = await create_agent(provider="deepseek", model="deepseek-chat")
+agent = await create_agent(
+    mcp_config={
+        "github": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github"]
+        },
+        "filesystem": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"]
+        }
+    }
+)
 ```
 
-### Skill System
-spoon-core enables advanced skill features:
-- LLM-powered intent matching
-- Script execution within skills
-- State persistence across sessions
+Supported MCP transport types:
+- stdio (command-line servers)
+- npx/uvx (package runners)
+- SSE (Server-Sent Events)
+- HTTP/WebSocket
 
-### MCP Integration
-spoon-core provides enhanced MCP support:
-- Multiple transport types (stdio, npx, uvx, SSE, HTTP, WebSocket)
-- Connection pooling and health checks
-- Automatic retry and recovery
+## Skills System
 
-spoon-ai-sdk is included as a required dependency (v0.4.0+). It will be installed automatically when you run `uv sync` or `pip install -e .`.
+Create custom skills by adding `SKILL.md` files to your workspace:
+
+```
+~/.spoon-bot/workspace/skills/
+├── code_review/
+│   └── SKILL.md
+├── git_helper/
+│   └── SKILL.md
+└── custom_skill/
+    └── SKILL.md
+```
+
+Skills are automatically discovered and can be invoked by the agent.
 
 ## Development
 
