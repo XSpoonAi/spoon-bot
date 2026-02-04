@@ -91,6 +91,56 @@ spoon-bot status             # Show status
 spoon-bot version            # Show version
 ```
 
+## Gateway API
+
+spoon-bot includes a WebSocket and REST API gateway for remote agent control.
+
+### Installation
+
+```bash
+pip install spoon-bot[gateway]
+```
+
+### Quick Start
+
+```python
+import asyncio
+import uvicorn
+from spoon_bot.gateway import create_app, GatewayConfig
+from spoon_bot.agent.loop import create_agent
+from spoon_bot.gateway.app import set_agent
+
+async def main():
+    # Create agent
+    agent = await create_agent()
+
+    # Create gateway app
+    config = GatewayConfig(host="0.0.0.0", port=8080)
+    app = create_app(config)
+
+    # Set agent
+    set_agent(agent)
+
+    # Run server
+    uvicorn.run(app, host=config.host, port=config.port)
+
+asyncio.run(main())
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/auth/login` | POST | Authenticate and get tokens |
+| `/v1/agent/chat` | POST | Send message to agent |
+| `/v1/agent/status` | GET | Get agent status |
+| `/v1/sessions` | GET/POST | Manage sessions |
+| `/v1/tools` | GET | List available tools |
+| `/v1/skills` | GET | List available skills |
+| `/v1/ws` | WS | WebSocket for real-time communication |
+
+See [docs/API_DESIGN.md](docs/API_DESIGN.md) for full API documentation.
+
 ## spoon-core Integration
 
 spoon-bot can optionally integrate with [spoon-core](https://github.com/XSpoonAi/core) for enhanced capabilities:
