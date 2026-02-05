@@ -1,4 +1,12 @@
-"""WebSocket message protocol."""
+"""WebSocket message protocol.
+
+Protocol design based on: docs/plans/2025-02-05-spoon-bot-api-design.md
+
+Message Format:
+- Client → Server (Request): {"id": "...", "method": "...", "params": {...}}
+- Server → Client (Response): {"id": "...", "result": {...}, "error": null}
+- Server → Client (Event): {"event": "...", "data": {...}, "timestamp": "..."}
+"""
 
 from __future__ import annotations
 
@@ -18,6 +26,64 @@ class MessageType(str, Enum):
     STREAM = "stream"
     PING = "ping"
     PONG = "pong"
+
+
+class ClientMethod(str, Enum):
+    """Client-to-server method types."""
+
+    # Chat methods
+    CHAT_SEND = "chat.send"
+    CHAT_CANCEL = "chat.cancel"
+
+    # Confirmation methods
+    CONFIRM_RESPOND = "confirm.respond"
+
+    # Subscription methods
+    SUBSCRIBE = "subscribe"
+    UNSUBSCRIBE = "unsubscribe"
+
+    # Session methods
+    SESSION_SWITCH = "session.switch"
+    SESSION_LIST = "session.list"
+    SESSION_CLEAR = "session.clear"
+    SESSION_EXPORT = "session.export"
+    SESSION_IMPORT = "session.import"
+
+    # Agent methods
+    AGENT_STATUS = "agent.status"
+
+    # Heartbeat
+    PING = "ping"
+
+
+class ServerEvent(str, Enum):
+    """Server-to-client event types."""
+
+    # Agent state events
+    AGENT_THINKING = "agent.thinking"
+    AGENT_STEP = "agent.step"
+    AGENT_STREAMING = "agent.streaming"
+    AGENT_TOOL_CALL = "agent.tool_call"
+    AGENT_TOOL_RESULT = "agent.tool_result"
+    AGENT_COMPLETE = "agent.complete"
+    AGENT_ERROR = "agent.error"
+    AGENT_CANCELLED = "agent.cancelled"
+    AGENT_IDLE = "agent.idle"
+
+    # Confirmation events
+    CONFIRM_REQUEST = "confirm.request"
+    CONFIRM_TIMEOUT = "confirm.timeout"
+    CONFIRM_RESPONSE = "confirm.response"
+
+    # Resource events
+    METRICS_UPDATE = "metrics.update"
+    RESOURCE_TOKEN_LIMIT = "resource.token_limit"
+    RESOURCE_TIME_LIMIT = "resource.time_limit"
+
+    # Connection events
+    CONNECTION_ESTABLISHED = "connection.established"
+    CONNECTION_READY = "connection.ready"
+    CONNECTION_ERROR = "connection.error"
 
 
 @dataclass

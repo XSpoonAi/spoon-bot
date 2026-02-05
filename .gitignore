@@ -54,3 +54,10 @@ workspace/sessions/
 # OS
 .DS_Store
 Thumbs.db
+
+# Documentation (not uploaded to GitHub)
+docs/
+*.md
+!README.md
+!CONTRIBUTING.md
+!CHANGELOG.md
