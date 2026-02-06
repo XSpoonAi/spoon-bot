@@ -1,0 +1,19 @@
+{
+  "name": "spoon-bot-api-tests",
+  "version": "1.0.0",
+  "description": "Integration tests for spoon-bot gateway API",
+  "scripts": {
+    "test": "jest --verbose --forceExit --detectOpenHandles",
+    "test:ci": "jest --verbose --forceExit --detectOpenHandles --ci"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 60000,
+    "verbose": true
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "jest": "^29.7.0",
+    "ws": "^8.19.0"
+  }
+}
