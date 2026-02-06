@@ -25,7 +25,6 @@ from loguru import logger
 from spoon_bot.gateway.config import GatewayConfig
 from spoon_bot.gateway.websocket.manager import ConnectionManager
 from spoon_bot.gateway.core_integration import (
-    SpoonCoreAgent,
     SpoonCoreIdentity,
     SpoonCorePayments,
     is_spoon_core_available,
@@ -48,7 +47,8 @@ async def _lifespan(app: FastAPI):
     # Auto-create agent from environment variables
     provider = os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
     model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "")
-    base_url = os.environ.get("BASE_URL", "")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get("BASE_URL", "")
+    workspace = os.environ.get("SPOON_BOT_WORKSPACE_PATH", "/data/workspace")
 
     # Determine default model per provider if not specified
     if not model:
@@ -62,35 +62,52 @@ async def _lifespan(app: FastAPI):
         model = default_models.get(provider, "claude-sonnet-4-20250514")
 
     # Log base URL if custom proxy is set
-    anthropic_base = os.environ.get("ANTHROPIC_BASE_URL", "")
-    if anthropic_base:
-        logger.info(f"Custom Anthropic base URL: {anthropic_base}")
+    if base_url:
+        logger.info(f"Custom base URL detected: {base_url}")
 
     logger.info(f"Initializing agent: provider={provider}, model={model}")
 
     try:
-        agent = SpoonCoreAgent(
+        # Use create_agent from agent.loop - it properly handles:
+        # - Native OS tools (shell, filesystem, etc.)
+        # - base_url for custom endpoints
+        # - ToolManager creation
+        # - Skill system
+        from spoon_bot.agent.loop import create_agent
+
+        enable_skills = os.environ.get("SPOON_BOT_ENABLE_SKILLS", "true").lower() == "true"
+        logger.info(f"Skills enabled: {enable_skills}")
+
+        agent = await create_agent(
             model=model,
             provider=provider,
-            enable_skills=True,
+            base_url=base_url or None,
+            workspace=workspace,
+            enable_skills=enable_skills,
+            auto_commit=False,  # No git auto-commit in Docker gateway mode
         )
-        await agent.initialize()
         app_module._agent = agent
-        logger.info("Agent initialized successfully")
+        logger.info(
+            f"Agent initialized successfully: "
+            f"tools={len(agent.tools)}, skills={len(agent.skills)}"
+        )
     except Exception as e:
         logger.error(f"Failed to initialize agent: {e}")
         logger.warning("Gateway will start without agent - set valid API keys to enable")
 
-    # Initialize spoon-core services
-    identity = SpoonCoreIdentity()
-    payments = SpoonCorePayments()
-    app_module._identity = identity
-    app_module._payments = payments
+    # Initialize spoon-core services (optional)
+    try:
+        identity = SpoonCoreIdentity()
+        payments = SpoonCorePayments()
+        app_module._identity = identity
+        app_module._payments = payments
 
-    if identity.available:
-        logger.info("ERC8004 identity service enabled")
-    if payments.available:
-        logger.info("X402 payment service enabled")
+        if identity.available:
+            logger.info("ERC8004 identity service enabled")
+        if payments.available:
+            logger.info("X402 payment service enabled")
+    except Exception as e:
+        logger.debug(f"Optional spoon-core services not available: {e}")
 
     yield
 
