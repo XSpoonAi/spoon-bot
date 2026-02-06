@@ -52,6 +52,14 @@ services:
 
       # --- Custom Base URLs (for proxies / self-hosted) ---
       ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+
+      # --- Authentication ---
+      GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
+      GATEWAY_AUTH_REQUIRED: "${GATEWAY_AUTH_REQUIRED:-true}"
+
+      # --- Skills ---
+      SPOON_BOT_ENABLE_SKILLS: "${SPOON_BOT_ENABLE_SKILLS:-true}"
 
       # --- Web3 (optional) ---
       PRIVATE_KEY: "${PRIVATE_KEY:-}"

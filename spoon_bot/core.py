@@ -103,12 +103,51 @@ class SpoonBotConfig:
 
     @classmethod
     def from_env(cls) -> "SpoonBotConfig":
-        """Create config from environment variables."""
+        """Create config from environment variables.
+
+        Supports both SPOON_* (original) and SPOON_BOT_* (gateway) env vars.
+        """
+        provider = (
+            os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
+            or os.environ.get("SPOON_PROVIDER")
+            or "anthropic"
+        )
+        model = (
+            os.environ.get("SPOON_BOT_DEFAULT_MODEL")
+            or os.environ.get("SPOON_MODEL")
+            or "claude-sonnet-4-20250514"
+        )
+
+        # Resolve API key based on provider
+        api_key = None
+        if provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+        elif provider == "anthropic":
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
+
+        # Resolve base_url based on provider
+        base_url = None
+        if provider == "openai":
+            base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
+        elif provider == "anthropic":
+            base_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
+        else:
+            base_url = os.environ.get("BASE_URL")
+
+        max_steps = int(
+            os.environ.get("SPOON_BOT_MAX_ITERATIONS")
+            or os.environ.get("SPOON_MAX_STEPS")
+            or "15"
+        )
+
         return cls(
-            model=os.environ.get("SPOON_MODEL", "claude-sonnet-4-20250514"),
-            provider=os.environ.get("SPOON_PROVIDER", "anthropic"),
-            api_key=os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-            max_steps=int(os.environ.get("SPOON_MAX_STEPS", "15")),
+            model=model,
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            max_steps=max_steps,
         )
 
 

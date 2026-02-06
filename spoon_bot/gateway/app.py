@@ -28,6 +28,12 @@ _connection_manager: ConnectionManager | None = None
 _config: GatewayConfig | None = None
 _identity: SpoonCoreIdentity | None = None
 _payments: SpoonCorePayments | None = None
+_auth_required: bool = True  # Can be set to False via GATEWAY_AUTH_REQUIRED=false
+
+
+def is_auth_required() -> bool:
+    """Check if authentication is required."""
+    return _auth_required
 
 
 def get_agent() -> SpoonCoreAgent | AgentLoop:

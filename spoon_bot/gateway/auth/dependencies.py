@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Header, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from spoon_bot.gateway.app import get_config
+from spoon_bot.gateway.app import get_config, is_auth_required
 from spoon_bot.gateway.auth.jwt import verify_token, TokenData
 from spoon_bot.gateway.auth.api_key import verify_api_key, APIKeyData
 
@@ -25,6 +25,7 @@ async def get_current_user(
     Get the current authenticated user.
 
     Supports both JWT Bearer tokens and API keys.
+    If auth is disabled (GATEWAY_AUTH_REQUIRED=false), returns a default user.
 
     Args:
         credentials: Bearer token credentials.
@@ -34,8 +35,20 @@ async def get_current_user(
         TokenData or APIKeyData for authenticated user.
 
     Raises:
-        HTTPException: If authentication fails.
+        HTTPException: If authentication fails and auth is required.
     """
+    # If auth is not required, return a default anonymous user
+    if not is_auth_required():
+        from datetime import datetime, timezone
+        return TokenData(
+            user_id="anonymous",
+            session_key="default",
+            token_type="access",
+            scopes=["agent:read", "agent:write", "admin"],
+            issued_at=datetime.now(timezone.utc),
+            expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        )
+
     config = get_config()
 
     # Try API key first

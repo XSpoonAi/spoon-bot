@@ -11,6 +11,10 @@ Usage with uvicorn:
 
 Environment variables:
     See .env.example for all available configuration options.
+    GATEWAY_AUTH_REQUIRED: Set to "false" to disable authentication (default: true)
+    GATEWAY_API_KEY: Set a gateway API key for docker access
+    OPENAI_API_KEY / ANTHROPIC_API_KEY: LLM provider API keys
+    OPENAI_BASE_URL / ANTHROPIC_BASE_URL / BASE_URL: Custom LLM base URLs
 """
 
 from __future__ import annotations
@@ -47,7 +51,16 @@ async def _lifespan(app: FastAPI):
     # Auto-create agent from environment variables
     provider = os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
     model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get("BASE_URL", "")
+
+    # Resolve base URL from multiple env vars (provider-specific takes priority)
+    base_url = ""
+    if provider == "openai":
+        base_url = os.environ.get("OPENAI_BASE_URL", "") or os.environ.get("BASE_URL", "")
+    elif provider == "anthropic":
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get("BASE_URL", "")
+    else:
+        base_url = os.environ.get("BASE_URL", "")
+
     workspace = os.environ.get("SPOON_BOT_WORKSPACE_PATH", "/data/workspace")
 
     # Determine default model per provider if not specified
@@ -61,18 +74,12 @@ async def _lifespan(app: FastAPI):
         }
         model = default_models.get(provider, "claude-sonnet-4-20250514")
 
-    # Log base URL if custom proxy is set
+    # Log configuration
     if base_url:
-        logger.info(f"Custom base URL detected: {base_url}")
-
+        logger.info(f"Custom base URL: {base_url}")
     logger.info(f"Initializing agent: provider={provider}, model={model}")
 
     try:
-        # Use create_agent from agent.loop - it properly handles:
-        # - Native OS tools (shell, filesystem, etc.)
-        # - base_url for custom endpoints
-        # - ToolManager creation
-        # - Skill system
         from spoon_bot.agent.loop import create_agent
 
         enable_skills = os.environ.get("SPOON_BOT_ENABLE_SKILLS", "true").lower() == "true"
@@ -87,10 +94,11 @@ async def _lifespan(app: FastAPI):
             auto_commit=False,  # No git auto-commit in Docker gateway mode
         )
         app_module._agent = agent
-        logger.info(
-            f"Agent initialized successfully: "
-            f"tools={len(agent.tools)}, skills={len(agent.skills)}"
-        )
+
+        # Log tool/skill counts
+        tool_count = len(agent.tools) if hasattr(agent.tools, '__len__') else len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else 0
+        skill_count = len(agent.skills) if hasattr(agent, 'skills') and agent.skills else 0
+        logger.info(f"Agent initialized: tools={tool_count}, skills={skill_count}")
     except Exception as e:
         import traceback
         logger.error(f"Failed to initialize agent: {e}")
@@ -136,6 +144,15 @@ def create_app() -> FastAPI:
     if gateway_api_key:
         config.api_keys[gateway_api_key] = "docker-user"
         logger.info("Gateway API key configured from GATEWAY_API_KEY env var")
+
+    # Configure auth requirement
+    auth_required = os.environ.get("GATEWAY_AUTH_REQUIRED", "true").lower()
+    if auth_required == "false" or (not gateway_api_key and auth_required != "true"):
+        app_module._auth_required = False
+        logger.info("Authentication DISABLED - all endpoints are public")
+    else:
+        app_module._auth_required = True
+        logger.info("Authentication ENABLED")
 
     app_module._config = config
 
