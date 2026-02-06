@@ -134,7 +134,7 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
                     total_requests=0,
                     active_sessions=len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0,
                     tools_available=len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else len(agent.tools) if hasattr(agent.tools, '__len__') else 0,
-                    skills_loaded=0,  # Skills count via agent if available
+                    skills_loaded=len(agent.skills.list_skills()) if hasattr(agent.skills, 'list_skills') else len(agent.skills) if hasattr(agent.skills, '__len__') else 0,  # Skills count via agent if available
                 ),
             ),
             meta=MetaInfo(request_id=request_id),
