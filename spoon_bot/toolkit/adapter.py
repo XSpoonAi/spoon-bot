@@ -187,7 +187,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("blockchain")
             logger.info(f"Loaded {len(tools)} blockchain tools")
 
-        except ImportError as e:
+        except (ImportError, AttributeError, Exception) as e:
             logger.warning(f"spoon-toolkits blockchain tools not available: {e}")
 
         return tools

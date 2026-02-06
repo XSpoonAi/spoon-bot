@@ -92,7 +92,9 @@ async def _lifespan(app: FastAPI):
             f"tools={len(agent.tools)}, skills={len(agent.skills)}"
         )
     except Exception as e:
+        import traceback
         logger.error(f"Failed to initialize agent: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         logger.warning("Gateway will start without agent - set valid API keys to enable")
 
     # Initialize spoon-core services (optional)
@@ -128,6 +130,13 @@ def create_app() -> FastAPI:
         Configured FastAPI application with agent auto-initialization.
     """
     config = GatewayConfig.from_env()
+
+    # Configure API key from environment if provided
+    gateway_api_key = os.environ.get("GATEWAY_API_KEY", "")
+    if gateway_api_key:
+        config.api_keys[gateway_api_key] = "docker-user"
+        logger.info("Gateway API key configured from GATEWAY_API_KEY env var")
+
     app_module._config = config
 
     app = FastAPI(

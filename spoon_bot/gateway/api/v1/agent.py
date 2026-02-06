@@ -46,11 +46,12 @@ async def chat(
             session_key = user.session_key
 
         # Process with agent
-        response_text = await agent.process(
-            message=request.message,
-            media=request.media if request.media else None,
-            session_key=session_key,
-        )
+        # AgentLoop.process() accepts message and media
+        kwargs = {"message": request.message}
+        if request.media:
+            kwargs["media"] = request.media
+
+        response_text = await agent.process(**kwargs)
 
         duration_ms = int((time.time() - start_time) * 1000)
 
@@ -131,9 +132,9 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
                 uptime=0,  # TODO: Track uptime
                 stats=AgentStats(
                     total_requests=0,
-                    active_sessions=len(agent.sessions.list_sessions()),
-                    tools_available=len(agent.tools.list_tools()),
-                    skills_loaded=len(agent.skills.list()),
+                    active_sessions=len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0,
+                    tools_available=len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else len(agent.tools) if hasattr(agent.tools, '__len__') else 0,
+                    skills_loaded=0,  # Skills count via agent if available
                 ),
             ),
             meta=MetaInfo(request_id=request_id),

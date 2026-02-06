@@ -192,11 +192,8 @@ class WebSocketHandler:
             WSEvent(event="agent.thinking", data={"status": "processing"}),
         )
 
-        # Process with agent
-        response = await agent.process(
-            message=message,
-            session_key=session_key,
-        )
+        # Process with agent (AgentLoop.process accepts message and media)
+        response = await agent.process(message=message)
 
         # Emit complete event
         await manager.send_message(
@@ -217,8 +214,8 @@ class WebSocketHandler:
 
         return {
             "status": "ready",
-            "tools": len(agent.tools.list_tools()),
-            "skills": len(agent.skills.list()),
+            "tools": len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else 0,
+            "skills": 0,
         }
 
     async def _handle_session_switch(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -237,14 +234,16 @@ class WebSocketHandler:
     async def _handle_session_list(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle session list."""
         agent = get_agent()
-        sessions = agent.sessions.list_sessions()
-
-        return {
-            "sessions": [
-                {"key": s.session_key, "message_count": len(s.messages)}
-                for s in sessions
-            ]
-        }
+        try:
+            sessions = agent.sessions.list_sessions()
+            return {
+                "sessions": [
+                    {"key": s.session_key if hasattr(s, 'session_key') else str(s), "message_count": len(s.messages) if hasattr(s, 'messages') else 0}
+                    for s in sessions
+                ]
+            }
+        except Exception:
+            return {"sessions": []}
 
     async def _handle_session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle session clear."""
