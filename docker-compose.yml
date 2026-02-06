@@ -1,0 +1,77 @@
+# =============================================================================
+# spoon-bot Docker Compose
+#
+# Quick start:
+#   cp .env.example .env    # Configure your API keys
+#   docker compose up -d    # Start gateway
+#
+# Access:
+#   REST API:   http://localhost:8080/v1/
+#   WebSocket:  ws://localhost:8080/v1/ws
+#   API Docs:   http://localhost:8080/docs
+#   Health:     http://localhost:8080/health
+# =============================================================================
+
+services:
+  spoon-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spoon-bot
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    volumes:
+      # Persistent workspace data (memory, skills, sessions)
+      - spoon-data:/data
+    environment:
+      # --- Run Mode ---
+      SPOON_BOT_MODE: gateway
+
+      # --- Gateway ---
+      GATEWAY_HOST: "0.0.0.0"
+      GATEWAY_PORT: "8080"
+      GATEWAY_DEBUG: "${GATEWAY_DEBUG:-false}"
+      GATEWAY_WORKERS: "${GATEWAY_WORKERS:-1}"
+
+      # --- JWT Auth ---
+      JWT_SECRET: "${JWT_SECRET:-}"
+      JWT_ACCESS_EXPIRE_MINUTES: "${JWT_ACCESS_EXPIRE_MINUTES:-15}"
+
+      # --- LLM API Keys (set at least one) ---
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+
+      # --- LLM Provider Settings ---
+      SPOON_BOT_DEFAULT_PROVIDER: "${SPOON_BOT_DEFAULT_PROVIDER:-anthropic}"
+      SPOON_BOT_DEFAULT_MODEL: "${SPOON_BOT_DEFAULT_MODEL:-}"
+      BASE_URL: "${BASE_URL:-}"
+
+      # --- Custom Base URLs (for proxies / self-hosted) ---
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+
+      # --- Web3 (optional) ---
+      PRIVATE_KEY: "${PRIVATE_KEY:-}"
+      RPC_URL: "${RPC_URL:-}"
+      SCAN_URL: "${SCAN_URL:-}"
+      CHAIN_ID: "${CHAIN_ID:-}"
+
+      # --- Agent Settings ---
+      SPOON_BOT_MAX_ITERATIONS: "${SPOON_BOT_MAX_ITERATIONS:-20}"
+      SPOON_BOT_LOG_LEVEL: "${SPOON_BOT_LOG_LEVEL:-INFO}"
+
+      # --- Telegram (optional) ---
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  spoon-data:
+    driver: local
