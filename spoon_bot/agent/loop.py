@@ -54,6 +54,7 @@ from spoon_bot.agent.tools.web3 import (
     ContractCallTool,
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
+from spoon_bot.agent.tools.image_gen import ImageGenerateTool
 from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
@@ -272,6 +273,7 @@ class AgentLoop:
         # Web tools
         self.tools.register(WebSearchTool())
         self.tools.register(WebFetchTool())
+        self.tools.register(ImageGenerateTool(workspace=self.workspace))
 
         # Web3 tools
         self.tools.register(BalanceCheckTool())

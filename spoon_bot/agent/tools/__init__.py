@@ -37,6 +37,7 @@ from spoon_bot.agent.tools.web import (
     WebFetchTool,
     WebBrowserTool,
 )
+from spoon_bot.agent.tools.image_gen import ImageGenerateTool
 
 __all__ = [
     # Base
@@ -71,4 +72,6 @@ __all__ = [
     "WebSearchTool",
     "WebFetchTool",
     "WebBrowserTool",
+    # Image Generation
+    "ImageGenerateTool",
 ]
