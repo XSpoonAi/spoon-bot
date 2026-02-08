@@ -238,6 +238,24 @@ class AgentLoop:
         # Initialize agent
         await self._agent.initialize()
 
+        # Patch execute_tool to normalize proxy-prefixed tool names.
+        # Some API proxies (e.g. cliproxy) add a "proxy_" prefix to
+        # tool names in LLM responses (e.g. "proxy_image_generate"
+        # instead of "image_generate"). This wrapper strips the prefix
+        # before dispatching so all registered tools work correctly.
+        _original_execute_tool = self._agent.execute_tool
+
+        async def _patched_execute_tool(tool_call):
+            name = tool_call.function.name
+            if name not in self._agent.available_tools.tool_map and name.startswith("proxy_"):
+                stripped = name[len("proxy_"):]
+                if stripped in self._agent.available_tools.tool_map:
+                    tool_call.function.name = stripped
+                    logger.debug(f"Normalized tool name: {name} -> {stripped}")
+            return await _original_execute_tool(tool_call)
+
+        self._agent.execute_tool = _patched_execute_tool
+
         self._initialized = True
         logger.info(
             f"AgentLoop initialized: spoon-core agent ready, "
