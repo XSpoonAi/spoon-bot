@@ -21,6 +21,14 @@ scripts:
       type: python
       file: scripts/export.py
       timeout: 60
+      input_schema:
+        type: object
+        properties:
+          content: {type: string, description: "Text content to export"}
+          format: {type: string, description: "Export format: markdown, pdf, excel, or mermaid"}
+          title: {type: string, description: "Document title"}
+          output_path: {type: string, description: "Output file path"}
+        required: [content, format]
 ---
 
 # Document Export Skill

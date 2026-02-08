@@ -21,6 +21,14 @@ scripts:
       type: python
       file: scripts/generate.py
       timeout: 120
+      input_schema:
+        type: object
+        properties:
+          prompt: {type: string, description: "Text description of the image"}
+          width: {type: integer, description: "Width in pixels (default 512)"}
+          height: {type: integer, description: "Height in pixels (default 512)"}
+          save_path: {type: string, description: "File path to save image"}
+        required: [prompt]
 ---
 
 # Image Generate Skill

@@ -21,6 +21,13 @@ scripts:
       type: python
       file: scripts/summarize.py
       timeout: 30
+      input_schema:
+        type: object
+        properties:
+          text: {type: string, description: "Text to summarize"}
+          style: {type: string, description: "Summary style: brief, detailed, or bullet_points"}
+          max_length: {type: integer, description: "Maximum summary length"}
+        required: [text]
 ---
 
 # Document Summarize Skill
