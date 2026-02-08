@@ -61,3 +61,9 @@ docs/
 !README.md
 !CONTRIBUTING.md
 !CHANGELOG.md
+node_modules/
+
+# Local runner scripts with credentials
+run_spoon.sh
+spoon_run.sh
+test_spoon.py

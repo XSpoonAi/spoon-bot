@@ -355,25 +355,138 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
-    ) -> AsyncGenerator[str, None]:
+        thinking: bool = False,
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """
-        Stream a response.
+        Stream a response with typed chunks.
 
         Args:
             message: User message.
             media: Optional media files.
+            thinking: Whether to include thinking output.
 
         Yields:
-            Response chunks.
+            Dicts with 'type' (content/thinking/tool_call/done), 'delta', and 'metadata'.
         """
         if not self._initialized:
             await self.initialize()
 
-        async for chunk in self._agent.stream(message):
-            if hasattr(chunk, "content") and chunk.content:
-                yield chunk.content
-            elif isinstance(chunk, str):
-                yield chunk
+        kwargs: dict[str, Any] = {}
+        if thinking:
+            kwargs["thinking"] = True
+        if media:
+            kwargs["media"] = media
+
+        full_content = ""
+        try:
+            async for chunk in self._agent.stream(message, **kwargs):
+                # Determine chunk type and delta
+                chunk_type = "content"
+                delta = ""
+                metadata: dict[str, Any] = {}
+
+                if hasattr(chunk, "type") and chunk.type == "thinking":
+                    chunk_type = "thinking"
+                    delta = chunk.content if hasattr(chunk, "content") else str(chunk)
+                elif hasattr(chunk, "metadata") and isinstance(chunk.metadata, dict) and chunk.metadata.get("type") == "thinking":
+                    chunk_type = "thinking"
+                    delta = chunk.delta if hasattr(chunk, "delta") else (chunk.content if hasattr(chunk, "content") else str(chunk))
+                elif hasattr(chunk, "content") and chunk.content:
+                    delta = chunk.content
+                    full_content += delta
+                elif isinstance(chunk, str):
+                    delta = chunk
+                    full_content += delta
+
+                if delta:
+                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+
+            # Emit done
+            yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
+
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
+
+        # Save to session only if we got actual content
+        if full_content:
+            try:
+                self._session.add_message("user", message)
+                self._session.add_message("assistant", full_content)
+                self.sessions.save(self._session)
+            except Exception as e:
+                logger.warning(f"Failed to save session after streaming: {e}")
+
+    async def process_with_thinking(
+        self,
+        message: str,
+        media: list[str] | None = None,
+    ) -> tuple[str, str | None]:
+        """
+        Process a user message and return the agent's response with thinking content.
+
+        Args:
+            message: The user's message.
+            media: Optional list of media file paths.
+
+        Returns:
+            Tuple of (response_text, thinking_content). thinking_content may be None.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        logger.info(f"Processing message (with thinking): {message[:100]}...")
+
+        # Refresh memory context
+        try:
+            memory_context = self.memory.get_memory_context()
+            if memory_context:
+                self.context.set_memory_context(memory_context)
+        except Exception as e:
+            logger.warning(f"Failed to load memory context: {e}")
+
+        # Run agent with thinking enabled
+        try:
+            run_kwargs: dict[str, Any] = {"thinking": True}
+            if media:
+                run_kwargs["media"] = media
+            result = await self._agent.run(message, **run_kwargs)
+
+            # Extract content and thinking
+            if hasattr(result, "content"):
+                final_content = result.content
+            else:
+                final_content = str(result)
+
+            thinking_content = None
+            if hasattr(result, "thinking_content"):
+                thinking_content = result.thinking_content
+            elif hasattr(result, "thinking"):
+                thinking_content = result.thinking
+            elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
+                thinking_content = result.metadata.get("thinking")
+
+        except Exception as e:
+            logger.error(f"Agent processing error: {e}")
+            return f"I encountered an error: {user_friendly_error(e)}", None
+
+        # Save to session
+        try:
+            self._session.add_message("user", message)
+            self._session.add_message("assistant", final_content)
+            self.sessions.save(self._session)
+        except Exception as e:
+            logger.warning(f"Failed to save session: {e}")
+
+        # Auto-commit workspace changes
+        if self._auto_commit and self._git:
+            try:
+                if self._git.has_changes():
+                    self._git.commit(message)
+            except Exception as e:
+                logger.warning(f"Failed to auto-commit: {e}")
+
+        return final_content, thinking_content
 
     def clear_history(self) -> None:
         """Clear conversation history."""
