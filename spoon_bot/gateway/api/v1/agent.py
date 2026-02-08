@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Annotated
+from typing import Annotated, AsyncGenerator
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 
 from spoon_bot.gateway.app import get_agent
 from spoon_bot.gateway.auth.dependencies import CurrentUser
@@ -15,6 +17,7 @@ from spoon_bot.gateway.models.responses import (
     APIResponse,
     MetaInfo,
     ChatResponse,
+    StreamChunk,
     UsageInfo,
     ToolCallInfo,
     StatusResponse,
@@ -24,18 +27,51 @@ from spoon_bot.gateway.models.responses import (
 router = APIRouter()
 
 
-@router.post("/chat", response_model=APIResponse[ChatResponse])
+async def _stream_sse(agent, message: str, media: list[str] | None, thinking: bool) -> AsyncGenerator[str, None]:
+    """Generate SSE events from agent streaming."""
+    kwargs = {"message": message, "thinking": thinking}
+    if media:
+        kwargs["media"] = media
+
+    try:
+        async for chunk_data in agent.stream(**kwargs):
+            # Filter out "done" chunks — clients use [DONE] as the completion signal
+            if chunk_data.get("type") == "done":
+                continue
+            chunk = StreamChunk(
+                type=chunk_data["type"],
+                delta=chunk_data["delta"],
+                metadata=chunk_data.get("metadata", {}),
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
+    except Exception as e:
+        error_chunk = StreamChunk(
+            type="error",
+            delta="",
+            metadata={"error": str(e)},
+        )
+        yield f"data: {error_chunk.model_dump_json()}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+
+@router.post("/chat")
 async def chat(
     request: ChatRequest,
     user: CurrentUser,
-) -> APIResponse[ChatResponse]:
+):
     """
     Send a message to the agent and get a response.
 
-    This is a synchronous endpoint that waits for the agent to complete.
+    When options.stream=true, returns Server-Sent Events (SSE).
+    Otherwise returns a standard JSON response.
     """
     request_id = f"req_{uuid4().hex[:12]}"
     start_time = time.time()
+
+    # Determine options
+    stream = request.options.stream if request.options else False
+    thinking = request.options.thinking if request.options else False
 
     try:
         agent = get_agent()
@@ -45,13 +81,28 @@ async def chat(
         if hasattr(user, "session_key"):
             session_key = user.session_key
 
-        # Process with agent
-        # AgentLoop.process() accepts message and media
+        # Streaming mode: return SSE
+        if stream:
+            return StreamingResponse(
+                _stream_sse(agent, request.message, request.media or None, thinking),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Request-ID": request_id,
+                },
+            )
+
+        # Non-streaming mode
         kwargs = {"message": request.message}
         if request.media:
             kwargs["media"] = request.media
 
-        response_text = await agent.process(**kwargs)
+        thinking_content = None
+        if thinking:
+            response_text, thinking_content = await agent.process_with_thinking(**kwargs)
+        else:
+            response_text = await agent.process(**kwargs)
 
         duration_ms = int((time.time() - start_time) * 1000)
 
@@ -61,6 +112,7 @@ async def chat(
                 response=response_text,
                 tool_calls=[],  # TODO: Extract tool calls from response
                 usage=None,  # TODO: Track usage
+                thinking_content=thinking_content,
             ),
             meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
         )

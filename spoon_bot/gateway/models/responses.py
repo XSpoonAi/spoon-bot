@@ -75,6 +75,15 @@ class ChatResponse(BaseModel):
     response: str
     tool_calls: list[ToolCallInfo] = Field(default_factory=list)
     usage: UsageInfo | None = None
+    thinking_content: str | None = None
+
+
+class StreamChunk(BaseModel):
+    """Streaming response chunk model."""
+
+    type: str  # "content", "thinking", "tool_call", "done"
+    delta: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionInfo(BaseModel):

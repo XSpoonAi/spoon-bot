@@ -13,6 +13,7 @@ class ChatOptions(BaseModel):
 
     max_iterations: int = Field(default=20, ge=1, le=100)
     stream: bool = False
+    thinking: bool = False
     model: str | None = None
 
 
