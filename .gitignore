@@ -61,6 +61,7 @@ docs/
 !README.md
 !CONTRIBUTING.md
 !CHANGELOG.md
+!workspace/skills/**/SKILL.md
 
 # Node modules
 node_modules/
