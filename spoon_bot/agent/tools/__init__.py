@@ -37,6 +37,11 @@ from spoon_bot.agent.tools.web import (
     WebFetchTool,
     WebBrowserTool,
 )
+from spoon_bot.agent.tools.document import (
+    DocumentParseTool,
+    DocumentExportTool,
+    DocumentSummarizeTool,
+)
 
 __all__ = [
     # Base
@@ -71,4 +76,8 @@ __all__ = [
     "WebSearchTool",
     "WebFetchTool",
     "WebBrowserTool",
+    # Document
+    "DocumentParseTool",
+    "DocumentExportTool",
+    "DocumentSummarizeTool",
 ]

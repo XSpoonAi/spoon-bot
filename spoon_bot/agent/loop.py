@@ -54,6 +54,7 @@ from spoon_bot.agent.tools.web3 import (
     ContractCallTool,
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
+from spoon_bot.agent.tools.document import DocumentParseTool, DocumentExportTool, DocumentSummarizeTool
 from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
@@ -272,6 +273,11 @@ class AgentLoop:
         # Web tools
         self.tools.register(WebSearchTool())
         self.tools.register(WebFetchTool())
+
+        # Document processing tools
+        self.tools.register(DocumentParseTool(workspace=self.workspace))
+        self.tools.register(DocumentExportTool(workspace=self.workspace))
+        self.tools.register(DocumentSummarizeTool())
 
         # Web3 tools
         self.tools.register(BalanceCheckTool())
