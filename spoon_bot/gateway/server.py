@@ -37,42 +37,32 @@ from spoon_bot.gateway import app as app_module
 
 
 def _normalize_provider(provider: str) -> str:
-    """Normalize provider aliases while preserving backward compatibility."""
-    p = (provider or "anthropic").strip().lower()
-    alias_map = {
-        "codex": "openai",
-    }
-    return alias_map.get(p, p)
+    """Normalize provider value from env."""
+    return (provider or "anthropic").strip().lower()
 
 
 def _resolve_provider_model() -> tuple[str, str]:
-    """Resolve provider/model from env with codex-aware defaults."""
-    raw_provider = os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
-    provider = _normalize_provider(raw_provider)
+    """Resolve provider/model from env with provider-specific defaults."""
+    provider = _normalize_provider(os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic"))
 
     model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "").strip()
 
     # Provider-specific model env fallbacks (only used if generic model env missing)
     if not model:
-        if raw_provider.strip().lower() == "codex":
-            model = os.environ.get("CODEX_MODEL", "").strip()
-        elif provider == "openai":
+        if provider == "openai":
             model = os.environ.get("OPENAI_MODEL", "").strip()
         elif provider == "anthropic":
             model = os.environ.get("ANTHROPIC_MODEL", "").strip()
 
     if not model:
         default_models = {
-            "anthropic": "claude-sonnet-4-20250514",
+            "anthropic": "claude-opus-4-20250514",
             "openai": "gpt-4o",
             "deepseek": "deepseek-chat",
             "gemini": "gemini-2.0-flash",
             "openrouter": "anthropic/claude-sonnet-4",
         }
-        if raw_provider.strip().lower() == "codex":
-            model = "gpt-5.3-codex"
-        else:
-            model = default_models.get(provider, "claude-sonnet-4-20250514")
+        model = default_models.get(provider, "claude-opus-4-20250514")
 
     return provider, model
 

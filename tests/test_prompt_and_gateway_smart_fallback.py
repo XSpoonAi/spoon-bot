@@ -58,14 +58,14 @@ def test_context_includes_default_system_prompt(tmp_path):
     assert "clarifying questions" in prompt
 
 
-def test_resolve_provider_model_codex_defaults(monkeypatch):
-    monkeypatch.setenv("SPOON_BOT_DEFAULT_PROVIDER", "codex")
+def test_resolve_provider_model_default_anthropic_opus(monkeypatch):
+    monkeypatch.setenv("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
     monkeypatch.delenv("SPOON_BOT_DEFAULT_MODEL", raising=False)
-    monkeypatch.delenv("CODEX_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
 
     provider, model = _resolve_provider_model()
-    assert provider == "openai"
-    assert model == "gpt-5.3-codex"
+    assert provider == "anthropic"
+    assert model == "claude-opus-4-20250514"
 
 
 def test_chat_replaces_generic_error_with_smart_fallback(app_with_fallback_agent):
