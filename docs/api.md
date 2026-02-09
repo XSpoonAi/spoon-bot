@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-02-09 08:09 UTC.  
+> **Auto-generated** from source code on 2026-02-09 08:14 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -119,7 +119,8 @@ Root endpoint with API information.
 
 Send a message to the agent and get a response.
 
-This is a synchronous endpoint that waits for the agent to complete.
+When options.stream=true, returns Server-Sent Events (SSE).
+Otherwise returns a standard JSON response.
 
 **Auth Required:** Yes
 
@@ -170,7 +171,7 @@ This is a synchronous endpoint that waits for the agent to complete.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:28`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:59`*
 
 ---
 
@@ -224,7 +225,7 @@ Get agent status and statistics.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:120`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:172`*
 
 ---
 
@@ -236,19 +237,19 @@ Get agent status and statistics.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:76`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:128`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:96`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:148`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:110`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:162`*
 
 ---
 
@@ -429,6 +430,8 @@ Handle event unsubscription.
 | `agent.thinking` | Agent | Agent Thinking |
 | `agent.step` | Agent | Agent Step |
 | `agent.streaming` | Agent | Agent Streaming |
+| `agent.stream.chunk` | Agent | Agent Stream Chunk |
+| `agent.stream.done` | Agent | Agent Stream Done |
 | `agent.tool_call` | Agent | Agent Tool Call |
 | `agent.tool_result` | Agent | Agent Tool Result |
 | `agent.complete` | Agent | Agent Complete |
@@ -461,6 +464,7 @@ Options for chat requests.
 |-------|------|---------|
 | `max_iterations` | `int` | Field(default=20, ge=1, le=100) |
 | `stream` | `bool` | False |
+| `thinking` | `bool` | False |
 | `model` | `str | None` | None |
 
 #### `ChatRequest`
@@ -623,6 +627,17 @@ Chat response model.
 | `response` | `str` | *(required)* |
 | `tool_calls` | `list[ToolCallInfo]` | Field(default_factory=list) |
 | `usage` | `UsageInfo | None` | None |
+| `thinking_content` | `str | None` | None |
+
+#### `StreamChunk`
+
+Streaming response chunk model.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `type` | `str` | *(required)* |
+| `delta` | `str` | '' |
+| `metadata` | `dict[str, Any]` | Field(default_factory=dict) |
 
 #### `SessionInfo`
 
