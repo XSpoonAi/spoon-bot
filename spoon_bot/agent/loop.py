@@ -34,7 +34,7 @@ except ImportError as e:
 
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder
-from spoon_bot.agent.tools.registry import ToolRegistry
+from spoon_bot.agent.tools.registry import CORE_TOOLS, ToolRegistry
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.filesystem import (
     ReadFileTool,
@@ -86,6 +86,16 @@ class AgentLoop:
     - spoon-bot's native OS tools (shell, filesystem, etc.)
     """
 
+    # Task-agnostic next_step_prompt that replaces the crypto-centric default.
+    # The original spoon-core template ("You can interact with the Neo blockchain …
+    # Pick tools by matching the user's request to the tool names …") is injected
+    # as a USER message every step, causing the LLM to waste iterations echoing
+    # policy text instead of doing useful work.  This minimal version avoids that.
+    DEFAULT_NEXT_STEP_PROMPT = (
+        "Continue with the next step. "
+        "When the task is fully complete, provide your final answer."
+    )
+
     def __init__(
         self,
         workspace: Path | str | None = None,
@@ -102,6 +112,8 @@ class AgentLoop:
         system_prompt: str | None = None,
         enable_skills: bool = True,
         auto_commit: bool = True,
+        enabled_tools: set[str] | None = None,
+        tool_profile: str | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -121,6 +133,8 @@ class AgentLoop:
             system_prompt: Custom system prompt.
             enable_skills: Whether to enable skill system.
             auto_commit: Whether to auto-commit workspace changes after each message.
+            enabled_tools: Explicit set of tool names to enable. None = all.
+            tool_profile: Named profile ('coding', 'web3', 'research', 'full').
         """
         # Validate parameters
         try:
@@ -142,6 +156,8 @@ class AgentLoop:
         self.workspace = self._config.workspace
         self.model = model
         self.provider = provider
+        self.api_key = api_key
+        self.base_url = base_url
         self.max_iterations = self._config.max_iterations
         self.shell_timeout = self._config.shell_timeout
         self.max_output = self._config.max_output
@@ -180,12 +196,26 @@ class AgentLoop:
         # Register native tools
         self._register_native_tools()
 
+        # Apply tool filter: explicit > profile > core default
+        if enabled_tools is not None or tool_profile is not None:
+            self.tools.set_tool_filter(
+                enabled_tools=enabled_tools,
+                tool_profile=tool_profile,
+            )
+        else:
+            # Default: only load core tools into the agent.
+            # All other tools remain in the registry and can be activated
+            # dynamically via add_tool().
+            self.tools.set_tool_filter(enabled_tools=set(CORE_TOOLS))
+
         # Track initialization state
         self._initialized = False
 
+        active_count = len(self.tools)
+        total_count = len(self.tools._tools)
         logger.info(
             f"AgentLoop created: model={model}, provider={provider}, "
-            f"tools={len(self.tools)}, session={session_key}"
+            f"tools={active_count}/{total_count}, session={session_key}"
         )
 
     async def initialize(self) -> None:
@@ -193,11 +223,31 @@ class AgentLoop:
         if self._initialized:
             return
 
+        # Build system prompt (spoon-bot context + available tool summaries)
+        system_prompt = self._system_prompt or self.context.build_system_prompt()
+
+        # Append available-tools summary so the LLM knows what can be loaded
+        inactive_tools = self.tools.get_inactive_tools()
+        if inactive_tools:
+            tool_lines = "\n".join(
+                f"- {t.name}: {t.description}"
+                for t in inactive_tools.values()
+            )
+            system_prompt += (
+                "\n\n## Dynamically Loadable Tools\n\n"
+                "The following tools are available but not currently loaded. "
+                "If you need any of them, tell the user which tool you need "
+                "and they can be loaded on demand.\n\n"
+                f"{tool_lines}"
+            )
+
         # Create ChatBot (spoon-core LLM interface)
         self._chatbot = ChatBot(
             model_name=self.model,
             llm_provider=self.provider,
-            system_prompt=self._system_prompt,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            system_prompt=system_prompt,
         )
 
         # Create MCP tools
@@ -209,8 +259,17 @@ class AgentLoop:
             )
             self._mcp_tools.append(mcp_tool)
 
-        # Create ToolManager with native + MCP tools
-        all_tools = list(self.tools._tools.values()) + self._mcp_tools
+        # Only pass active (filtered) tools + MCP tools to the agent
+        active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
+
+        # Common agent kwargs
+        agent_kwargs: dict[str, Any] = {
+            "llm": self._chatbot,
+            "tools": ToolManager(active_tools) if active_tools else None,
+            "max_steps": self.max_iterations,
+            "system_prompt": system_prompt,
+            "next_step_prompt": self.DEFAULT_NEXT_STEP_PROMPT,
+        }
 
         # Create SkillManager if enabled
         if self._enable_skills:
@@ -220,28 +279,23 @@ class AgentLoop:
                 auto_discover=True,
                 include_default_paths=False,
             )
-
-            # Create SpoonReactSkill agent
-            self._agent = SpoonReactSkill(
-                llm=self._chatbot,
-                tools=ToolManager(all_tools) if all_tools else None,
-                skill_manager=self._skill_manager,
-                max_steps=self.max_iterations,
-            )
+            agent_kwargs["skill_manager"] = self._skill_manager
+            self._agent = SpoonReactSkill(**agent_kwargs)
         else:
-            # Create SpoonReactMCP agent (no skills)
-            self._agent = SpoonReactMCP(
-                llm=self._chatbot,
-                tools=ToolManager(all_tools) if all_tools else None,
-                max_steps=self.max_iterations,
-            )
+            self._agent = SpoonReactMCP(**agent_kwargs)
 
         # Initialize agent
         await self._agent.initialize()
 
+        # Increase default step timeout for proxy/custom endpoints
+        if self.base_url:
+            self._agent._default_timeout = 300.0
+
         self._initialized = True
+        active_count = len(self.tools.get_active_tools())
+        total_count = len(self.tools._tools)
         logger.info(
-            f"AgentLoop initialized: spoon-core agent ready, "
+            f"AgentLoop initialized: tools={active_count}/{total_count}, "
             f"mcp_servers={len(self._mcp_tools)}, "
             f"skills_enabled={self._enable_skills}"
         )
@@ -371,7 +425,10 @@ class AgentLoop:
             thinking: Whether to include thinking output.
 
         Yields:
-            Dicts with 'type' (content/thinking/tool_call/done), 'delta', and 'metadata'.
+            Dicts with keys:
+              type:     "content" | "thinking" | "tool_call" | "tool_result" | "done"
+              delta:    Incremental text (may be empty for non-text events)
+              metadata: Extra context (tool name, args, step number, etc.)
         """
         if not self._initialized:
             await self.initialize()
@@ -385,20 +442,51 @@ class AgentLoop:
         full_content = ""
         try:
             async for chunk in self._agent.stream(message, **kwargs):
-                # Determine chunk type and delta
                 chunk_type = "content"
                 delta = ""
                 metadata: dict[str, Any] = {}
 
+                # -- Thinking chunks --
                 if hasattr(chunk, "type") and chunk.type == "thinking":
                     chunk_type = "thinking"
                     delta = chunk.content if hasattr(chunk, "content") else str(chunk)
-                elif hasattr(chunk, "metadata") and isinstance(chunk.metadata, dict) and chunk.metadata.get("type") == "thinking":
+                elif (
+                    hasattr(chunk, "metadata")
+                    and isinstance(chunk.metadata, dict)
+                    and chunk.metadata.get("type") == "thinking"
+                ):
                     chunk_type = "thinking"
-                    delta = chunk.delta if hasattr(chunk, "delta") else (chunk.content if hasattr(chunk, "content") else str(chunk))
+                    delta = (
+                        getattr(chunk, "delta", None)
+                        or getattr(chunk, "content", None)
+                        or str(chunk)
+                    )
+
+                # -- Dict chunks (tool_calls, structured events) --
+                elif isinstance(chunk, dict):
+                    if "tool_calls" in chunk and chunk["tool_calls"]:
+                        for tc in chunk["tool_calls"]:
+                            fn = tc.get("function", {})
+                            yield {
+                                "type": "tool_call",
+                                "delta": "",
+                                "metadata": {
+                                    "id": tc.get("id", ""),
+                                    "name": fn.get("name", ""),
+                                    "arguments": fn.get("arguments", ""),
+                                },
+                            }
+                        continue
+                    if "content" in chunk and chunk["content"]:
+                        delta = chunk["content"]
+                        full_content += delta
+
+                # -- Object chunks with content --
                 elif hasattr(chunk, "content") and chunk.content:
                     delta = chunk.content
                     full_content += delta
+
+                # -- Plain string chunks --
                 elif isinstance(chunk, str):
                     delta = chunk
                     full_content += delta
@@ -493,6 +581,89 @@ class AgentLoop:
 
         return final_content, thinking_content
 
+    # ------------------------------------------------------------------
+    # Dynamic tool management
+    # ------------------------------------------------------------------
+
+    def add_tool(self, name: str) -> bool:
+        """
+        Dynamically activate a tool and inject it into the running agent.
+
+        The tool must already be registered in the ToolRegistry.  This method
+        activates it in the filter, then adds it to the agent's ToolManager
+        so it becomes available for the next LLM step.
+
+        Args:
+            name: Registered tool name to activate.
+
+        Returns:
+            True if the tool was activated, False otherwise.
+        """
+        tool = self.tools.get(name)
+        if tool is None:
+            logger.warning(f"add_tool: '{name}' is not registered")
+            return False
+
+        if not self.tools.activate_tool(name):
+            logger.debug(f"add_tool: '{name}' is already active")
+            return False
+
+        # If the agent is initialized, inject the tool into its ToolManager
+        if self._agent and hasattr(self._agent, "available_tools"):
+            tm: ToolManager = self._agent.available_tools
+            if name not in tm.tool_map:
+                tm.add_tool(tool)
+                logger.info(f"Injected tool '{name}' into running agent")
+
+        return True
+
+    def add_tools(self, *names: str) -> list[str]:
+        """
+        Activate multiple tools at once.
+
+        Args:
+            *names: Tool names to activate.
+
+        Returns:
+            List of tool names that were successfully activated.
+        """
+        activated = []
+        for name in names:
+            if self.add_tool(name):
+                activated.append(name)
+        return activated
+
+    def remove_tool(self, name: str) -> bool:
+        """
+        Dynamically deactivate a tool and remove it from the running agent.
+
+        Args:
+            name: Tool name to deactivate.
+
+        Returns:
+            True if the tool was deactivated, False otherwise.
+        """
+        if not self.tools.deactivate_tool(name):
+            return False
+
+        # Remove from agent's ToolManager if running
+        if self._agent and hasattr(self._agent, "available_tools"):
+            tm: ToolManager = self._agent.available_tools
+            if name in tm.tool_map:
+                tm.remove_tool(name)
+                logger.info(f"Removed tool '{name}' from running agent")
+
+        return True
+
+    def get_available_tools(self) -> list[dict[str, Any]]:
+        """
+        List all registered tools with their active/inactive status.
+
+        Returns:
+            List of dicts with name, description, and active flag.
+        """
+        return self.tools.get_all_tool_summaries()
+
     def clear_history(self) -> None:
         """Clear conversation history."""
         self._session.clear()
@@ -543,12 +714,19 @@ async def create_agent(
     mcp_config: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
     auto_commit: bool = True,
+    enabled_tools: set[str] | None = None,
+    tool_profile: str | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
     Create and initialize an AgentLoop.
 
     This is the recommended way to create an agent.
+
+    By default only core tools (shell, read_file, write_file, edit_file,
+    list_dir) are loaded into the agent.  Use ``enabled_tools`` or
+    ``tool_profile`` to override, or call ``agent.add_tool(name)`` after
+    creation to dynamically inject additional tools.
 
     Args:
         model: Model name.
@@ -560,6 +738,8 @@ async def create_agent(
         mcp_config: MCP server configurations.
         enable_skills: Whether to enable skill system.
         auto_commit: Whether to auto-commit workspace changes after each message.
+        enabled_tools: Explicit set of tool names to enable. None = core only.
+        tool_profile: Named profile ('core', 'coding', 'web3', 'research', 'full').
         **kwargs: Additional arguments for AgentLoop.
 
     Returns:
@@ -569,9 +749,12 @@ async def create_agent(
         >>> agent = await create_agent()
         >>> response = await agent.process("Hello!")
 
-        >>> agent = await create_agent(
-        ...     mcp_config={"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}
-        ... )
+        >>> # Load all tools
+        >>> agent = await create_agent(tool_profile="full")
+
+        >>> # Dynamically add a tool after creation
+        >>> agent = await create_agent()
+        >>> agent.add_tool("web_search")
     """
     agent = AgentLoop(
         model=model,
@@ -583,6 +766,8 @@ async def create_agent(
         mcp_config=mcp_config,
         enable_skills=enable_skills,
         auto_commit=auto_commit,
+        enabled_tools=enabled_tools,
+        tool_profile=tool_profile,
         **kwargs,
     )
 
