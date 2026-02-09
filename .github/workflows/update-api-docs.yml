@@ -1,0 +1,61 @@
+name: Update API Docs
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'spoon_bot/gateway/**'
+      - 'scripts/generate_api_docs.py'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'spoon_bot/gateway/**'
+      - 'scripts/generate_api_docs.py'
+
+permissions:
+  contents: write
+
+jobs:
+  check-docs:
+    name: Check API docs are up-to-date
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check docs freshness
+        run: python scripts/generate_api_docs.py --check
+
+  update-docs:
+    name: Auto-update API docs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate API docs
+        run: python scripts/generate_api_docs.py
+
+      - name: Check for changes
+        id: diff
+        run: |
+          git diff --quiet docs/api.md && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated docs
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/api.md
+          git commit -m "docs: auto-update API documentation"
+          git push

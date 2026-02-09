@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class ToolkitToolWrapper(Tool):
     """Wrapper that adapts spoon-toolkit tools to spoon-bot Tool interface."""
 
-    def __init__(self, toolkit_tool: Any):
+    def __init__(self, toolkit_tool: Any, timeout_seconds: float = 30.0):
         """
         Initialize wrapper.
 
@@ -25,6 +25,7 @@ class ToolkitToolWrapper(Tool):
             toolkit_tool: Instance from spoon-toolkits.
         """
         self._tool = toolkit_tool
+        self._timeout_seconds = timeout_seconds
 
     @property
     def name(self) -> str:
@@ -60,23 +61,38 @@ class ToolkitToolWrapper(Tool):
         try:
             # Check if tool has async execute
             if hasattr(self._tool, "arun"):
-                result = await self._tool.arun(**kwargs)
+                result = await asyncio.wait_for(
+                    self._tool.arun(**kwargs),
+                    timeout=self._timeout_seconds,
+                )
             elif hasattr(self._tool, "execute"):
                 if asyncio.iscoroutinefunction(self._tool.execute):
-                    result = await self._tool.execute(**kwargs)
+                    result = await asyncio.wait_for(
+                        self._tool.execute(**kwargs),
+                        timeout=self._timeout_seconds,
+                    )
                 else:
                     # Run sync function in executor to avoid blocking
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self._tool.execute(**kwargs)
+                    result = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: self._tool.execute(**kwargs)
+                        ),
+                        timeout=self._timeout_seconds,
                     )
             elif hasattr(self._tool, "run"):
                 # Run sync function in executor to avoid blocking
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._tool.run(**kwargs)
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self._tool.run(**kwargs)
+                    ),
+                    timeout=self._timeout_seconds,
                 )
             elif callable(self._tool):
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self._tool(**kwargs)
+                result = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self._tool(**kwargs)
+                    ),
+                    timeout=self._timeout_seconds,
                 )
             else:
                 return f"Error: Tool '{self.name}' is not callable"
@@ -85,7 +101,7 @@ class ToolkitToolWrapper(Tool):
 
         except asyncio.TimeoutError as e:
             logger.error(f"Toolkit tool {self.name} timed out: {e}")
-            return f"Error: Tool '{self.name}' timed out"
+            return f"Error: Tool '{self.name}' timed out after {self._timeout_seconds:g} seconds"
         except asyncio.CancelledError:
             logger.warning(f"Toolkit tool {self.name} was cancelled")
             return f"Error: Tool '{self.name}' was cancelled"

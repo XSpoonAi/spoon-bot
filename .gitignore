@@ -56,15 +56,21 @@ workspace/sessions/
 Thumbs.db
 
 # Documentation (not uploaded to GitHub)
-docs/
+docs/*
 *.md
 !README.md
 !CONTRIBUTING.md
 !CHANGELOG.md
 !workspace/skills/**/SKILL.md
+!docs/api.md
 
 # Node modules
 node_modules/
 
 # Generated images
 generated_images/
+
+# Local runner scripts with credentials
+run_spoon.sh
+spoon_run.sh
+test_spoon.py
