@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -100,7 +101,13 @@ async def execute_tool(
         )
 
     try:
-        result = await agent.tools.execute(tool_name, **request.arguments)
+        result = await agent.tools.execute(tool_name, request.arguments)
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                result = parsed
+            except json.JSONDecodeError:
+                pass
 
         return APIResponse(
             success=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
@@ -25,9 +26,22 @@ router = APIRouter()
 async def list_sessions(user: CurrentUser) -> APIResponse[SessionListResponse]:
     """List all sessions."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent = get_agent()
+    agent: Any = get_agent()
+    sessions_manager: Any = getattr(agent, "sessions", None)
+    if sessions_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
+        )
 
-    sessions = agent.sessions.list_sessions()
+    session_keys = sessions_manager.list_sessions()
+    sessions: list[Any] = []
+
+    for key in session_keys:
+        session = sessions_manager.get(key)
+        if session is None:
+            continue
+        sessions.append(session)
 
     return APIResponse(
         success=True,
@@ -52,10 +66,16 @@ async def create_session(
 ) -> APIResponse[SessionResponse]:
     """Create a new session."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent = get_agent()
+    agent: Any = get_agent()
+    sessions_manager: Any = getattr(agent, "sessions", None)
+    if sessions_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
+        )
 
     # Check if session already exists
-    existing = agent.sessions.get(request.key)
+    existing = sessions_manager.get(request.key)
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -63,7 +83,7 @@ async def create_session(
         )
 
     # Create session
-    session = agent.sessions.get_or_create(request.key)
+    session = sessions_manager.get_or_create(request.key)
 
     return APIResponse(
         success=True,
@@ -85,9 +105,15 @@ async def get_session(
 ) -> APIResponse[SessionResponse]:
     """Get session details."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent = get_agent()
+    agent: Any = get_agent()
+    sessions_manager: Any = getattr(agent, "sessions", None)
+    if sessions_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
+        )
 
-    session = agent.sessions.get(session_key)
+    session = sessions_manager.get(session_key)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -113,9 +139,15 @@ async def delete_session(
     user: CurrentUser,
 ) -> dict:
     """Delete a session."""
-    agent = get_agent()
+    agent: Any = get_agent()
+    sessions_manager: Any = getattr(agent, "sessions", None)
+    if sessions_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
+        )
 
-    deleted = agent.sessions.delete(session_key)
+    deleted = sessions_manager.delete(session_key)
 
     return {"deleted": deleted}
 
@@ -126,9 +158,15 @@ async def clear_session(
     user: CurrentUser,
 ) -> dict:
     """Clear session history."""
-    agent = get_agent()
+    agent: Any = get_agent()
+    sessions_manager: Any = getattr(agent, "sessions", None)
+    if sessions_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
+        )
 
-    session = agent.sessions.get(session_key)
+    session = sessions_manager.get(session_key)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -137,6 +175,6 @@ async def clear_session(
 
     count = len(session.messages)
     session.messages.clear()
-    agent.sessions.save(session)
+    sessions_manager.save(session)
 
     return {"cleared": True, "messages_removed": count}
