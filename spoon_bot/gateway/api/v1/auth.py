@@ -9,6 +9,7 @@ from spoon_bot.gateway.auth.jwt import (
     create_access_token,
     create_refresh_token,
     verify_token,
+    revoke_token,
 )
 from spoon_bot.gateway.auth.api_key import verify_api_key
 from spoon_bot.gateway.auth.dependencies import CurrentUser
@@ -20,15 +21,10 @@ router = APIRouter()
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: LoginRequest) -> TokenResponse:
-    """
-    Authenticate and get tokens.
-
-    Supports API key authentication.
-    """
+    """Authenticate and get tokens."""
     config = get_config()
     user_id = None
 
-    # Try API key authentication
     if request.api_key:
         api_key_data = verify_api_key(request.api_key, config)
         if api_key_data:
@@ -40,7 +36,6 @@ async def login(request: LoginRequest) -> TokenResponse:
             detail={"code": "AUTH_INVALID", "message": "Invalid credentials"},
         )
 
-    # Create tokens
     access_token = create_access_token(
         user_id=user_id,
         session_key="default",
@@ -82,7 +77,6 @@ async def refresh_token(request: RefreshRequest) -> TokenResponse:
             detail={"code": "AUTH_INVALID", "message": "Invalid or expired refresh token"},
         )
 
-    # Create new access token
     access_token = create_access_token(
         user_id=token_data.user_id,
         session_key="default",
@@ -94,19 +88,26 @@ async def refresh_token(request: RefreshRequest) -> TokenResponse:
 
     return TokenResponse(
         access_token=access_token,
-        refresh_token=None,  # Don't issue new refresh token
+        refresh_token=None,
         expires_in=config.jwt.access_token_expire_minutes * 60,
     )
 
 
 @router.post("/logout")
 async def logout(request: RefreshRequest) -> dict:
-    """
-    Logout and invalidate refresh token.
+    """Logout and revoke refresh token."""
+    config = get_config()
 
-    Note: In production, store revoked tokens in a blacklist.
-    """
-    # TODO: Add token to blacklist
+    token_data = verify_token(
+        request.refresh_token,
+        config.jwt.secret_key,
+        config.jwt.algorithm,
+        expected_type="refresh",
+    )
+
+    if token_data:
+        revoke_token(request.refresh_token, token_data.token_id)
+
     return {"success": True}
 
 
