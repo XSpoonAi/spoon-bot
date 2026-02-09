@@ -218,6 +218,7 @@ class AgentLoop:
                 skill_paths=[str(p) for p in self._skill_paths],
                 llm=self._chatbot,
                 auto_discover=True,
+                include_default_paths=False,
             )
 
             # Create SpoonReactSkill agent
