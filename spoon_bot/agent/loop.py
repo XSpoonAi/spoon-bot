@@ -54,6 +54,7 @@ from spoon_bot.agent.tools.web3 import (
     ContractCallTool,
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
+from spoon_bot.agent.tools.document import DocumentParseTool
 from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
@@ -217,6 +218,7 @@ class AgentLoop:
                 skill_paths=[str(p) for p in self._skill_paths],
                 llm=self._chatbot,
                 auto_discover=True,
+                include_default_paths=False,
             )
 
             # Create SpoonReactSkill agent
@@ -272,6 +274,9 @@ class AgentLoop:
         # Web tools
         self.tools.register(WebSearchTool())
         self.tools.register(WebFetchTool())
+
+        # Document processing tools
+        self.tools.register(DocumentParseTool(workspace=self.workspace))
 
         # Web3 tools
         self.tools.register(BalanceCheckTool())
