@@ -61,11 +61,10 @@ docs/*
 !README.md
 !CONTRIBUTING.md
 !CHANGELOG.md
+node_modules/
+
 !workspace/skills/**/SKILL.md
 !docs/api.md
-
-# Node modules
-node_modules/
 
 # Generated images
 generated_images/

@@ -190,6 +190,8 @@ class WebSocketHandler:
             raise ValueError("Message is required")
 
         session_key = params.get("session_key", conn.session_key)
+        stream = params.get("stream", False)
+        thinking = params.get("thinking", False)
         task_id = f"task_{uuid4().hex[:8]}"
         self._current_task_id = task_id
         self._cancel_requested = False
@@ -200,26 +202,75 @@ class WebSocketHandler:
             WSEvent(event="agent.thinking", data={"task_id": task_id, "status": "processing"}),
         )
 
-        # Process with global AgentLoop (accepts message and media only)
-        response = await agent.process(message=message)
+        if stream:
+            # Streaming mode: emit chunks via WSEvent
+            full_content = ""
+            async for chunk_data in agent.stream(message=message, thinking=thinking):
+                if self._cancel_requested:
+                    break
+
+                chunk_type = chunk_data.get("type", "content")
+                delta = chunk_data.get("delta", "")
+                metadata = chunk_data.get("metadata", {})
+
+                if chunk_type == "done":
+                    # Send stream done event
+                    await manager.send_message(
+                        self.connection_id,
+                        WSEvent(event=ServerEvent.AGENT_STREAM_DONE.value, data={
+                            "task_id": task_id,
+                            "content": full_content,
+                        }),
+                    )
+                else:
+                    if chunk_type == "content":
+                        full_content += delta
+
+                    # Send stream chunk event
+                    await manager.send_message(
+                        self.connection_id,
+                        WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
+                            "task_id": task_id,
+                            "type": chunk_type,
+                            "delta": delta,
+                            "metadata": metadata,
+                        }),
+                    )
+
+            response = full_content
+        else:
+            # Non-streaming mode
+            if thinking:
+                response, thinking_content = await agent.process_with_thinking(message=message)
+            else:
+                response = await agent.process(message=message)
+                thinking_content = None
 
         # Emit complete event
+        complete_data: dict[str, Any] = {
+            "task_id": task_id,
+            "status": "done",
+            "response": response[:200] if isinstance(response, str) else str(response)[:200],
+        }
+        if not stream and thinking and thinking_content:
+            complete_data["thinking_content"] = thinking_content
+
         await manager.send_message(
             self.connection_id,
-            WSEvent(event="agent.complete", data={
-                "task_id": task_id,
-                "status": "done",
-                "response": response[:200] if isinstance(response, str) else str(response)[:200],
-            }),
+            WSEvent(event="agent.complete", data=complete_data),
         )
 
         self._current_task_id = None
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "task_id": task_id,
             "content": response,
             "session_key": session_key,
         }
+        if not stream and thinking and thinking_content:
+            result["thinking_content"] = thinking_content
+
+        return result
 
     async def _handle_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle cancel request."""

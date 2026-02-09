@@ -63,6 +63,8 @@ class ServerEvent(str, Enum):
     AGENT_THINKING = "agent.thinking"
     AGENT_STEP = "agent.step"
     AGENT_STREAMING = "agent.streaming"
+    AGENT_STREAM_CHUNK = "agent.stream.chunk"
+    AGENT_STREAM_DONE = "agent.stream.done"
     AGENT_TOOL_CALL = "agent.tool_call"
     AGENT_TOOL_RESULT = "agent.tool_result"
     AGENT_COMPLETE = "agent.complete"
