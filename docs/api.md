@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-02-09 08:05 UTC.  
+> **Auto-generated** from source code on 2026-02-09 08:09 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -57,7 +57,7 @@ Authenticate and get tokens.
 
 **Response Model:** `TokenResponse`
 
-*Source: `spoon_bot\gateway\api\v1\auth.py:22`*
+*Source: `spoon_bot/gateway/api/v1/auth.py:22`*
 
 ### `POST /v1/auth/refresh`
 
@@ -67,7 +67,7 @@ Refresh access token using refresh token.
 
 **Response Model:** `TokenResponse`
 
-*Source: `spoon_bot\gateway\api\v1\auth.py:68`*
+*Source: `spoon_bot/gateway/api/v1/auth.py:68`*
 
 ### `POST /v1/auth/logout`
 
@@ -75,13 +75,13 @@ Logout and invalidate refresh token.
 
 **Request Body:** `RefreshRequest`
 
-*Source: `spoon_bot\gateway\api\v1\auth.py:103`*
+*Source: `spoon_bot/gateway/api/v1/auth.py:103`*
 
 ### `GET /v1/auth/verify`
 
 Verify current authentication.
 
-*Source: `spoon_bot\gateway\api\v1\auth.py:114`*
+*Source: `spoon_bot/gateway/api/v1/auth.py:114`*
 
 ---
 
@@ -95,21 +95,21 @@ Health check endpoint.
 
 **Response Model:** `HealthResponse`
 
-*Source: `spoon_bot\gateway\api\health.py:19`*
+*Source: `spoon_bot/gateway/api/health.py:19`*
 
 ### `GET /ready`
 
 Readiness check endpoint.
 
 
-*Source: `spoon_bot\gateway\api\health.py:38`*
+*Source: `spoon_bot/gateway/api/health.py:38`*
 
 ### `GET /`
 
 Root endpoint with API information.
 
 
-*Source: `spoon_bot\gateway\api\health.py:61`*
+*Source: `spoon_bot/gateway/api/health.py:61`*
 
 ---
 
@@ -170,7 +170,7 @@ This is a synchronous endpoint that waits for the agent to complete.
 }
 ```
 
-*Source: `spoon_bot\gateway\api\v1\agent.py:28`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:28`*
 
 ---
 
@@ -224,7 +224,7 @@ Get agent status and statistics.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot\gateway\api\v1\agent.py:120`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:120`*
 
 ---
 
@@ -236,19 +236,19 @@ Get agent status and statistics.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot\gateway\api\v1\agent.py:76`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:76`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot\gateway\api\v1\agent.py:96`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:96`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot\gateway\api\v1\agent.py:110`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:110`*
 
 ---
 
@@ -261,7 +261,7 @@ List all sessions.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\sessions.py:25`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:25`*
 
 ### `POST /v1/sessions`
 
@@ -271,7 +271,7 @@ Create a new session.
 
 **Request Body:** `SessionCreateRequest`
 
-*Source: `spoon_bot\gateway\api\v1\sessions.py:49`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:49`*
 
 ### `GET /v1/sessions/{session_key}`
 
@@ -280,7 +280,7 @@ Get session details.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\sessions.py:82`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:82`*
 
 ### `DELETE /v1/sessions/{session_key}`
 
@@ -289,7 +289,7 @@ Delete a session.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\sessions.py:111`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:111`*
 
 ### `POST /v1/sessions/{session_key}/clear`
 
@@ -298,7 +298,7 @@ Clear session history.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\sessions.py:124`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:124`*
 
 ---
 
@@ -311,7 +311,7 @@ List all available tools.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\tools.py:24`*
+*Source: `spoon_bot/gateway/api/v1/tools.py:24`*
 
 ### `GET /v1/tools/{tool_name}/schema`
 
@@ -320,7 +320,7 @@ Get the schema for a specific tool.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\tools.py:51`*
+*Source: `spoon_bot/gateway/api/v1/tools.py:51`*
 
 ### `POST /v1/tools/{tool_name}/execute`
 
@@ -330,7 +330,7 @@ Execute a tool directly.
 
 **Request Body:** `ToolExecuteRequest`
 
-*Source: `spoon_bot\gateway\api\v1\tools.py:82`*
+*Source: `spoon_bot/gateway/api/v1/tools.py:82`*
 
 ---
 
@@ -343,7 +343,7 @@ List all available skills.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\skills.py:24`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:24`*
 
 ### `POST /v1/skills/{skill_name}/activate`
 
@@ -353,7 +353,7 @@ Activate a skill.
 
 **Request Body:** `SkillActivateRequest`
 
-*Source: `spoon_bot\gateway\api\v1\skills.py:51`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:51`*
 
 ### `POST /v1/skills/{skill_name}/deactivate`
 
@@ -362,7 +362,7 @@ Deactivate a skill.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot\gateway\api\v1\skills.py:89`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:89`*
 
 ---
 
@@ -451,7 +451,7 @@ Handle event unsubscription.
 
 ### Request Models
 
-*Source: `spoon_bot\gateway\models\requests.py`*
+*Source: `spoon_bot/gateway/models/requests.py`*
 
 #### `ChatOptions`
 
@@ -539,7 +539,7 @@ Configuration update request model.
 
 ### Response Models
 
-*Source: `spoon_bot\gateway\models\responses.py`*
+*Source: `spoon_bot/gateway/models/responses.py`*
 
 #### `MetaInfo`
 
