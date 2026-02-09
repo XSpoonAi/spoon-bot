@@ -43,7 +43,31 @@ def _fallback_response(message: str) -> str:
             "我目前没有接入实时天气数据源，无法直接给出上海今日天气。"
             "你可以启用天气类技能/工具后再试，或告诉我你偏好的天气 API。"
         )
-    return "我可以处理通用问题。当前若需实时外部信息，请先配置对应工具或 API。"
+    return (
+        "我现在无法稳定调用底层模型或工具，但仍可以继续帮你处理通用任务。"
+        "你可以补充更具体的目标/约束（例如期望输出格式、技术栈、上下文），"
+        "我会先基于现有信息给出可执行方案。"
+    )
+
+
+def _needs_smart_fallback(response_text: str) -> bool:
+    if not response_text:
+        return True
+
+    lowered = response_text.strip().lower()
+    generic_markers = (
+        "i encountered an error",
+        "an unexpected error occurred",
+        "please try again",
+        "internal error",
+    )
+    return any(marker in lowered for marker in generic_markers)
+
+
+def _smart_response_or_fallback(message: str, response_text: str | None) -> str:
+    if response_text is None or _needs_smart_fallback(response_text):
+        return _fallback_response(message)
+    return response_text
 
 
 @router.post("/chat", response_model=APIResponse[ChatResponse])
@@ -66,6 +90,7 @@ async def chat(
 
         if stream:
             async def event_stream():
+                sent_any_chunk = False
                 try:
                     kwargs = {"message": request.message, "session_key": session_key}
                     if request.media:
@@ -78,22 +103,31 @@ async def chat(
                         stream_iter = agent.stream(**kwargs)
 
                     async for chunk in stream_iter:
-                        yield f"data: {chunk}\n\n"
+                        chunk_text = str(chunk or "")
+                        normalized = _smart_response_or_fallback(request.message, chunk_text)
+                        if normalized:
+                            sent_any_chunk = True
+                            yield f"data: {normalized}\n\n"
                 except Exception:
                     fallback = _fallback_response(request.message)
+                    sent_any_chunk = True
                     yield f"data: {fallback}\n\n"
                 finally:
+                    if not sent_any_chunk:
+                        fallback = _fallback_response(request.message)
+                        yield f"data: {fallback}\n\n"
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         try:
-            response_text = await _process_with_session(
+            raw_response_text = await _process_with_session(
                 agent,
                 message=request.message,
                 session_key=session_key,
                 media=request.media,
             )
+            response_text = _smart_response_or_fallback(request.message, raw_response_text)
         except Exception:
             response_text = _fallback_response(request.message)
 
