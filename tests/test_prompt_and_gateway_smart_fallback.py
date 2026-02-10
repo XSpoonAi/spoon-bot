@@ -60,11 +60,25 @@ def test_context_includes_default_system_prompt(tmp_path):
 def test_resolve_provider_model_default_anthropic_opus(monkeypatch):
     monkeypatch.setenv("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
     monkeypatch.delenv("SPOON_BOT_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("SPOON_PROVIDER", raising=False)
+    monkeypatch.delenv("SPOON_MODEL", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
 
     provider, model = _resolve_provider_model()
     assert provider == "anthropic"
     assert model == "claude-opus-4-20250514"
+
+
+def test_resolve_provider_model_spoon_legacy_env(monkeypatch):
+    """SPOON_PROVIDER/SPOON_MODEL are used when SPOON_BOT_* are not set."""
+    monkeypatch.delenv("SPOON_BOT_DEFAULT_PROVIDER", raising=False)
+    monkeypatch.delenv("SPOON_BOT_DEFAULT_MODEL", raising=False)
+    monkeypatch.setenv("SPOON_PROVIDER", "gemini")
+    monkeypatch.setenv("SPOON_MODEL", "gemini-3-flash-preview")
+
+    provider, model = _resolve_provider_model()
+    assert provider == "gemini"
+    assert model == "gemini-3-flash-preview"
 
 
 def test_chat_strict_passthrough_keeps_generic_error_text(app_with_error_agent):

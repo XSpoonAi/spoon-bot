@@ -42,10 +42,21 @@ def _normalize_provider(provider: str) -> str:
 
 
 def _resolve_provider_model() -> tuple[str, str]:
-    """Resolve provider/model from env with provider-specific defaults."""
-    provider = _normalize_provider(os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic"))
+    """Resolve provider/model from env with provider-specific defaults.
 
-    model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "").strip()
+    Checks SPOON_BOT_* first, then SPOON_* legacy vars, then provider-specific
+    env vars. No auto-conversion or keyword-based mapping.
+    """
+    provider = _normalize_provider(
+        os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
+        or os.environ.get("SPOON_PROVIDER")
+        or "anthropic"
+    )
+
+    model = (
+        os.environ.get("SPOON_BOT_DEFAULT_MODEL", "").strip()
+        or os.environ.get("SPOON_MODEL", "").strip()
+    )
 
     # Provider-specific model env fallbacks (only used if generic model env missing)
     if not model:
