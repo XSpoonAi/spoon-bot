@@ -99,8 +99,8 @@ class AgentLoop:
     def __init__(
         self,
         workspace: Path | str | None = None,
-        model: str = "claude-sonnet-4-20250514",
-        provider: str = "anthropic",
+        model: str = "anthropic/claude-4.5-sonnet",
+        provider: str = "openrouter",
         api_key: str | None = None,
         base_url: str | None = None,
         max_iterations: int = 20,
@@ -277,7 +277,6 @@ class AgentLoop:
                 skill_paths=[str(p) for p in self._skill_paths],
                 llm=self._chatbot,
                 auto_discover=True,
-                include_default_paths=False,
             )
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
@@ -705,8 +704,8 @@ class AgentLoop:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4-20250514",
-    provider: str = "anthropic",
+    model: str = "anthropic/claude-4.5-sonnet",
+    provider: str = "openrouter",
     api_key: str | None = None,
     workspace: Path | str | None = None,
     session_key: str = "default",
