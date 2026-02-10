@@ -36,6 +36,20 @@ async def _process_with_session(agent, *, message: str, session_key: str, media:
         return await agent.process(**kwargs)
 
 
+async def _process_with_optional_retry(agent, *, message: str, session_key: str, media: list[str] | None = None) -> str:
+    first = await _process_with_session(agent, message=message, session_key=session_key, media=media)
+    if _needs_smart_fallback(first):
+        retried = await _process_with_session(
+            agent,
+            message=_build_directive_message(message),
+            session_key=session_key,
+            media=media,
+        )
+        if not _needs_smart_fallback(retried):
+            return retried
+    return first
+
+
 def _fallback_response(message: str) -> str:
     text = message.lower()
     if "weather" in text or "天气" in text:
@@ -61,13 +75,37 @@ def _needs_smart_fallback(response_text: str) -> bool:
         "please try again",
         "internal error",
     )
-    return any(marker in lowered for marker in generic_markers)
+    intro_markers = (
+        "you are spoon-bot",
+        "you are spoon ai",
+        "i'm spoon ai",
+        "i am spoon ai",
+        "i'm **spoon ai**",
+        "welcome! 👋 i'm **spoon ai**",
+        "your all-capable ai agent",
+        "neo blockchain",
+        "我是spoon",
+        "我是 spoon",
+        "我是一个ai助手",
+        "作为spoon",
+    )
+    return any(marker in lowered for marker in generic_markers) or any(
+        marker in lowered for marker in intro_markers
+    )
 
 
 def _smart_response_or_fallback(message: str, response_text: str | None) -> str:
     if response_text is None or _needs_smart_fallback(response_text):
         return _fallback_response(message)
     return response_text
+
+
+def _build_directive_message(message: str) -> str:
+    return (
+        "请忽略自我介绍、欢迎词和能力清单，直接执行用户请求并给出结果。"
+        "若需要联网，请优先调用可用工具查询后回答。\n"
+        f"用户请求：{message}"
+    )
 
 
 @router.post("/chat", response_model=APIResponse[ChatResponse])
@@ -91,6 +129,7 @@ async def chat(
         if stream:
             async def event_stream():
                 sent_any_chunk = False
+                buffer_parts: list[str] = []
                 try:
                     kwargs = {"message": request.message, "session_key": session_key}
                     if request.media:
@@ -104,13 +143,25 @@ async def chat(
 
                     async for chunk in stream_iter:
                         chunk_text = str(chunk or "")
-                        normalized = _smart_response_or_fallback(request.message, chunk_text)
-                        if normalized:
+                        if chunk_text:
+                            buffer_parts.append(chunk_text)
                             sent_any_chunk = True
-                            yield f"data: {normalized}\n\n"
+
+                    combined = "".join(buffer_parts).strip()
+                    if _needs_smart_fallback(combined):
+                        retried = await _process_with_optional_retry(
+                            agent,
+                            message=request.message,
+                            session_key=session_key,
+                            media=request.media,
+                        )
+                        normalized = _smart_response_or_fallback(request.message, retried)
+                        yield f"data: {normalized}\n\n"
+                    else:
+                        for chunk_text in buffer_parts:
+                            yield f"data: {chunk_text}\n\n"
                 except Exception:
                     fallback = _fallback_response(request.message)
-                    sent_any_chunk = True
                     yield f"data: {fallback}\n\n"
                 finally:
                     if not sent_any_chunk:
@@ -121,7 +172,7 @@ async def chat(
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
         try:
-            raw_response_text = await _process_with_session(
+            raw_response_text = await _process_with_optional_retry(
                 agent,
                 message=request.message,
                 session_key=session_key,

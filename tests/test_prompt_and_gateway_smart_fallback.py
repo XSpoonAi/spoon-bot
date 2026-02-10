@@ -24,12 +24,42 @@ class DummyAgentForFallback:
         yield "I encountered an error: An unexpected error occurred. Please try again."
 
 
+class DummyAgentIntroTemplate:
+    async def process(self, message: str, session_key: str | None = None, media=None):
+        return "Welcome! 👋 I'm **Spoon AI**, your all-capable AI agent for the **Neo blockchain** and broader crypto ecosystem."
+
+
 @pytest.fixture
 def app_with_fallback_agent(monkeypatch):
     app = FastAPI()
     app.include_router(agent_router, prefix="/v1/agent")
 
     dummy = DummyAgentForFallback()
+
+    def fake_get_agent():
+        return dummy
+
+    from spoon_bot.gateway import app as gateway_app
+    from spoon_bot.gateway.api.v1 import agent as agent_mod
+
+    monkeypatch.setattr(gateway_app, "get_agent", fake_get_agent)
+    monkeypatch.setattr(agent_mod, "get_agent", fake_get_agent)
+
+    async def fake_user():
+        return DummyUser()
+
+    from spoon_bot.gateway.auth import dependencies as deps
+    app.dependency_overrides[deps.get_current_user] = fake_user
+
+    return app
+
+
+@pytest.fixture
+def app_with_intro_template_agent(monkeypatch):
+    app = FastAPI()
+    app.include_router(agent_router, prefix="/v1/agent")
+
+    dummy = DummyAgentIntroTemplate()
 
     def fake_get_agent():
         return dummy
@@ -92,3 +122,14 @@ def test_chat_sse_replaces_generic_error_and_keeps_done(app_with_fallback_agent)
     assert "data: [DONE]" in body
     assert "无法稳定调用底层模型或工具" in body
     assert "I encountered an error" not in body
+
+
+def test_chat_replaces_intro_template_with_weather_fallback(app_with_intro_template_agent):
+    client = TestClient(app_with_intro_template_agent)
+
+    r = client.post("/v1/agent/chat", json={"message": "查询上海实时天气"})
+    assert r.status_code == 200
+    msg = r.json()["data"]["response"]
+
+    assert "实时天气数据源" in msg
+    assert "You are spoon-bot" not in msg
