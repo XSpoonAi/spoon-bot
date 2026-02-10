@@ -61,3 +61,4 @@ docs/
 !README.md
 !CONTRIBUTING.md
 !CHANGELOG.md
+node_modules/

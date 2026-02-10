@@ -150,6 +150,8 @@ class AgentLoop:
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
         self._auto_commit = auto_commit
+        self.api_key = api_key
+        self.base_url = base_url
 
         # spoon-core components (initialized later)
         self._chatbot: ChatBot | None = None
@@ -200,9 +202,13 @@ class AgentLoop:
             return
 
         # Create ChatBot (spoon-core LLM interface)
+        # IMPORTANT: forward explicit api_key/base_url so provider routing can't be
+        # silently altered by ambient environment/config fallback.
         self._chatbot = ChatBot(
             model_name=self.model,
             llm_provider=self.provider,
+            api_key=self.api_key,
+            base_url=self.base_url,
             system_prompt=self._system_prompt,
         )
 

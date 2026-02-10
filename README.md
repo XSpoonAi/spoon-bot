@@ -104,7 +104,7 @@ spoon-bot agent -m "List files in the current directory"
 ```bash
 # OpenAI GPT
 export OPENAI_API_KEY=your-key
-spoon-bot agent --provider openai --model gpt-4o
+spoon-bot agent --provider openai --model gpt-5.2
 
 # DeepSeek
 export DEEPSEEK_API_KEY=your-key
@@ -124,7 +124,7 @@ spoon-bot supports multiple LLM providers through the spoon-ai-sdk. You can swit
 | Provider | Models | Notes |
 |----------|--------|-------|
 | **Anthropic** | `claude-sonnet-4-20250514`, `claude-opus-4-20250514`, `claude-3-5-haiku-20241022` | Default provider |
-| **OpenAI** | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o1-mini` | Full tool support |
+| **OpenAI** | `gpt-5.2` (recommended), `gpt-5.1`, `gpt-5` | Full tool support |
 | **DeepSeek** | `deepseek-chat`, `deepseek-coder` | Cost-effective |
 | **Gemini** | `gemini-2.0-flash`, `gemini-2.0-pro`, `gemini-1.5-pro` | Google AI |
 | **OpenRouter** | 200+ models | Multi-model gateway |
@@ -138,7 +138,7 @@ from spoon_bot.agent.loop import create_agent
 agent = await create_agent()
 
 # OpenAI GPT
-agent = await create_agent(provider="openai", model="gpt-4o")
+agent = await create_agent(provider="openai", model="gpt-5.2")
 
 # DeepSeek
 agent = await create_agent(provider="deepseek", model="deepseek-chat")
@@ -230,7 +230,7 @@ Default workspace: `~/.spoon-bot/workspace/`
 ```bash
 spoon-bot agent                        # Interactive mode (default provider)
 spoon-bot agent --provider openai      # Use specific provider
-spoon-bot agent --model gpt-4o         # Use specific model
+spoon-bot agent --model gpt-5.2  # Use specific model
 spoon-bot agent -m "message"           # One-shot mode
 spoon-bot onboard                      # Initialize workspace
 spoon-bot status                       # Show status
@@ -262,7 +262,7 @@ from spoon_bot.gateway.app import set_agent
 
 async def main():
     # Create agent with your preferred provider
-    agent = await create_agent(provider="openai", model="gpt-4o")
+    agent = await create_agent(provider="openai", model="gpt-5.2")
 
     # Create gateway app
     config = GatewayConfig(host="0.0.0.0", port=8080)

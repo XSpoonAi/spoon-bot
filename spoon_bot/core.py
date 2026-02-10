@@ -118,22 +118,29 @@ class SpoonBotConfig:
             or "claude-sonnet-4-20250514"
         )
 
-        # Resolve API key based on provider
-        api_key = None
-        if provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY")
-        elif provider == "anthropic":
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
+        # Resolve API key based on provider — generic mapping so any provider
+        # can be selected via SPOON_PROVIDER without code changes.
+        _PROVIDER_KEY_ENV = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+        }
+        key_env = _PROVIDER_KEY_ENV.get(provider, f"{provider.upper()}_API_KEY")
+        api_key = os.environ.get(key_env)
         if not api_key:
+            # Fallback: try common keys (backwards compat)
             api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
         # Resolve base_url based on provider
-        base_url = None
-        if provider == "openai":
-            base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
-        elif provider == "anthropic":
-            base_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
-        else:
+        _PROVIDER_URL_ENV = {
+            "openai": "OPENAI_BASE_URL",
+            "anthropic": "ANTHROPIC_BASE_URL",
+            "gemini": "GEMINI_BASE_URL",
+        }
+        url_env = _PROVIDER_URL_ENV.get(provider, f"{provider.upper()}_BASE_URL")
+        base_url = os.environ.get(url_env)
+        if not base_url:
             base_url = os.environ.get("BASE_URL")
 
         max_steps = int(
