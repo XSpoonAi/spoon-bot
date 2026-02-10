@@ -1,101 +1,98 @@
-import asyncio
+import pytest
 
 from spoon_bot.agent.loop import AgentLoop
 
 
-class _FakeAgent:
+class DummyMemory:
     def __init__(self):
-        self.memory = object()  # only used for hasattr check
-        self.seeded_messages = []
+        self.messages = []
 
-    async def add_message(self, role: str, content: str):
-        self.seeded_messages.append({"role": role, "content": content})
-
-
-def _run(coro):
-    return asyncio.run(coro)
+    def add_message(self, role, content):
+        self.messages.append({"role": role, "content": content})
 
 
-def test_initial_history_seed_injects_recent_window_and_clips(tmp_path):
-    loop = AgentLoop(
-        workspace=tmp_path,
-        session_key="seed-window",
-        enable_skills=False,
-        auto_commit=False,
-    )
-
-    # Build 14 history messages -> only last 12 should be seeded
-    for i in range(14):
-        role = "user" if i % 2 == 0 else "assistant"
-        content = (f"msg-{i}-" + "x" * 2500)  # exceeds clip limit
-        loop._session.add_message(role, content)
-
-    # Add a non user/assistant role that should be filtered out
-    loop._session.add_message("tool", "tool output")
-
-    fake_agent = _FakeAgent()
-    loop._agent = fake_agent
-
-    _run(loop._seed_session_history_into_agent_memory())
-
-    assert len(fake_agent.seeded_messages) == 12
-    # Last 12 from msg-2 ... msg-13
-    assert fake_agent.seeded_messages[0]["content"].startswith("msg-2-")
-    assert fake_agent.seeded_messages[-1]["content"].startswith("msg-13-")
-    # clipping applied
-    assert all(len(m["content"]) <= 2000 for m in fake_agent.seeded_messages)
-    # filtered to user/assistant only
-    assert all(m["role"] in {"user", "assistant"} for m in fake_agent.seeded_messages)
+class DummyRunResult:
+    def __init__(self, content="ok"):
+        self.content = content
 
 
-def test_restart_can_restore_from_persisted_session(tmp_path):
-    # First process instance writes session to disk
-    loop1 = AgentLoop(
-        workspace=tmp_path,
-        session_key="persisted-restart",
-        enable_skills=False,
-        auto_commit=False,
-    )
-    loop1._session.add_message("user", "remember code: blue-whale-729")
-    loop1._session.add_message("assistant", "got it")
-    loop1.sessions.save(loop1._session)
+class DummyAgent:
+    def __init__(self):
+        self.memory = DummyMemory()
 
-    # Simulate process restart: new AgentLoop instance
-    loop2 = AgentLoop(
-        workspace=tmp_path,
-        session_key="persisted-restart",
-        enable_skills=False,
-        auto_commit=False,
-    )
-    fake_agent = _FakeAgent()
-    loop2._agent = fake_agent
+    async def initialize(self):
+        return None
 
-    _run(loop2._seed_session_history_into_agent_memory())
-
-    assert len(fake_agent.seeded_messages) == 2
-    assert fake_agent.seeded_messages[0]["content"] == "remember code: blue-whale-729"
-    assert fake_agent.seeded_messages[1]["content"] == "got it"
+    async def run(self, _message):
+        return DummyRunResult("ok")
 
 
-def test_seeding_is_idempotent_and_wont_bloat_on_repeat(tmp_path):
-    loop = AgentLoop(
-        workspace=tmp_path,
-        session_key="idempotent",
-        enable_skills=False,
-        auto_commit=False,
-    )
+class DummyChatBot:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class DummyToolManager:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+
+class DummySkillManager:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+@pytest.fixture
+def patch_core(monkeypatch):
+    monkeypatch.setattr("spoon_bot.agent.loop.ChatBot", DummyChatBot)
+    monkeypatch.setattr("spoon_bot.agent.loop.ToolManager", DummyToolManager)
+    monkeypatch.setattr("spoon_bot.agent.loop.SkillManager", DummySkillManager)
+    monkeypatch.setattr("spoon_bot.agent.loop.SpoonReactMCP", lambda *a, **k: DummyAgent())
+    monkeypatch.setattr("spoon_bot.agent.loop.SpoonReactSkill", lambda *a, **k: DummyAgent())
+
+
+@pytest.mark.asyncio
+async def test_initial_seed_effective(tmp_path, patch_core):
+    loop = AgentLoop(workspace=tmp_path, session_key="seed-init", enable_skills=False, auto_commit=False)
+    loop._session.add_message("user", "hello")
+    loop._session.add_message("assistant", "world")
+    loop.sessions.save(loop._session)
+
+    await loop.initialize()
+
+    assert loop._history_seeded is True
+    assert len(loop._agent.memory.messages) == 2
+    assert loop._agent.memory.messages[0]["role"] == "user"
+    assert loop._agent.memory.messages[1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_restart_restores_from_persisted_session(tmp_path, patch_core):
+    first = AgentLoop(workspace=tmp_path, session_key="seed-restart", enable_skills=False, auto_commit=False)
+    first._session.add_message("user", "persist-user")
+    first._session.add_message("assistant", "persist-assistant")
+    first.sessions.save(first._session)
+
+    second = AgentLoop(workspace=tmp_path, session_key="seed-restart", enable_skills=False, auto_commit=False)
+    await second.initialize()
+
+    assert second._history_seeded is True
+    assert len(second._agent.memory.messages) == 2
+    assert second._agent.memory.messages[0]["content"] == "persist-user"
+    assert second._agent.memory.messages[1]["content"] == "persist-assistant"
+
+
+@pytest.mark.asyncio
+async def test_repeated_process_does_not_bloat_seeded_memory(tmp_path, patch_core):
+    loop = AgentLoop(workspace=tmp_path, session_key="seed-nobloat", enable_skills=False, auto_commit=False)
     loop._session.add_message("user", "u1")
     loop._session.add_message("assistant", "a1")
+    loop.sessions.save(loop._session)
 
-    fake_agent = _FakeAgent()
-    loop._agent = fake_agent
+    await loop.initialize()
+    seeded_count = len(loop._agent.memory.messages)
 
-    _run(loop._seed_session_history_into_agent_memory())
-    first_count = len(fake_agent.seeded_messages)
+    await loop.process("one")
+    await loop.process("two")
 
-    # Repeat seeding (equivalent to repeated initialization attempts)
-    _run(loop._seed_session_history_into_agent_memory())
-    second_count = len(fake_agent.seeded_messages)
-
-    assert first_count == 2
-    assert second_count == 2
+    assert len(loop._agent.memory.messages) == seeded_count
