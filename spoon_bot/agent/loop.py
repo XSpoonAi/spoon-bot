@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
@@ -69,6 +70,29 @@ from spoon_bot.exceptions import (
     user_friendly_error,
 )
 from spoon_bot.services.git import GitManager
+
+
+def _normalize_provider_model_and_base_url(
+    provider: str,
+    model: str,
+    base_url: str | None,
+) -> tuple[str, str, str | None]:
+    normalized_provider = provider.strip().lower()
+    normalized_model = model.strip()
+
+    model_aliases = {
+        "gemini3flash": "gemini-3-flash-preview",
+        "gemini-3-flash": "gemini-3-flash-preview",
+        "gemini_3_flash": "gemini-3-flash-preview",
+    }
+    mapped_model = model_aliases.get(normalized_model.lower(), normalized_model)
+
+    configured_base_url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
+
+    if normalized_provider == "gemini" and configured_base_url:
+        return "openai", mapped_model, configured_base_url
+
+    return normalized_provider, mapped_model, base_url
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -520,13 +544,28 @@ async def create_agent(
         ...     mcp_config={"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}
         ... )
     """
-    agent = AgentLoop(
-        model=model,
+    resolved_provider, resolved_model, resolved_base_url = _normalize_provider_model_and_base_url(
         provider=provider,
+        model=model,
+        base_url=base_url,
+    )
+
+    logger.info(
+        "Resolved model route: requested_provider={} requested_model={} resolved_provider={} resolved_model={} base_url={}",
+        provider,
+        model,
+        resolved_provider,
+        resolved_model,
+        resolved_base_url or "",
+    )
+
+    agent = AgentLoop(
+        model=resolved_model,
+        provider=resolved_provider,
         api_key=api_key,
         workspace=workspace,
         session_key=session_key,
-        base_url=base_url,
+        base_url=resolved_base_url,
         mcp_config=mcp_config,
         enable_skills=enable_skills,
         auto_commit=auto_commit,
