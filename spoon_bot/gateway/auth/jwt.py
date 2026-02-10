@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import jwt
 from loguru import logger
+
+_REVOKED_TOKEN_IDS: set[str] = set()
+_REVOKED_TOKEN_HASHES: set[str] = set()
 
 
 @dataclass
@@ -28,6 +30,23 @@ class TokenData:
         return datetime.now(timezone.utc) > self.expires_at
 
 
+def revoke_token(token: str, token_id: str | None = None) -> None:
+    """Revoke a token by raw token hash and/or token id."""
+    if token:
+        _REVOKED_TOKEN_HASHES.add(token)
+    if token_id:
+        _REVOKED_TOKEN_IDS.add(token_id)
+
+
+def is_token_revoked(token: str, token_id: str | None = None) -> bool:
+    """Check token revocation status."""
+    if token in _REVOKED_TOKEN_HASHES:
+        return True
+    if token_id and token_id in _REVOKED_TOKEN_IDS:
+        return True
+    return False
+
+
 def create_access_token(
     user_id: str,
     session_key: str,
@@ -36,20 +55,7 @@ def create_access_token(
     algorithm: str = "HS256",
     expires_minutes: int = 15,
 ) -> str:
-    """
-    Create a JWT access token.
-
-    Args:
-        user_id: User identifier.
-        session_key: Agent session key.
-        scopes: Permission scopes.
-        secret_key: JWT secret key.
-        algorithm: JWT algorithm.
-        expires_minutes: Token expiration in minutes.
-
-    Returns:
-        Encoded JWT token string.
-    """
+    """Create a JWT access token."""
     now = datetime.now(timezone.utc)
     expires = now + timedelta(minutes=expires_minutes)
 
@@ -72,19 +78,7 @@ def create_refresh_token(
     expires_days: int = 7,
     token_id: str | None = None,
 ) -> str:
-    """
-    Create a JWT refresh token.
-
-    Args:
-        user_id: User identifier.
-        secret_key: JWT secret key.
-        algorithm: JWT algorithm.
-        expires_days: Token expiration in days.
-        token_id: Optional token ID for revocation tracking.
-
-    Returns:
-        Encoded JWT token string.
-    """
+    """Create a JWT refresh token."""
     import uuid
 
     now = datetime.now(timezone.utc)
@@ -107,24 +101,18 @@ def verify_token(
     algorithm: str = "HS256",
     expected_type: str | None = None,
 ) -> TokenData | None:
-    """
-    Verify and decode a JWT token.
-
-    Args:
-        token: JWT token string.
-        secret_key: JWT secret key.
-        algorithm: JWT algorithm.
-        expected_type: Expected token type ("access" or "refresh").
-
-    Returns:
-        TokenData if valid, None if invalid.
-    """
+    """Verify and decode a JWT token."""
     try:
         payload = jwt.decode(token, secret_key, algorithms=[algorithm])
 
         token_type = payload.get("type", "access")
         if expected_type and token_type != expected_type:
             logger.warning(f"Token type mismatch: expected {expected_type}, got {token_type}")
+            return None
+
+        token_id = payload.get("jti")
+        if is_token_revoked(token, token_id):
+            logger.warning("Token is revoked")
             return None
 
         return TokenData(
@@ -134,7 +122,7 @@ def verify_token(
             scopes=payload.get("scope", []),
             issued_at=datetime.fromtimestamp(payload["iat"], tz=timezone.utc),
             expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
-            token_id=payload.get("jti"),
+            token_id=token_id,
         )
 
     except jwt.ExpiredSignatureError:

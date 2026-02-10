@@ -36,6 +36,48 @@ from spoon_bot.gateway.core_integration import (
 from spoon_bot.gateway import app as app_module
 
 
+def _normalize_provider(provider: str) -> str:
+    """Normalize provider value from env."""
+    return (provider or "anthropic").strip().lower()
+
+
+def _resolve_provider_model() -> tuple[str, str]:
+    """Resolve provider/model from env with provider-specific defaults.
+
+    Checks SPOON_BOT_* first, then SPOON_* legacy vars, then provider-specific
+    env vars. No auto-conversion or keyword-based mapping.
+    """
+    provider = _normalize_provider(
+        os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
+        or os.environ.get("SPOON_PROVIDER")
+        or "anthropic"
+    )
+
+    model = (
+        os.environ.get("SPOON_BOT_DEFAULT_MODEL", "").strip()
+        or os.environ.get("SPOON_MODEL", "").strip()
+    )
+
+    # Provider-specific model env fallbacks (only used if generic model env missing)
+    if not model:
+        if provider == "openai":
+            model = os.environ.get("OPENAI_MODEL", "").strip()
+        elif provider == "anthropic":
+            model = os.environ.get("ANTHROPIC_MODEL", "").strip()
+
+    if not model:
+        default_models = {
+            "anthropic": "claude-opus-4-20250514",
+            "openai": "gpt-4o",
+            "deepseek": "deepseek-chat",
+            "gemini": "gemini-2.0-flash",
+            "openrouter": "anthropic/claude-sonnet-4",
+        }
+        model = default_models.get(provider, "claude-opus-4-20250514")
+
+    return provider, model
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Application lifespan handler with auto agent initialization."""
@@ -49,8 +91,7 @@ async def _lifespan(app: FastAPI):
     app_module._connection_manager = connection_manager
 
     # Auto-create agent from environment variables
-    provider = os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
-    model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "")
+    provider, model = _resolve_provider_model()
 
     # Resolve base URL from multiple env vars (provider-specific takes priority)
     base_url = ""
@@ -62,17 +103,6 @@ async def _lifespan(app: FastAPI):
         base_url = os.environ.get("BASE_URL", "")
 
     workspace = os.environ.get("SPOON_BOT_WORKSPACE_PATH", "/data/workspace")
-
-    # Determine default model per provider if not specified
-    if not model:
-        default_models = {
-            "anthropic": "claude-sonnet-4-20250514",
-            "openai": "gpt-4o",
-            "deepseek": "deepseek-chat",
-            "gemini": "gemini-2.0-flash",
-            "openrouter": "anthropic/claude-sonnet-4",
-        }
-        model = default_models.get(provider, "claude-sonnet-4-20250514")
 
     # Log configuration
     if base_url:

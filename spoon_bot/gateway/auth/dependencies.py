@@ -26,16 +26,6 @@ async def get_current_user(
 
     Supports both JWT Bearer tokens and API keys.
     If auth is disabled (GATEWAY_AUTH_REQUIRED=false), returns a default user.
-
-    Args:
-        credentials: Bearer token credentials.
-        x_api_key: API key from header.
-
-    Returns:
-        TokenData or APIKeyData for authenticated user.
-
-    Raises:
-        HTTPException: If authentication fails and auth is required.
     """
     # If auth is not required, return a default anonymous user
     if not is_auth_required():
@@ -84,11 +74,7 @@ async def get_current_user_optional(
     ] = None,
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
 ) -> TokenData | APIKeyData | None:
-    """
-    Get the current user if authenticated, None otherwise.
-
-    Same as get_current_user but doesn't raise on failure.
-    """
+    """Get the current user if authenticated, None otherwise."""
     config = get_config()
 
     if x_api_key:
@@ -110,15 +96,7 @@ async def get_current_user_optional(
 
 
 def require_scope(required_scope: str):
-    """
-    Dependency factory to require a specific scope.
-
-    Args:
-        required_scope: Required permission scope.
-
-    Returns:
-        Dependency function.
-    """
+    """Dependency factory to require a specific scope."""
 
     async def check_scope(
         user: Annotated[TokenData | APIKeyData, Depends(get_current_user)]
