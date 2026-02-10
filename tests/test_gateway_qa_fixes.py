@@ -83,7 +83,7 @@ def app(monkeypatch):
     return app, dummy
 
 
-def test_chat_session_key_and_fallback(app):
+def test_chat_session_key_strict_error(app):
     app_obj, dummy = app
     client = TestClient(app_obj)
 
@@ -91,14 +91,16 @@ def test_chat_session_key_and_fallback(app):
     assert r.status_code == 200
     assert dummy.calls[-1][1] == "qa_session"  # user session overrides request
 
-    # force process failure -> fallback
+    # force process failure -> strict error
     async def broken_process(*args, **kwargs):
         raise RuntimeError("boom")
 
     dummy.process = broken_process
     r2 = client.post("/v1/agent/chat", json={"message": "weather in shanghai"})
-    assert r2.status_code == 200
-    assert "天气" in r2.json()["data"]["response"] or "weather" in r2.json()["data"]["response"].lower()
+    assert r2.status_code == 500
+    body = r2.json()
+    assert body["detail"]["code"] == "AGENT_ERROR"
+    assert "boom" in body["detail"]["message"]
 
 
 def test_chat_sse_stream(app):

@@ -36,78 +36,6 @@ async def _process_with_session(agent, *, message: str, session_key: str, media:
         return await agent.process(**kwargs)
 
 
-async def _process_with_optional_retry(agent, *, message: str, session_key: str, media: list[str] | None = None) -> str:
-    first = await _process_with_session(agent, message=message, session_key=session_key, media=media)
-    if _needs_smart_fallback(first):
-        retried = await _process_with_session(
-            agent,
-            message=_build_directive_message(message),
-            session_key=session_key,
-            media=media,
-        )
-        if not _needs_smart_fallback(retried):
-            return retried
-    return first
-
-
-def _fallback_response(message: str) -> str:
-    text = message.lower()
-    if "weather" in text or "天气" in text:
-        return (
-            "我目前没有接入实时天气数据源，无法直接给出上海今日天气。"
-            "你可以启用天气类技能/工具后再试，或告诉我你偏好的天气 API。"
-        )
-    return (
-        "我现在无法稳定调用底层模型或工具，但仍可以继续帮你处理通用任务。"
-        "你可以补充更具体的目标/约束（例如期望输出格式、技术栈、上下文），"
-        "我会先基于现有信息给出可执行方案。"
-    )
-
-
-def _needs_smart_fallback(response_text: str) -> bool:
-    if not response_text:
-        return True
-
-    lowered = response_text.strip().lower()
-    generic_markers = (
-        "i encountered an error",
-        "an unexpected error occurred",
-        "please try again",
-        "internal error",
-    )
-    intro_markers = (
-        "you are spoon-bot",
-        "you are spoon ai",
-        "i'm spoon ai",
-        "i am spoon ai",
-        "i'm **spoon ai**",
-        "welcome! 👋 i'm **spoon ai**",
-        "your all-capable ai agent",
-        "neo blockchain",
-        "我是spoon",
-        "我是 spoon",
-        "我是一个ai助手",
-        "作为spoon",
-    )
-    return any(marker in lowered for marker in generic_markers) or any(
-        marker in lowered for marker in intro_markers
-    )
-
-
-def _smart_response_or_fallback(message: str, response_text: str | None) -> str:
-    if response_text is None or _needs_smart_fallback(response_text):
-        return _fallback_response(message)
-    return response_text
-
-
-def _build_directive_message(message: str) -> str:
-    return (
-        "请忽略自我介绍、欢迎词和能力清单，直接执行用户请求并给出结果。"
-        "若需要联网，请优先调用可用工具查询后回答。\n"
-        f"用户请求：{message}"
-    )
-
-
 @router.post("/chat", response_model=APIResponse[ChatResponse])
 async def chat(
     request: ChatRequest,
@@ -147,40 +75,23 @@ async def chat(
                             buffer_parts.append(chunk_text)
                             sent_any_chunk = True
 
-                    combined = "".join(buffer_parts).strip()
-                    if _needs_smart_fallback(combined):
-                        retried = await _process_with_optional_retry(
-                            agent,
-                            message=request.message,
-                            session_key=session_key,
-                            media=request.media,
-                        )
-                        normalized = _smart_response_or_fallback(request.message, retried)
-                        yield f"data: {normalized}\n\n"
-                    else:
-                        for chunk_text in buffer_parts:
-                            yield f"data: {chunk_text}\n\n"
-                except Exception:
-                    fallback = _fallback_response(request.message)
-                    yield f"data: {fallback}\n\n"
+                    for chunk_text in buffer_parts:
+                        yield f"data: {chunk_text}\n\n"
+                except Exception as e:
+                    yield f"data: [ERROR] {str(e)}\n\n"
                 finally:
                     if not sent_any_chunk:
-                        fallback = _fallback_response(request.message)
-                        yield f"data: {fallback}\n\n"
+                        yield "data: [ERROR] empty stream response\n\n"
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        try:
-            raw_response_text = await _process_with_optional_retry(
-                agent,
-                message=request.message,
-                session_key=session_key,
-                media=request.media,
-            )
-            response_text = _smart_response_or_fallback(request.message, raw_response_text)
-        except Exception:
-            response_text = _fallback_response(request.message)
+        response_text = await _process_with_session(
+            agent,
+            message=request.message,
+            session_key=session_key,
+            media=request.media,
+        )
 
         duration_ms = int((time.time() - start_time) * 1000)
 
