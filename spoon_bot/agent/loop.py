@@ -8,6 +8,7 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
@@ -182,6 +183,12 @@ class AgentLoop:
         # Track initialization state
         self._initialized = False
 
+        # Session history seeding controls (for multi-turn continuity)
+        self._history_seeded = False
+        self._last_seed_fingerprint: str | None = None
+        self._history_seed_max_messages = 12
+        self._history_seed_max_chars = 2000
+
         logger.info(
             f"AgentLoop created: model={model}, provider={provider}, "
             f"tools={len(self.tools)}, session={session_key}"
@@ -237,12 +244,64 @@ class AgentLoop:
         # Initialize agent
         await self._agent.initialize()
 
+        # Seed persisted session history into spoon-core memory for multi-turn continuity
+        await self._seed_session_history_into_agent_memory()
+
         self._initialized = True
         logger.info(
             f"AgentLoop initialized: spoon-core agent ready, "
             f"mcp_servers={len(self._mcp_tools)}, "
             f"skills_enabled={self._enable_skills}"
         )
+
+    def _compute_history_fingerprint(self, messages: list[dict[str, str]]) -> str:
+        """Compute stable fingerprint for seeded session history."""
+        payload = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    async def _seed_session_history_into_agent_memory(self) -> None:
+        """Seed persisted session history into spoon-core agent memory safely.
+
+        - Only user/assistant text messages
+        - Window-limited to avoid context bloat
+        - Per-message char clipping for safety
+        - Idempotent via fingerprint guard
+        """
+        if not self._agent or not hasattr(self._agent, "memory"):
+            return
+
+        # Pull persisted history and keep only user/assistant content
+        raw_history = self._session.get_history()
+        filtered: list[dict[str, str]] = []
+        for msg in raw_history:
+            role = (msg.get("role") or "").strip()
+            content = msg.get("content")
+            if role not in {"user", "assistant"}:
+                continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+            clipped = content[: self._history_seed_max_chars]
+            filtered.append({"role": role, "content": clipped})
+
+        if not filtered:
+            return
+
+        windowed = filtered[-self._history_seed_max_messages :]
+        fingerprint = self._compute_history_fingerprint(windowed)
+
+        # Idempotency: skip if exact same window already seeded
+        if self._history_seeded and self._last_seed_fingerprint == fingerprint:
+            return
+
+        added = 0
+        for msg in windowed:
+            # spoon-core BaseAgent has async add_message(role, content)
+            await self._agent.add_message(msg["role"], msg["content"])
+            added += 1
+
+        self._history_seeded = True
+        self._last_seed_fingerprint = fingerprint
+        logger.info(f"Seeded {added} session history messages into agent memory")
 
     def _register_native_tools(self) -> None:
         """Register the default native OS tools."""
