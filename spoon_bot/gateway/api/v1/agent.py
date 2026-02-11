@@ -428,6 +428,25 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
     try:
         agent = get_agent()
 
+        # Safely count tools and skills — AgentLoop exposes these as
+        # simple list[str] properties, not manager objects.
+        tools_count = 0
+        skills_count = 0
+        sessions_count = 0
+        try:
+            tools_count = len(agent.tools) if hasattr(agent, 'tools') and agent.tools else 0
+        except Exception:
+            pass
+        try:
+            skills_count = len(agent.skills) if hasattr(agent, 'skills') and agent.skills else 0
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, 'sessions') and agent.sessions:
+                sessions_count = len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0
+        except Exception:
+            pass
+
         return APIResponse(
             success=True,
             data=StatusResponse(
@@ -436,9 +455,9 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
                 uptime=0,  # TODO: Track uptime
                 stats=AgentStats(
                     total_requests=0,
-                    active_sessions=len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0,
-                    tools_available=len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else len(agent.tools) if hasattr(agent.tools, '__len__') else 0,
-                    skills_loaded=len(agent.skills.list_skills()) if hasattr(agent.skills, 'list_skills') else len(agent.skills) if hasattr(agent.skills, '__len__') else 0,  # Skills count via agent if available
+                    active_sessions=sessions_count,
+                    tools_available=tools_count,
+                    skills_loaded=skills_count,
                 ),
             ),
             meta=MetaInfo(request_id=request_id),

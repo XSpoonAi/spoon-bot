@@ -53,18 +53,11 @@ async def _lifespan(app: FastAPI):
     app_module._connection_manager = connection_manager
 
     # Auto-create agent from environment variables
+    # Provider-specific API key / base_url resolution is handled by spoon-core's
+    # ConfigurationManager, which reads standard env vars (e.g. OPENROUTER_API_KEY,
+    # OPENAI_BASE_URL) automatically.
     provider = os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
     model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "")
-
-    # Resolve base URL from multiple env vars (provider-specific takes priority)
-    base_url = ""
-    if provider == "openai":
-        base_url = os.environ.get("OPENAI_BASE_URL", "") or os.environ.get("BASE_URL", "")
-    elif provider == "anthropic":
-        base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get("BASE_URL", "")
-    else:
-        base_url = os.environ.get("BASE_URL", "")
-
     workspace = os.environ.get("SPOON_BOT_WORKSPACE_PATH", "/data/workspace")
 
     # Determine default model per provider if not specified
@@ -75,12 +68,10 @@ async def _lifespan(app: FastAPI):
             "deepseek": "deepseek-chat",
             "gemini": "gemini-2.0-flash",
             "openrouter": "anthropic/claude-sonnet-4",
+            "ollama": "llama3.2",
         }
         model = default_models.get(provider, "claude-sonnet-4-20250514")
 
-    # Log configuration
-    if base_url:
-        logger.info(f"Custom base URL: {base_url}")
     logger.info(f"Initializing agent: provider={provider}, model={model}")
 
     try:
@@ -92,7 +83,6 @@ async def _lifespan(app: FastAPI):
         agent = await create_agent(
             model=model,
             provider=provider,
-            base_url=base_url or None,
             workspace=workspace,
             enable_skills=enable_skills,
         )

@@ -31,9 +31,35 @@ class AgentLoop(SpoonBot):
     async def process_with_thinking(
         self, message: str, **kwargs: Any
     ) -> tuple[str, str | None]:
-        """Non-streaming call that also returns thinking content."""
-        response = await self.chat(message, **kwargs)
-        return response, None  # thinking not supported yet in core
+        """Non-streaming call that also returns thinking content.
+
+        Attempts to extract thinking content from the result object's
+        ``thinking_content``, ``thinking``, or ``metadata`` attributes.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        try:
+            result = await self._agent.run(message, **kwargs)
+        except Exception as exc:
+            return f"Error processing request: {exc}", None
+
+        # Extract response text
+        if hasattr(result, "content"):
+            response = result.content
+        else:
+            response = str(result)
+
+        # Extract thinking content (try multiple attribute names)
+        thinking: str | None = None
+        if hasattr(result, "thinking_content") and result.thinking_content:
+            thinking = result.thinking_content
+        elif hasattr(result, "thinking") and result.thinking:
+            thinking = result.thinking
+        elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
+            thinking = result.metadata.get("thinking")
+
+        return response, thinking
 
     async def stream(self, message: str, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
         """Streaming agent call that yields chunk dicts.
@@ -42,18 +68,25 @@ class AgentLoop(SpoonBot):
         ``type`` (content | thinking | done), ``delta``, ``metadata``.
 
         Extra kwargs like ``thinking`` are consumed here and not passed
-        to the underlying spoon-core agent (which doesn't support them).
+        to the underlying spoon-core ChatBot (which doesn't support them).
         """
-        # Strip kwargs not understood by the core agent
+        # Strip kwargs not understood by ChatBot.astream()
         kwargs.pop("thinking", None)
-        async for chunk in super().stream(message, **kwargs):
-            yield {"type": "content", "delta": chunk, "metadata": {}}
-        yield {"type": "done", "delta": "", "metadata": {}}
+        full_content = ""
+        try:
+            async for chunk in super().stream(message, **kwargs):
+                full_content += chunk
+                yield {"type": "content", "delta": chunk, "metadata": {}}
+            yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
+        except Exception as exc:
+            yield {"type": "done", "delta": "", "metadata": {"content": full_content, "error": str(exc)}}
 
 
 async def create_agent(
     model: str = "claude-sonnet-4-20250514",
     provider: str = "anthropic",
+    api_key: str | None = None,
+    base_url: str | None = None,
     mcp_servers: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
     skill_paths: list[str] | None = None,
@@ -65,10 +98,16 @@ async def create_agent(
     Signature intentionally mirrors :func:`spoon_bot.core.create_agent`
     but returns an ``AgentLoop`` so the gateway gets the ``process()`` /
     ``stream()`` helpers it relies on.
+
+    ``api_key`` and ``base_url`` are optional overrides.  When *None*,
+    spoon-core's ``ConfigurationManager`` automatically resolves them
+    from standard env vars (e.g. ``OPENROUTER_API_KEY``).
     """
     config = SpoonBotConfig(
         model=model,
         provider=provider,
+        api_key=api_key,
+        base_url=base_url,
         mcp_servers=mcp_servers or {},
         enable_skills=enable_skills,
         skill_paths=skill_paths or [],
