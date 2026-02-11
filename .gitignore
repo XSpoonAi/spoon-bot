@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+logs/
+
+# Local development
+.spoon-bot/
+workspace/memory/*.md
+workspace/sessions/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (not uploaded to GitHub)
+docs/*
+*.md
+!README.md
+!CONTRIBUTING.md
+!CHANGELOG.md
+node_modules/
+
+!workspace/skills/**/SKILL.md
+!docs/api.md
+
+# Generated images
+generated_images/
+
+# Local runner scripts with credentials
+run_spoon.sh
+spoon_run.sh
+test_spoon.py
