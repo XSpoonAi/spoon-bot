@@ -96,8 +96,28 @@ async def websocket_endpoint(
                     continue
 
                 if isinstance(message, WSRequest):
-                    response = await handler.handle_request(message)
-                    await manager.send_message(conn_id, response)
+                    # Run chat requests as background tasks so the message
+                    # loop stays free to process cancel / status requests.
+                    if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
+                        _req = message  # capture for closure
+
+                        async def _run_chat(req: WSRequest = _req) -> None:
+                            try:
+                                result = await handler._handle_chat(req.params)
+                                await manager.send_message(
+                                    conn_id, WSResponse(id=req.id, result=result),
+                                )
+                            except Exception as exc:
+                                logger.error(f"Chat error: {exc}")
+                                await manager.send_message(
+                                    conn_id,
+                                    WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
+                                )
+
+                        handler._current_task = asyncio.create_task(_run_chat())
+                    else:
+                        response = await handler.handle_request(message)
+                        await manager.send_message(conn_id, response)
 
             except ValueError as e:
                 await manager.send_message(
