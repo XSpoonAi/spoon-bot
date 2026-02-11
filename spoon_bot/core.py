@@ -200,9 +200,8 @@ class SpoonBot:
             )
             self._mcp_tools.append(mcp_tool)
 
-        # Create ToolManager
-        if self._mcp_tools:
-            self._tool_manager = ToolManager(self._mcp_tools)
+        # Create ToolManager (always create one — SpoonReactSkill requires it)
+        self._tool_manager = ToolManager(self._mcp_tools)
 
         # Create SkillManager if enabled
         if self.config.enable_skills:

@@ -22,6 +22,10 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
+
+load_dotenv(override=True)  # Load .env, overriding system env vars
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
@@ -91,7 +95,6 @@ async def _lifespan(app: FastAPI):
             base_url=base_url or None,
             workspace=workspace,
             enable_skills=enable_skills,
-            auto_commit=False,  # No git auto-commit in Docker gateway mode
         )
         app_module._agent = agent
 
