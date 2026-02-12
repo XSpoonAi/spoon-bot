@@ -9,6 +9,7 @@ Based on: docs/plans/2025-02-05-spoon-bot-api-design.md
 from __future__ import annotations
 
 import asyncio
+import json
 from uuid import uuid4
 from typing import Any, Callable, Coroutine
 
@@ -85,10 +86,31 @@ async def websocket_endpoint(
             ),
         )
 
-        # Message loop
+        # Message loop — handles both JSON text frames and binary audio frames
         while True:
             try:
-                data = await websocket.receive_json()
+                raw = await websocket.receive()
+
+                # --- Binary frame: audio data ---
+                if "bytes" in raw and raw["bytes"]:
+                    try:
+                        handler._handle_audio_binary(raw["bytes"])
+                    except Exception as exc:
+                        await manager.send_message(
+                            conn_id,
+                            WSEvent(
+                                event=ServerEvent.AUDIO_ERROR.value,
+                                data={"error": str(exc)},
+                            ),
+                        )
+                    continue
+
+                # --- Text frame: JSON message ---
+                if "text" in raw and raw["text"]:
+                    data = json.loads(raw["text"])
+                else:
+                    continue
+
                 message = parse_message(data)
 
                 if message.type.value == "ping":
@@ -99,28 +121,54 @@ async def websocket_endpoint(
                     continue
 
                 if isinstance(message, WSRequest):
-                    # Run chat requests as background tasks so the message
-                    # loop stays free to process cancel / status requests.
-                    if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
+                    # Run chat and audio requests as background tasks so the
+                    # message loop stays free for cancel / status requests.
+                    _is_chat = message.method in (
+                        "agent.chat",
+                        ClientMethod.CHAT_SEND.value,
+                    )
+                    _is_audio = message.method in (
+                        ClientMethod.AUDIO_SEND.value,
+                        ClientMethod.AUDIO_STREAM_START.value,
+                        ClientMethod.AUDIO_STREAM_END.value,
+                    )
+
+                    if _is_chat or _is_audio:
                         _req = message  # capture for closure
 
-                        async def _run_chat(req: WSRequest = _req) -> None:
+                        async def _run_handler(req: WSRequest = _req) -> None:
                             try:
-                                result = await handler._handle_chat(req.params)
+                                if req.method == ClientMethod.AUDIO_SEND.value:
+                                    result = await handler._handle_audio_send(req.params)
+                                elif req.method == ClientMethod.AUDIO_STREAM_START.value:
+                                    result = await handler._handle_audio_stream_start(req.params)
+                                elif req.method == ClientMethod.AUDIO_STREAM_END.value:
+                                    result = await handler._handle_audio_stream_end(req.params)
+                                else:
+                                    result = await handler._handle_chat(req.params)
                                 await manager.send_message(
                                     conn_id, WSResponse(id=req.id, result=result),
                                 )
                             except Exception as exc:
-                                logger.error(f"Chat error: {exc}")
+                                logger.error(f"Handler error for {req.method}: {exc}")
                                 await manager.send_message(
                                     conn_id,
                                     WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
                                 )
 
-                        handler._current_task = asyncio.create_task(_run_chat())
+                        handler._current_task = asyncio.create_task(_run_handler())
                     else:
                         response = await handler.handle_request(message)
                         await manager.send_message(conn_id, response)
+
+            except json.JSONDecodeError as e:
+                await manager.send_message(
+                    conn_id,
+                    WSError(
+                        code="INVALID_JSON",
+                        message=f"Invalid JSON: {e}",
+                    ),
+                )
 
             except ValueError as e:
                 await manager.send_message(
@@ -165,6 +213,10 @@ class WebSocketHandler:
             ClientMethod.CHAT_SEND.value: self._handle_chat,  # "chat.send" -> same handler
             "agent.cancel": self._handle_cancel,
             ClientMethod.CHAT_CANCEL.value: self._handle_cancel,
+            # Audio methods
+            ClientMethod.AUDIO_SEND.value: self._handle_audio_send,
+            ClientMethod.AUDIO_STREAM_START.value: self._handle_audio_stream_start,
+            ClientMethod.AUDIO_STREAM_END.value: self._handle_audio_stream_end,
             # Confirmation
             ClientMethod.CONFIRM_RESPOND.value: self._handle_confirm_respond,
             # Status
@@ -430,6 +482,170 @@ class WebSocketHandler:
         if self._current_task is not None and not self._current_task.done():
             self._current_task.cancel()
         return {"cancelled": True, "task_id": task_id}
+
+    # ========== Audio ==========
+
+    def _handle_audio_binary(self, data: bytes) -> None:
+        """Handle a binary WebSocket frame containing audio chunk data.
+
+        Binary frames are used during audio streaming sessions (after
+        audio.stream.start). The data is appended to the active stream buffer.
+        """
+        try:
+            from spoon_bot.services.audio.streaming import AudioStreamManager
+        except ImportError:
+            raise ValueError("Audio streaming service not available")
+
+        stream_mgr = self._get_stream_manager()
+        if not stream_mgr.has_active_session(self.connection_id):
+            raise ValueError("No active audio stream. Send audio.stream.start first.")
+        stream_mgr.add_chunk(self.connection_id, data)
+
+    def _get_stream_manager(self):
+        """Get or create the AudioStreamManager singleton."""
+        if not hasattr(self, "_stream_manager") or self._stream_manager is None:
+            from spoon_bot.services.audio.factory import create_transcriber
+            from spoon_bot.services.audio.streaming import AudioStreamManager
+
+            config = get_config()
+            transcriber = create_transcriber(config.audio.stt_provider)
+            self._stream_manager = AudioStreamManager(
+                transcriber=transcriber,
+                max_audio_size_bytes=config.audio.max_audio_size_mb * 1024 * 1024,
+                max_stream_duration_seconds=config.audio.max_audio_duration_seconds,
+            )
+        return self._stream_manager
+
+    async def _handle_audio_send(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle audio.send — send a complete audio message (base64) for processing.
+
+        Params:
+            data: Base64-encoded audio data
+            format: Audio format (wav, mp3, etc.)
+            message: Optional accompanying text
+            language: Optional language hint
+            stream: Whether to stream the response
+        """
+        audio_data = params.get("data", "")
+        audio_format = params.get("format", "wav")
+        text_message = params.get("message", "")
+        language = params.get("language")
+        do_stream = params.get("stream", False)
+
+        if not audio_data:
+            raise ValueError("Audio data is required")
+
+        manager = get_connection_manager()
+
+        # Emit received event
+        await manager.send_message(
+            self.connection_id,
+            WSEvent(event=ServerEvent.AUDIO_RECEIVED.value, data={"format": audio_format}),
+        )
+
+        # Process through audio pipeline
+        from spoon_bot.gateway.api.v1.agent import _process_audio_input
+
+        effective_message, transcription_info = await _process_audio_input(
+            audio_data=audio_data,
+            audio_format=audio_format,
+            message=text_message,
+            language=language,
+        )
+
+        # Emit transcription result
+        if transcription_info:
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AUDIO_TRANSCRIPTION.value,
+                    data={
+                        "text": transcription_info.text,
+                        "language": transcription_info.language,
+                        "duration_seconds": transcription_info.duration_seconds,
+                    },
+                ),
+            )
+
+        if not effective_message:
+            raise ValueError("No speech detected in audio")
+
+        # Route to chat handler with the transcribed/processed message
+        chat_params = {
+            "message": effective_message,
+            "stream": do_stream,
+        }
+        return await self._handle_chat(chat_params)
+
+    async def _handle_audio_stream_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle audio.stream.start — begin a streaming audio session.
+
+        After this, the client sends binary frames with audio chunks,
+        then sends audio.stream.end to finalize.
+        """
+        audio_format = params.get("format", "wav")
+        language = params.get("language")
+        sample_rate = params.get("sample_rate", 16000)
+        channels = params.get("channels", 1)
+        text_message = params.get("message", "")
+
+        stream_mgr = self._get_stream_manager()
+        stream_mgr.start_session(
+            connection_id=self.connection_id,
+            audio_format=audio_format,
+            language=language,
+            sample_rate=sample_rate,
+            channels=channels,
+            text_message=text_message,
+        )
+
+        return {
+            "success": True,
+            "session_id": self.connection_id,
+            "message": "Audio stream started. Send binary frames, then audio.stream.end.",
+        }
+
+    async def _handle_audio_stream_end(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle audio.stream.end — finalize a streaming audio session.
+
+        Transcribes the accumulated audio and sends the result through the chat pipeline.
+        """
+        do_stream = params.get("stream", False)
+        manager = get_connection_manager()
+        stream_mgr = self._get_stream_manager()
+
+        # Transcribe accumulated audio
+        result = await stream_mgr.end_session(self.connection_id)
+
+        # Emit transcription
+        await manager.send_message(
+            self.connection_id,
+            WSEvent(
+                event=ServerEvent.AUDIO_TRANSCRIPTION.value,
+                data={
+                    "text": result.text,
+                    "language": result.language,
+                    "duration_seconds": result.duration_seconds,
+                },
+            ),
+        )
+
+        if result.is_empty:
+            return {"success": True, "transcription": "", "message": "No speech detected"}
+
+        # Get the original text message from the session (if any)
+        text_message = params.get("message", "")
+        if text_message:
+            effective_message = f"{text_message}\n\n[Voice input]: {result.text}"
+        else:
+            effective_message = result.text
+
+        # Route to chat handler
+        chat_params = {
+            "message": effective_message,
+            "stream": do_stream,
+        }
+        return await self._handle_chat(chat_params)
 
     # ========== Confirmation ==========
 

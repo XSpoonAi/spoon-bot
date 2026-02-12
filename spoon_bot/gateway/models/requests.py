@@ -17,12 +17,24 @@ class ChatOptions(BaseModel):
     model: str | None = None
 
 
-class ChatRequest(BaseModel):
-    """Chat request model."""
+class AudioInput(BaseModel):
+    """Audio input for voice messages."""
 
-    message: str = Field(..., min_length=1, max_length=100000)
+    data: str = Field(..., description="Base64-encoded audio data")
+    format: str = Field(default="wav", description="Audio format: wav, mp3, ogg, webm, flac, m4a")
+    language: str | None = Field(default=None, description="Language hint (ISO 639-1, e.g. 'en', 'zh')")
+
+
+class ChatRequest(BaseModel):
+    """Chat request model.
+
+    Supports text, audio, or both. When audio is provided, message can be empty.
+    """
+
+    message: str = Field(default="", max_length=100000)
     session_key: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     media: list[str] = Field(default_factory=list, max_length=10)
+    audio: AudioInput | None = Field(default=None, description="Voice/audio input")
     options: ChatOptions | None = None
 
     @field_validator("message")

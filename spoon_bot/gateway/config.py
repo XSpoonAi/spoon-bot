@@ -59,6 +59,27 @@ class BudgetConfig:
 
 
 @dataclass
+class AudioConfig:
+    """Audio/voice input configuration."""
+
+    enabled: bool = True
+    stt_provider: str = "whisper"
+    stt_model: str = "whisper-1"
+    max_audio_size_mb: int = 25  # Whisper API limit
+    max_audio_duration_seconds: int = 600  # 10 minutes
+    supported_formats: list[str] = field(
+        default_factory=lambda: ["wav", "mp3", "ogg", "webm", "flac", "m4a", "aac"]
+    )
+    streaming_chunk_duration_ms: int = 3000
+    enable_streaming: bool = True
+    default_language: str | None = None  # auto-detect if None
+    # Providers that support native audio input (skip transcription)
+    native_audio_providers: list[str] = field(
+        default_factory=lambda: ["openai", "gemini"]
+    )
+
+
+@dataclass
 class GatewayConfig:
     """Gateway configuration."""
 
@@ -84,6 +105,9 @@ class GatewayConfig:
 
     # Budget / timeouts
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+
+    # Audio / voice input
+    audio: AudioConfig = field(default_factory=AudioConfig)
 
     # Agent settings
     default_session_key: str = "default"
@@ -117,5 +141,19 @@ class GatewayConfig:
                 stream_timeout_ms=int(
                     os.environ.get("GATEWAY_TIMEOUT_STREAM_MS", "300000")
                 ),
+            ),
+            audio=AudioConfig(
+                enabled=os.environ.get("GATEWAY_AUDIO_ENABLED", "true").lower() == "true",
+                stt_provider=os.environ.get("GATEWAY_AUDIO_STT_PROVIDER", "whisper"),
+                stt_model=os.environ.get("GATEWAY_AUDIO_STT_MODEL", "whisper-1"),
+                default_language=os.environ.get("GATEWAY_AUDIO_DEFAULT_LANGUAGE"),
+                enable_streaming=os.environ.get("GATEWAY_AUDIO_STREAMING", "true").lower() == "true",
+                native_audio_providers=[
+                    p.strip()
+                    for p in os.environ.get(
+                        "GATEWAY_AUDIO_NATIVE_PROVIDERS", "openai,gemini"
+                    ).split(",")
+                    if p.strip()
+                ],
             ),
         )

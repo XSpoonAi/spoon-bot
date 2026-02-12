@@ -52,6 +52,11 @@ class ClientMethod(str, Enum):
     # Agent methods
     AGENT_STATUS = "agent.status"
 
+    # Audio methods
+    AUDIO_SEND = "audio.send"
+    AUDIO_STREAM_START = "audio.stream.start"
+    AUDIO_STREAM_END = "audio.stream.end"
+
     # Heartbeat
     PING = "ping"
 
@@ -81,6 +86,12 @@ class ServerEvent(str, Enum):
     METRICS_UPDATE = "metrics.update"
     RESOURCE_TOKEN_LIMIT = "resource.token_limit"
     RESOURCE_TIME_LIMIT = "resource.time_limit"
+
+    # Audio events
+    AUDIO_RECEIVED = "audio.received"
+    AUDIO_TRANSCRIPTION = "audio.transcription"
+    AUDIO_TRANSCRIPTION_PARTIAL = "audio.transcription.partial"
+    AUDIO_ERROR = "audio.error"
 
     # Connection events
     CONNECTION_ESTABLISHED = "connection.established"

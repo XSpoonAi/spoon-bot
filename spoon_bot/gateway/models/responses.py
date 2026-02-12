@@ -71,6 +71,16 @@ class ToolCallInfo(BaseModel):
     result: str | None = None
 
 
+class TranscriptionInfo(BaseModel):
+    """Audio transcription result information."""
+
+    text: str
+    language: str | None = None
+    duration_seconds: float | None = None
+    confidence: float | None = None
+    provider: str | None = None
+
+
 class ChatResponse(BaseModel):
     """Chat response model."""
 
@@ -78,6 +88,7 @@ class ChatResponse(BaseModel):
     tool_calls: list[ToolCallInfo] = Field(default_factory=list)
     usage: UsageInfo | None = None
     thinking_content: str | None = None
+    transcription: TranscriptionInfo | None = None
 
 
 class StreamChunk(BaseModel):
