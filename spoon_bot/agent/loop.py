@@ -446,38 +446,129 @@ class AgentLoop:
         full_content = ""
 
         # ------------------------------------------------------------------
-        # Streaming strategy:
-        #
-        # The spoon-core base agent's stream() has a bug in its while-loop
-        # condition and the output_queue is a ThreadSafeOutputQueue that
-        # does not expose put_nowait (used by ToolCallAgent.step).  Rather
-        # than monkey-patching core internals, we use a reliable fallback:
-        # run process() (which works) and emit the result as SSE content
-        # chunks.  This provides a working SSE endpoint for clients while
-        # maintaining compatibility with the agent lifecycle.
+        # Streaming uses the spoon-core run+stream pattern:
+        #   1. Clear task_done + drain output_queue
+        #   2. Start run(message) in background — sets task_done on finish
+        #   3. Read chunks from output_queue until task_done AND queue empty
         # ------------------------------------------------------------------
 
         try:
-            kwargs: dict[str, Any] = {"message": message}
-            if media:
-                kwargs["media"] = media
+            # 1. Reset streaming state
+            self._agent.task_done.clear()
+            while not self._agent.output_queue.empty():
+                try:
+                    await asyncio.wait_for(self._agent.output_queue.get(), timeout=0.1)
+                except (asyncio.TimeoutError, Exception):
+                    break
 
-            if thinking:
-                response_text, thinking_content = await self.process_with_thinking(**kwargs)
-                if thinking_content:
-                    yield {
-                        "type": "thinking",
-                        "delta": thinking_content,
-                        "metadata": {},
-                    }
-                full_content = response_text
-            else:
-                response_text = await self.process(**kwargs)
-                full_content = response_text
+            # 2. Start run() in background
+            async def _run_and_signal() -> None:
+                try:
+                    await self._agent.run(request=message)
+                except Exception as exc:
+                    logger.error(f"Background agent run failed: {exc}")
+                    try:
+                        await self._agent.output_queue.put(f"Error: {exc}")
+                    except Exception:
+                        pass
+                finally:
+                    self._agent.task_done.set()
 
-            # Emit the full response as a content chunk
-            if full_content:
-                yield {"type": "content", "delta": full_content, "metadata": {}}
+            logger.debug(f"Creating bg task, agent state={self._agent.state}")
+            bg_task = asyncio.create_task(_run_and_signal())
+
+            # Force a yield to allow the background task to start
+            await asyncio.sleep(0)
+
+            # 3. Read output chunks (mirrors fixed BaseAgent.stream logic)
+            oq = self._agent.output_queue
+            td = self._agent.task_done
+            logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
+            stream_timeout = 120.0
+            deadline = asyncio.get_event_loop().time() + stream_timeout
+            chunk_count = 0
+
+            logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
+            while not (td.is_set() and oq.empty()):
+                if asyncio.get_event_loop().time() > deadline:
+                    logger.warning("Streaming deadline reached, stopping")
+                    break
+
+                try:
+                    # Use oq.get() without timeout kwarg — works for both
+                    # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
+                    # handled by the outer asyncio.wait_for.
+                    chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
+                    chunk_count += 1
+                    logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    logger.warning("Streaming cancelled")
+                    break
+                except Exception as e:
+                    logger.warning(f"Queue get error: {type(e).__name__}: {e}")
+                    continue
+
+                chunk_type = "content"
+                delta = ""
+                metadata: dict[str, Any] = {}
+
+                # -- Thinking chunks --
+                if hasattr(chunk, "type") and chunk.type == "thinking":
+                    chunk_type = "thinking"
+                    delta = chunk.content if hasattr(chunk, "content") else str(chunk)
+                elif (
+                    hasattr(chunk, "metadata")
+                    and isinstance(chunk.metadata, dict)
+                    and chunk.metadata.get("type") == "thinking"
+                ):
+                    chunk_type = "thinking"
+                    delta = (
+                        getattr(chunk, "delta", None)
+                        or getattr(chunk, "content", None)
+                        or str(chunk)
+                    )
+
+                # -- Dict chunks (tool_calls, structured events) --
+                elif isinstance(chunk, dict):
+                    if "tool_calls" in chunk and chunk["tool_calls"]:
+                        for tc in chunk["tool_calls"]:
+                            fn = tc.get("function", {})
+                            yield {
+                                "type": "tool_call",
+                                "delta": "",
+                                "metadata": {
+                                    "id": tc.get("id", ""),
+                                    "name": fn.get("name", ""),
+                                    "arguments": fn.get("arguments", ""),
+                                },
+                            }
+                        continue
+                    if "content" in chunk and chunk["content"]:
+                        delta = chunk["content"]
+                        full_content += delta
+
+                # -- Object chunks with content --
+                elif hasattr(chunk, "content") and chunk.content:
+                    delta = chunk.content
+                    full_content += delta
+
+                # -- Plain string chunks --
+                elif isinstance(chunk, str):
+                    delta = chunk
+                    full_content += delta
+
+                if delta:
+                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+
+            logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
+
+            # Ensure background task completes
+            try:
+                await asyncio.wait_for(bg_task, timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
             # Emit done
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
