@@ -436,6 +436,26 @@ class ShellTool(Tool):
             # Unix: use shlex.quote
             return shlex.quote(arg)
 
+    async def _communicate_with_timeout(
+        self,
+        process: asyncio.subprocess.Process,
+    ) -> tuple[bytes, bytes, int]:
+        """Communicate with process, killing it on timeout to avoid zombies."""
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.timeout,
+            )
+            return stdout, stderr, process.returncode or 0
+        except asyncio.TimeoutError:
+            # Kill the process to prevent zombie processes
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass  # Process already exited
+            await process.wait()
+            raise
+
     async def _execute_with_shell(
         self,
         command: str,
@@ -460,12 +480,7 @@ class ShellTool(Tool):
                 executable="/bin/sh",
             )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=self.timeout,
-        )
-
-        return stdout, stderr, process.returncode or 0
+        return await self._communicate_with_timeout(process)
 
     async def _execute_without_shell(
         self,
@@ -484,12 +499,7 @@ class ShellTool(Tool):
             cwd=cwd,
         )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=self.timeout,
-        )
-
-        return stdout, stderr, process.returncode or 0
+        return await self._communicate_with_timeout(process)
 
     async def execute(
         self,
