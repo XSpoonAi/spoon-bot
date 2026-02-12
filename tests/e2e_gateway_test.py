@@ -8,12 +8,18 @@ Start the gateway first:
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:8080"
+# Ensure spoon_bot is importable when running the test script directly
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+BASE = "http://127.0.0.1:9090"
 PASS = 0
 FAIL = 0
 RESULTS = []
@@ -22,8 +28,8 @@ RESULTS = []
 def req(method: str, path: str, body: dict | None = None, timeout: float = 60.0) -> tuple[int, dict | str]:
     """Simple HTTP request helper."""
     url = f"{BASE}{path}"
-    data = json.dumps(body).encode() if body else None
-    headers = {"Content-Type": "application/json"} if body else {}
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if body is not None else {}
     r = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
