@@ -1,22 +1,32 @@
+---
+name: code_review
+description: A skill for performing automated code reviews with security and best practices analysis
+version: 1.0.0
+author: XSpoon Team
+tags:
+  - code
+  - review
+  - security
+  - quality
+triggers:
+  - type: keyword
+    keywords:
+      - review code
+      - code review
+      - check code
+      - analyze code
+    priority: 80
+  - type: pattern
+    patterns:
+      - "(?i)review\\s+(this|the)?\\s*(code|file|changes?)"
+    priority: 75
+composable: true
+persist_state: false
+---
+
 # Code Review Skill
 
-A skill for performing automated code reviews with security and best practices analysis.
-
-## Metadata
-
-- **name**: code_review
-- **version**: 1.0.0
-- **author**: XSpoon Team
-- **tags**: code, review, security, quality
-
-## Triggers
-
-- Keywords: "review code", "code review", "check code", "analyze code"
-- Pattern: `review\s+(this|the)?\s*(code|file|changes?)`
-
-## Description
-
-This skill performs comprehensive code reviews focusing on:
+A skill for performing comprehensive code reviews focusing on:
 - Security vulnerabilities (injection, XSS, etc.)
 - Code quality and maintainability
 - Performance issues

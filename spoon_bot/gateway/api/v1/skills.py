@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from uuid import uuid4
-from typing import Any, Protocol, cast
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -21,60 +20,60 @@ from spoon_bot.gateway.models.responses import (
 router = APIRouter()
 
 
-class SkillRegistry(Protocol):
-    def list(self) -> list[str]:
-        ...
+def _get_skill_manager(agent):
+    """Resolve the real SkillManager from the agent.
 
-    def get(self, name: str) -> Any:
-        ...
+    The agent's ``.skills`` property returns a plain ``list[str]``,
+    so we need the underlying ``_skill_manager`` / ``skill_manager``
+    to perform activate/deactivate operations.
+    """
+    if hasattr(agent, "_skill_manager") and agent._skill_manager is not None:
+        return agent._skill_manager
+    if hasattr(agent, "skill_manager"):
+        sm = agent.skill_manager
+        if sm is not None:
+            return sm
+    return None
 
-    def is_active(self, name: str) -> bool:
-        ...
 
-    async def activate(self, name: str, context: dict | None = None) -> Any:
-        ...
-
-    async def deactivate(self, name: str) -> bool:
-        ...
+def _safe_get_agent():
+    """Get agent with a structured error on failure instead of raw 500."""
+    try:
+        return get_agent()
+    except RuntimeError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "AGENT_NOT_READY", "message": "Agent is not initialized yet"},
+        )
 
 
 @router.get("", response_model=APIResponse[SkillListResponse])
 async def list_skills(user: CurrentUser) -> APIResponse[SkillListResponse]:
     """List all available skills."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent: Any = get_agent()
+    agent = _safe_get_agent()
 
-    skills: list[Any] = []
-    skills_obj: Any = getattr(agent, "skills", None)
-    if skills_obj is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "INTERNAL_ERROR", "message": "Skill registry unavailable"},
-        )
+    sm = _get_skill_manager(agent)
+    skills: list[SkillInfo] = []
 
-    if isinstance(skills_obj, list):
-        skill_names = skills_obj
+    if sm is not None:
+        # Use the real SkillManager registry
+        skill_names = sm.list() if hasattr(sm, "list") else []
         for name in skill_names:
-            skills.append(
-                SkillInfo(
-                    name=name,
-                    description="",
-                    active=False,
-                )
-            )
-    else:
-        skills_manager = cast(SkillRegistry, skills_obj)
-        skill_names = skills_manager.list()
-        for name in skill_names:
-            skill = skills_manager.get(name)
+            skill = sm.get(name) if hasattr(sm, "get") else None
             if skill:
+                is_active = sm.is_active(name) if hasattr(sm, "is_active") else False
                 skills.append(
                     SkillInfo(
-                        name=skill.name,
-                        description=skill.description,
-                        active=skills_manager.is_active(name),
+                        name=skill.name if hasattr(skill, "name") else name,
+                        description=getattr(skill, "description", ""),
+                        active=is_active,
                     )
                 )
+    else:
+        # Fallback: use the name list from agent.skills property
+        for name in getattr(agent, "skills", []):
+            skills.append(SkillInfo(name=name, description="", active=False))
 
     return APIResponse(
         success=True,
@@ -91,27 +90,33 @@ async def activate_skill(
 ) -> APIResponse[SkillResponse]:
     """Activate a skill."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent: Any = get_agent()
+    agent = _safe_get_agent()
+    sm = _get_skill_manager(agent)
+
+    if sm is None:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"code": "SKILLS_UNSUPPORTED", "message": "Skill system is not enabled"},
+        )
+
+    # Check skill exists
+    existing = sm.get(skill_name) if hasattr(sm, "get") else None
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SKILL_NOT_FOUND", "message": f"Skill '{skill_name}' not found"},
+        )
 
     try:
-        skills_obj: Any = getattr(agent, "skills", None)
-        if skills_obj is None:
-            raise ValueError("Skill registry unavailable")
-        if isinstance(skills_obj, list):
-            raise ValueError("Skill activation not supported by current skill registry")
-        if not hasattr(skills_obj, "activate"):
-            raise ValueError("Skill activation not supported by current skill registry")
-
-        skills_manager = cast(SkillRegistry, skills_obj)
-        skill = await skills_manager.activate(skill_name, context=request.context)
+        skill = await sm.activate(skill_name, context=request.context)
 
         return APIResponse(
             success=True,
             data=SkillResponse(
                 activated=True,
                 skill=SkillInfo(
-                    name=skill.name,
-                    description=skill.description,
+                    name=skill.name if hasattr(skill, "name") else skill_name,
+                    description=getattr(skill, "description", ""),
                     active=True,
                 ),
             ),
@@ -122,6 +127,11 @@ async def activate_skill(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "NOT_FOUND", "message": str(e)},
+        )
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"code": "UNSUPPORTED", "message": str(e)},
         )
     except Exception as e:
         raise HTTPException(
@@ -137,27 +147,30 @@ async def deactivate_skill(
 ) -> APIResponse[SkillResponse]:
     """Deactivate a skill."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent: Any = get_agent()
+    agent = _safe_get_agent()
+    sm = _get_skill_manager(agent)
 
-    skills_obj: Any = getattr(agent, "skills", None)
-    if skills_obj is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "INTERNAL_ERROR", "message": "Skill registry unavailable"},
-        )
-    if isinstance(skills_obj, list):
+    if sm is None:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={"code": "NOT_SUPPORTED", "message": "Skill deactivation not supported"},
-        )
-    if not hasattr(skills_obj, "deactivate"):
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={"code": "NOT_SUPPORTED", "message": "Skill deactivation not supported"},
+            detail={"code": "SKILLS_UNSUPPORTED", "message": "Skill system is not enabled"},
         )
 
-    skills_manager = cast(SkillRegistry, skills_obj)
-    deactivated = await skills_manager.deactivate(skill_name)
+    # Check skill exists
+    existing = sm.get(skill_name) if hasattr(sm, "get") else None
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SKILL_NOT_FOUND", "message": f"Skill '{skill_name}' not found"},
+        )
+
+    try:
+        deactivated = await sm.deactivate(skill_name)
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"code": "UNSUPPORTED", "message": str(e)},
+        )
 
     return APIResponse(
         success=True,

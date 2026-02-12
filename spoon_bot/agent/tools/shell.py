@@ -50,6 +50,7 @@ class CommandValidator:
         "dd if=/dev/random",
         "format c:",
         "format d:",
+        "format e:",
         # Fork bombs and resource exhaustion
         ":(){ :|:& };:",
         # System modification
@@ -60,7 +61,6 @@ class CommandValidator:
         # Windows specific
         "del /f /s /q c:\\",
         "rd /s /q c:\\",
-        "format",
     })
 
     # Regex patterns for dangerous operations
@@ -177,17 +177,35 @@ class CommandValidator:
         return base.lower()
 
     def _check_dangerous_commands(self, command: str) -> str | None:
-        """Check if command matches any dangerous command patterns."""
+        """Check if command matches any dangerous command patterns.
+
+        Uses word-boundary aware matching so that tokens appearing inside
+        URLs or quoted strings (e.g. ``curl ...?format=3``) are not
+        incorrectly flagged.
+        """
         cmd_lower = command.lower().strip()
 
-        # Check exact matches
+        # Check dangerous commands — match only when the dangerous string
+        # appears as the start of the command or after a shell separator,
+        # not inside an unrelated substring like a URL query parameter.
         for dangerous in self.DANGEROUS_COMMANDS:
-            if dangerous.lower() in cmd_lower:
+            d_lower = dangerous.lower()
+            # Quick substring pre-check
+            if d_lower not in cmd_lower:
+                continue
+            # Build a word-boundary regex so "format c:" matches but
+            # "?format=3" does not.
+            escaped = re.escape(d_lower)
+            if re.search(rf"(?:^|[\s;|&]){escaped}", cmd_lower):
                 return f"Blocked dangerous command: '{dangerous}'"
 
-        # Check custom blocklist
+        # Check custom blocklist with same boundary logic
         for blocked in self.custom_blocklist:
-            if blocked.lower() in cmd_lower:
+            b_lower = blocked.lower()
+            if b_lower not in cmd_lower:
+                continue
+            escaped = re.escape(b_lower)
+            if re.search(rf"(?:^|[\s;|&]){escaped}", cmd_lower):
                 return f"Blocked by custom blocklist: '{blocked}'"
 
         # Check regex patterns

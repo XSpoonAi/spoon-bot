@@ -185,27 +185,44 @@ class SpoonBot:
 
         self._chatbot = ChatBot(**chatbot_kwargs)
 
-        # Create MCP tools
-        for name, mcp_config in self.config.mcp_servers.items():
-            mcp_tool = MCPTool(
-                name=name,
-                description=f"MCP server: {name}",
-                mcp_config=mcp_config,
-            )
-            self._mcp_tools.append(mcp_tool)
+        # Create MCP tools — each server exposes multiple tools with their
+        # own names.  Use server_name as the config key but let MCPTool
+        # handle individual tool discovery internally.
+        for server_name, mcp_config in self.config.mcp_servers.items():
+            try:
+                mcp_tool = MCPTool(
+                    name=server_name,
+                    description=f"MCP server: {server_name}",
+                    mcp_config=mcp_config,
+                )
+                self._mcp_tools.append(mcp_tool)
+                logger.info(f"Created MCP tool for server: {server_name}")
+            except Exception as exc:
+                logger.error(f"Failed to create MCP tool '{server_name}': {exc}")
 
         # Create ToolManager
         if self._mcp_tools:
             self._tool_manager = ToolManager(self._mcp_tools)
 
         # Create SkillManager if enabled
+        # Check signature at runtime to avoid passing unsupported
+        # parameters to older spoon-core versions.
         if self.config.enable_skills:
+            import inspect
             skill_paths = self.config.skill_paths or [str(self.config.workspace / "skills")]
-            self._skill_manager = SkillManager(
-                skill_paths=skill_paths,
-                llm=self._chatbot,
-                auto_discover=True,
-            )
+
+            sm_sig = inspect.signature(SkillManager.__init__)
+            sm_params = set(sm_sig.parameters.keys())
+
+            sm_kwargs: dict[str, Any] = {"skill_paths": skill_paths}
+            if "llm" in sm_params:
+                sm_kwargs["llm"] = self._chatbot
+            if "auto_discover" in sm_params:
+                sm_kwargs["auto_discover"] = True
+            if "include_default_paths" in sm_params:
+                sm_kwargs["include_default_paths"] = False
+
+            self._skill_manager = SkillManager(**sm_kwargs)
 
         # Create appropriate agent based on configuration
         if self.config.enable_skills and self._skill_manager:
@@ -222,8 +239,35 @@ class SpoonBot:
                 max_steps=self.config.max_steps,
             )
 
+        # Patch missing _map_mcp_tool_name on agents that don't have it.
+        # Some spoon-core versions require this method for MCP tool dispatch
+        # but SpoonReactSkill may not implement it.
+        if not hasattr(self._agent, "_map_mcp_tool_name"):
+            def _map_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
+                """Map an MCP tool call name back to (server_name, actual_tool_name).
+
+                Convention: MCP tools are named ``<server>__<tool>`` or just ``<tool>``.
+                Falls back to scanning all registered MCP tools.
+                """
+                if "__" in tool_name:
+                    parts = tool_name.split("__", 1)
+                    return (parts[0], parts[1])
+                # Fallback: try each MCP tool server
+                for mcp_tool in self._mcp_tools:
+                    return (mcp_tool.name, tool_name)
+                return None
+            self._agent._map_mcp_tool_name = _map_mcp_tool_name
+
         # Initialize agent
         await self._agent.initialize()
+
+        # Patch ScriptTool parameters to match skill input_schema (Bug #8)
+        if self._skill_manager:
+            try:
+                from spoon_bot.skills.script_tool_patch import patch_all_script_tools
+                patch_all_script_tools(self._skill_manager)
+            except Exception as exc:
+                logger.debug(f"ScriptTool patching skipped: {exc}")
 
         self._initialized = True
         logger.info(

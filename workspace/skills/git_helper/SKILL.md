@@ -1,26 +1,31 @@
+---
+name: git_helper
+description: A skill for automating common Git operations with safety checks
+version: 1.0.0
+author: XSpoon Team
+tags:
+  - git
+  - version-control
+  - automation
+triggers:
+  - type: keyword
+    keywords:
+      - git commit
+      - commit changes
+      - push code
+      - create branch
+    priority: 80
+  - type: pattern
+    patterns:
+      - "(?i)(commit|push|branch|merge|rebase)"
+    priority: 75
+composable: true
+persist_state: false
+---
+
 # Git Helper Skill
 
 A skill for automating common Git operations with safety checks.
-
-## Metadata
-
-- **name**: git_helper
-- **version**: 1.0.0
-- **author**: XSpoon Team
-- **tags**: git, version-control, automation
-
-## Triggers
-
-- Keywords: "git commit", "commit changes", "push code", "create branch"
-- Pattern: `(commit|push|branch|merge|rebase)`
-
-## Description
-
-This skill helps with Git operations including:
-- Creating well-formatted commit messages
-- Branch management
-- Safe push operations with checks
-- Merge conflict resolution
 
 ## Instructions
 
