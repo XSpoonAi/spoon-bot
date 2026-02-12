@@ -30,6 +30,19 @@ from spoon_bot.gateway.models.responses import (
 router = APIRouter()
 
 
+def _switch_session(agent, session_key: str | None) -> None:
+    """Switch the agent's active session if the agent supports it."""
+    if not session_key or session_key == "default":
+        return
+    # AgentLoop stores sessions via SessionManager
+    if hasattr(agent, "sessions") and hasattr(agent, "_session"):
+        try:
+            agent._session = agent.sessions.get_or_create(session_key)
+            agent.session_key = session_key
+        except Exception:
+            pass  # Gracefully degrade — keep default session
+
+
 async def _stream_sse(
     agent,
     message: str,
@@ -39,19 +52,32 @@ async def _stream_sse(
     session_key: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE events from agent streaming."""
+    _switch_session(agent, session_key)
+
     kwargs = {"message": message, "thinking": thinking}
     if media:
         kwargs["media"] = media
-    if session_key:
-        kwargs["session_key"] = session_key
 
     try:
         async for chunk_data in agent.stream(**kwargs):
-            # Filter out "done" chunks — clients use [DONE] as the completion signal
-            if chunk_data.get("type") == "done":
+            chunk_type = chunk_data.get("type", "content")
+
+            # Propagate error chunks to the client
+            if chunk_type == "error":
+                error_chunk = StreamChunk(
+                    type="error",
+                    delta=chunk_data.get("delta", ""),
+                    metadata=chunk_data.get("metadata", {}),
+                )
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
                 continue
+
+            # Filter out "done" chunks — clients use [DONE] as the completion signal
+            if chunk_type == "done":
+                continue
+
             chunk = StreamChunk(
-                type=chunk_data["type"],
+                type=chunk_type,
                 delta=chunk_data["delta"],
                 metadata=chunk_data.get("metadata", {}),
             )
@@ -111,12 +137,12 @@ async def chat(
                 },
             )
 
-        # Non-streaming mode
+        # Non-streaming mode — switch session before processing
+        _switch_session(agent, session_key)
+
         kwargs = {"message": request.message}
         if request.media:
             kwargs["media"] = request.media
-        if session_key:
-            kwargs["session_key"] = session_key
 
         thinking_content = None
         if thinking:
@@ -176,14 +202,15 @@ class AsyncTask:
 _task_store: dict[str, AsyncTask] = {}
 
 
-async def _run_async_task(task: AsyncTask, agent, message: str, **kwargs):
+async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str | None = None):
     """Background coroutine that drives agent processing for an async task."""
     task.status = TaskStatus.RUNNING
     try:
+        _switch_session(agent, session_key)
         if task._cancel_event.is_set():
             task.status = TaskStatus.CANCELLED
             return
-        response = await agent.process(message=message, **kwargs)
+        response = await agent.process(message=message)
         if task._cancel_event.is_set():
             task.status = TaskStatus.CANCELLED
             return
@@ -219,15 +246,12 @@ async def chat_async(
         )
 
     session_key = request.session_key
-    extra_kwargs: dict[str, str] = {}
-    if session_key:
-        extra_kwargs["session_key"] = session_key
 
     task = AsyncTask(task_id=task_id)
     _task_store[task_id] = task
 
     bg = asyncio.create_task(
-        _run_async_task(task, agent, request.message, **extra_kwargs)
+        _run_async_task(task, agent, request.message, session_key=session_key)
     )
     task._bg_task = bg
 

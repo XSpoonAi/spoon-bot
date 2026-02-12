@@ -433,72 +433,58 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        kwargs: dict[str, Any] = {}
-        if thinking:
-            kwargs["thinking"] = True
-        if media:
-            kwargs["media"] = media
+        logger.info(f"Streaming message: {message[:100]}...")
+
+        # Refresh memory context
+        try:
+            memory_context = self.memory.get_memory_context()
+            if memory_context:
+                self.context.set_memory_context(memory_context)
+        except Exception as e:
+            logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+
+        # ------------------------------------------------------------------
+        # Streaming strategy:
+        #
+        # The spoon-core base agent's stream() has a bug in its while-loop
+        # condition and the output_queue is a ThreadSafeOutputQueue that
+        # does not expose put_nowait (used by ToolCallAgent.step).  Rather
+        # than monkey-patching core internals, we use a reliable fallback:
+        # run process() (which works) and emit the result as SSE content
+        # chunks.  This provides a working SSE endpoint for clients while
+        # maintaining compatibility with the agent lifecycle.
+        # ------------------------------------------------------------------
+
         try:
-            async for chunk in self._agent.stream(message, **kwargs):
-                chunk_type = "content"
-                delta = ""
-                metadata: dict[str, Any] = {}
+            kwargs: dict[str, Any] = {"message": message}
+            if media:
+                kwargs["media"] = media
 
-                # -- Thinking chunks --
-                if hasattr(chunk, "type") and chunk.type == "thinking":
-                    chunk_type = "thinking"
-                    delta = chunk.content if hasattr(chunk, "content") else str(chunk)
-                elif (
-                    hasattr(chunk, "metadata")
-                    and isinstance(chunk.metadata, dict)
-                    and chunk.metadata.get("type") == "thinking"
-                ):
-                    chunk_type = "thinking"
-                    delta = (
-                        getattr(chunk, "delta", None)
-                        or getattr(chunk, "content", None)
-                        or str(chunk)
-                    )
+            if thinking:
+                response_text, thinking_content = await self.process_with_thinking(**kwargs)
+                if thinking_content:
+                    yield {
+                        "type": "thinking",
+                        "delta": thinking_content,
+                        "metadata": {},
+                    }
+                full_content = response_text
+            else:
+                response_text = await self.process(**kwargs)
+                full_content = response_text
 
-                # -- Dict chunks (tool_calls, structured events) --
-                elif isinstance(chunk, dict):
-                    if "tool_calls" in chunk and chunk["tool_calls"]:
-                        for tc in chunk["tool_calls"]:
-                            fn = tc.get("function", {})
-                            yield {
-                                "type": "tool_call",
-                                "delta": "",
-                                "metadata": {
-                                    "id": tc.get("id", ""),
-                                    "name": fn.get("name", ""),
-                                    "arguments": fn.get("arguments", ""),
-                                },
-                            }
-                        continue
-                    if "content" in chunk and chunk["content"]:
-                        delta = chunk["content"]
-                        full_content += delta
-
-                # -- Object chunks with content --
-                elif hasattr(chunk, "content") and chunk.content:
-                    delta = chunk.content
-                    full_content += delta
-
-                # -- Plain string chunks --
-                elif isinstance(chunk, str):
-                    delta = chunk
-                    full_content += delta
-
-                if delta:
-                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+            # Emit the full response as a content chunk
+            if full_content:
+                yield {"type": "content", "delta": full_content, "metadata": {}}
 
             # Emit done
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
+            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
 
         # Save to session only if we got actual content
