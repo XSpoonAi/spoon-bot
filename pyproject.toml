@@ -58,8 +58,22 @@ gateway = [
     "PyJWT>=2.8.0",
     "websockets>=12.0",
 ]
+# Multi-platform channel integrations
+telegram = [
+    "python-telegram-bot[all]>=21.0",
+]
+discord = [
+    "discord.py>=2.3.0",
+    "aiohttp>=3.9.0",
+]
+feishu = [
+    "lark-oapi>=1.2.0",
+]
+all-channels = [
+    "spoon-bot[telegram,discord,feishu]",
+]
 all = [
-    "spoon-bot[core,toolkit,memory,web3,document,gateway]",
+    "spoon-bot[toolkit,memory,web3,document,gateway,all-channels]",
 ]
 dev = [
     "pytest>=7.0.0",

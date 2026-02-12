@@ -425,9 +425,13 @@ def status():
 
 @app.command()
 def gateway(
-    telegram_token: Optional[str] = typer.Option(
-        None, "--telegram", envvar="TELEGRAM_BOT_TOKEN",
-        help="Telegram bot token",
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c",
+        help="Path to config file (YAML)",
+    ),
+    channels: Optional[str] = typer.Option(
+        None, "--channels",
+        help="Comma-separated list of channels to enable (e.g., telegram,discord)",
     ),
     cli_enabled: bool = typer.Option(
         True, "--cli/--no-cli",
@@ -443,13 +447,24 @@ def gateway(
     ),
 ):
     """
-    Start spoon-bot in gateway mode (24/7 server).
+    Start spoon-bot in gateway mode (multi-channel server).
 
-    Gateway mode enables multi-channel communication with the agent.
-    Use --telegram to enable Telegram bot integration.
+    Gateway mode enables multi-platform communication with the agent.
+    Supports Telegram, Discord, Feishu, and more.
+
+    Examples:
+      # Load all channels from config file
+      spoon-bot gateway
+
+      # Load specific channels
+      spoon-bot gateway --channels telegram,discord
+
+      # Use custom config
+      spoon-bot gateway --config my-config.yaml
     """
     asyncio.run(_run_gateway(
-        telegram_token=telegram_token,
+        config=config,
+        channels=channels.split(',') if channels else None,
         cli_enabled=cli_enabled,
         model=model,
         workspace=workspace,
@@ -457,7 +472,8 @@ def gateway(
 
 
 async def _run_gateway(
-    telegram_token: Optional[str],
+    config: Optional[Path],
+    channels: Optional[list[str]],
     cli_enabled: bool,
     model: Optional[str],
     workspace: Optional[Path],
@@ -465,41 +481,41 @@ async def _run_gateway(
     """Internal async gateway runner."""
     from spoon_bot.agent.loop import create_agent
     from spoon_bot.channels.manager import ChannelManager
-    from spoon_bot.channels.cli_channel import CLIChannel
 
     workspace = workspace or get_workspace()
 
-    # Show startup panel with config
+    # Show startup panel
     startup_info = Table.grid(padding=(0, 2))
     startup_info.add_column()
     startup_info.add_column()
+    startup_info.add_row("[dim]Mode:[/dim]", "Gateway (Multi-channel)")
     startup_info.add_row("[dim]Workspace:[/dim]", str(workspace))
-    startup_info.add_row("[dim]CLI Channel:[/dim]", "Enabled" if cli_enabled else "Disabled")
-    startup_info.add_row("[dim]Telegram:[/dim]", "Enabled" if telegram_token else "Disabled")
+    if config:
+        startup_info.add_row("[dim]Config:[/dim]", str(config))
+    startup_info.add_row("[dim]CLI:[/dim]", "Enabled" if cli_enabled else "Disabled")
 
     console.print(Panel(
         startup_info,
         title="[bold blue]spoon-bot Gateway[/bold blue]",
-        subtitle="Multi-channel mode",
+        subtitle="Loading configuration...",
         border_style="blue",
     ))
 
-    # Create agent with progress
+    # Create agent
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]"):
             agent = await create_agent(
                 model=model,
                 workspace=workspace,
             )
-        print_success(f"Agent initialized with model: {agent.model}")
+        print_success(f"Agent initialized: {agent.model}")
     except ValueError as e:
-        config_error = ConfigurationError(
+        print_error(ConfigurationError(
             str(e),
-            user_message="Unable to initialize the agent. Please check your configuration.",
-        )
-        print_error(config_error)
+            user_message="Unable to initialize agent. Check your API keys.",
+        ))
         console.print("\n[bold]Quick fix:[/bold]")
-        console.print("  [cyan]export ANTHROPIC_API_KEY=your-api-key[/cyan]")
+        console.print("  [cyan]export OPENROUTER_API_KEY=your-key[/cyan]")
         raise typer.Exit(1)
     except Exception as e:
         print_error(e)
@@ -509,50 +525,68 @@ async def _run_gateway(
     manager = ChannelManager()
     manager.set_agent(agent)
 
-    # Add CLI channel if enabled
-    if cli_enabled:
-        cli_channel = CLIChannel()
-        manager.add_channel(cli_channel)
-        print_success("CLI channel enabled")
+    # Load channels from config
+    try:
+        with console.status("[bold blue]Loading channels...[/bold blue]"):
+            await manager.load_from_config(config)
 
-    # Add Telegram channel if token provided
-    if telegram_token:
-        try:
-            from spoon_bot.channels.telegram_channel import TelegramChannel
-            telegram_channel = TelegramChannel(token=telegram_token)
-            manager.add_channel(telegram_channel)
-            print_success("Telegram channel enabled")
-        except ImportError:
-            print_warning(
-                "python-telegram-bot not installed. "
-                "Install with: pip install python-telegram-bot"
+        # Start specific channels if requested
+        if channels:
+            await manager.start_channels(channels)
+        else:
+            await manager.start_all()
+
+        # Show loaded channels
+        channels_table = Table()
+        channels_table.add_column("Channel", style="cyan")
+        channels_table.add_column("Account", style="green")
+        channels_table.add_column("Status", style="yellow")
+
+        health = await manager.health_check_all()
+        for ch_name, ch_health in health["channels"].items():
+            status = ch_health.get("status", "unknown")
+            status_icon = "✓" if status == "running" else "✗"
+            status_color = "green" if status == "running" else "red"
+
+            # Parse channel name (format: type:account)
+            parts = ch_name.split(":", 1)
+            ch_type = parts[0]
+            ch_account = parts[1] if len(parts) > 1 else "default"
+
+            channels_table.add_row(
+                ch_type,
+                ch_account,
+                f"[{status_color}]{status_icon}[/{status_color}] {status}"
             )
 
-    if not manager.channel_names:
-        print_error(ConfigurationError(
-            "No channels enabled",
-            user_message="No communication channels are enabled. Enable at least one channel."
+        console.print(Panel(
+            channels_table,
+            title=f"[bold]Active Channels ({health['running_channels']}/{health['total_channels']})[/bold]",
+            border_style="green",
         ))
+
+        if health['running_channels'] == 0:
+            print_warning("No channels are running. Check your configuration.")
+            raise typer.Exit(1)
+
+    except FileNotFoundError:
+        print_warning("No config file found. Using defaults.")
+        print_warning("Create config with: cp config.example.yaml ~/.spoon-bot/config.yaml")
+    except ImportError as e:
+        print_error(f"Missing dependency: {e}")
+        console.print("\n[bold]Install missing channels:[/bold]")
+        console.print("  [cyan]uv pip install -e \".[telegram]\"[/cyan]  # Telegram")
+        console.print("  [cyan]uv pip install -e \".[discord]\"[/cyan]   # Discord")
+        console.print("  [cyan]uv pip install -e \".[all-channels]\"[/cyan]  # All")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Failed to load channels: {e}")
         raise typer.Exit(1)
 
-    # Show active channels
-    channels_table = Table.grid()
-    for name in manager.channel_names:
-        channels_table.add_row(f"  [green]>[/green] {name}")
+    console.print("\n[dim]Gateway running. Press Ctrl+C to stop.[/dim]\n")
 
-    console.print(Panel(
-        channels_table,
-        title="[bold]Active Channels[/bold]",
-        border_style="green",
-    ))
-
-    console.print("\n[dim]Press Ctrl+C to stop the gateway[/dim]\n")
-
-    # Start gateway
+    # Keep running
     try:
-        await manager.start()
-
-        # Keep running until interrupted
         while manager.is_running:
             await asyncio.sleep(1)
 
