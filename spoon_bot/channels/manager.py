@@ -100,9 +100,14 @@ class ChannelManager:
 
         Args:
             config_path: Path to config file (uses default locations if None)
+
+        Raises:
+            ImportError: If required channel dependencies are missing
         """
         self._config = load_channels_config(config_path)
         logger.info("Configuration loaded, creating channels...")
+
+        missing_deps = []
 
         # Telegram channels
         for config, account_id in self._config.get_telegram_configs():
@@ -113,6 +118,8 @@ class ChannelManager:
                 self.add_channel(channel)
             except ImportError as e:
                 logger.warning(f"Failed to load Telegram channel: {e}")
+                if "telegram" not in missing_deps:
+                    missing_deps.append("telegram")
 
         # Discord channels
         for config, account_id in self._config.get_discord_configs():
@@ -123,6 +130,8 @@ class ChannelManager:
                 self.add_channel(channel)
             except ImportError as e:
                 logger.warning(f"Failed to load Discord channel: {e}")
+                if "discord" not in missing_deps:
+                    missing_deps.append("discord")
 
         # Feishu channels
         for config, account_id in self._config.get_feishu_configs():
@@ -133,6 +142,8 @@ class ChannelManager:
                 self.add_channel(channel)
             except ImportError as e:
                 logger.warning(f"Failed to load Feishu channel: {e}")
+                if "feishu" not in missing_deps:
+                    missing_deps.append("feishu")
 
         # CLI channel (if enabled)
         if self._config.is_cli_enabled():
@@ -143,6 +154,14 @@ class ChannelManager:
                 self.add_channel(cli_channel)
             except ImportError as e:
                 logger.warning(f"Failed to load CLI channel: {e}")
+
+        # Raise if any configured channels are missing dependencies
+        if missing_deps:
+            deps_str = ", ".join(missing_deps)
+            raise ImportError(
+                f"Missing dependencies for channels: {deps_str}. "
+                f"Install with: uv pip install -e \".[{','.join(missing_deps)}]\""
+            )
 
         logger.info(f"Loaded {len(self._channels)} channels from configuration")
 

@@ -573,14 +573,27 @@ async def _run_gateway(
         print_warning("No config file found. Using defaults.")
         print_warning("Create config with: cp config.example.yaml ~/.spoon-bot/config.yaml")
     except ImportError as e:
-        print_error(f"Missing dependency: {e}")
-        console.print("\n[bold]Install missing channels:[/bold]")
-        console.print("  [cyan]uv pip install -e \".[telegram]\"[/cyan]  # Telegram")
-        console.print("  [cyan]uv pip install -e \".[discord]\"[/cyan]   # Discord")
-        console.print("  [cyan]uv pip install -e \".[all-channels]\"[/cyan]  # All")
+        error_msg = str(e)
+        print_error(ConfigurationError(
+            error_msg,
+            user_message="Missing dependencies for configured channels.",
+        ))
+
+        # Parse missing dependencies from error message
+        if "Missing dependencies for channels:" in error_msg:
+            console.print("\n[bold]Install the missing dependencies:[/bold]")
+            # Extract suggestion from error message if available
+            if "Install with:" in error_msg:
+                install_cmd = error_msg.split("Install with:")[1].strip()
+                console.print(f"  [cyan]{install_cmd}[/cyan]")
+        else:
+            console.print("\n[bold]Install missing channels:[/bold]")
+            console.print("  [cyan]uv pip install -e \".[telegram]\"[/cyan]  # Telegram")
+            console.print("  [cyan]uv pip install -e \".[discord]\"[/cyan]   # Discord")
+            console.print("  [cyan]uv pip install -e \".[all-channels]\"[/cyan]  # All")
         raise typer.Exit(1)
     except Exception as e:
-        print_error(f"Failed to load channels: {e}")
+        print_error(e)
         raise typer.Exit(1)
 
     console.print("\n[dim]Gateway running. Press Ctrl+C to stop.[/dim]\n")

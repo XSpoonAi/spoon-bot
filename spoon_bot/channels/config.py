@@ -28,8 +28,12 @@ class ChannelsConfig:
         self.feishu = config_dict.get("feishu", {})
         self.cli = config_dict.get("cli", {})
 
-    def get_telegram_configs(self) -> list[ChannelConfig]:
-        """Get Telegram channel configurations."""
+    def get_telegram_configs(self) -> list[tuple[ChannelConfig, str]]:
+        """Get Telegram channel configurations.
+
+        Returns:
+            List of tuples containing (ChannelConfig, account_name)
+        """
         if not self.telegram.get("enabled", False):
             return []
 
@@ -183,7 +187,7 @@ def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfi
     if config_path is None:
         # No config found, return empty config
         logger.warning("No channels config file found, using defaults")
-        return ChannelsConfig({"channels": {}})
+        return ChannelsConfig({})
 
     config_path = Path(config_path)
 
@@ -193,7 +197,11 @@ def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfi
     logger.info(f"Loading channels config from: {config_path}")
 
     with open(config_path, "r", encoding="utf-8") as f:
-        full_config = yaml.safe_load(f)
+        full_config = yaml.safe_load(f) or {}
+
+    # Validate config is a dictionary
+    if not isinstance(full_config, dict):
+        raise ValueError(f"Invalid config file format: expected dict, got {type(full_config).__name__}")
 
     # Extract channels section
     channels_dict = full_config.get("channels", {})
