@@ -260,6 +260,20 @@ class AgentLoopConfig(BaseModel):
         description="Use spoon-core SkillManager if available"
     )
 
+    # Session persistence
+    session_store_backend: str = Field(
+        default="file",
+        description="Session storage backend: 'file' (JSONL), 'sqlite', or 'postgres'"
+    )
+    session_store_dsn: str | None = Field(
+        default=None,
+        description="Database connection string (required for 'postgres' backend)"
+    )
+    session_store_db_path: str | None = Field(
+        default=None,
+        description="SQLite database path (for 'sqlite' backend, default: workspace/sessions.db)"
+    )
+
     @field_validator("workspace", mode="before")
     @classmethod
     def coerce_workspace_path(cls, v: Path | str | None) -> Path:

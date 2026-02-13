@@ -62,6 +62,7 @@ from spoon_bot.agent.tools.document import DocumentParseTool
 from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
+from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
 from spoon_bot.exceptions import (
     SpoonBotError,
@@ -118,6 +119,9 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        session_store_backend: str = "file",
+        session_store_dsn: str | None = None,
+        session_store_db_path: str | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -139,6 +143,9 @@ class AgentLoop:
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
             tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
+            session_store_dsn: PostgreSQL DSN for 'postgres' backend.
+            session_store_db_path: SQLite DB path for 'sqlite' backend.
         """
         # Validate parameters
         try:
@@ -180,7 +187,25 @@ class AgentLoop:
         # spoon-bot components
         self.context = ContextBuilder(self.workspace)
         self.tools = ToolRegistry()
-        self.sessions = SessionManager(self.workspace)
+
+        # Session persistence — configurable backend
+        _store_backend = session_store_backend or "file"
+        _store_db_path = session_store_db_path
+        if _store_backend == "sqlite" and not _store_db_path:
+            _store_db_path = str(self.workspace / "sessions.db")
+        try:
+            _session_store = create_session_store(
+                backend=_store_backend,
+                workspace=self.workspace,
+                db_path=_store_db_path,
+                dsn=session_store_dsn,
+            )
+            self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
+            logger.info(f"Session store: {_store_backend}")
+        except Exception as exc:
+            logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
+            self.sessions = SessionManager(self.workspace)
+
         self.memory = MemoryStore(self.workspace)
         self._git = GitManager(self.workspace) if auto_commit else None
 

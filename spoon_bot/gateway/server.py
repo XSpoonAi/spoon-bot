@@ -76,12 +76,20 @@ async def _lifespan(app: FastAPI):
         enable_skills = os.environ.get("SPOON_BOT_ENABLE_SKILLS", "true").lower() == "true"
         logger.info(f"Skills enabled: {enable_skills}")
 
+        # Session persistence config from env
+        session_store_backend = os.environ.get("SESSION_STORE_BACKEND", "file")
+        session_store_dsn = os.environ.get("SESSION_STORE_DSN")
+        session_store_db_path = os.environ.get("SESSION_STORE_DB_PATH")
+
         agent = await create_agent(
             model=model,
             provider=provider,
             workspace=workspace,
             enable_skills=enable_skills,
             auto_commit=False,  # No git auto-commit in Docker gateway mode
+            session_store_backend=session_store_backend,
+            session_store_dsn=session_store_dsn,
+            session_store_db_path=session_store_db_path,
         )
         app_module._agent = agent
 
