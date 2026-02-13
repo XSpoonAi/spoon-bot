@@ -10,10 +10,12 @@ from enum import Enum
 from typing import Annotated, AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from logging import getLogger
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 
-from spoon_bot.gateway.app import get_agent
+from spoon_bot.gateway.app import get_agent, get_config
 from spoon_bot.gateway.auth.dependencies import CurrentUser
 from spoon_bot.gateway.models.requests import ChatRequest
 from spoon_bot.gateway.models.responses import (
@@ -21,13 +23,79 @@ from spoon_bot.gateway.models.responses import (
     MetaInfo,
     ChatResponse,
     StreamChunk,
+    TranscriptionInfo,
     UsageInfo,
     ToolCallInfo,
     StatusResponse,
     AgentStats,
 )
 
+logger = getLogger(__name__)
+
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Audio processing helper
+# ---------------------------------------------------------------------------
+
+async def _process_audio_input(
+    audio_data: str | bytes,
+    audio_format: str = "wav",
+    mime_type: str | None = None,
+    message: str = "",
+    language: str | None = None,
+) -> tuple[str, TranscriptionInfo | None]:
+    """Process audio input through the audio pipeline.
+
+    Returns (message_text, transcription_info).
+    """
+    config = get_config()
+    provider_obj = getattr(get_agent(), "config", None)
+    provider_name = getattr(provider_obj, "provider", "anthropic") if provider_obj else "anthropic"
+
+    try:
+        from spoon_bot.services.audio.pipeline import AudioPipeline
+
+        pipeline = AudioPipeline(
+            provider=provider_name,
+            stt_provider=config.audio.stt_provider,
+            stt_model=config.audio.stt_model,
+            native_audio_providers=frozenset(config.audio.native_audio_providers),
+        )
+
+        if isinstance(audio_data, str):
+            processed = await pipeline.process_base64(
+                b64_audio=audio_data,
+                audio_format=audio_format,
+                mime_type=mime_type,
+                text=message,
+                language=language,
+            )
+        else:
+            processed = await pipeline.process(
+                audio_data=audio_data,
+                audio_format=audio_format,
+                text=message,
+                language=language,
+            )
+
+        transcription_info = None
+        if processed.transcription:
+            transcription_info = TranscriptionInfo(
+                text=processed.transcription.text,
+                language=processed.transcription.language,
+                duration_seconds=processed.transcription.duration_seconds,
+                provider=processed.transcription.provider,
+            )
+        return processed.text, transcription_info
+
+    except Exception as e:
+        logger.error(f"Audio processing failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "AUDIO_PROCESSING_ERROR", "message": str(e)},
+        )
 
 
 def _switch_session(agent, session_key: str | None) -> None:
@@ -119,12 +187,24 @@ async def chat(
         if hasattr(user, "session_key"):
             session_key = user.session_key
 
+        # Process audio input if provided
+        transcription_info = None
+        message = request.message
+        if request.audio_data:
+            message, transcription_info = await _process_audio_input(
+                audio_data=request.audio_data,
+                audio_format=request.audio_format or "wav",
+                mime_type=request.audio_mime_type,
+                message=request.message,
+                language=request.audio_language,
+            )
+
         # Streaming mode: return SSE
         if stream:
             return StreamingResponse(
                 _stream_sse(
                     agent,
-                    request.message,
+                    message,
                     request.media or None,
                     thinking,
                     session_key=session_key,
@@ -140,7 +220,7 @@ async def chat(
         # Non-streaming mode — switch session before processing
         _switch_session(agent, session_key)
 
-        kwargs = {"message": request.message}
+        kwargs = {"message": message}
         if request.media:
             kwargs["media"] = request.media
 
@@ -159,6 +239,7 @@ async def chat(
                 tool_calls=[],  # TODO: Extract tool calls from response
                 usage=None,  # TODO: Track usage
                 thinking_content=thinking_content,
+                transcription=transcription_info,
             ),
             meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
         )
@@ -362,3 +443,134 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "INTERNAL_ERROR", "message": str(e)},
         )
+
+
+# ---------------------------------------------------------------------------
+# Voice / audio endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/voice/transcribe")
+async def voice_transcribe(
+    audio: Annotated[UploadFile, File(description="Audio file to transcribe")],
+    language: Annotated[str | None, Form(description="ISO 639-1 language hint")] = None,
+    user: CurrentUser = None,
+):
+    """Transcribe an audio file to text (STT only, no agent processing)."""
+    request_id = f"req_{uuid4().hex[:12]}"
+    start_time = time.time()
+
+    config = get_config()
+    if not config.audio.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "AUDIO_DISABLED", "message": "Audio input is disabled"},
+        )
+
+    # Read and validate upload
+    audio_bytes = await audio.read()
+    max_bytes = config.audio.max_audio_size_mb * 1024 * 1024
+    if len(audio_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "AUDIO_TOO_LARGE",
+                "message": f"Audio file exceeds {config.audio.max_audio_size_mb}MB limit",
+            },
+        )
+
+    # Determine format from filename or content type
+    audio_format = None
+    if audio.filename:
+        ext = audio.filename.rsplit(".", 1)[-1].lower() if "." in audio.filename else None
+        if ext in {"wav", "mp3", "ogg", "webm", "flac", "m4a", "aac"}:
+            audio_format = ext
+
+    _, transcription_info = await _process_audio_input(
+        audio_data=audio_bytes,
+        audio_format=audio_format or "wav",
+        mime_type=audio.content_type,
+        message="",
+        language=language,
+    )
+
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    return APIResponse(
+        success=True,
+        data=transcription_info,
+        meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
+    )
+
+
+@router.post("/voice/chat")
+async def voice_chat(
+    audio: Annotated[UploadFile, File(description="Audio file")],
+    message: Annotated[str, Form(description="Optional text message")] = "",
+    session_key: Annotated[str, Form(description="Session key")] = "default",
+    language: Annotated[str | None, Form(description="ISO 639-1 language hint")] = None,
+    stream: Annotated[bool, Form(description="Stream response")] = False,
+    user: CurrentUser = None,
+):
+    """Send voice + optional text to the agent (multipart upload)."""
+    request_id = f"req_{uuid4().hex[:12]}"
+    start_time = time.time()
+
+    config = get_config()
+    if not config.audio.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "AUDIO_DISABLED", "message": "Audio input is disabled"},
+        )
+
+    agent = get_agent()
+
+    audio_bytes = await audio.read()
+    max_bytes = config.audio.max_audio_size_mb * 1024 * 1024
+    if len(audio_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "AUDIO_TOO_LARGE",
+                "message": f"Audio file exceeds {config.audio.max_audio_size_mb}MB limit",
+            },
+        )
+
+    # Determine format
+    audio_format = None
+    if audio.filename:
+        ext = audio.filename.rsplit(".", 1)[-1].lower() if "." in audio.filename else None
+        if ext in {"wav", "mp3", "ogg", "webm", "flac", "m4a", "aac"}:
+            audio_format = ext
+
+    processed_message, transcription_info = await _process_audio_input(
+        audio_data=audio_bytes,
+        audio_format=audio_format or "wav",
+        mime_type=audio.content_type,
+        message=message,
+        language=language,
+    )
+
+    if stream:
+        return StreamingResponse(
+            _stream_sse(agent, processed_message, None, False, session_key=session_key),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    _switch_session(agent, session_key)
+    response_text = await agent.process(message=processed_message)
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    return APIResponse(
+        success=True,
+        data=ChatResponse(
+            response=response_text,
+            transcription=transcription_info,
+        ),
+        meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
+    )
