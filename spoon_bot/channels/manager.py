@@ -176,6 +176,9 @@ class ChannelManager:
         """
         logger.info("Reloading configuration...")
 
+        # Save running state before stopping (stop_all sets _running to False)
+        was_running = self._running
+
         # Stop all channels
         await self.stop_all()
 
@@ -185,8 +188,8 @@ class ChannelManager:
         # Reload
         await self.load_from_config(config_path)
 
-        # Restart if was running
-        if self._running:
+        # Restart if was running before reload
+        if was_running:
             await self.start_all()
 
         logger.info("Configuration reloaded")
