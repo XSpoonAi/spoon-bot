@@ -58,7 +58,7 @@ gateway = [
     "PyJWT>=2.8.0",
     "websockets>=12.0",
 ]
-# Multi-platform channel integrations
+# Multi-platform channel integrations (added in v0.2.0)
 telegram = [
     "python-telegram-bot[all]>=21.0",
 ]
@@ -69,9 +69,14 @@ discord = [
 feishu = [
     "lark-oapi>=1.2.0",
 ]
+# Convenience extra for all channel integrations
 all-channels = [
     "spoon-bot[telegram,discord,feishu]",
 ]
+# MIGRATION NOTE (v0.2.0): The 'all' extra now includes channel integrations.
+# Previously 'all' only included core extras (toolkit, memory, web3, document, gateway).
+# If you need the previous behavior without channels, use individual extras instead:
+#   pip install spoon-bot[toolkit,memory,web3,document,gateway]
 all = [
     "spoon-bot[toolkit,memory,web3,document,gateway,all-channels]",
 ]

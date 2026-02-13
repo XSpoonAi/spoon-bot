@@ -96,11 +96,15 @@ class AgentLoop:
         "When the task is fully complete, provide your final answer."
     )
 
+    # Default model/provider - keep in sync with core.py and create_agent()
+    DEFAULT_MODEL = "claude-sonnet-4-20250514"
+    DEFAULT_PROVIDER = "anthropic"
+
     def __init__(
         self,
         workspace: Path | str | None = None,
-        model: str = "meta-llama/llama-3.2-3b-instruct:free",
-        provider: str = "openrouter",
+        model: str | None = None,
+        provider: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
         max_iterations: int = 20,
@@ -152,10 +156,10 @@ class AgentLoop:
             logger.error(f"Configuration validation failed: {e}")
             raise ValueError(f"Invalid AgentLoop configuration: {e}") from e
 
-        # Store config
+        # Store config (apply defaults if not provided)
         self.workspace = self._config.workspace
-        self.model = model
-        self.provider = provider
+        self.model = model or self.DEFAULT_MODEL
+        self.provider = provider or self.DEFAULT_PROVIDER
         self.api_key = api_key
         self.base_url = base_url
         self.max_iterations = self._config.max_iterations
@@ -747,8 +751,8 @@ class AgentLoop:
 
 
 async def create_agent(
-    model: str = "meta-llama/llama-3.2-3b-instruct:free",
-    provider: str = "openrouter",
+    model: str | None = None,
+    provider: str | None = None,
     api_key: str | None = None,
     workspace: Path | str | None = None,
     session_key: str = "default",
@@ -798,6 +802,10 @@ async def create_agent(
         >>> agent = await create_agent()
         >>> agent.add_tool("web_search")
     """
+    # Apply defaults from AgentLoop class constants
+    model = model or AgentLoop.DEFAULT_MODEL
+    provider = provider or AgentLoop.DEFAULT_PROVIDER
+
     agent = AgentLoop(
         model=model,
         provider=provider,

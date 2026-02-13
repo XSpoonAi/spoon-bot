@@ -74,13 +74,18 @@ except ImportError as e:
     ) from e
 
 
+# Default model/provider - keep in sync with agent/loop.py
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_PROVIDER = "anthropic"
+
+
 @dataclass
 class SpoonBotConfig:
     """Configuration for SpoonBot."""
 
     # LLM settings
-    model: str = "claude-sonnet-4.5"
-    provider: str = "openrouter"
+    model: str = DEFAULT_MODEL
+    provider: str = DEFAULT_PROVIDER
     api_key: str | None = None
     base_url: str | None = None
 
@@ -110,12 +115,12 @@ class SpoonBotConfig:
         provider = (
             os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
             or os.environ.get("SPOON_PROVIDER")
-            or "anthropic"
+            or DEFAULT_PROVIDER
         )
         model = (
             os.environ.get("SPOON_BOT_DEFAULT_MODEL")
             or os.environ.get("SPOON_MODEL")
-            or "claude-sonnet-4-20250514"
+            or DEFAULT_MODEL
         )
 
         # Resolve API key based on provider
@@ -389,8 +394,8 @@ class SpoonBot:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4.5",
-    provider: str = "openrouter",
+    model: str | None = None,
+    provider: str | None = None,
     mcp_servers: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
     skill_paths: list[str] | None = None,
@@ -423,8 +428,8 @@ async def create_agent(
         ... )
     """
     config = SpoonBotConfig(
-        model=model,
-        provider=provider,
+        model=model or DEFAULT_MODEL,
+        provider=provider or DEFAULT_PROVIDER,
         mcp_servers=mcp_servers or {},
         enable_skills=enable_skills,
         skill_paths=skill_paths or [],
