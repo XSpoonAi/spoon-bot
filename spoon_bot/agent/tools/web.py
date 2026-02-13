@@ -13,6 +13,25 @@ from loguru import logger
 from spoon_bot.agent.tools.base import Tool
 
 
+# Shared httpx client for connection pooling across web tools.
+# Created lazily on first use to avoid issues at import time.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Get or create a shared httpx.AsyncClient with connection pooling."""
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+            ),
+        )
+    return _shared_client
+
+
 class WebSearchTool(Tool):
     """
     Tool to search the web for information.
@@ -134,17 +153,17 @@ class WebSearchTool(Tool):
             payload["time_range"] = time_range
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    "https://api.tavily.com/search",
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}",
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            client = _get_http_client()
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
         except httpx.HTTPStatusError as exc:
             logger.error(f"Tavily API error: {exc.response.status_code} {exc.response.text[:300]}")
             return f"Error: Tavily search failed ({exc.response.status_code})"
@@ -346,40 +365,37 @@ class WebFetchTool(Tool):
             request_headers.update(headers)
 
         try:
-            async with httpx.AsyncClient(
-                timeout=float(self._timeout),
+            client = _get_http_client()
+            resp = await client.request(
+                method=method,
+                url=url,
+                headers=request_headers,
+                content=body.encode() if body else None,
                 follow_redirects=True,
-                max_redirects=5,
-            ) as client:
-                resp = await client.request(
-                    method=method,
-                    url=url,
-                    headers=request_headers,
-                    content=body.encode() if body else None,
-                )
-                resp.raise_for_status()
+            )
+            resp.raise_for_status()
 
-                content_type = resp.headers.get("content-type", "")
-                raw = resp.text
+            content_type = resp.headers.get("content-type", "")
+            raw = resp.text
 
-                # Truncate very large responses
-                if len(raw) > self._max_content_size:
-                    raw = raw[: self._max_content_size] + "\n\n[Content truncated]"
+            # Truncate very large responses
+            if len(raw) > self._max_content_size:
+                raw = raw[: self._max_content_size] + "\n\n[Content truncated]"
 
-                # JSON response — return formatted
-                if "json" in content_type:
-                    try:
-                        data = resp.json()
-                        return _json.dumps(data, ensure_ascii=False, indent=2)
-                    except Exception:
-                        return raw
+            # JSON response — return formatted
+            if "json" in content_type:
+                try:
+                    data = resp.json()
+                    return _json.dumps(data, ensure_ascii=False, indent=2)
+                except Exception:
+                    return raw
 
-                # HTML — try to extract readable text
-                if "html" in content_type and extract_text:
-                    return self._extract_text_from_html(raw, selector)
+            # HTML — try to extract readable text
+            if "html" in content_type and extract_text:
+                return self._extract_text_from_html(raw, selector)
 
-                # Plain text / other
-                return raw
+            # Plain text / other
+            return raw
 
         except httpx.HTTPStatusError as exc:
             return f"Error: HTTP {exc.response.status_code} for {url}"

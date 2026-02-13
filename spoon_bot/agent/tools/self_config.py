@@ -18,11 +18,15 @@ from spoon_bot.agent.tools.base import Tool
 
 class ActivateToolTool(Tool):
     """
-    Dynamically activate a registered but inactive tool at runtime.
+    Dynamically activate registered but inactive tools at runtime.
 
-    When the agent receives a request that needs a tool not currently loaded,
-    it can call this tool to activate it.  The newly activated tool becomes
-    immediately available for subsequent steps.
+    The AI Agent autonomously decides which tools to activate based on
+    the user's request. No hardcoded topic mapping — the agent reads the
+    tool descriptions from ``list`` and activates what it needs.
+
+    Actions:
+        - activate: Activate one or more tools by name.
+        - list:     Show all inactive tools with descriptions.
     """
 
     def __init__(
@@ -30,12 +34,6 @@ class ActivateToolTool(Tool):
         activate_fn: Callable[[str], bool],
         list_inactive_fn: Callable[[], list[dict[str, str]]],
     ):
-        """
-        Args:
-            activate_fn:  ``AgentLoop.add_tool`` — activates a tool by name.
-            list_inactive_fn:  Returns ``[{"name": ..., "description": ...}]``
-                for currently *inactive* tools.
-        """
         self._activate = activate_fn
         self._list_inactive = list_inactive_fn
 
@@ -46,9 +44,13 @@ class ActivateToolTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Dynamically load an inactive tool so it becomes available for use. "
-            "Call with action='list' to see available tools, or action='activate' "
-            "with tool_name to enable a specific tool."
+            "Dynamically load inactive tools at runtime. "
+            "Use action='list' to see all available inactive tools and their "
+            "descriptions, then action='activate' with tool_name to load the "
+            "ones you need. You can activate multiple tools by calling this "
+            "tool repeatedly. Always activate the right tools BEFORE answering "
+            "domain-specific questions (e.g. crypto prices, blockchain ops, "
+            "security checks)."
         )
 
     @property
@@ -59,11 +61,18 @@ class ActivateToolTool(Tool):
                 "action": {
                     "type": "string",
                     "enum": ["activate", "list"],
-                    "description": "Action: 'activate' a tool or 'list' available inactive tools",
+                    "description": (
+                        "'activate' (load a tool by name), "
+                        "'list' (show all inactive tools)"
+                    ),
                 },
                 "tool_name": {
                     "type": "string",
-                    "description": "Name of the tool to activate (required for 'activate' action)",
+                    "description": (
+                        "Tool name to activate. You can also pass a "
+                        "comma-separated list to activate multiple at once, "
+                        "e.g. 'get_token_price,get_24h_stats'"
+                    ),
                 },
             },
             "required": ["action"],
@@ -73,6 +82,36 @@ class ActivateToolTool(Tool):
         action = kwargs.get("action", "list")
         tool_name = kwargs.get("tool_name")
 
+        if action == "activate":
+            if not tool_name:
+                return "Error: 'tool_name' is required for 'activate' action."
+
+            # Support comma-separated multi-activate
+            names = [n.strip() for n in tool_name.split(",") if n.strip()]
+
+            activated: list[str] = []
+            already_active: list[str] = []
+            not_found: list[str] = []
+
+            for tn in names:
+                ok = self._activate(tn)
+                if ok:
+                    activated.append(tn)
+                else:
+                    # Cannot distinguish "already active" from "not found"
+                    # so just report it generically
+                    already_active.append(tn)
+
+            parts: list[str] = []
+            if activated:
+                parts.append(f"Activated: {', '.join(activated)}.")
+            if already_active:
+                parts.append(
+                    f"Already active or not found: {', '.join(already_active)}."
+                )
+            parts.append("You can now use the activated tools.")
+            return " ".join(parts)
+
         if action == "list":
             inactive = self._list_inactive()
             if not inactive:
@@ -81,18 +120,6 @@ class ActivateToolTool(Tool):
             for t in inactive:
                 lines.append(f"- **{t['name']}**: {t['description']}")
             return "\n".join(lines)
-
-        if action == "activate":
-            if not tool_name:
-                return "Error: 'tool_name' is required for 'activate' action."
-            ok = self._activate(tool_name)
-            if ok:
-                return f"Tool '{tool_name}' activated successfully. You can now use it."
-            return (
-                f"Could not activate '{tool_name}'. "
-                "It may already be active or not registered. "
-                "Use action='list' to see available tools."
-            )
 
         return f"Unknown action: {action}"
 
