@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -125,17 +126,107 @@ class BalanceCheckTool(Tool):
                 f"  - QuickNode: https://quicknode.com"
             )
 
-        # Stub implementation - would use web3.py in real implementation
-        return (
-            f"[STUB] Balance check would execute:\n"
-            f"  Chain: {chain}\n"
-            f"  Address: {wallet_address}\n"
-            f"  RPC: {rpc_url[:30]}...\n"
-            f"  Tokens: {tokens or ['native']}\n\n"
-            f"To enable Web3 functionality, install web3.py:\n"
-            f"  pip install web3\n\n"
-            f"And configure the BalanceCheckTool with a real implementation."
-        )
+        try:
+            from web3 import Web3
+        except ImportError:
+            return (
+                "Error: Web3 provider not available. Install web3.py to enable blockchain tools.\n"
+                "  pip install web3"
+            )
+
+        def _native_symbol(chain_name: str) -> str:
+            symbols = {
+                "ethereum": "ETH",
+                "sepolia": "ETH",
+                "goerli": "ETH",
+                "polygon": "MATIC",
+                "arbitrum": "ETH",
+                "optimism": "ETH",
+                "base": "ETH",
+                "bsc": "BNB",
+                "avalanche": "AVAX",
+                "fantom": "FTM",
+            }
+            return symbols.get(chain_name, "NATIVE")
+
+        def _fetch_balances() -> dict[str, Any]:
+            web3 = Web3(Web3.HTTPProvider(rpc_url))
+            if not web3.is_connected():
+                raise RuntimeError("RPC connection failed")
+
+            checksum_address = web3.to_checksum_address(wallet_address)
+            result: dict[str, Any] = {
+                "chain": chain,
+                "address": checksum_address,
+                "native": {},
+                "tokens": [],
+            }
+
+            native_balance = web3.eth.get_balance(checksum_address)
+            result["native"] = {
+                "symbol": _native_symbol(chain),
+                "wei": str(native_balance),
+                "amount": str(web3.from_wei(native_balance, "ether")),
+            }
+
+            if tokens:
+                erc20_abi = [
+                    {
+                        "constant": True,
+                        "inputs": [{"name": "owner", "type": "address"}],
+                        "name": "balanceOf",
+                        "outputs": [{"name": "balance", "type": "uint256"}],
+                        "type": "function",
+                    },
+                    {
+                        "constant": True,
+                        "inputs": [],
+                        "name": "decimals",
+                        "outputs": [{"name": "", "type": "uint8"}],
+                        "type": "function",
+                    },
+                    {
+                        "constant": True,
+                        "inputs": [],
+                        "name": "symbol",
+                        "outputs": [{"name": "", "type": "string"}],
+                        "type": "function",
+                    },
+                ]
+
+                for token in tokens:
+                    token_address = web3.to_checksum_address(token)
+                    contract = web3.eth.contract(address=token_address, abi=erc20_abi)
+                    balance = contract.functions.balanceOf(checksum_address).call()
+                    try:
+                        decimals = contract.functions.decimals().call()
+                    except Exception:
+                        decimals = 18
+                    try:
+                        symbol = contract.functions.symbol().call()
+                    except Exception:
+                        symbol = "TOKEN"
+
+                    amount = balance / (10 ** decimals)
+                    result["tokens"].append(
+                        {
+                            "address": token_address,
+                            "symbol": symbol,
+                            "decimals": decimals,
+                            "raw": str(balance),
+                            "amount": str(amount),
+                        }
+                    )
+
+            return result
+
+        try:
+            import asyncio
+
+            balances = await asyncio.to_thread(_fetch_balances)
+            return json.dumps(balances, ensure_ascii=True)
+        except Exception as e:
+            return f"Error: Balance check failed: {e}"
 
 
 class TransferTool(Tool):

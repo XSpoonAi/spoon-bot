@@ -118,7 +118,7 @@ class ToolInfo(BaseModel):
 class ToolResponse(BaseModel):
     """Tool execution response."""
 
-    result: str
+    result: Any
     success: bool = True
 
 
