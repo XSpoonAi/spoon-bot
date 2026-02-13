@@ -20,8 +20,24 @@ from spoon_bot.defaults import (
 )
 
 
+class ConfigValidationError(ValueError):
+    """Raised when configuration validation fails."""
+
+    def __init__(self, channel: str, field: str, message: str):
+        self.channel = channel
+        self.field = field
+        super().__init__(f"[{channel}] {field}: {message}")
+
+
 class ChannelsConfig:
     """Configuration container for all channels."""
+
+    # Required fields for each channel type
+    _REQUIRED_FIELDS = {
+        "telegram": ["token"],
+        "discord": ["token"],
+        "feishu": ["app_id", "app_secret"],
+    }
 
     def __init__(self, config_dict: dict[str, Any]):
         """
@@ -29,12 +45,78 @@ class ChannelsConfig:
 
         Args:
             config_dict: Raw configuration dictionary
+
+        Raises:
+            ConfigValidationError: If validation fails
         """
         self.raw = config_dict
         self.telegram = config_dict.get("telegram", {})
         self.discord = config_dict.get("discord", {})
         self.feishu = config_dict.get("feishu", {})
         self.cli = config_dict.get("cli", {})
+
+        # Validate all enabled channels
+        self._validate_all()
+
+    def _validate_all(self) -> None:
+        """Validate all channel configurations."""
+        if self.telegram.get("enabled", False):
+            self._validate_channel("telegram", self.telegram)
+        if self.discord.get("enabled", False):
+            self._validate_channel("discord", self.discord)
+        if self.feishu.get("enabled", False):
+            self._validate_channel("feishu", self.feishu)
+
+    def _validate_channel(self, channel_type: str, config: dict[str, Any]) -> None:
+        """
+        Validate a channel configuration.
+
+        Args:
+            channel_type: Type of channel (telegram, discord, feishu)
+            config: Channel configuration dict
+
+        Raises:
+            ConfigValidationError: If validation fails
+        """
+        # Validate accounts field
+        accounts = config.get("accounts")
+        if accounts is None:
+            raise ConfigValidationError(
+                channel_type, "accounts", "field is required when channel is enabled"
+            )
+        if not isinstance(accounts, list):
+            raise ConfigValidationError(
+                channel_type, "accounts", f"must be a list, got {type(accounts).__name__}"
+            )
+        if len(accounts) == 0:
+            raise ConfigValidationError(
+                channel_type, "accounts", "must contain at least one account"
+            )
+
+        # Validate each account
+        required_fields = self._REQUIRED_FIELDS.get(channel_type, [])
+        for i, account in enumerate(accounts):
+            if not isinstance(account, dict):
+                raise ConfigValidationError(
+                    channel_type, f"accounts[{i}]", f"must be a dict, got {type(account).__name__}"
+                )
+
+            account_name = account.get("name", f"accounts[{i}]")
+
+            # Check required fields
+            for field in required_fields:
+                value = account.get(field)
+                if value is None:
+                    raise ConfigValidationError(
+                        channel_type, f"{account_name}.{field}", "is required"
+                    )
+                # Check if it's an unresolved env var
+                resolved = self._resolve_env(value)
+                if resolved is None and value.startswith("${"):
+                    logger.warning(
+                        f"[{channel_type}] {account_name}.{field}: "
+                        f"environment variable {value} is not set"
+                    )
 
     def _build_common_config(
         self,

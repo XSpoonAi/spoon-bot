@@ -94,12 +94,30 @@ class ChannelManager:
         """
         return self._channels.get(name)
 
-    # Known external package names for each channel type
-    # Used to distinguish "missing dependency" from "internal import error"
-    _CHANNEL_PACKAGES = {
-        "telegram": {"telegram", "python-telegram-bot"},
-        "discord": {"discord", "aiohttp"},
-        "feishu": {"lark", "lark_oapi"},
+    # Channel type registry - single source of truth for channel metadata
+    # Each entry: kind -> {import_path, class_name, packages, install_extra, pip_package}
+    _CHANNEL_REGISTRY = {
+        "telegram": {
+            "import_path": "spoon_bot.channels.telegram.channel",
+            "class_name": "TelegramChannel",
+            "packages": {"telegram", "python-telegram-bot"},
+            "install_extra": "telegram",
+            "pip_package": "python-telegram-bot[all]>=21.0",
+        },
+        "discord": {
+            "import_path": "spoon_bot.channels.discord.channel",
+            "class_name": "DiscordChannel",
+            "packages": {"discord", "aiohttp"},
+            "install_extra": "discord",
+            "pip_package": "discord.py>=2.3.0",
+        },
+        "feishu": {
+            "import_path": "spoon_bot.channels.feishu.channel",
+            "class_name": "FeishuChannel",
+            "packages": {"lark", "lark_oapi"},
+            "install_extra": "feishu",
+            "pip_package": "lark-oapi>=1.2.0",
+        },
     }
 
     def _is_missing_dependency(self, kind: str, error: ImportError) -> bool:
@@ -116,8 +134,9 @@ class ChannelManager:
         # Check if the missing module is a known external package
         missing_name = getattr(error, "name", None)
         if missing_name:
+            registry_entry = self._CHANNEL_REGISTRY.get(kind, {})
+            known_packages = registry_entry.get("packages", set())
             # Direct package name match
-            known_packages = self._CHANNEL_PACKAGES.get(kind, set())
             if missing_name in known_packages:
                 return True
             # Check if it's a submodule of a known package
@@ -173,6 +192,29 @@ class ChannelManager:
                     # Re-raise to make it clear this is a code issue, not missing deps
                     raise
 
+    def _build_install_hint(self, missing_deps: list[str]) -> str:
+        """
+        Build installation hint message for missing dependencies.
+
+        Args:
+            missing_deps: List of missing channel types
+
+        Returns:
+            Formatted installation hint string
+        """
+        extras = []
+        packages = []
+        for kind in missing_deps:
+            entry = self._CHANNEL_REGISTRY.get(kind, {})
+            extras.append(entry.get("install_extra", kind))
+            packages.append(entry.get("pip_package", kind))
+
+        extras_str = ",".join(extras)
+        return (
+            f"Missing dependencies for channels: {', '.join(missing_deps)}. "
+            f"Install with: uv pip install -e \".[{extras_str}]\""
+        )
+
     async def load_from_config(self, config_path: str | Path | None = None) -> None:
         """
         Load channels from configuration file.
@@ -188,21 +230,26 @@ class ChannelManager:
 
         missing_deps: list[str] = []
 
-        # Channel type definitions: (kind, import_path, class_name, config_getter)
-        channel_types = [
-            ("telegram", "spoon_bot.channels.telegram.channel", "TelegramChannel",
-             self._config.get_telegram_configs),
-            ("discord", "spoon_bot.channels.discord.channel", "DiscordChannel",
-             self._config.get_discord_configs),
-            ("feishu", "spoon_bot.channels.feishu.channel", "FeishuChannel",
-             self._config.get_feishu_configs),
-        ]
+        # Config getters for each channel type
+        config_getters = {
+            "telegram": self._config.get_telegram_configs,
+            "discord": self._config.get_discord_configs,
+            "feishu": self._config.get_feishu_configs,
+        }
 
-        # Load all channel types using unified loader
-        for kind, import_path, class_name, config_getter in channel_types:
-            configs = config_getter()
-            if configs:
-                self._load_channel_type(kind, import_path, class_name, configs, missing_deps)
+        # Load all channel types using registry-driven loader
+        for kind, entry in self._CHANNEL_REGISTRY.items():
+            config_getter = config_getters.get(kind)
+            if config_getter:
+                configs = config_getter()
+                if configs:
+                    self._load_channel_type(
+                        kind,
+                        entry["import_path"],
+                        entry["class_name"],
+                        configs,
+                        missing_deps,
+                    )
 
         # CLI channel (if enabled) - special case, no external deps
         if self._config.is_cli_enabled():
@@ -216,11 +263,7 @@ class ChannelManager:
 
         # Raise if any configured channels are missing dependencies
         if missing_deps:
-            deps_str = ", ".join(missing_deps)
-            raise ImportError(
-                f"Missing dependencies for channels: {deps_str}. "
-                f"Install with: uv pip install -e \".[{','.join(missing_deps)}]\""
-            )
+            raise ImportError(self._build_install_hint(missing_deps))
 
         logger.info(f"Loaded {len(self._channels)} channels from configuration")
 
