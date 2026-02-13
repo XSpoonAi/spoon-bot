@@ -316,12 +316,16 @@ class AgentLoop:
 
         # Create SkillManager if enabled
         if self._enable_skills:
-            self._skill_manager = SkillManager(
-                skill_paths=[str(p) for p in self._skill_paths],
-                llm=self._chatbot,
-                auto_discover=True,
-                include_default_paths=False,
-            )
+            import inspect
+            _sm_sig = inspect.signature(SkillManager.__init__)
+            _sm_kwargs: dict[str, Any] = {
+                "skill_paths": [str(p) for p in self._skill_paths],
+                "llm": self._chatbot,
+                "auto_discover": True,
+            }
+            if "include_default_paths" in _sm_sig.parameters:
+                _sm_kwargs["include_default_paths"] = False
+            self._skill_manager = SkillManager(**_sm_kwargs)
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
         else:
