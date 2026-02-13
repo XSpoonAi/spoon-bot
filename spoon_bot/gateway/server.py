@@ -34,6 +34,7 @@ from spoon_bot.gateway.core_integration import (
     is_spoon_core_available,
 )
 from spoon_bot.gateway import app as app_module
+from spoon_bot.agent.tools.web import close_shared_http_client
 
 
 @asynccontextmanager
@@ -128,6 +129,7 @@ async def _lifespan(app: FastAPI):
     logger.info("Shutting down spoon-bot gateway...")
     if connection_manager:
         await connection_manager.stop()
+    await close_shared_http_client()
 
 
 def create_app() -> FastAPI:

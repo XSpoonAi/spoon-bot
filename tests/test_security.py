@@ -90,6 +90,17 @@ class TestCommandValidator:
             assert "injection" in error.lower() or "blocked" in error.lower()
 
         @pytest.mark.parametrize("command", [
+            "echo hello\ncat /etc/passwd",
+            "echo hello\rwhoami",
+            "echo hello\r\nid",
+        ])
+        def test_blocks_newline_chaining(self, command):
+            v = CommandValidator()
+            is_valid, error = v.validate(command)
+            assert not is_valid
+            assert "injection" in error.lower() or "blocked" in error.lower()
+
+        @pytest.mark.parametrize("command", [
             "ls && echo hello",
             "echo test && cat /etc/passwd",
         ])

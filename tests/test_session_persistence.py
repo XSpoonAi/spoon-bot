@@ -321,6 +321,21 @@ class TestSessionManagerWithStore:
         with pytest.raises(ValueError, match="Either 'workspace' or 'store'"):
             SessionManager(workspace=None)
 
+    def test_cache_capacity_min_boundary(self, tmp_dir: Path):
+        store = SQLiteSessionStore(str(tmp_dir / "cap-min.db"))
+        sm = SessionManager(store=store, max_cached_sessions=0)
+        sm.get_or_create("s1")
+        sm.get_or_create("s2")
+        assert len(sm._sessions) == 1
+
+    def test_cache_capacity_enforced(self, tmp_dir: Path):
+        store = SQLiteSessionStore(str(tmp_dir / "cap.db"))
+        sm = SessionManager(store=store, max_cached_sessions=2)
+        sm.get_or_create("s1")
+        sm.get_or_create("s2")
+        sm.get_or_create("s3")
+        assert len(sm._sessions) == 2
+
 
 # ============================================================================
 # §5  create_session_store factory
