@@ -43,6 +43,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.self_config import (
+    ActivateToolTool,
     SelfConfigTool,
     MemoryManagementTool,
     SelfUpgradeTool,
@@ -235,9 +236,11 @@ class AgentLoop:
             )
             system_prompt += (
                 "\n\n## Dynamically Loadable Tools\n\n"
-                "The following tools are available but not currently loaded. "
-                "If you need any of them, tell the user which tool you need "
-                "and they can be loaded on demand.\n\n"
+                "The following tools are registered but not currently active. "
+                "Use the `activate_tool` tool to load any of them on demand. "
+                "For example, if you need `get_token_price` to check crypto prices, "
+                "call `activate_tool(action='activate', tool_name='get_token_price')` "
+                "first, then use the tool in the next step.\n\n"
                 f"{tool_lines}"
             )
 
@@ -321,6 +324,15 @@ class AgentLoop:
         memory_tool.set_memory_store(self.memory)
         self.tools.register(memory_tool)
         self.tools.register(SelfUpgradeTool(workspace=self.workspace))
+
+        # Dynamic tool activation — lets the LLM load tools on demand
+        self.tools.register(ActivateToolTool(
+            activate_fn=self.add_tool,
+            list_inactive_fn=lambda: [
+                {"name": t.name, "description": t.description}
+                for t in self.tools.get_inactive_tools().values()
+            ],
+        ))
 
         # Background task tool
         self.tools.register(SpawnTool())

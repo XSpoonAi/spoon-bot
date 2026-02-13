@@ -4,11 +4,97 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+
+
+# ---------------------------------------------------------------------------
+# Dynamic tool activation
+# ---------------------------------------------------------------------------
+
+
+class ActivateToolTool(Tool):
+    """
+    Dynamically activate a registered but inactive tool at runtime.
+
+    When the agent receives a request that needs a tool not currently loaded,
+    it can call this tool to activate it.  The newly activated tool becomes
+    immediately available for subsequent steps.
+    """
+
+    def __init__(
+        self,
+        activate_fn: Callable[[str], bool],
+        list_inactive_fn: Callable[[], list[dict[str, str]]],
+    ):
+        """
+        Args:
+            activate_fn:  ``AgentLoop.add_tool`` — activates a tool by name.
+            list_inactive_fn:  Returns ``[{"name": ..., "description": ...}]``
+                for currently *inactive* tools.
+        """
+        self._activate = activate_fn
+        self._list_inactive = list_inactive_fn
+
+    @property
+    def name(self) -> str:
+        return "activate_tool"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Dynamically load an inactive tool so it becomes available for use. "
+            "Call with action='list' to see available tools, or action='activate' "
+            "with tool_name to enable a specific tool."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["activate", "list"],
+                    "description": "Action: 'activate' a tool or 'list' available inactive tools",
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the tool to activate (required for 'activate' action)",
+                },
+            },
+            "required": ["action"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        action = kwargs.get("action", "list")
+        tool_name = kwargs.get("tool_name")
+
+        if action == "list":
+            inactive = self._list_inactive()
+            if not inactive:
+                return "All tools are already active."
+            lines = ["Available tools that can be activated:\n"]
+            for t in inactive:
+                lines.append(f"- **{t['name']}**: {t['description']}")
+            return "\n".join(lines)
+
+        if action == "activate":
+            if not tool_name:
+                return "Error: 'tool_name' is required for 'activate' action."
+            ok = self._activate(tool_name)
+            if ok:
+                return f"Tool '{tool_name}' activated successfully. You can now use it."
+            return (
+                f"Could not activate '{tool_name}'. "
+                "It may already be active or not registered. "
+                "Use action='list' to see available tools."
+            )
+
+        return f"Unknown action: {action}"
 
 
 class SelfConfigTool(Tool):

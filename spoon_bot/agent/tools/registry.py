@@ -16,7 +16,7 @@ from spoon_bot.agent.tools.base import Tool, ToolSchema
 # ---------------------------------------------------------------------------
 CORE_TOOLS: frozenset[str] = frozenset({
     "shell", "read_file", "write_file", "edit_file", "list_dir",
-    "web_search", "web_fetch",
+    "web_search", "web_fetch", "activate_tool",
 })
 
 # ---------------------------------------------------------------------------
