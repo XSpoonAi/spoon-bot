@@ -94,6 +94,40 @@ class ChannelManager:
         """
         return self._channels.get(name)
 
+    def _load_channel_type(
+        self,
+        kind: str,
+        import_path: str,
+        class_name: str,
+        configs: list[tuple[Any, str]],
+        missing_deps: list[str],
+    ) -> None:
+        """
+        Load channels of a specific type.
+
+        This unified loader handles ImportError collection for all channel types,
+        reducing code duplication.
+
+        Args:
+            kind: Channel type name (e.g., "telegram", "discord", "feishu")
+            import_path: Full module path to import from
+            class_name: Channel class name to instantiate
+            configs: List of (config, account_id) tuples
+            missing_deps: List to append missing dependency names to
+        """
+        import importlib
+
+        for config, account_id in configs:
+            try:
+                module = importlib.import_module(import_path)
+                channel_class = getattr(module, class_name)
+                channel = channel_class(config, account_id)
+                self.add_channel(channel)
+            except ImportError as e:
+                logger.warning(f"Failed to load {kind} channel: {e}")
+                if kind not in missing_deps:
+                    missing_deps.append(kind)
+
     async def load_from_config(self, config_path: str | Path | None = None) -> None:
         """
         Load channels from configuration file.
@@ -107,45 +141,25 @@ class ChannelManager:
         self._config = load_channels_config(config_path)
         logger.info("Configuration loaded, creating channels...")
 
-        missing_deps = []
+        missing_deps: list[str] = []
 
-        # Telegram channels
-        for config, account_id in self._config.get_telegram_configs():
-            try:
-                from spoon_bot.channels.telegram.channel import TelegramChannel
+        # Channel type definitions: (kind, import_path, class_name, config_getter)
+        channel_types = [
+            ("telegram", "spoon_bot.channels.telegram.channel", "TelegramChannel",
+             self._config.get_telegram_configs),
+            ("discord", "spoon_bot.channels.discord.channel", "DiscordChannel",
+             self._config.get_discord_configs),
+            ("feishu", "spoon_bot.channels.feishu.channel", "FeishuChannel",
+             self._config.get_feishu_configs),
+        ]
 
-                channel = TelegramChannel(config, account_id)
-                self.add_channel(channel)
-            except ImportError as e:
-                logger.warning(f"Failed to load Telegram channel: {e}")
-                if "telegram" not in missing_deps:
-                    missing_deps.append("telegram")
+        # Load all channel types using unified loader
+        for kind, import_path, class_name, config_getter in channel_types:
+            configs = config_getter()
+            if configs:
+                self._load_channel_type(kind, import_path, class_name, configs, missing_deps)
 
-        # Discord channels
-        for config, account_id in self._config.get_discord_configs():
-            try:
-                from spoon_bot.channels.discord.channel import DiscordChannel
-
-                channel = DiscordChannel(config, account_id)
-                self.add_channel(channel)
-            except ImportError as e:
-                logger.warning(f"Failed to load Discord channel: {e}")
-                if "discord" not in missing_deps:
-                    missing_deps.append("discord")
-
-        # Feishu channels
-        for config, account_id in self._config.get_feishu_configs():
-            try:
-                from spoon_bot.channels.feishu.channel import FeishuChannel
-
-                channel = FeishuChannel(config, account_id)
-                self.add_channel(channel)
-            except ImportError as e:
-                logger.warning(f"Failed to load Feishu channel: {e}")
-                if "feishu" not in missing_deps:
-                    missing_deps.append("feishu")
-
-        # CLI channel (if enabled)
+        # CLI channel (if enabled) - special case, no external deps
         if self._config.is_cli_enabled():
             try:
                 from spoon_bot.channels.cli_channel import CLIChannel

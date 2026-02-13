@@ -69,6 +69,14 @@ from spoon_bot.exceptions import (
     user_friendly_error,
 )
 from spoon_bot.services.git import GitManager
+from spoon_bot.defaults import (
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_SHELL_TIMEOUT,
+    DEFAULT_MAX_OUTPUT,
+    DEFAULT_SESSION_KEY,
+)
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -96,10 +104,6 @@ class AgentLoop:
         "When the task is fully complete, provide your final answer."
     )
 
-    # Default model/provider - keep in sync with core.py and create_agent()
-    DEFAULT_MODEL = "claude-sonnet-4-20250514"
-    DEFAULT_PROVIDER = "anthropic"
-
     def __init__(
         self,
         workspace: Path | str | None = None,
@@ -107,10 +111,10 @@ class AgentLoop:
         provider: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_iterations: int = 20,
-        shell_timeout: int = 60,
-        max_output: int = 10000,
-        session_key: str = "default",
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
+        max_output: int = DEFAULT_MAX_OUTPUT,
+        session_key: str = DEFAULT_SESSION_KEY,
         skill_paths: list[Path | str] | None = None,
         mcp_config: dict[str, dict[str, Any]] | None = None,
         system_prompt: str | None = None,
@@ -156,10 +160,10 @@ class AgentLoop:
             logger.error(f"Configuration validation failed: {e}")
             raise ValueError(f"Invalid AgentLoop configuration: {e}") from e
 
-        # Store config (apply defaults if not provided)
+        # Store config (apply defaults from spoon_bot.defaults if not provided)
         self.workspace = self._config.workspace
-        self.model = model or self.DEFAULT_MODEL
-        self.provider = provider or self.DEFAULT_PROVIDER
+        self.model = model or DEFAULT_MODEL
+        self.provider = provider or DEFAULT_PROVIDER
         self.api_key = api_key
         self.base_url = base_url
         self.max_iterations = self._config.max_iterations
@@ -802,9 +806,9 @@ async def create_agent(
         >>> agent = await create_agent()
         >>> agent.add_tool("web_search")
     """
-    # Apply defaults from AgentLoop class constants
-    model = model or AgentLoop.DEFAULT_MODEL
-    provider = provider or AgentLoop.DEFAULT_PROVIDER
+    # Apply defaults from spoon_bot.defaults
+    model = model or DEFAULT_MODEL
+    provider = provider or DEFAULT_PROVIDER
 
     agent = AgentLoop(
         model=model,

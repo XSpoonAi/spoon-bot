@@ -10,6 +10,14 @@ import yaml
 from loguru import logger
 
 from spoon_bot.channels.base import ChannelConfig, ChannelMode
+from spoon_bot.defaults import (
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
+    DEFAULT_RETRY_MAX_ATTEMPTS,
+    DEFAULT_RETRY_DELAY,
+    DEFAULT_HEALTH_CHECK_INTERVAL,
+    DEFAULT_MEDIA_MAX_MB,
+)
 
 
 class ChannelsConfig:
@@ -28,6 +36,36 @@ class ChannelsConfig:
         self.feishu = config_dict.get("feishu", {})
         self.cli = config_dict.get("cli", {})
 
+    def _build_common_config(
+        self,
+        account: dict[str, Any],
+        channel_name: str,
+        mode: ChannelMode,
+    ) -> dict[str, Any]:
+        """
+        Build common configuration fields shared across all channel types.
+
+        This reduces duplication when constructing ChannelConfig objects.
+        Default values are imported from spoon_bot.defaults for consistency.
+
+        Args:
+            account: Raw account configuration dict
+            channel_name: Channel type name (e.g., "telegram", "discord")
+            mode: Channel operating mode
+
+        Returns:
+            Dictionary with common config fields
+        """
+        return {
+            "name": channel_name,
+            "mode": mode,
+            "enabled": True,
+            "retry_max_attempts": account.get("retry_max_attempts", DEFAULT_RETRY_MAX_ATTEMPTS),
+            "retry_delay": account.get("retry_delay", DEFAULT_RETRY_DELAY),
+            "health_check_interval": account.get("health_check_interval", DEFAULT_HEALTH_CHECK_INTERVAL),
+            "agent_config": account.get("agent_config", {}),
+        }
+
     def get_telegram_configs(self) -> list[tuple[ChannelConfig, str]]:
         """Get Telegram channel configurations.
 
@@ -45,21 +83,17 @@ class ChannelsConfig:
             mode_str = account.get("mode", "polling")
             mode = ChannelMode.WEBHOOK if mode_str == "webhook" else ChannelMode.POLLING
 
+            # Build config with common fields + Telegram-specific fields
+            common = self._build_common_config(account, "telegram", mode)
             config = ChannelConfig(
-                name="telegram",
-                mode=mode,
-                enabled=True,
-                retry_max_attempts=account.get("retry_max_attempts", 3),
-                retry_delay=account.get("retry_delay", 1.0),
-                health_check_interval=account.get("health_check_interval", 60.0),
+                **common,
                 webhook_path=account.get("webhook_url"),
                 webhook_secret=account.get("webhook_secret"),
-                # Telegram-specific config
+                # Telegram-specific
                 token=self._resolve_env(account.get("token")),
                 allowed_users=account.get("allowed_users", []),
                 groups=account.get("groups", {}),
-                media_max_mb=account.get("media_max_mb", 20),
-                agent_config=account.get("agent_config", {}),
+                media_max_mb=account.get("media_max_mb", DEFAULT_MEDIA_MAX_MB),
             )
             configs.append((config, name))
 
@@ -76,19 +110,15 @@ class ChannelsConfig:
         for account in accounts:
             name = account.get("name", "default")
 
+            # Build config with common fields + Discord-specific fields
+            common = self._build_common_config(account, "discord", ChannelMode.GATEWAY)
             config = ChannelConfig(
-                name="discord",
-                mode=ChannelMode.GATEWAY,
-                enabled=True,
-                retry_max_attempts=account.get("retry_max_attempts", 3),
-                retry_delay=account.get("retry_delay", 1.0),
-                health_check_interval=account.get("health_check_interval", 60.0),
-                # Discord-specific config
+                **common,
+                # Discord-specific
                 token=self._resolve_env(account.get("token")),
                 intents=account.get("intents", []),
                 allowed_guilds=account.get("allowed_guilds", []),
                 allowed_users=account.get("allowed_users", []),
-                agent_config=account.get("agent_config", {}),
             )
             configs.append((config, name))
 
@@ -105,20 +135,16 @@ class ChannelsConfig:
         for account in accounts:
             name = account.get("name", "default")
 
+            # Build config with common fields + Feishu-specific fields
+            common = self._build_common_config(account, "feishu", ChannelMode.WEBHOOK)
             config = ChannelConfig(
-                name="feishu",
-                mode=ChannelMode.WEBHOOK,
-                enabled=True,
-                retry_max_attempts=account.get("retry_max_attempts", 3),
-                retry_delay=account.get("retry_delay", 1.0),
-                health_check_interval=account.get("health_check_interval", 60.0),
+                **common,
                 webhook_path=account.get("webhook_url"),
-                # Feishu-specific config
+                # Feishu-specific
                 app_id=self._resolve_env(account.get("app_id")),
                 app_secret=self._resolve_env(account.get("app_secret")),
                 verification_token=self._resolve_env(account.get("verification_token")),
                 encrypt_key=self._resolve_env(account.get("encrypt_key")),
-                agent_config=account.get("agent_config", {}),
             )
             configs.append((config, name))
 
@@ -219,12 +245,14 @@ def create_default_config(output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    from spoon_bot.defaults import DEFAULT_MAX_ITERATIONS
+
     default_config = {
         "agent": {
-            "model": "anthropic/claude-3.5-sonnet",
-            "provider": "openrouter",
+            "model": DEFAULT_MODEL,
+            "provider": DEFAULT_PROVIDER,
             "workspace": "~/.spoon-bot/workspace",
-            "max_iterations": 20,
+            "max_iterations": DEFAULT_MAX_ITERATIONS,
             "tool_profile": "core",
         },
         "sessions": {

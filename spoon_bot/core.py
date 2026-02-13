@@ -73,10 +73,8 @@ except ImportError as e:
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
 
-
-# Default model/provider - keep in sync with agent/loop.py
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
-DEFAULT_PROVIDER = "anthropic"
+# Import defaults from single source of truth
+from spoon_bot.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER
 
 
 @dataclass
