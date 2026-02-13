@@ -1,0 +1,118 @@
+# Spoon-Bot Configuration Example
+# Copy this file to ~/.spoon-bot/config.yaml or config.yaml
+# and fill in your credentials
+
+# Agent Configuration
+agent:
+  model: "anthropic/claude-3.5-sonnet"  # or "meta-llama/llama-3.2-3b-instruct:free"
+  provider: "openrouter"
+  workspace: "~/.spoon-bot/workspace"
+  max_iterations: 20
+  tool_profile: "core"  # Options: core, coding, web3, research, full
+
+# Session Configuration
+sessions:
+  default_timeout: 3600  # Session timeout in seconds (1 hour)
+  max_sessions: 100      # Maximum concurrent sessions
+  persistence: true      # Save sessions to disk
+
+# Channels Configuration
+channels:
+  # ========== Telegram Bot ==========
+  telegram:
+    enabled: false  # Set to true to enable
+    accounts:
+      - name: "main_bot"
+        token: "${TELEGRAM_BOT_TOKEN}"  # Get from @BotFather
+        mode: "polling"  # Options: polling, webhook
+
+        # Webhook configuration (only if mode: webhook)
+        webhook_url: "https://your-domain.com/telegram/webhook"
+        webhook_secret: "your_webhook_secret"
+
+        # Access control
+        allowed_users: []  # List of Telegram user IDs (empty = allow all)
+          # - 123456789
+          # - 987654321
+
+        # Group chat settings
+        groups:
+          enabled: true           # Allow group chats
+          require_mention: true   # Require @bot_mention in groups
+          allowed_chats: []       # Chat whitelist (empty = all allowed)
+            # - "@group_username"
+            # - -1001234567890  # Group chat ID
+
+        # Media settings
+        media_max_mb: 20  # Maximum file size in MB
+
+        # Agent configuration for this bot
+        agent_config:
+          tool_profile: "full"  # This bot uses all tools
+          # Or specify individual tools:
+          # enabled_tools:
+          #   - shell
+          #   - read_file
+          #   - write_file
+
+  # ========== Discord Bot ==========
+  discord:
+    enabled: false  # Set to true to enable
+    accounts:
+      - name: "dev_bot"
+        token: "${DISCORD_BOT_TOKEN}"  # From Discord Developer Portal
+
+        # Discord Intents (what events bot can receive)
+        intents:
+          - "guilds"
+          - "guild_messages"
+          - "message_content"  # Required to read message content
+          - "dm_messages"
+          # - "guild_members"  # Uncomment if needed
+          # - "guild_presences"  # Uncomment if needed
+
+        # Access control
+        allowed_guilds: []  # Server whitelist (empty = all allowed)
+          # - 123456789012345678  # Server ID
+
+        allowed_users: []  # User whitelist (empty = all allowed)
+          # - 987654321098765432  # User ID
+
+        # Agent configuration
+        agent_config:
+          tool_profile: "coding"  # This bot focused on coding
+
+  # ========== Feishu (Lark) Bot ==========
+  feishu:
+    enabled: false  # Set to true to enable
+    accounts:
+      - name: "enterprise_bot"
+        app_id: "${FEISHU_APP_ID}"
+        app_secret: "${FEISHU_APP_SECRET}"
+        verification_token: "${FEISHU_VERIFICATION_TOKEN}"
+        encrypt_key: "${FEISHU_ENCRYPT_KEY}"  # Optional: for event encryption
+
+        # Webhook URL (configured in Feishu admin panel)
+        webhook_url: "https://your-domain.com/feishu/webhook"
+
+        # Agent configuration
+        agent_config:
+          tool_profile: "research"
+
+  # ========== CLI (Terminal) ==========
+  cli:
+    enabled: true  # CLI is always available in agent mode
+
+# ========== Environment Variables ==========
+# You can use ${VAR_NAME} syntax to reference environment variables
+# Set them in your shell:
+#   export TELEGRAM_BOT_TOKEN="your_token"
+#   export DISCORD_BOT_TOKEN="your_token"
+#   export FEISHU_APP_ID="your_app_id"
+#   export FEISHU_APP_SECRET="your_secret"
+#   export OPENROUTER_API_KEY="sk-or-v1-..."
+
+# Or create a .env file:
+#   TELEGRAM_BOT_TOKEN=your_token
+#   DISCORD_BOT_TOKEN=your_token
+#   OPENROUTER_API_KEY=sk-or-v1-...

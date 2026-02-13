@@ -99,8 +99,8 @@ class AgentLoop:
     def __init__(
         self,
         workspace: Path | str | None = None,
-        model: str = "claude-sonnet-4-20250514",
-        provider: str = "anthropic",
+        model: str = "meta-llama/llama-3.2-3b-instruct:free",
+        provider: str = "openrouter",
         api_key: str | None = None,
         base_url: str | None = None,
         max_iterations: int = 20,
@@ -277,7 +277,6 @@ class AgentLoop:
                 skill_paths=[str(p) for p in self._skill_paths],
                 llm=self._chatbot,
                 auto_discover=True,
-                include_default_paths=False,
             )
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
@@ -388,6 +387,9 @@ class AgentLoop:
             else:
                 final_content = str(result)
 
+            # Filter out technical execution steps (Step 1:, Step 2:, etc.)
+            final_content = self._filter_execution_steps(final_content)
+
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             return f"I encountered an error: {user_friendly_error(e)}"
@@ -409,6 +411,46 @@ class AgentLoop:
                 logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content
+
+    def _filter_execution_steps(self, content: str) -> str:
+        """
+        Filter out technical execution steps from agent output.
+        Removes lines like "Step 1: Observed output of cmd..."
+
+        Args:
+            content: Raw agent output
+
+        Returns:
+            Cleaned content without execution steps
+        """
+        import re
+
+        lines = content.split('\n')
+        filtered_lines = []
+        skip_until_blank = False
+
+        for line in lines:
+            # Skip lines that match execution step patterns
+            if re.match(r'^Step \d+:', line):
+                skip_until_blank = True
+                continue
+
+            # Skip lines that are part of step output
+            if skip_until_blank:
+                # If we hit a blank line or normal content, stop skipping
+                if line.strip() == '' or not line.startswith((' ', '\t', 'Observed', 'Error', 'Security', 'Command:', 'Successfully')):
+                    skip_until_blank = False
+                    if line.strip():  # Add the line if it's not blank
+                        filtered_lines.append(line)
+                continue
+
+            # Keep all other lines
+            filtered_lines.append(line)
+
+        # Join and clean up excessive blank lines
+        result = '\n'.join(filtered_lines)
+        result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
+        return result.strip()
 
     async def stream(
         self,
@@ -705,8 +747,8 @@ class AgentLoop:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4-20250514",
-    provider: str = "anthropic",
+    model: str = "meta-llama/llama-3.2-3b-instruct:free",
+    provider: str = "openrouter",
     api_key: str | None = None,
     workspace: Path | str | None = None,
     session_key: str = "default",

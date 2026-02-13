@@ -79,8 +79,8 @@ class SpoonBotConfig:
     """Configuration for SpoonBot."""
 
     # LLM settings
-    model: str = "claude-sonnet-4-20250514"
-    provider: str = "anthropic"
+    model: str = "claude-sonnet-4.5"
+    provider: str = "openrouter"
     api_key: str | None = None
     base_url: str | None = None
 
@@ -389,8 +389,8 @@ class SpoonBot:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4-20250514",
-    provider: str = "anthropic",
+    model: str = "claude-sonnet-4.5",
+    provider: str = "openrouter",
     mcp_servers: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
     skill_paths: list[str] | None = None,
