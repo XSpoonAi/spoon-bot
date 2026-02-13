@@ -534,14 +534,24 @@ class AgentLoop:
                 elif isinstance(chunk, dict):
                     if "tool_calls" in chunk and chunk["tool_calls"]:
                         for tc in chunk["tool_calls"]:
-                            fn = tc.get("function", {})
+                            # tc may be a ToolCall pydantic object or a dict
+                            if isinstance(tc, dict):
+                                fn = tc.get("function", {})
+                                tc_id = tc.get("id", "")
+                                fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                                fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                            else:
+                                tc_id = getattr(tc, "id", "")
+                                fn_obj = getattr(tc, "function", None)
+                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
                             yield {
                                 "type": "tool_call",
                                 "delta": "",
                                 "metadata": {
-                                    "id": tc.get("id", ""),
-                                    "name": fn.get("name", ""),
-                                    "arguments": fn.get("arguments", ""),
+                                    "id": tc_id,
+                                    "name": fn_name,
+                                    "arguments": fn_args,
                                 },
                             }
                         continue
