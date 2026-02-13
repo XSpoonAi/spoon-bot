@@ -17,6 +17,7 @@ from spoon_bot.gateway.core_integration import (
     SpoonCorePayments,
     is_spoon_core_available,
 )
+from spoon_bot.agent.tools.web import close_shared_http_client
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
@@ -133,6 +134,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down spoon-bot gateway...")
     if _connection_manager:
         await _connection_manager.stop()
+    await close_shared_http_client()
 
 
 def create_app(config: GatewayConfig | None = None) -> FastAPI:
