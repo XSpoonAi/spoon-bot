@@ -165,7 +165,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("crypto")
             logger.info(f"Loaded {len(tools)} crypto tools")
 
-        except ImportError as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits crypto tools not available: {e}")
 
         return tools
@@ -203,7 +203,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("blockchain")
             logger.info(f"Loaded {len(tools)} blockchain tools")
 
-        except (ImportError, AttributeError, Exception) as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits blockchain tools not available: {e}")
 
         return tools
@@ -254,7 +254,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("security")
             logger.info(f"Loaded {len(tools)} security tools")
 
-        except ImportError as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits security tools not available: {e}")
 
         return tools
@@ -275,7 +275,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("social")
             logger.info(f"Loaded {len(tools)} social tools")
 
-        except ImportError as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits social tools not available: {e}")
 
         return tools
