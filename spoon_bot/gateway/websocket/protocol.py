@@ -120,10 +120,16 @@ class WSRequest(WSMessage):
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WSRequest":
         """Create from dictionary."""
+        raw_params = data.get("params", {})
+        # Ensure params is always a dict – reject non-dict values (#14)
+        if not isinstance(raw_params, dict):
+            raise ValueError(
+                f"'params' must be a JSON object, got {type(raw_params).__name__}"
+            )
         return cls(
             id=data.get("id"),
             method=data.get("method", ""),
-            params=data.get("params", {}),
+            params=raw_params,
         )
 
 

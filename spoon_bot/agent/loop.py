@@ -34,7 +34,10 @@ except ImportError as e:
 
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder
-from spoon_bot.agent.tools.registry import CORE_TOOLS, ToolRegistry
+from spoon_bot.agent.tools.registry import (
+    CORE_TOOLS,
+    ToolRegistry,
+)
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.filesystem import (
     ReadFileTool,
@@ -230,19 +233,7 @@ class AgentLoop:
         # Append available-tools summary so the LLM knows what can be loaded
         inactive_tools = self.tools.get_inactive_tools()
         if inactive_tools:
-            tool_lines = "\n".join(
-                f"- {t.name}: {t.description}"
-                for t in inactive_tools.values()
-            )
-            system_prompt += (
-                "\n\n## Dynamically Loadable Tools\n\n"
-                "The following tools are registered but not currently active. "
-                "Use the `activate_tool` tool to load any of them on demand. "
-                "For example, if you need `get_token_price` to check crypto prices, "
-                "call `activate_tool(action='activate', tool_name='get_token_price')` "
-                "first, then use the tool in the next step.\n\n"
-                f"{tool_lines}"
-            )
+            system_prompt += self._build_dynamic_tools_prompt(inactive_tools)
 
         # Create ChatBot (spoon-core LLM interface)
         self._chatbot = ChatBot(
@@ -253,14 +244,26 @@ class AgentLoop:
             system_prompt=system_prompt,
         )
 
-        # Create MCP tools
+        # Create MCP tools – expand each server into individual tools (#5)
         for name, config in self._mcp_config.items():
             mcp_tool = MCPTool(
                 name=name,
                 description=f"MCP server: {name}",
                 mcp_config=config,
             )
-            self._mcp_tools.append(mcp_tool)
+            # Try to discover real server tools and create one MCPTool per tool
+            try:
+                expanded = await mcp_tool.expand_server_tools()
+                if expanded:
+                    self._mcp_tools.extend(expanded)
+                    logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
+                else:
+                    # Fallback: keep proxy tool (server might be offline)
+                    self._mcp_tools.append(mcp_tool)
+                    logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
+            except Exception as exc:
+                logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
+                self._mcp_tools.append(mcp_tool)
 
         # Only pass active (filtered) tools + MCP tools to the agent
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
@@ -567,8 +570,10 @@ class AgentLoop:
                                 },
                             }
                         continue
-                    if "content" in chunk and chunk["content"]:
-                        delta = chunk["content"]
+                    # Support both "content" and "delta" keys (#10)
+                    text = chunk.get("content") or chunk.get("delta") or ""
+                    if text:
+                        delta = text
                         full_content += delta
 
                 # -- Object chunks with content --
@@ -679,6 +684,36 @@ class AgentLoop:
                 logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content, thinking_content
+
+    # ------------------------------------------------------------------
+    # Dynamic prompt helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_dynamic_tools_prompt(inactive_tools: dict[str, "Tool"]) -> str:
+        """Build the 'Dynamically Loadable Tools' system-prompt section.
+
+        Lists ALL inactive tools with their descriptions so the AI Agent
+        can autonomously decide which to activate. No hardcoded topic
+        mapping — the LLM reads tool descriptions and decides for itself.
+        """
+        lines: list[str] = [
+            "\n\n## Dynamically Loadable Tools\n\n"
+            "The following specialized tools are registered but not yet active. "
+            "Use `activate_tool(action='list')` to refresh this list at any time, "
+            "or `activate_tool(action='activate', tool_name='<name>')` to load "
+            "a tool. You can activate multiple tools in one call using "
+            "comma-separated names.\n\n"
+            "**Read each tool's description carefully and activate the ones "
+            "you need BEFORE answering the user's question. "
+            "Always prefer specialized tools over generic web_search when "
+            "a matching tool is available.**\n"
+        ]
+
+        for tool in inactive_tools.values():
+            lines.append(f"- `{tool.name}`: {tool.description}")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Dynamic tool management
