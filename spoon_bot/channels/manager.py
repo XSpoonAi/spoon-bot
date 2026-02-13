@@ -94,6 +94,38 @@ class ChannelManager:
         """
         return self._channels.get(name)
 
+    # Known external package names for each channel type
+    # Used to distinguish "missing dependency" from "internal import error"
+    _CHANNEL_PACKAGES = {
+        "telegram": {"telegram", "python-telegram-bot"},
+        "discord": {"discord", "aiohttp"},
+        "feishu": {"lark", "lark_oapi"},
+    }
+
+    def _is_missing_dependency(self, kind: str, error: ImportError) -> bool:
+        """
+        Check if an ImportError is due to a missing external dependency.
+
+        Args:
+            kind: Channel type name
+            error: The ImportError to check
+
+        Returns:
+            True if this is a missing dependency, False if it's an internal error
+        """
+        # Check if the missing module is a known external package
+        missing_name = getattr(error, "name", None)
+        if missing_name:
+            # Direct package name match
+            known_packages = self._CHANNEL_PACKAGES.get(kind, set())
+            if missing_name in known_packages:
+                return True
+            # Check if it's a submodule of a known package
+            for pkg in known_packages:
+                if missing_name.startswith(f"{pkg}."):
+                    return True
+        return False
+
     def _load_channel_type(
         self,
         kind: str,
@@ -106,7 +138,9 @@ class ChannelManager:
         Load channels of a specific type.
 
         This unified loader handles ImportError collection for all channel types,
-        reducing code duplication.
+        reducing code duplication. It distinguishes between missing dependencies
+        (which get installation hints) and internal import errors (which are
+        logged with full traceback for debugging).
 
         Args:
             kind: Channel type name (e.g., "telegram", "discord", "feishu")
@@ -116,6 +150,7 @@ class ChannelManager:
             missing_deps: List to append missing dependency names to
         """
         import importlib
+        import traceback
 
         for config, account_id in configs:
             try:
@@ -124,9 +159,19 @@ class ChannelManager:
                 channel = channel_class(config, account_id)
                 self.add_channel(channel)
             except ImportError as e:
-                logger.warning(f"Failed to load {kind} channel: {e}")
-                if kind not in missing_deps:
-                    missing_deps.append(kind)
+                if self._is_missing_dependency(kind, e):
+                    # Missing external dependency - suggest installation
+                    logger.warning(f"Missing {kind} dependency: {e.name or e}")
+                    if kind not in missing_deps:
+                        missing_deps.append(kind)
+                else:
+                    # Internal import error - log full traceback for debugging
+                    logger.error(
+                        f"Internal import error in {kind} channel module:\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    # Re-raise to make it clear this is a code issue, not missing deps
+                    raise
 
     async def load_from_config(self, config_path: str | Path | None = None) -> None:
         """
