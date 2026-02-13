@@ -116,9 +116,9 @@ spoon-bot agent --provider openai --model gpt-5.2
 export DEEPSEEK_API_KEY=your-key
 spoon-bot agent --provider deepseek --model deepseek-v3.2
 
-# Google Gemini 2.5
+# Google Gemini 3
 export GEMINI_API_KEY=your-key
-spoon-bot agent --provider gemini --model gemini-2.5-flash
+spoon-bot agent --provider gemini --model gemini-3-flash-preview
 
 # OpenRouter (access 400+ models with one key)
 export OPENROUTER_API_KEY=sk-or-xxx
@@ -131,33 +131,69 @@ spoon-bot supports multiple LLM providers through the spoon-ai-sdk. You can swit
 
 ### Supported Providers
 
-| Provider | Recommended Models | Notes |
-|----------|-------------------|-------|
-| **Anthropic** | `claude-opus-4.6`, `claude-sonnet-4.5`, `claude-sonnet-4`, `claude-haiku-4.5` | Default provider, 1M context |
-| **OpenAI** | `gpt-5.2`, `gpt-5.2-codex`, `gpt-5`, `gpt-5-mini`, `o4-mini`, `o3` | Full tool support, 400K context |
-| **DeepSeek** | `deepseek-v3.2`, `deepseek-chat-v3.1`, `deepseek-r1` | Cost-effective, 164K context |
-| **Gemini** | `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` | 1M context |
-| **OpenRouter** | 400+ models via single API | Multi-model gateway |
-| **Qwen** | `qwen3-max-thinking`, `qwen3-coder-next`, `qwen3-coder-plus` | Via OpenRouter |
+| Provider | Recommended Models | Context | Notes |
+|----------|-------------------|---------|-------|
+| **Anthropic** | `claude-opus-4.6`, `claude-sonnet-4.5`, `claude-sonnet-4`, `claude-haiku-4.5` | 200K–1M | Default provider |
+| **OpenAI** | `gpt-5.2`, `gpt-5.2-codex`, `gpt-5`, `gpt-5-mini`, `o4-mini`, `o3` | 200K–400K | Full tool support |
+| **DeepSeek** | `deepseek-v3.2`, `deepseek-chat-v3.1`, `deepseek-r1` | 64K–164K | Cost-effective |
+| **Gemini** | `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1M | Google AI |
+| **Qwen** | `qwen3-max-thinking`, `qwen3-coder-next`, `qwen3-coder-plus` | 262K–1M | Via OpenRouter |
+| **OpenRouter** | 400+ models via single API | varies | Multi-model gateway |
 
-### Using Programmatically
+### Per-Provider Configuration
+
+#### Anthropic (Default)
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-xxx
+spoon-bot agent --model claude-sonnet-4.5
+```
 
 ```python
-from spoon_bot.agent.loop import create_agent
+agent = await create_agent(provider="anthropic", model="claude-sonnet-4.5")
+```
 
-# Anthropic Claude (default)
-agent = await create_agent()
+#### OpenAI
 
-# OpenAI GPT-5.2
+```bash
+export OPENAI_API_KEY=sk-xxx
+spoon-bot agent --provider openai --model gpt-5.2
+```
+
+```python
 agent = await create_agent(provider="openai", model="gpt-5.2")
+```
 
-# DeepSeek V3.2
+#### DeepSeek
+
+```bash
+export DEEPSEEK_API_KEY=xxx
+spoon-bot agent --provider deepseek --model deepseek-v3.2
+```
+
+```python
 agent = await create_agent(provider="deepseek", model="deepseek-v3.2")
+```
 
-# Google Gemini 2.5
-agent = await create_agent(provider="gemini", model="gemini-2.5-flash")
+#### Google Gemini
 
-# OpenRouter (access 400+ models with one key)
+```bash
+export GEMINI_API_KEY=xxx
+spoon-bot agent --provider gemini --model gemini-3-flash-preview
+```
+
+```python
+agent = await create_agent(provider="gemini", model="gemini-3-flash-preview")
+```
+
+#### OpenRouter (Multi-Model Gateway)
+
+```bash
+export OPENROUTER_API_KEY=sk-or-xxx
+spoon-bot agent --provider openrouter --model anthropic/claude-sonnet-4.5
+```
+
+```python
 agent = await create_agent(
     provider="openrouter",
     model="anthropic/claude-sonnet-4.5"
@@ -208,14 +244,20 @@ agent = await create_agent(
 | `openai/gpt-5.2` | OpenAI | 400K | $1.75 / $14.00 |
 | `openai/gpt-5.2-codex` | OpenAI | 400K | $1.75 / $14.00 |
 | `openai/gpt-5-mini` | OpenAI | 400K | $0.25 / $2.00 |
+| `openai/gpt-5-nano` | OpenAI | 400K | $0.05 / $0.40 |
 | `openai/o4-mini` | OpenAI | 200K | $1.10 / $4.40 |
+| `openai/o3` | OpenAI | 200K | $2.00 / $8.00 |
+| `google/gemini-3-pro-preview` | Google | 1M | $2.00 / $12.00 |
+| `google/gemini-3-flash-preview` | Google | 1M | $0.50 / $3.00 |
 | `google/gemini-2.5-pro` | Google | 1M | $1.25 / $10.00 |
 | `google/gemini-2.5-flash` | Google | 1M | $0.30 / $2.50 |
 | `deepseek/deepseek-v3.2` | DeepSeek | 164K | $0.25 / $0.38 |
 | `deepseek/deepseek-r1` | DeepSeek | 64K | $0.70 / $2.50 |
 | `qwen/qwen3-max-thinking` | Qwen | 262K | $1.20 / $6.00 |
+| `qwen/qwen3-coder-plus` | Qwen | 1M | — |
 | `qwen/qwen3-coder-next` | Qwen | 262K | $0.07 / $0.30 |
 | `moonshotai/kimi-k2.5` | Moonshot | 262K | $0.45 / $2.25 |
+| `minimax/minimax-m2.5` | MiniMax | 205K | $0.30 / $1.20 |
 
 ### Fallback and Load Balancing
 
@@ -308,6 +350,23 @@ The agent autonomously manages its tool inventory. Instead of hardcoded topic-to
 4. Deactivates unused tools to save context space
 
 Use the `activate_tool` tool with actions `activate` (single or batch) and `list` (show available tools).
+
+## Context Window
+
+spoon-bot automatically resolves the context window based on the selected model. For example, Claude Sonnet 4.5 gets 1M tokens, GPT-5.2 gets 400K, and DeepSeek V3.2 gets 164K. The default for unknown models is 128K.
+
+You can override this via environment variable or code:
+
+```bash
+# Override to 256K
+CONTEXT_WINDOW=256000 spoon-bot agent --model gpt-5.2
+```
+
+```python
+agent = await create_agent(model="gpt-5.2", context_window=256_000)
+```
+
+The agent includes its context budget in the system prompt, allowing it to adjust verbosity accordingly.
 
 ## Architecture
 
@@ -542,6 +601,7 @@ ruff check spoon_bot/
 | `SESSION_STORE_BACKEND` | `file` | Session backend: `file`, `sqlite`, `postgres` |
 | `SESSION_STORE_DB_PATH` | `./workspace/sessions.db` | SQLite database path |
 | `SESSION_STORE_DSN` | — | PostgreSQL connection string |
+| `CONTEXT_WINDOW` | auto | Context window override (tokens) |
 | `GATEWAY_AUTH_REQUIRED` | `false` | Enable gateway authentication |
 | `GATEWAY_API_KEY` | — | Gateway API key |
 | `JWT_SECRET` | — | JWT signing secret |

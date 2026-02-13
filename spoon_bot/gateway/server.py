@@ -81,6 +81,10 @@ async def _lifespan(app: FastAPI):
         session_store_dsn = os.environ.get("SESSION_STORE_DSN")
         session_store_db_path = os.environ.get("SESSION_STORE_DB_PATH")
 
+        # Context window override (optional)
+        _ctx_env = os.environ.get("CONTEXT_WINDOW")
+        context_window = int(_ctx_env) if _ctx_env else None
+
         agent = await create_agent(
             model=model,
             provider=provider,
@@ -90,6 +94,7 @@ async def _lifespan(app: FastAPI):
             session_store_backend=session_store_backend,
             session_store_dsn=session_store_dsn,
             session_store_db_path=session_store_db_path,
+            context_window=context_window,
         )
         app_module._agent = agent
 

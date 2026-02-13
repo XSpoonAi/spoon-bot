@@ -59,7 +59,7 @@ from spoon_bot.agent.tools.web3 import (
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.agent.tools.document import DocumentParseTool
-from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
+from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
@@ -122,6 +122,7 @@ class AgentLoop:
         session_store_backend: str = "file",
         session_store_dsn: str | None = None,
         session_store_db_path: str | None = None,
+        context_window: int | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -146,6 +147,7 @@ class AgentLoop:
             session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
             session_store_dsn: PostgreSQL DSN for 'postgres' backend.
             session_store_db_path: SQLite DB path for 'sqlite' backend.
+            context_window: Override context window in tokens (auto-resolved from model if None).
         """
         # Validate parameters
         try:
@@ -177,6 +179,10 @@ class AgentLoop:
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
         self._auto_commit = auto_commit
+
+        # Context window — auto-resolved from model when not explicit
+        self.context_window = resolve_context_window(model, context_window)
+        logger.info(f"Context window: {self.context_window:,} tokens (model={model})")
 
         # spoon-core components (initialized later)
         self._chatbot: ChatBot | None = None
@@ -254,6 +260,12 @@ class AgentLoop:
 
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
+
+        # Context budget hint
+        system_prompt += (
+            f"\n\n[Context budget: {self.context_window:,} tokens. "
+            f"Be concise when context is limited.]\n"
+        )
 
         # Append available-tools summary so the LLM knows what can be loaded
         inactive_tools = self.tools.get_inactive_tools()
