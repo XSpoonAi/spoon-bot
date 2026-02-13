@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-02-10 10:34 UTC.  
+> **Auto-generated** from source code on 2026-02-09 08:14 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -262,7 +262,7 @@ List all sessions.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:26`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:25`*
 
 ### `POST /v1/sessions`
 
@@ -272,7 +272,7 @@ Create a new session.
 
 **Request Body:** `SessionCreateRequest`
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:63`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:49`*
 
 ### `GET /v1/sessions/{session_key}`
 
@@ -281,7 +281,7 @@ Get session details.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:102`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:82`*
 
 ### `DELETE /v1/sessions/{session_key}`
 
@@ -290,7 +290,7 @@ Delete a session.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:137`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:111`*
 
 ### `POST /v1/sessions/{session_key}/clear`
 
@@ -299,7 +299,7 @@ Clear session history.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:156`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:124`*
 
 ---
 
@@ -312,7 +312,7 @@ List all available tools.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/tools.py:25`*
+*Source: `spoon_bot/gateway/api/v1/tools.py:24`*
 
 ### `GET /v1/tools/{tool_name}/schema`
 
@@ -321,7 +321,7 @@ Get the schema for a specific tool.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/tools.py:52`*
+*Source: `spoon_bot/gateway/api/v1/tools.py:51`*
 
 ### `POST /v1/tools/{tool_name}/execute`
 
@@ -331,7 +331,7 @@ Execute a tool directly.
 
 **Request Body:** `ToolExecuteRequest`
 
-*Source: `spoon_bot/gateway/api/v1/tools.py:83`*
+*Source: `spoon_bot/gateway/api/v1/tools.py:82`*
 
 ---
 
@@ -344,7 +344,7 @@ List all available skills.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:42`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:24`*
 
 ### `POST /v1/skills/{skill_name}/activate`
 
@@ -354,7 +354,7 @@ Activate a skill.
 
 **Request Body:** `SkillActivateRequest`
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:87`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:51`*
 
 ### `POST /v1/skills/{skill_name}/deactivate`
 
@@ -363,7 +363,7 @@ Deactivate a skill.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:134`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:89`*
 
 ---
 
@@ -682,7 +682,7 @@ Tool execution response.
 
 | Field | Type | Default |
 |-------|------|---------|
-| `result` | `Any` | *(required)* |
+| `result` | `str` | *(required)* |
 | `success` | `bool` | True |
 
 #### `ToolListResponse`

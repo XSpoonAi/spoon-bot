@@ -107,24 +107,6 @@ class SessionManager:
         self._sessions[session_key] = session
         return session
 
-    def get(self, session_key: str) -> Session | None:
-        """
-        Get an existing session without creating a new one.
-
-        Args:
-            session_key: Unique session identifier.
-
-        Returns:
-            Session instance if found, otherwise None.
-        """
-        if session_key in self._sessions:
-            return self._sessions[session_key]
-
-        session = self._load_session(session_key)
-        if session is not None:
-            self._sessions[session_key] = session
-        return session
-
     def save(self, session: Session) -> None:
         """
         Save a session to disk.
