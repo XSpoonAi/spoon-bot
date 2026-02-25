@@ -59,9 +59,10 @@ from spoon_bot.agent.tools.web3 import (
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.agent.tools.document import DocumentParseTool
-from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
+from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
+from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
 from spoon_bot.exceptions import (
     SpoonBotError,
@@ -126,6 +127,10 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        session_store_backend: str = "file",
+        session_store_dsn: str | None = None,
+        session_store_db_path: str | None = None,
+        context_window: int | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -147,6 +152,10 @@ class AgentLoop:
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
             tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
+            session_store_dsn: PostgreSQL DSN for 'postgres' backend.
+            session_store_db_path: SQLite DB path for 'sqlite' backend.
+            context_window: Override context window in tokens (auto-resolved from model if None).
         """
         # Validate parameters
         try:
@@ -179,6 +188,10 @@ class AgentLoop:
         self._system_prompt = system_prompt
         self._auto_commit = auto_commit
 
+        # Context window — auto-resolved from model when not explicit
+        self.context_window = resolve_context_window(model, context_window)
+        logger.info(f"Context window: {self.context_window:,} tokens (model={model})")
+
         # spoon-core components (initialized later)
         self._chatbot: ChatBot | None = None
         self._agent: SpoonReactMCP | SpoonReactSkill | None = None
@@ -188,7 +201,25 @@ class AgentLoop:
         # spoon-bot components
         self.context = ContextBuilder(self.workspace)
         self.tools = ToolRegistry()
-        self.sessions = SessionManager(self.workspace)
+
+        # Session persistence — configurable backend
+        _store_backend = session_store_backend or "file"
+        _store_db_path = session_store_db_path
+        if _store_backend == "sqlite" and not _store_db_path:
+            _store_db_path = str(self.workspace / "sessions.db")
+        try:
+            _session_store = create_session_store(
+                backend=_store_backend,
+                workspace=self.workspace,
+                db_path=_store_db_path,
+                dsn=session_store_dsn,
+            )
+            self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
+            logger.info(f"Session store: {_store_backend}")
+        except Exception as exc:
+            logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
+            self.sessions = SessionManager(self.workspace)
+
         self.memory = MemoryStore(self.workspace)
         self._git = GitManager(self.workspace) if auto_commit else None
 
@@ -237,6 +268,12 @@ class AgentLoop:
 
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
+
+        # Context budget hint
+        system_prompt += (
+            f"\n\n[Context budget: {self.context_window:,} tokens. "
+            f"Be concise when context is limited.]\n"
+        )
 
         # Append available-tools summary so the LLM knows what can be loaded
         inactive_tools = self.tools.get_inactive_tools()
@@ -287,11 +324,16 @@ class AgentLoop:
 
         # Create SkillManager if enabled
         if self._enable_skills:
-            self._skill_manager = SkillManager(
-                skill_paths=[str(p) for p in self._skill_paths],
-                llm=self._chatbot,
-                auto_discover=True,
-            )
+            import inspect
+            _sm_sig = inspect.signature(SkillManager.__init__)
+            _sm_kwargs: dict[str, Any] = {
+                "skill_paths": [str(p) for p in self._skill_paths],
+                "llm": self._chatbot,
+                "auto_discover": True,
+            }
+            if "include_default_paths" in _sm_sig.parameters:
+                _sm_kwargs["include_default_paths"] = False
+            self._skill_manager = SkillManager(**_sm_kwargs)
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
         else:

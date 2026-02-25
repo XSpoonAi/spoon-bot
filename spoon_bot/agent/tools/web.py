@@ -32,6 +32,14 @@ def _get_http_client() -> httpx.AsyncClient:
     return _shared_client
 
 
+async def close_shared_http_client() -> None:
+    """Close the shared httpx client so pools are drained on app shutdown."""
+    global _shared_client
+    if _shared_client is not None and not _shared_client.is_closed:
+        await _shared_client.aclose()
+    _shared_client = None
+
+
 class WebSearchTool(Tool):
     """
     Tool to search the web for information.

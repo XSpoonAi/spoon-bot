@@ -86,6 +86,8 @@ class CommandValidator:
         re.compile(r";\s*\S"),  # command1; command2
         re.compile(r"\|\|"),    # command1 || command2
         re.compile(r"&&"),      # command1 && command2
+        # Newline / carriage-return multi-command injection
+        re.compile(r"[\r\n]+\s*\S"),
         # Pipes (can be dangerous but often legitimate - more lenient)
         # Command substitution
         re.compile(r"\$\("),    # $(command)
