@@ -73,14 +73,17 @@ except ImportError as e:
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
 
+# Import defaults from single source of truth
+from spoon_bot.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER
+
 
 @dataclass
 class SpoonBotConfig:
     """Configuration for SpoonBot."""
 
     # LLM settings
-    model: str = "claude-sonnet-4-20250514"
-    provider: str = "anthropic"
+    model: str = DEFAULT_MODEL
+    provider: str = DEFAULT_PROVIDER
     api_key: str | None = None
     base_url: str | None = None
 
@@ -116,12 +119,12 @@ class SpoonBotConfig:
         provider = (
             os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
             or os.environ.get("SPOON_PROVIDER")
-            or "anthropic"
+            or DEFAULT_PROVIDER
         )
         model = (
             os.environ.get("SPOON_BOT_DEFAULT_MODEL")
             or os.environ.get("SPOON_MODEL")
-            or "claude-sonnet-4-20250514"
+            or DEFAULT_MODEL
         )
 
         max_steps = int(
@@ -429,8 +432,8 @@ class SpoonBot:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4-20250514",
-    provider: str = "anthropic",
+    model: str | None = None,
+    provider: str | None = None,
     mcp_servers: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
     skill_paths: list[str] | None = None,
@@ -463,8 +466,8 @@ async def create_agent(
         ... )
     """
     config = SpoonBotConfig(
-        model=model,
-        provider=provider,
+        model=model or DEFAULT_MODEL,
+        provider=provider or DEFAULT_PROVIDER,
         mcp_servers=mcp_servers or {},
         enable_skills=enable_skills,
         skill_paths=skill_paths or [],

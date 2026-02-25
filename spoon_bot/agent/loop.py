@@ -73,6 +73,14 @@ from spoon_bot.exceptions import (
     user_friendly_error,
 )
 from spoon_bot.services.git import GitManager
+from spoon_bot.defaults import (
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_SHELL_TIMEOUT,
+    DEFAULT_MAX_OUTPUT,
+    DEFAULT_SESSION_KEY,
+)
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -103,14 +111,14 @@ class AgentLoop:
     def __init__(
         self,
         workspace: Path | str | None = None,
-        model: str = "claude-sonnet-4-20250514",
-        provider: str = "anthropic",
+        model: str | None = None,
+        provider: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_iterations: int = 20,
-        shell_timeout: int = 60,
-        max_output: int = 10000,
-        session_key: str = "default",
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
+        max_output: int = DEFAULT_MAX_OUTPUT,
+        session_key: str = DEFAULT_SESSION_KEY,
         skill_paths: list[Path | str] | None = None,
         mcp_config: dict[str, dict[str, Any]] | None = None,
         system_prompt: str | None = None,
@@ -156,10 +164,10 @@ class AgentLoop:
             logger.error(f"Configuration validation failed: {e}")
             raise ValueError(f"Invalid AgentLoop configuration: {e}") from e
 
-        # Store config
+        # Store config (apply defaults from spoon_bot.defaults if not provided)
         self.workspace = self._config.workspace
-        self.model = model
-        self.provider = provider
+        self.model = model or DEFAULT_MODEL
+        self.provider = provider or DEFAULT_PROVIDER
         self.api_key = api_key
         self.base_url = base_url
         self.max_iterations = self._config.max_iterations
@@ -283,7 +291,6 @@ class AgentLoop:
                 skill_paths=[str(p) for p in self._skill_paths],
                 llm=self._chatbot,
                 auto_discover=True,
-                include_default_paths=False,
             )
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
@@ -403,6 +410,9 @@ class AgentLoop:
             else:
                 final_content = str(result)
 
+            # Filter out technical execution steps (Step 1:, Step 2:, etc.)
+            final_content = self._filter_execution_steps(final_content)
+
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             return f"I encountered an error: {user_friendly_error(e)}"
@@ -424,6 +434,46 @@ class AgentLoop:
                 logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content
+
+    def _filter_execution_steps(self, content: str) -> str:
+        """
+        Filter out technical execution steps from agent output.
+        Removes lines like "Step 1: Observed output of cmd..."
+
+        Args:
+            content: Raw agent output
+
+        Returns:
+            Cleaned content without execution steps
+        """
+        import re
+
+        lines = content.split('\n')
+        filtered_lines = []
+        skip_until_blank = False
+
+        for line in lines:
+            # Skip lines that match execution step patterns
+            if re.match(r'^Step \d+:', line):
+                skip_until_blank = True
+                continue
+
+            # Skip lines that are part of step output
+            if skip_until_blank:
+                # If we hit a blank line or normal content, stop skipping
+                if line.strip() == '' or not line.startswith((' ', '\t', 'Observed', 'Error', 'Security', 'Command:', 'Successfully')):
+                    skip_until_blank = False
+                    if line.strip():  # Add the line if it's not blank
+                        filtered_lines.append(line)
+                continue
+
+            # Keep all other lines
+            filtered_lines.append(line)
+
+        # Join and clean up excessive blank lines
+        result = '\n'.join(filtered_lines)
+        result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
+        return result.strip()
 
     async def stream(
         self,
@@ -839,8 +889,8 @@ class AgentLoop:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4-20250514",
-    provider: str = "anthropic",
+    model: str | None = None,
+    provider: str | None = None,
     api_key: str | None = None,
     workspace: Path | str | None = None,
     session_key: str = "default",
@@ -890,6 +940,10 @@ async def create_agent(
         >>> agent = await create_agent()
         >>> agent.add_tool("web_search")
     """
+    # Apply defaults from spoon_bot.defaults
+    model = model or DEFAULT_MODEL
+    provider = provider or DEFAULT_PROVIDER
+
     agent = AgentLoop(
         model=model,
         provider=provider,
