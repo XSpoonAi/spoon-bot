@@ -7,7 +7,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **Multi-Provider LLM**: Supports Anthropic, OpenAI, DeepSeek, Gemini, OpenRouter, and more
 - **Agent-centric**: Autonomous execution with safety rails
 - **OS-native**: Built-in shell/filesystem tools as priority
-- **Memory-first**: Four-layer memory system (file + short-term + Mem0 + checkpointer)
+- **Memory-first**: Four-layer memory system (file + semantic search via memsearch + short-term + checkpointer)
 - **Self-managing**: Self-configuration, self-upgrade, memory management tools
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem
@@ -183,6 +183,76 @@ llm_manager = LLMManager(config_manager)
 # Set fallback chain: if OpenAI fails, try Anthropic, then Gemini
 llm_manager.set_fallback_chain(["openai", "anthropic", "gemini"])
 ```
+
+## Semantic Memory (memsearch)
+
+spoon-bot supports semantic memory search via [memsearch](https://github.com/zilliztech/memsearch), which provides hybrid search (dense vector + BM25 full-text) over the agent's Markdown memory files using Milvus Lite.
+
+### Setup
+
+Install the `memory` extra:
+
+```bash
+# With uv
+uv sync --extra memory
+
+# With pip
+pip install -e ".[memory]"
+```
+
+> **Note:** Milvus Lite requires **Linux or macOS**. On Windows, use WSL.
+
+### Environment Variables
+
+Embedding credentials use `OPENAI_EMBEDDING_*` variables to avoid conflicts with standard `OPENAI_*` keys (which may be used for Whisper STT/TTS or the OpenAI LLM provider). If `OPENAI_EMBEDDING_*` variables are not set, the system falls back to the standard `OPENAI_*` variables.
+
+```bash
+# Embedding API (OpenAI-compatible endpoint)
+OPENAI_EMBEDDING_API_KEY=your-embedding-api-key
+OPENAI_EMBEDDING_BASE_URL=https://ai.gitee.com/v1   # or https://api.openai.com/v1
+OPENAI_EMBEDDING_MODEL=Qwen3-Embedding-0.6B          # or text-embedding-3-small
+```
+
+### Programmatic Usage
+
+```python
+from pathlib import Path
+from spoon_bot.memory.semantic_store import SemanticMemoryStore
+
+store = SemanticMemoryStore(
+    workspace=Path("./workspace"),
+    embedding_provider="openai",
+    embedding_model="Qwen3-Embedding-0.6B",
+)
+
+# Index existing memory files
+await store.initialize()
+
+# Semantic search
+results = await store.async_search("Redis caching configuration")
+for r in results:
+    print(f"[{r['heading']}] score={r['score']:.3f}  {r['content'][:80]}")
+```
+
+### AgentLoop Integration
+
+Enable semantic memory in the agent loop via `MemSearchConfig`:
+
+```python
+from spoon_bot.agent.loop import create_agent
+from spoon_bot.config import MemSearchConfig
+
+agent = await create_agent(
+    provider="openrouter",
+    model="google/gemini-3-flash-preview",
+    memsearch_config=MemSearchConfig(
+        enabled=True,
+        embedding_provider="openai",
+    ),
+)
+```
+
+When enabled, the `memory` tool's `search` action automatically uses semantic search instead of basic text matching.
 
 ## Architecture
 

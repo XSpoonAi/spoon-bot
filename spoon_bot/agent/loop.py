@@ -55,7 +55,7 @@ from spoon_bot.agent.tools.web3 import (
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.agent.tools.document import DocumentParseTool
-from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
+from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.memory.store import MemoryStore
@@ -114,6 +114,7 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -177,7 +178,34 @@ class AgentLoop:
         self.context = ContextBuilder(self.workspace)
         self.tools = ToolRegistry()
         self.sessions = SessionManager(self.workspace)
-        self.memory = MemoryStore(self.workspace)
+
+        # Memory store — semantic (memsearch) or file-based
+        self._memsearch_config: MemSearchConfig | None = None
+        if memsearch_config is not None:
+            if isinstance(memsearch_config, dict):
+                self._memsearch_config = MemSearchConfig(**memsearch_config)
+            else:
+                self._memsearch_config = memsearch_config
+
+        if self._memsearch_config and self._memsearch_config.enabled:
+            try:
+                from spoon_bot.memory.semantic_store import SemanticMemoryStore
+                self.memory = SemanticMemoryStore(
+                    self.workspace,
+                    embedding_provider=self._memsearch_config.embedding_provider,
+                    embedding_model=self._memsearch_config.get_embedding_model(),
+                    embedding_api_key=self._memsearch_config.get_embedding_api_key(),
+                    embedding_base_url=self._memsearch_config.get_embedding_base_url(),
+                    milvus_uri=self._memsearch_config.milvus_uri,
+                    collection=self._memsearch_config.collection,
+                )
+                logger.info("Using SemanticMemoryStore (memsearch)")
+            except ImportError:
+                logger.warning("memsearch not installed, falling back to file-based memory")
+                self.memory = MemoryStore(self.workspace)
+        else:
+            self.memory = MemoryStore(self.workspace)
+
         self._git = GitManager(self.workspace) if auto_commit else None
 
         # Skill paths
@@ -222,6 +250,10 @@ class AgentLoop:
         """Initialize spoon-core components."""
         if self._initialized:
             return
+
+        # Initialize semantic memory if enabled
+        if hasattr(self.memory, "initialize"):
+            await self.memory.initialize()
 
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
@@ -716,6 +748,7 @@ async def create_agent(
     auto_commit: bool = True,
     enabled_tools: set[str] | None = None,
     tool_profile: str | None = None,
+    memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -768,6 +801,7 @@ async def create_agent(
         auto_commit=auto_commit,
         enabled_tools=enabled_tools,
         tool_profile=tool_profile,
+        memsearch_config=memsearch_config,
         **kwargs,
     )
 
