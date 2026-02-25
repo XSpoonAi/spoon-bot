@@ -48,7 +48,6 @@ try:
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.agents.skill_mixin import SkillEnabledMixin
     from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
     from spoon_ai.skills import SkillManager
     from spoon_ai.graph import StateGraph
 
@@ -72,6 +71,18 @@ except ImportError as e:
     raise ImportError(
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
+
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    MCP_TOOL_AVAILABLE = True
+    _MCP_TOOL_IMPORT_ERROR: Exception | None = None
+except ImportError as e:
+    MCPTool = None  # type: ignore[assignment]
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_IMPORT_ERROR = e
+    logger.warning(
+        f"MCPTool import failed ({e}). MCP integrations are disabled; SpoonBot core remains available."
+    )
 
 # Import defaults from single source of truth
 from spoon_bot.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER
@@ -191,7 +202,14 @@ class SpoonBot:
         # Create MCP tools — each server exposes multiple tools with their
         # own names.  Use server_name as the config key but let MCPTool
         # handle individual tool discovery internally.
+        if self.config.mcp_servers and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP server configs were provided but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP initialization."
+            )
         for server_name, mcp_config in self.config.mcp_servers.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
             try:
                 mcp_tool = MCPTool(
                     name=server_name,
@@ -363,6 +381,11 @@ class SpoonBot:
     def add_mcp_server(self, name: str, config: dict[str, Any]) -> None:
         """Add an MCP server configuration."""
         self.config.mcp_servers[name] = config
+        if not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                f"MCPTool unavailable ({_MCP_TOOL_IMPORT_ERROR}); stored config for '{name}' but did not create MCP tool."
+            )
+            return
         mcp_tool = MCPTool(name=name, description=f"MCP server: {name}", mcp_config=config)
         self._mcp_tools.append(mcp_tool)
         if self._tool_manager:

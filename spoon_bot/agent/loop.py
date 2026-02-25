@@ -22,7 +22,6 @@ try:
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
     from spoon_ai.skills import SkillManager
 
     SPOON_CORE_AVAILABLE = True
@@ -31,6 +30,18 @@ except ImportError as e:
     raise ImportError(
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
+
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    MCP_TOOL_AVAILABLE = True
+    _MCP_TOOL_IMPORT_ERROR: Exception | None = None
+except ImportError as e:
+    MCPTool = None  # type: ignore[assignment]
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_IMPORT_ERROR = e
+    logger.warning(
+        f"MCPTool import failed ({e}). MCP integrations are disabled; AgentLoop remains available."
+    )
 
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder
@@ -321,25 +332,39 @@ class AgentLoop:
         )
 
         # Create MCP tools – expand each server into individual tools (#5)
+        if self._mcp_config and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP configuration provided but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP server setup."
+            )
         for name, config in self._mcp_config.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
+
             mcp_tool = MCPTool(
                 name=name,
                 description=f"MCP server: {name}",
                 mcp_config=config,
             )
             # Try to discover real server tools and create one MCPTool per tool
-            try:
-                expanded = await mcp_tool.expand_server_tools()
-                if expanded:
-                    self._mcp_tools.extend(expanded)
-                    logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
-                else:
-                    # Fallback: keep proxy tool (server might be offline)
+            if hasattr(mcp_tool, "expand_server_tools"):
+                try:
+                    expanded = await mcp_tool.expand_server_tools()
+                    if expanded:
+                        self._mcp_tools.extend(expanded)
+                        logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
+                    else:
+                        # Fallback: keep proxy tool (server might be offline)
+                        self._mcp_tools.append(mcp_tool)
+                        logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
+                except Exception as exc:
+                    logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
                     self._mcp_tools.append(mcp_tool)
-                    logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
-            except Exception as exc:
-                logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
+            else:
                 self._mcp_tools.append(mcp_tool)
+                logger.info(
+                    f"MCP server '{name}': expand_server_tools() unavailable in this spoon-core version; using proxy."
+                )
 
         # Only pass active (filtered) tools + MCP tools to the agent
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
