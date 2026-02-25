@@ -356,6 +356,22 @@ class MemoryManagementTool(Tool):
         elif action == "search":
             if not query:
                 return "Error: 'query' is required for 'search' action"
+            # Use semantic search if available, else fall back to text search
+            if hasattr(self._memory_store, 'async_search'):
+                raw_results = await self._memory_store.async_search(query, top_k=10)
+                if raw_results:
+                    lines = ["Search results (semantic):"]
+                    for r in raw_results:
+                        source = r.get("source", "unknown")
+                        heading = r.get("heading", "")
+                        score = r.get("score", 0)
+                        content_text = r.get("content", "").strip()
+                        if len(content_text) > 200:
+                            content_text = content_text[:200] + "..."
+                        label = heading if heading else source
+                        lines.append(f"- [{label} | score={score:.3f}] {content_text}")
+                    return "\n".join(lines)
+                return "No results found"
             results = self._memory_store.search(query)
             if results:
                 return "Search results:\n" + "\n".join(results)
