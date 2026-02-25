@@ -22,7 +22,6 @@ try:
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
     from spoon_ai.skills import SkillManager
 
     SPOON_CORE_AVAILABLE = True
@@ -31,6 +30,18 @@ except ImportError as e:
     raise ImportError(
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
+
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    MCP_TOOL_AVAILABLE = True
+    _MCP_TOOL_IMPORT_ERROR: Exception | None = None
+except ImportError as e:
+    MCPTool = None  # type: ignore[assignment]
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_IMPORT_ERROR = e
+    logger.warning(
+        f"MCPTool import failed ({e}). MCP integrations are disabled; AgentLoop remains available."
+    )
 
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder
@@ -59,7 +70,7 @@ from spoon_bot.agent.tools.web3 import (
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.agent.tools.document import DocumentParseTool
-from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params, resolve_context_window
+from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
@@ -131,6 +142,7 @@ class AgentLoop:
         session_store_dsn: str | None = None,
         session_store_db_path: str | None = None,
         context_window: int | None = None,
+        memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -220,7 +232,33 @@ class AgentLoop:
             logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
             self.sessions = SessionManager(self.workspace)
 
-        self.memory = MemoryStore(self.workspace)
+        # Memory store — semantic (memsearch) or file-based
+        self._memsearch_config: MemSearchConfig | None = None
+        if memsearch_config is not None:
+            if isinstance(memsearch_config, dict):
+                self._memsearch_config = MemSearchConfig(**memsearch_config)
+            else:
+                self._memsearch_config = memsearch_config
+
+        if self._memsearch_config and self._memsearch_config.enabled:
+            try:
+                from spoon_bot.memory.semantic_store import SemanticMemoryStore
+                self.memory = SemanticMemoryStore(
+                    self.workspace,
+                    embedding_provider=self._memsearch_config.embedding_provider,
+                    embedding_model=self._memsearch_config.get_embedding_model(),
+                    embedding_api_key=self._memsearch_config.get_embedding_api_key(),
+                    embedding_base_url=self._memsearch_config.get_embedding_base_url(),
+                    milvus_uri=self._memsearch_config.milvus_uri,
+                    collection=self._memsearch_config.collection,
+                )
+                logger.info("Using SemanticMemoryStore (memsearch)")
+            except ImportError:
+                logger.warning("memsearch not installed, falling back to file-based memory")
+                self.memory = MemoryStore(self.workspace)
+        else:
+            self.memory = MemoryStore(self.workspace)
+
         self._git = GitManager(self.workspace) if auto_commit else None
 
         # Skill paths
@@ -266,6 +304,10 @@ class AgentLoop:
         if self._initialized:
             return
 
+        # Initialize semantic memory if enabled
+        if hasattr(self.memory, 'initialize'):
+            await self.memory.initialize()
+
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
 
@@ -290,25 +332,39 @@ class AgentLoop:
         )
 
         # Create MCP tools – expand each server into individual tools (#5)
+        if self._mcp_config and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP configuration provided but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP server setup."
+            )
         for name, config in self._mcp_config.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
+
             mcp_tool = MCPTool(
                 name=name,
                 description=f"MCP server: {name}",
                 mcp_config=config,
             )
             # Try to discover real server tools and create one MCPTool per tool
-            try:
-                expanded = await mcp_tool.expand_server_tools()
-                if expanded:
-                    self._mcp_tools.extend(expanded)
-                    logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
-                else:
-                    # Fallback: keep proxy tool (server might be offline)
+            if hasattr(mcp_tool, "expand_server_tools"):
+                try:
+                    expanded = await mcp_tool.expand_server_tools()
+                    if expanded:
+                        self._mcp_tools.extend(expanded)
+                        logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
+                    else:
+                        # Fallback: keep proxy tool (server might be offline)
+                        self._mcp_tools.append(mcp_tool)
+                        logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
+                except Exception as exc:
+                    logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
                     self._mcp_tools.append(mcp_tool)
-                    logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
-            except Exception as exc:
-                logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
+            else:
                 self._mcp_tools.append(mcp_tool)
+                logger.info(
+                    f"MCP server '{name}': expand_server_tools() unavailable in this spoon-core version; using proxy."
+                )
 
         # Only pass active (filtered) tools + MCP tools to the agent
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
@@ -942,6 +998,7 @@ async def create_agent(
     auto_commit: bool = True,
     enabled_tools: set[str] | None = None,
     tool_profile: str | None = None,
+    memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -998,6 +1055,7 @@ async def create_agent(
         auto_commit=auto_commit,
         enabled_tools=enabled_tools,
         tool_profile=tool_profile,
+        memsearch_config=memsearch_config,
         **kwargs,
     )
 
