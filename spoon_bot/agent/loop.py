@@ -78,6 +78,7 @@ from spoon_bot.memory.store import MemoryStore
 from spoon_bot.exceptions import (
     SpoonBotError,
     APIKeyMissingError,
+    ContextOverflowError,
     LLMError,
     LLMConnectionError,
     LLMTimeoutError,
@@ -331,6 +332,28 @@ class AgentLoop:
             system_prompt=system_prompt,
         )
 
+        # Warn about potential provider/model mismatch that may cause fallback noise
+        if self.provider and self.model:
+            model_lower = self.model.lower()
+            provider_lower = self.provider.lower()
+            _provider_model_hints = {
+                "anthropic": ["claude"],
+                "openai": ["gpt", "o1", "o3", "o4"],
+                "deepseek": ["deepseek"],
+                "gemini": ["gemini"],
+                "openrouter": [],  # openrouter supports all models
+            }
+            expected_prefixes = _provider_model_hints.get(provider_lower, [])
+            if expected_prefixes:
+                model_base = model_lower.rsplit("/", 1)[-1]
+                if not any(model_base.startswith(p) for p in expected_prefixes):
+                    logger.warning(
+                        f"Model '{self.model}' may not be native to provider "
+                        f"'{self.provider}'. If you see fallback errors in logs, "
+                        f"consider using 'openrouter' as provider or matching "
+                        f"the model to the provider."
+                    )
+
         # Create MCP tools – expand each server into individual tools (#5)
         if self._mcp_config and not MCP_TOOL_AVAILABLE:
             logger.warning(
@@ -469,6 +492,44 @@ class AgentLoop:
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
 
+    def _estimate_token_count(self) -> int:
+        """Rough token estimate for current session messages (~4 chars per token)."""
+        return sum(len(m.get("content", "")) for m in self._session.messages) // 4
+
+    def _trim_context_if_needed(self) -> None:
+        """Auto-trim oldest messages if context budget approaches the limit.
+
+        Keeps at minimum the two most recent messages (last user + assistant pair).
+        Raises ContextOverflowError if even after trimming the context is too large.
+        """
+        if not self._session.messages:
+            return
+
+        budget = int(self.context_window * 0.75)
+        estimated = self._estimate_token_count()
+
+        if estimated <= budget:
+            return
+
+        logger.warning(
+            f"Context approaching limit: ~{estimated:,} tokens "
+            f"(budget: {budget:,}, window: {self.context_window:,}). "
+            f"Trimming oldest messages."
+        )
+
+        messages = self._session.messages
+        while len(messages) > 2 and self._estimate_token_count() > budget:
+            removed = messages.pop(0)
+            logger.debug(
+                f"Trimmed message: role={removed.get('role')}, "
+                f"len={len(removed.get('content', ''))}"
+            )
+
+        # If still over the hard limit after trimming, raise
+        final_estimate = self._estimate_token_count()
+        if final_estimate > self.context_window:
+            raise ContextOverflowError(final_estimate, self.context_window)
+
     async def process(
         self,
         message: str,
@@ -498,6 +559,9 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to load memory context: {e}")
 
+        # Trim context if approaching window limit
+        self._trim_context_if_needed()
+
         # Run agent
         try:
             result = await self._agent.run(message)
@@ -513,7 +577,7 @@ class AgentLoop:
 
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
-            return f"I encountered an error: {user_friendly_error(e)}"
+            raise
 
         # Save to session
         try:
@@ -608,6 +672,9 @@ class AgentLoop:
 
         full_content = ""
 
+        # Trim context if approaching window limit
+        self._trim_context_if_needed()
+
         # ------------------------------------------------------------------
         # Streaming uses the spoon-core run+stream pattern:
         #   1. Clear task_done + drain output_queue
@@ -631,7 +698,11 @@ class AgentLoop:
                 except Exception as exc:
                     logger.error(f"Background agent run failed: {exc}")
                     try:
-                        await self._agent.output_queue.put(f"Error: {exc}")
+                        await self._agent.output_queue.put({
+                            "type": "error",
+                            "delta": str(exc),
+                            "metadata": {"error": str(exc), "error_code": type(exc).__name__},
+                        })
                     except Exception:
                         pass
                 finally:
@@ -695,6 +766,14 @@ class AgentLoop:
 
                 # -- Dict chunks (tool_calls, structured events) --
                 elif isinstance(chunk, dict):
+                    if chunk.get("type") == "error":
+                        yield {
+                            "type": "error",
+                            "delta": chunk.get("delta", ""),
+                            "metadata": chunk.get("metadata", {}),
+                        }
+                        continue
+
                     if "tool_calls" in chunk and chunk["tool_calls"]:
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
@@ -790,6 +869,9 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to load memory context: {e}")
 
+        # Trim context if approaching window limit
+        self._trim_context_if_needed()
+
         # Run agent with thinking enabled
         try:
             run_kwargs: dict[str, Any] = {"thinking": True}
@@ -813,7 +895,7 @@ class AgentLoop:
 
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
-            return f"I encountered an error: {user_friendly_error(e)}", None
+            raise
 
         # Save to session
         try:

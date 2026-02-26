@@ -222,6 +222,7 @@ class WebSocketHandler:
         self._current_task_id: str | None = None
         self._current_task: asyncio.Task | None = None
         self._pending_confirms: dict[str, asyncio.Future] = {}
+        self._chat_lock = asyncio.Lock()
 
         self._handlers: dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {
             # Chat methods
@@ -282,7 +283,12 @@ class WebSocketHandler:
     # ========== Chat ==========
 
     async def _handle_chat(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle chat.send / agent.chat — uses the global AgentLoop."""
+        """Handle chat.send / agent.chat — serialized to prevent state races."""
+        async with self._chat_lock:
+            return await self._execute_chat(params)
+
+    async def _execute_chat(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute chat request — uses the global AgentLoop."""
         agent = get_agent()
         manager = get_connection_manager()
         conn = manager.get_connection(self.connection_id)
@@ -304,6 +310,7 @@ class WebSocketHandler:
         task_id = f"task_{uuid4().hex[:8]}"
         self._current_task_id = task_id
         self._cancel_requested = False
+        had_error = False
 
         # Switch agent session to the requested session_key (#11)
         _switch_agent_session(agent, session_key)
@@ -325,6 +332,19 @@ class WebSocketHandler:
                 # Support both "delta" and "content" keys (#10)
                 delta = chunk_data.get("delta", "") or chunk_data.get("content", "")
                 metadata = chunk_data.get("metadata", {})
+
+                # Detect error chunks and propagate as agent.error event
+                if chunk_type == "error":
+                    had_error = True
+                    await manager.send_message(
+                        self.connection_id,
+                        WSEvent(event=ServerEvent.AGENT_ERROR.value, data={
+                            "task_id": task_id,
+                            "error": delta,
+                            "error_code": metadata.get("error_code", "AGENT_RUNTIME_ERROR"),
+                        }),
+                    )
+                    continue
 
                 if chunk_type == "done":
                     # Send stream done event
@@ -376,7 +396,7 @@ class WebSocketHandler:
 
         self._current_task_id = None
         result: dict[str, Any] = {
-            "success": True,
+            "success": not had_error,
             "task_id": task_id,
             "content": response,
             "session_key": session_key,
@@ -550,9 +570,27 @@ class WebSocketHandler:
 
     async def _handle_session_export(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle session.export."""
+        # Wait for any pending chat task to finish so messages are persisted
+        if self._current_task and not self._current_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._current_task), timeout=30.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
         agent = get_agent()
         session_key = params.get("session_key", "default")
-        session = agent.sessions.get(session_key)
+
+        # Prefer agent's current in-memory session (most up-to-date)
+        session = None
+        if (
+            hasattr(agent, '_session')
+            and hasattr(agent._session, 'session_key')
+            and agent._session.session_key == session_key
+        ):
+            session = agent._session
+        else:
+            session = agent.sessions.get(session_key)
+
         if session and hasattr(session, 'messages'):
             return {
                 "success": True,
