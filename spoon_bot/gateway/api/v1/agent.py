@@ -182,9 +182,16 @@ async def chat(
     try:
         agent = get_agent()
 
-        # Get session key from user token or request
+        # Session key: request body takes priority over user token.
+        # Only use user's token session_key when request didn't provide
+        # a custom one (i.e., still has the default value).
         session_key = request.session_key
-        if hasattr(user, "session_key"):
+        if (
+            session_key == "default"
+            and hasattr(user, "session_key")
+            and user.session_key
+            and user.session_key != "default"
+        ):
             session_key = user.session_key
 
         # Process audio input if provided
