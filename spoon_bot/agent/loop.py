@@ -810,14 +810,13 @@ class AgentLoop:
         """Return basic usage statistics for the current session.
 
         Returns:
-            Dictionary with message count, session key, model, and context window.
+            Dictionary with message count, session key, and model.
         """
         history = self._session.get_history()
         return {
             "messages": len(history),
             "session_key": self.session_key,
             "model": self.model,
-            "context_window": self.context_window,
         }
 
     @property

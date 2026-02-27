@@ -585,11 +585,6 @@ async def _run_gateway(
     effective_max_iterations = agent_cfg.get("max_iterations")
     effective_enable_skills = agent_cfg.get("enable_skills", True)
 
-    # Session store from YAML (less commonly overridden via CLI)
-    session_store_backend = agent_cfg.get("session_store_backend") or os.getenv("SESSION_STORE_BACKEND", "file")
-    session_store_dsn = agent_cfg.get("session_store_dsn") or os.getenv("SESSION_STORE_DSN")
-    session_store_db_path = agent_cfg.get("session_store_db_path") or os.getenv("SESSION_STORE_DB_PATH")
-
     # ------------------------------------------------------------------
     # 3. Show startup panel with effective values
     # ------------------------------------------------------------------
@@ -623,9 +618,6 @@ async def _run_gateway(
         base_url=effective_base_url,
         workspace=effective_workspace,
         enable_skills=effective_enable_skills,
-        session_store_backend=session_store_backend,
-        session_store_dsn=session_store_dsn,
-        session_store_db_path=session_store_db_path,
     )
     if effective_tool_profile is not None:
         create_kwargs["tool_profile"] = effective_tool_profile

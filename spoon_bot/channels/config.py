@@ -500,18 +500,13 @@ def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfi
         FileNotFoundError: If an explicit config file is not found.
         yaml.YAMLError: If YAML parsing fails.
     """
-    try:
-        full_config = _find_and_load_yaml(config_path)
-    except FileNotFoundError:
-        raise
-    except Exception:
-        raise
+    full_config = _find_and_load_yaml(config_path)
 
     if not full_config:
         logger.warning("No channels config file found, using defaults")
         return ChannelsConfig({})
 
-    logger.info(f"Loading channels config (path resolved internally)")
+    logger.info("Loading channels config from YAML")
     return ChannelsConfig(full_config.get("channels", {}))
 
 

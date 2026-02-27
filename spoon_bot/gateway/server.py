@@ -112,25 +112,6 @@ async def _lifespan(app: FastAPI):
         )
         logger.info(f"Skills enabled: {enable_skills}")
 
-        # Session persistence — env vars override YAML
-        session_store_backend = (
-            os.environ.get("SESSION_STORE_BACKEND")
-            or yaml_agent.get("session_store_backend")
-            or "file"
-        )
-        session_store_dsn = (
-            os.environ.get("SESSION_STORE_DSN")
-            or yaml_agent.get("session_store_dsn")
-        )
-        session_store_db_path = (
-            os.environ.get("SESSION_STORE_DB_PATH")
-            or yaml_agent.get("session_store_db_path")
-        )
-
-        # Context window override (optional)
-        _ctx_env = os.environ.get("CONTEXT_WINDOW")
-        context_window = int(_ctx_env) if _ctx_env else None
-
         create_kwargs: dict = dict(
             model=model,
             provider=provider,

@@ -34,30 +34,13 @@ channels:
 
         media_max_mb: 20
 
-  # Discord Bot
+  # Discord Bot (not yet implemented)
   discord:
-    enabled: true
-    accounts:
-      - name: "spoon_discord_bot"
-        token: "${DISCORD_BOT_TOKEN}"
-        intents:
-          - "guilds"
-          - "guild_messages"
-          - "message_content"
-          - "dm_messages"
-        allowed_guilds:
-          - 1476166258268311708
-        allowed_users:
-          - 1469248717532958823
+    enabled: false
 
-  # Feishu Bot (WebSocket long-connection)
+  # Feishu Bot (not yet implemented)
   feishu:
-    enabled: true
-    accounts:
-      - name: "spoon_feishu_bot"
-        app_id: "${FEISHU_APP_ID}"
-        app_secret: "${FEISHU_APP_SECRET}"
-        mode: "ws"
+    enabled: false
 
   # CLI
   cli:
