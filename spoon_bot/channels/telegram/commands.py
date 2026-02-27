@@ -396,7 +396,7 @@ class CommandHandlers:
 
         try:
             self._agent.note(text)
-            await update.message.reply_text(f"📝 Note saved.")
+            await update.message.reply_text("Note saved.")
         except Exception as e:
             await update.message.reply_text(f"Error saving note: {e}")
 
@@ -419,7 +419,7 @@ class CommandHandlers:
 
         try:
             self._agent.remember(text)
-            await update.message.reply_text("🧠 Remembered.")
+            await update.message.reply_text("Remembered.")
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
 

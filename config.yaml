@@ -25,8 +25,9 @@ channels:
         token: "${TELEGRAM_BOT_TOKEN}"
         mode: "polling"
 
-        allowed_users:
-          - 7656878599
+        # allowed_users: set via TELEGRAM_USER_ID env var, or list IDs here
+        # allowed_users:
+        #   - 123456789
 
         groups:
           enabled: false

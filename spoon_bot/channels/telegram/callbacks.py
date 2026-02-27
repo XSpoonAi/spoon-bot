@@ -106,6 +106,8 @@ class CallbackRouter:
             return
 
         if self._agent:
+            # AgentLoop.model is a plain str attribute (set in __init__).
+            # Reassigning it switches the model for subsequent LLM calls.
             self._agent.model = model_id
             logger.info(f"User {user_id} switched model to {model_id}")
 
@@ -175,13 +177,8 @@ class CallbackRouter:
 
         # Try to get skill details from agent
         detail = f"*Skill:* `{skill_name}`"
-        if self._agent and self._agent._skill_manager:
-            try:
-                all_skills = self._agent._skill_manager.list()
-                if skill_name in all_skills:
-                    detail += "\n\nThis skill is available and ready to use."
-            except Exception:
-                pass
+        if self._agent and skill_name in self._agent.skills:
+            detail += "\n\nThis skill is available and ready to use."
 
         await query.message.reply_text(detail, parse_mode="Markdown")
 
