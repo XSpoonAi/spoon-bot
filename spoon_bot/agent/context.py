@@ -1,5 +1,7 @@
 """Context builder for assembling agent prompts."""
 
+from __future__ import annotations
+
 import base64
 import mimetypes
 from datetime import datetime

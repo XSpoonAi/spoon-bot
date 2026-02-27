@@ -3,6 +3,8 @@
 All tools enforce workspace boundary security to prevent path traversal attacks.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Any
 import aiofiles

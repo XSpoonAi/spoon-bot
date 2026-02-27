@@ -39,6 +39,9 @@ from spoon_bot.gateway import app as app_module
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Application lifespan handler with auto agent initialization."""
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
 
     logger.info("Starting spoon-bot gateway (Docker mode)...")
     logger.info(f"spoon-core SDK available: {is_spoon_core_available()}")
@@ -48,9 +51,31 @@ async def _lifespan(app: FastAPI):
     await connection_manager.start()
     app_module._connection_manager = connection_manager
 
-    # Auto-create agent from environment variables
-    provider = os.environ.get("SPOON_BOT_DEFAULT_PROVIDER", "anthropic")
-    model = os.environ.get("SPOON_BOT_DEFAULT_MODEL", "")
+    # Auto-create agent.
+    # Priority: env vars > YAML agent section > built-in defaults.
+    # YAML is loaded when SPOON_BOT_CONFIG is set or config.yaml is found in default paths.
+    try:
+        from spoon_bot.channels.config import load_agent_config
+        yaml_agent: dict = load_agent_config()
+    except Exception as _yaml_err:
+        logger.debug(f"YAML agent config not loaded: {_yaml_err}")
+        yaml_agent = {}
+
+    provider = (
+        os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
+        or yaml_agent.get("provider")
+        or "anthropic"
+    )
+    model = (
+        os.environ.get("SPOON_BOT_DEFAULT_MODEL")
+        or yaml_agent.get("model")
+        or ""
+    )
+    workspace = (
+        os.environ.get("SPOON_BOT_WORKSPACE_PATH")
+        or yaml_agent.get("workspace")
+        or "/data/workspace"
+    )
 
     # Resolve base URL from multiple env vars (provider-specific takes priority)
     base_url = ""
@@ -60,8 +85,6 @@ async def _lifespan(app: FastAPI):
         base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get("BASE_URL", "")
     else:
         base_url = os.environ.get("BASE_URL", "")
-
-    workspace = os.environ.get("SPOON_BOT_WORKSPACE_PATH", "/data/workspace")
 
     # Determine default model per provider if not specified
     if not model:
@@ -82,10 +105,33 @@ async def _lifespan(app: FastAPI):
     try:
         from spoon_bot.agent.loop import create_agent
 
-        enable_skills = os.environ.get("SPOON_BOT_ENABLE_SKILLS", "true").lower() == "true"
+        _skills_env = os.environ.get("SPOON_BOT_ENABLE_SKILLS")
+        enable_skills = (
+            _skills_env.lower() == "true" if _skills_env is not None
+            else yaml_agent.get("enable_skills", True)
+        )
         logger.info(f"Skills enabled: {enable_skills}")
 
-        agent = await create_agent(
+        # Session persistence — env vars override YAML
+        session_store_backend = (
+            os.environ.get("SESSION_STORE_BACKEND")
+            or yaml_agent.get("session_store_backend")
+            or "file"
+        )
+        session_store_dsn = (
+            os.environ.get("SESSION_STORE_DSN")
+            or yaml_agent.get("session_store_dsn")
+        )
+        session_store_db_path = (
+            os.environ.get("SESSION_STORE_DB_PATH")
+            or yaml_agent.get("session_store_db_path")
+        )
+
+        # Context window override (optional)
+        _ctx_env = os.environ.get("CONTEXT_WINDOW")
+        context_window = int(_ctx_env) if _ctx_env else None
+
+        create_kwargs: dict = dict(
             model=model,
             provider=provider,
             base_url=base_url or None,
@@ -93,6 +139,12 @@ async def _lifespan(app: FastAPI):
             enable_skills=enable_skills,
             auto_commit=False,  # No git auto-commit in Docker gateway mode
         )
+        if yaml_agent.get("base_url"):
+            create_kwargs["base_url"] = yaml_agent["base_url"]
+        if yaml_agent.get("tool_profile"):
+            create_kwargs["tool_profile"] = yaml_agent["tool_profile"]
+
+        agent = await create_agent(**create_kwargs)
         app_module._agent = agent
 
         # Log tool/skill counts

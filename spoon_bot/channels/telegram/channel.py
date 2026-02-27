@@ -1,18 +1,25 @@
-"""Enhanced Telegram channel with full features."""
+"""Enhanced Telegram channel with full command and InlineKeyboard support."""
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from spoon_bot.bus.events import InboundMessage, OutboundMessage
 from spoon_bot.channels.base import BaseChannel, ChannelConfig, ChannelMode, ChannelStatus
+from spoon_bot.channels.telegram.constants import BOT_COMMANDS, DEFAULT_USER_STATE
 
 try:
-    from telegram import Bot, Update
-    from telegram.ext import Application, CommandHandler, MessageHandler, filters
+    from telegram import BotCommand, Bot, Update
+    from telegram.ext import (
+        Application,
+        CallbackQueryHandler,
+        CommandHandler,
+        MessageHandler,
+        filters,
+    )
 
     TELEGRAM_AVAILABLE = True
 except ImportError:
@@ -22,6 +29,9 @@ except ImportError:
         "Install with: pip install python-telegram-bot[all]"
     )
 
+if TYPE_CHECKING:
+    from spoon_bot.agent.loop import AgentLoop
+
 
 class TelegramChannel(BaseChannel):
     """
@@ -30,8 +40,10 @@ class TelegramChannel(BaseChannel):
     Features:
     - Polling and Webhook modes
     - Group chat support with mention filtering
-    - Media handling (images, documents, audio, video)
-    - Inline buttons support
+    - Media handling (images, documents, audio, video, voice)
+    - 23 slash commands with InlineKeyboard menus
+    - CallbackQuery routing for interactive buttons
+    - Per-user think/verbose state
     - User whitelist
     - Per-account configuration
     """
@@ -67,6 +79,43 @@ class TelegramChannel(BaseChannel):
         self._bot: Bot | None = None
         self._bot_username: str | None = None
 
+        # Per-user state (think/verbose)
+        self._user_states: dict[int, dict] = {}
+
+        # Sub-handlers (lazy-imported to avoid circular deps at module level)
+        self._commands: Any = None
+        self._callbacks: Any = None
+        self._media_ext: Any = None
+
+    # ------------------------------------------------------------------
+    # Per-user state helpers
+    # ------------------------------------------------------------------
+
+    def get_user_state(self, user_id: int) -> dict:
+        """Get per-user state, creating defaults if needed."""
+        return self._user_states.setdefault(user_id, dict(DEFAULT_USER_STATE))
+
+    def set_user_state(self, user_id: int, key: str, value: Any) -> None:
+        """Update a single key in per-user state."""
+        state = self.get_user_state(user_id)
+        state[key] = value
+
+    # ------------------------------------------------------------------
+    # Agent propagation
+    # ------------------------------------------------------------------
+
+    def set_agent(self, agent: AgentLoop) -> None:
+        """Override to propagate agent to command/callback handlers."""
+        super().set_agent(agent)
+        if self._commands:
+            self._commands.set_agent(agent)
+        if self._callbacks:
+            self._callbacks.set_agent(agent)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     async def start(self) -> None:
         """Start the Telegram bot."""
         self._set_status(ChannelStatus.STARTING)
@@ -78,10 +127,10 @@ class TelegramChannel(BaseChannel):
             # Create request with longer timeouts (important for unstable proxies)
             request = HTTPXRequest(
                 connection_pool_size=8,
-                connect_timeout=30.0,  # Increased from default 5.0
-                read_timeout=30.0,      # Increased from default 5.0
-                write_timeout=30.0,     # Increased from default 5.0
-                pool_timeout=30.0       # Increased from default 1.0
+                connect_timeout=30.0,
+                read_timeout=30.0,
+                write_timeout=30.0,
+                pool_timeout=30.0,
             )
 
             builder = Application.builder().token(self.token).request(request)
@@ -99,18 +148,22 @@ class TelegramChannel(BaseChannel):
             self._bot_username = bot_info.username
             logger.info(f"[{self.full_name}] Bot username: @{self._bot_username}")
 
-            # Add handlers
+            # Initialize sub-handlers
+            self._init_sub_handlers()
+
+            # Register all handlers
             self._register_handlers()
+
+            # Register commands with BotFather
+            await self._set_bot_commands()
 
             # Start application
             await self._app.initialize()
             await self._app.start()
 
             if self.config.mode == ChannelMode.WEBHOOK:
-                # Webhook mode
                 await self._setup_webhook()
             else:
-                # Polling mode
                 await self._app.updater.start_polling(drop_pending_updates=True)
 
             self._running = True
@@ -160,6 +213,10 @@ class TelegramChannel(BaseChannel):
             logger.error(f"[{self.full_name}] Error during stop: {e}")
             self._set_status(ChannelStatus.ERROR, e)
 
+    # ------------------------------------------------------------------
+    # Send
+    # ------------------------------------------------------------------
+
     async def send(self, message: OutboundMessage) -> None:
         """
         Send message to Telegram.
@@ -192,18 +249,15 @@ class TelegramChannel(BaseChannel):
                 # Try to split at newline
                 split_pos = content.rfind('\n', 0, MAX_LENGTH)
                 if split_pos == -1:
-                    # No newline found, split at space
                     split_pos = content.rfind(' ', 0, MAX_LENGTH)
                 if split_pos == -1:
-                    # No space found, force split
                     split_pos = MAX_LENGTH
 
                 chunks.append(content[:split_pos])
                 content = content[split_pos:].lstrip()
 
-            # Send each chunk
             for i, chunk in enumerate(chunks):
-                async def _send_chunk(text=chunk, first=(i==0)):
+                async def _send_chunk(text=chunk, first=(i == 0)):
                     try:
                         await self._bot.send_message(
                             chat_id=chat_id,
@@ -212,7 +266,6 @@ class TelegramChannel(BaseChannel):
                             reply_to_message_id=message.reply_to if message.reply_to and first else None,
                         )
                     except Exception:
-                        # Fallback to plain text
                         await self._bot.send_message(
                             chat_id=chat_id,
                             text=text,
@@ -220,11 +273,9 @@ class TelegramChannel(BaseChannel):
                         )
 
                 await self.send_with_retry(_send_chunk)
-                # Small delay between chunks
                 if i < len(chunks) - 1:
                     await asyncio.sleep(0.5)
         else:
-            # Send normal message
             async def _send():
                 try:
                     await self._bot.send_message(
@@ -234,7 +285,6 @@ class TelegramChannel(BaseChannel):
                         reply_to_message_id=message.reply_to if message.reply_to else None,
                     )
                 except Exception:
-                    # Fallback to plain text
                     await self._bot.send_message(
                         chat_id=chat_id,
                         text=content,
@@ -243,16 +293,37 @@ class TelegramChannel(BaseChannel):
 
             await self.send_with_retry(_send)
 
+    # ------------------------------------------------------------------
+    # Handler registration
+    # ------------------------------------------------------------------
+
+    def _init_sub_handlers(self) -> None:
+        """Initialize sub-handler objects (commands, callbacks, media)."""
+        from spoon_bot.channels.telegram.commands import CommandHandlers
+        from spoon_bot.channels.telegram.callbacks import CallbackRouter
+        from spoon_bot.channels.telegram.media_handlers import MediaHandlers
+
+        self._commands = CommandHandlers(self)
+        self._callbacks = CallbackRouter(self)
+        self._media_ext = MediaHandlers(self)
+
+        # Propagate agent if already set
+        if self._agent_loop:
+            self._commands.set_agent(self._agent_loop)
+            self._callbacks.set_agent(self._agent_loop)
+
     def _register_handlers(self) -> None:
-        """Register message handlers."""
+        """Register all message handlers on the Application."""
         if not self._app:
             return
 
-        # Command handlers
-        self._app.add_handler(CommandHandler("start", self._handle_start))
-        self._app.add_handler(CommandHandler("help", self._handle_help))
+        # 1. Slash commands (14 commands via CommandHandlers)
+        self._commands.register(self._app)
 
-        # Message handlers
+        # 2. CallbackQuery handler (InlineKeyboard interactions)
+        self._app.add_handler(CallbackQueryHandler(self._callbacks.handle_callback))
+
+        # 3. Text messages
         self._app.add_handler(
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -260,53 +331,34 @@ class TelegramChannel(BaseChannel):
             )
         )
 
-        # Media handlers
-        self._app.add_handler(
-            MessageHandler(filters.PHOTO, self._handle_photo)
-        )
-        self._app.add_handler(
-            MessageHandler(filters.Document.ALL, self._handle_document)
-        )
-        self._app.add_handler(
-            MessageHandler(filters.AUDIO, self._handle_audio)
-        )
-        self._app.add_handler(
-            MessageHandler(filters.VIDEO, self._handle_video)
-        )
-        self._app.add_handler(
-            MessageHandler(filters.VOICE, self._handle_voice)
-        )
+        # 4. Media handlers (existing: photo, document, audio, video, voice)
+        self._app.add_handler(MessageHandler(filters.PHOTO, self._handle_photo))
+        self._app.add_handler(MessageHandler(filters.Document.ALL, self._handle_document))
+        self._app.add_handler(MessageHandler(filters.AUDIO, self._handle_audio))
+        self._app.add_handler(MessageHandler(filters.VIDEO, self._handle_video))
+        self._app.add_handler(MessageHandler(filters.VOICE, self._handle_voice))
 
-        logger.debug(f"[{self.full_name}] Handlers registered")
+        # 5. Extended media handlers (location, sticker)
+        self._app.add_handler(MessageHandler(filters.LOCATION, self._media_ext.handle_location))
+        self._app.add_handler(MessageHandler(filters.Sticker.ALL, self._media_ext.handle_sticker))
 
-    async def _handle_start(self, update: Update, context: Any) -> None:
-        """Handle /start command."""
-        if not self._check_access(update):
-            await update.message.reply_text("You are not authorized to use this bot.")
+        logger.debug(f"[{self.full_name}] All handlers registered (23 commands + callbacks + media)")
+
+    async def _set_bot_commands(self) -> None:
+        """Register command menu with BotFather."""
+        if not self._bot:
             return
 
-        await update.message.reply_text(
-            f"Hello! I'm {self._bot_username}, your AI assistant.\n\n"
-            "Just send me a message and I'll help you with:\n"
-            "• Running shell commands\n"
-            "• Reading and writing files\n"
-            "• Code analysis and generation\n"
-            "• Research and information gathering\n\n"
-            "Type /help for more info."
-        )
+        try:
+            commands = [BotCommand(cmd, desc) for cmd, desc in BOT_COMMANDS]
+            await self._bot.set_my_commands(commands)
+            logger.info(f"[{self.full_name}] Registered {len(commands)} bot commands")
+        except Exception as e:
+            logger.warning(f"[{self.full_name}] Failed to register bot commands: {e}")
 
-    async def _handle_help(self, update: Update, context: Any) -> None:
-        """Handle /help command."""
-        if not self._check_access(update):
-            return
-
-        await update.message.reply_text(
-            f"**{self._bot_username} Commands**\n\n"
-            "/start - Start the bot\n"
-            "/help - Show this help\n\n"
-            "Just type any message to chat with the agent.",
-            parse_mode="Markdown",
-        )
+    # ------------------------------------------------------------------
+    # Text message handler (with think/verbose metadata injection)
+    # ------------------------------------------------------------------
 
     async def _handle_text_message(self, update: Update, context: Any) -> None:
         """Handle text messages."""
@@ -317,11 +369,12 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         message = update.message
 
-        # Create session key
         chat_id = message.chat_id
         session_key = f"telegram_{self.account_id}_{chat_id}"
 
-        # Create inbound message
+        # Inject per-user state into metadata
+        state = self.get_user_state(user.id)
+
         inbound = InboundMessage(
             content=message.text,
             channel=self.full_name,
@@ -333,11 +386,17 @@ class TelegramChannel(BaseChannel):
                 "chat_id": chat_id,
                 "chat_type": message.chat.type,
                 "username": user.username,
+                "think_level": state.get("think_level", "off"),
+                "verbose": state.get("verbose", False),
+                "reasoning": state.get("reasoning", "off"),
             },
         )
 
-        # Publish to bus
         await self.publish(inbound)
+
+    # ------------------------------------------------------------------
+    # Media handlers (photo, document, audio, video, voice)
+    # ------------------------------------------------------------------
 
     async def _handle_photo(self, update: Update, context: Any) -> None:
         """Handle photo messages."""
@@ -347,11 +406,9 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
 
-        # Get the largest photo
         photo = message.photo[-1]
         file = await photo.get_file()
 
-        # Create inbound message with media
         inbound = InboundMessage(
             content=message.caption or "[Photo]",
             channel=self.full_name,
@@ -384,7 +441,6 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         document = message.document
 
-        # Check file size
         max_size = self.media_max_mb * 1024 * 1024
         if document.file_size > max_size:
             await message.reply_text(
@@ -394,7 +450,6 @@ class TelegramChannel(BaseChannel):
 
         file = await document.get_file()
 
-        # Create inbound message
         inbound = InboundMessage(
             content=message.caption or f"[Document: {document.file_name}]",
             channel=self.full_name,
@@ -453,7 +508,6 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_video(self, update: Update, context: Any) -> None:
         """Handle video messages."""
-        # Similar to photo handler
         if not self._check_access(update):
             return
 
@@ -521,6 +575,10 @@ class TelegramChannel(BaseChannel):
 
         await self.publish(inbound)
 
+    # ------------------------------------------------------------------
+    # Access control
+    # ------------------------------------------------------------------
+
     def _check_access(self, update: Update) -> bool:
         """
         Check if user has access.
@@ -564,7 +622,6 @@ class TelegramChannel(BaseChannel):
                 if not message.text:
                     return False
 
-                # Check if bot is mentioned
                 mentioned = (
                     f"@{self._bot_username}" in message.text
                     or message.text.startswith("/")
@@ -573,6 +630,10 @@ class TelegramChannel(BaseChannel):
                     return False
 
         return True
+
+    # ------------------------------------------------------------------
+    # Webhook support
+    # ------------------------------------------------------------------
 
     async def _setup_webhook(self) -> None:
         """Setup webhook (for webhook mode)."""
@@ -599,13 +660,9 @@ class TelegramChannel(BaseChannel):
             Response dictionary
         """
         try:
-            # Parse update from request
             update_data = await request.json()
             update = Update.de_json(update_data, self._bot)
-
-            # Process update
             await self._app.process_update(update)
-
             return {"ok": True}
 
         except Exception as e:

@@ -53,6 +53,9 @@ class ChannelManager:
         """
         self._agent = agent
         self._bus.set_handler(self._handle_message)
+        # Propagate agent reference to all existing channels
+        for channel in self._channels.values():
+            channel.set_agent(agent)
         logger.info("Agent attached to ChannelManager")
 
     def add_channel(self, channel: BaseChannel) -> None:
@@ -63,6 +66,8 @@ class ChannelManager:
             channel: Channel to add.
         """
         channel.attach_bus(self._bus)
+        if self._agent:
+            channel.set_agent(self._agent)
         self._channels[channel.full_name] = channel
         logger.info(f"Added channel: {channel.full_name}")
 
@@ -484,11 +489,26 @@ class ChannelManager:
                 f"{message.content[:50]}..."
             )
 
-            # Process with agent
-            response_text = await self._agent.process(
-                message=message.content,
-                media=message.media if message.has_media else None,
-            )
+            # Route based on think/verbose metadata from channel
+            think_level = message.metadata.get("think_level", "off")
+            media = message.media if message.has_media else None
+
+            if think_level != "off":
+                response_text, thinking_content = await self._agent.process_with_thinking(
+                    message=message.content,
+                    media=media,
+                )
+                # Include thinking content in verbose mode
+                if message.metadata.get("verbose") and thinking_content:
+                    response_text = (
+                        f"💭 *Thinking:*\n{thinking_content}\n\n"
+                        f"---\n\n{response_text}"
+                    )
+            else:
+                response_text = await self._agent.process(
+                    message=message.content,
+                    media=media,
+                )
 
             # Create outbound message
             return OutboundMessage(

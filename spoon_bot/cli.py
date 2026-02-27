@@ -7,6 +7,7 @@ Provides user-friendly CLI with:
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -148,6 +149,10 @@ async def _run_agent(
     max_iterations: int,
 ) -> None:
     """Internal async agent runner."""
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from spoon_bot.agent.loop import create_agent
 
     workspace = workspace or get_workspace()
@@ -439,11 +444,27 @@ def gateway(
     ),
     model: Optional[str] = typer.Option(
         None, "--model",
-        help="Model to use",
+        help="LLM model name (overrides YAML agent.model)",
+    ),
+    provider: Optional[str] = typer.Option(
+        None, "--provider",
+        help="LLM provider (anthropic/openai/openrouter/…) (overrides YAML agent.provider)",
+    ),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key",
+        help="API key for the LLM provider (overrides YAML / env var)",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url",
+        help="Custom LLM API base URL (overrides YAML agent.base_url)",
+    ),
+    tool_profile: Optional[str] = typer.Option(
+        None, "--tool-profile",
+        help="Tool profile (core/coding/research/full) (overrides YAML agent.tool_profile)",
     ),
     workspace: Optional[Path] = typer.Option(
         None, "-w", "--workspace",
-        help="Workspace directory",
+        help="Workspace directory (overrides YAML agent.workspace)",
     ),
 ):
     """
@@ -452,14 +473,19 @@ def gateway(
     Gateway mode enables multi-platform communication with the agent.
     Supports Telegram, Discord, Feishu, and more.
 
+    Configuration priority: CLI args > YAML agent section > env vars > defaults.
+
     Examples:
-      # Load all channels from config file
+      # Load all channels + agent config from config.yaml
       spoon-bot gateway
+
+      # Override model at runtime
+      spoon-bot gateway --provider openrouter --model anthropic/claude-sonnet-4
 
       # Load specific channels
       spoon-bot gateway --channels telegram,discord
 
-      # Use custom config
+      # Use custom config file
       spoon-bot gateway --config my-config.yaml
     """
     asyncio.run(_run_gateway(
@@ -467,8 +493,26 @@ def gateway(
         channels=channels.split(',') if channels else None,
         cli_enabled=cli_enabled,
         model=model,
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        tool_profile=tool_profile,
         workspace=workspace,
     ))
+
+
+def _resolve_provider_api_key(provider: Optional[str]) -> Optional[str]:
+    """Read the API key from the standard env var for the given provider."""
+    env_map = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "ollama": None,  # no key needed
+    }
+    var = env_map.get((provider or "").lower())
+    return os.environ.get(var) if var else None
 
 
 async def _run_gateway(
@@ -476,22 +520,90 @@ async def _run_gateway(
     channels: Optional[list[str]],
     cli_enabled: bool,
     model: Optional[str],
-    workspace: Optional[Path],
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    tool_profile: Optional[str] = None,
+    workspace: Optional[Path] = None,
 ) -> None:
-    """Internal async gateway runner."""
+    """Internal async gateway runner.
+
+    Configuration priority: CLI args > YAML agent section > env vars > defaults.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from spoon_bot.agent.loop import create_agent
     from spoon_bot.channels.manager import ChannelManager
+    from spoon_bot.channels.config import load_agent_config
 
-    workspace = workspace or get_workspace()
+    # ------------------------------------------------------------------
+    # 1. Load agent config from YAML
+    # ------------------------------------------------------------------
+    try:
+        agent_cfg = load_agent_config(config)
+    except FileNotFoundError:
+        agent_cfg = {}
+    except Exception as exc:
+        print_warning(f"Could not read agent config from YAML: {exc}")
+        agent_cfg = {}
 
-    # Show startup panel
+    # ------------------------------------------------------------------
+    # 2. Resolve effective values (CLI > YAML > env > defaults)
+    # ------------------------------------------------------------------
+    effective_provider = (
+        provider
+        or agent_cfg.get("provider")
+        or os.getenv("SPOON_BOT_DEFAULT_PROVIDER")
+        # defaults.py fallback happens inside create_agent()
+    )
+    effective_model = (
+        model
+        or agent_cfg.get("model")
+        or os.getenv("SPOON_BOT_DEFAULT_MODEL")
+    )
+    effective_base_url = (
+        base_url
+        or agent_cfg.get("base_url")
+        or os.getenv("SPOON_BOT_BASE_URL")
+    )
+    effective_api_key = (
+        api_key
+        or agent_cfg.get("api_key")
+        or _resolve_provider_api_key(effective_provider)
+    )
+    effective_workspace = (
+        workspace
+        or (Path(agent_cfg["workspace"]) if agent_cfg.get("workspace") else None)
+        or get_workspace()
+    )
+    effective_tool_profile = (
+        tool_profile
+        or agent_cfg.get("tool_profile")
+    )
+    effective_max_iterations = agent_cfg.get("max_iterations")
+    effective_enable_skills = agent_cfg.get("enable_skills", True)
+
+    # Session store from YAML (less commonly overridden via CLI)
+    session_store_backend = agent_cfg.get("session_store_backend") or os.getenv("SESSION_STORE_BACKEND", "file")
+    session_store_dsn = agent_cfg.get("session_store_dsn") or os.getenv("SESSION_STORE_DSN")
+    session_store_db_path = agent_cfg.get("session_store_db_path") or os.getenv("SESSION_STORE_DB_PATH")
+
+    # ------------------------------------------------------------------
+    # 3. Show startup panel with effective values
+    # ------------------------------------------------------------------
     startup_info = Table.grid(padding=(0, 2))
     startup_info.add_column()
     startup_info.add_column()
     startup_info.add_row("[dim]Mode:[/dim]", "Gateway (Multi-channel)")
-    startup_info.add_row("[dim]Workspace:[/dim]", str(workspace))
+    startup_info.add_row("[dim]Provider:[/dim]", effective_provider or "(default)")
+    startup_info.add_row("[dim]Model:[/dim]", effective_model or "(default)")
+    startup_info.add_row("[dim]Workspace:[/dim]", str(effective_workspace))
     if config:
         startup_info.add_row("[dim]Config:[/dim]", str(config))
+    if effective_tool_profile:
+        startup_info.add_row("[dim]Tool profile:[/dim]", effective_tool_profile)
     startup_info.add_row("[dim]CLI:[/dim]", "Enabled" if cli_enabled else "Disabled")
 
     console.print(Panel(
@@ -501,14 +613,29 @@ async def _run_gateway(
         border_style="blue",
     ))
 
-    # Create agent
+    # ------------------------------------------------------------------
+    # 4. Create agent with merged config
+    # ------------------------------------------------------------------
+    create_kwargs: dict = dict(
+        model=effective_model,
+        provider=effective_provider,
+        api_key=effective_api_key,
+        base_url=effective_base_url,
+        workspace=effective_workspace,
+        enable_skills=effective_enable_skills,
+        session_store_backend=session_store_backend,
+        session_store_dsn=session_store_dsn,
+        session_store_db_path=session_store_db_path,
+    )
+    if effective_tool_profile is not None:
+        create_kwargs["tool_profile"] = effective_tool_profile
+    if effective_max_iterations is not None:
+        create_kwargs["max_iterations"] = int(effective_max_iterations)
+
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]"):
-            agent = await create_agent(
-                model=model,
-                workspace=workspace,
-            )
-        print_success(f"Agent initialized: {agent.model}")
+            agent = await create_agent(**create_kwargs)
+        print_success(f"Agent initialized: {agent.provider}/{agent.model}")
     except ValueError as e:
         print_error(ConfigurationError(
             str(e),

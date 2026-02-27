@@ -219,6 +219,9 @@ class AgentLoop:
         # Track initialization state
         self._initialized = False
 
+        # Stop flag: set by stop_current_task(), cleared on next process() call
+        self._stop_requested = False
+
         active_count = len(self.tools)
         total_count = len(self.tools._tools)
         logger.info(
@@ -371,6 +374,12 @@ class AgentLoop:
         Returns:
             The agent's response text.
         """
+        # Honour stop request from previous /stop command
+        if self._stop_requested:
+            self._stop_requested = False
+            logger.info("Task skipped due to stop request")
+            return "Task stopped."
+
         # Ensure initialized
         if not self._initialized:
             await self.initialize()
@@ -735,6 +744,81 @@ class AgentLoop:
         if not content or not content.strip():
             raise ValueError("Note content cannot be empty")
         self.memory.add_daily_note(content.strip())
+
+    # ------------------------------------------------------------------
+    # Session management helpers (new)
+    # ------------------------------------------------------------------
+
+    def stop_current_task(self) -> bool:
+        """Request the current or next agent task to stop.
+
+        Sets a flag that is checked at the start of the next ``process()``
+        call.  Cannot interrupt a task that is already mid-execution, but
+        will prevent the queued task from running.
+
+        Returns:
+            True (always succeeds in setting the flag).
+        """
+        self._stop_requested = True
+        logger.info("Stop requested — will be honoured on next process() call")
+        return True
+
+    def new_session(self, session_key: str | None = None) -> str:
+        """Switch to a brand-new conversation session.
+
+        Creates a new session in the configured backend and replaces the
+        current in-memory session.  The old session is preserved in storage.
+
+        Args:
+            session_key: Optional explicit key for the new session.
+                         Defaults to a UUID-based key.
+
+        Returns:
+            The new session key.
+        """
+        import uuid
+
+        new_key = session_key or f"session-{uuid.uuid4().hex[:8]}"
+        self._session = self.sessions.get_or_create(new_key)
+        self.session_key = new_key
+        logger.info(f"Switched to new session: {new_key}")
+        return new_key
+
+    def compact_session(self) -> int:
+        """Compact conversation history by keeping only first 2 and last 2 messages.
+
+        Useful for reducing context size when a session becomes very long.
+        The compacted history is immediately persisted.
+
+        Returns:
+            Number of messages removed.
+        """
+        history = self._session.get_history()
+        if len(history) <= 4:
+            return 0
+
+        removed = len(history) - 4
+        keep = history[:2] + history[-2:]
+        self._session.messages.clear()
+        for msg in keep:
+            self._session.add_message(msg["role"], msg["content"])
+        self.sessions.save(self._session)
+        logger.info(f"Session compacted: removed {removed} messages, kept {len(keep)}")
+        return removed
+
+    def get_usage(self) -> dict[str, Any]:
+        """Return basic usage statistics for the current session.
+
+        Returns:
+            Dictionary with message count, session key, model, and context window.
+        """
+        history = self._session.get_history()
+        return {
+            "messages": len(history),
+            "session_key": self.session_key,
+            "model": self.model,
+            "context_window": self.context_window,
+        }
 
     @property
     def skills(self) -> list[str]:

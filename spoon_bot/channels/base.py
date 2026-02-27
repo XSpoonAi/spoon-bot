@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from loguru import logger
 
 if TYPE_CHECKING:
+    from spoon_bot.agent.loop import AgentLoop
     from spoon_bot.bus.events import InboundMessage, OutboundMessage
     from spoon_bot.bus.queue import MessageBus
 
@@ -105,9 +106,20 @@ class BaseChannel(ABC):
         self._last_heartbeat: datetime | None = None
         self._running = False
 
+        # Agent reference (set by ChannelManager, used by subclasses)
+        self._agent_loop: AgentLoop | None = None
+
         # Tasks
         self._health_check_task: asyncio.Task | None = None
         self._message_tasks: set[asyncio.Task] = set()
+
+    def set_agent(self, agent: AgentLoop) -> None:
+        """Set agent reference. Override in subclasses to use it.
+
+        Args:
+            agent: AgentLoop instance.
+        """
+        self._agent_loop = agent
 
     def attach_bus(self, bus: MessageBus) -> None:
         """

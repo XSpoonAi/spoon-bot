@@ -39,6 +39,19 @@ class ChannelsConfig:
         "feishu": ["app_id", "app_secret"],
     }
 
+    # Well-known environment variable names for channel credentials.
+    # Used as fallback when a credential is not explicitly set in YAML.
+    _ENV_FALLBACKS: dict[str, dict[str, str]] = {
+        "telegram": {"token": "TELEGRAM_BOT_TOKEN"},
+        "discord": {"token": "DISCORD_BOT_TOKEN"},
+        "feishu": {
+            "app_id": "FEISHU_APP_ID",
+            "app_secret": "FEISHU_APP_SECRET",
+            "verification_token": "FEISHU_VERIFICATION_TOKEN",
+            "encrypt_key": "FEISHU_ENCRYPT_KEY",
+        },
+    }
+
     def __init__(self, config_dict: dict[str, Any]):
         """
         Initialize from configuration dictionary.
@@ -54,6 +67,9 @@ class ChannelsConfig:
         self.discord = config_dict.get("discord", {})
         self.feishu = config_dict.get("feishu", {})
         self.cli = config_dict.get("cli", {})
+
+        # Auto-discover channels from env vars when not in YAML
+        self._auto_discover_channels()
 
         # Validate all enabled channels
         self._validate_all()
@@ -103,19 +119,25 @@ class ChannelsConfig:
 
             account_name = account.get("name", f"accounts[{i}]")
 
-            # Check required fields
+            # Check required fields (with env-var fallback)
             for field in required_fields:
                 value = account.get(field)
-                if value is None:
+                resolved = self._resolve_with_fallback(value, channel_type, field)
+                if resolved is None:
+                    # Build a helpful message
+                    fallback_var = self._ENV_FALLBACKS.get(channel_type, {}).get(field)
+                    hint = f" or set {fallback_var}" if fallback_var else ""
                     raise ConfigValidationError(
-                        channel_type, f"{account_name}.{field}", "is required"
+                        channel_type,
+                        f"{account_name}.{field}",
+                        f"is required (set in config.yaml{hint})",
                     )
-                # Check if it's an unresolved env var
-                resolved = self._resolve_env(value)
-                if resolved is None and value.startswith("${"):
-                    logger.warning(
+                elif value and value.startswith("${") and self._resolve_env(value) is None:
+                    # Explicit ${VAR} in YAML but that var is unset —
+                    # fallback resolved it, log for transparency.
+                    logger.debug(
                         f"[{channel_type}] {account_name}.{field}: "
-                        f"environment variable {value} is not set"
+                        f"{value} not set, using env fallback"
                     )
 
     def _build_common_config(
@@ -162,18 +184,34 @@ class ChannelsConfig:
 
         for account in accounts:
             name = account.get("name", "default")
+            if account.get("agent_config"):
+                logger.warning(
+                    f"[telegram:{name}] 'agent_config' found but per-channel agent config is "
+                    "not yet supported. Use the top-level 'agent:' section instead."
+                )
             mode_str = account.get("mode", "polling")
             mode = ChannelMode.WEBHOOK if mode_str == "webhook" else ChannelMode.POLLING
 
             # Build config with common fields + Telegram-specific fields
             common = self._build_common_config(account, "telegram", mode)
+
+            # allowed_users: YAML list takes priority; fall back to TELEGRAM_USER_ID env var
+            allowed_users = account.get("allowed_users", [])
+            if not allowed_users:
+                env_uid = os.getenv("TELEGRAM_USER_ID")
+                if env_uid:
+                    try:
+                        allowed_users = [int(env_uid)]
+                    except ValueError:
+                        logger.warning(f"TELEGRAM_USER_ID={env_uid!r} is not a valid integer, ignoring")
+
             config = ChannelConfig(
                 **common,
                 webhook_path=account.get("webhook_url"),
                 webhook_secret=account.get("webhook_secret"),
-                # Telegram-specific
-                token=self._resolve_env(account.get("token")),
-                allowed_users=account.get("allowed_users", []),
+                # Telegram-specific (falls back to TELEGRAM_BOT_TOKEN env var)
+                token=self._resolve_with_fallback(account.get("token"), "telegram", "token"),
+                allowed_users=allowed_users,
                 groups=account.get("groups", {}),
                 media_max_mb=account.get("media_max_mb", DEFAULT_MEDIA_MAX_MB),
             )
@@ -191,16 +229,41 @@ class ChannelsConfig:
 
         for account in accounts:
             name = account.get("name", "default")
+            if account.get("agent_config"):
+                logger.warning(
+                    f"[discord:{name}] 'agent_config' found but per-channel agent config is "
+                    "not yet supported. Use the top-level 'agent:' section instead."
+                )
 
             # Build config with common fields + Discord-specific fields
             common = self._build_common_config(account, "discord", ChannelMode.GATEWAY)
+
+            # allowed_guilds / allowed_users: YAML takes priority; fall back to env vars
+            allowed_guilds = account.get("allowed_guilds", [])
+            if not allowed_guilds:
+                env_gid = os.getenv("DISCORD_GUILD_ID")
+                if env_gid:
+                    try:
+                        allowed_guilds = [int(env_gid)]
+                    except ValueError:
+                        logger.warning(f"DISCORD_GUILD_ID={env_gid!r} is not a valid integer, ignoring")
+
+            allowed_users = account.get("allowed_users", [])
+            if not allowed_users:
+                env_uid = os.getenv("DISCORD_USER_ID")
+                if env_uid:
+                    try:
+                        allowed_users = [int(env_uid)]
+                    except ValueError:
+                        logger.warning(f"DISCORD_USER_ID={env_uid!r} is not a valid integer, ignoring")
+
             config = ChannelConfig(
                 **common,
-                # Discord-specific
-                token=self._resolve_env(account.get("token")),
+                # Discord-specific (falls back to DISCORD_BOT_TOKEN env var)
+                token=self._resolve_with_fallback(account.get("token"), "discord", "token"),
                 intents=account.get("intents", []),
-                allowed_guilds=account.get("allowed_guilds", []),
-                allowed_users=account.get("allowed_users", []),
+                allowed_guilds=allowed_guilds,
+                allowed_users=allowed_users,
             )
             configs.append((config, name))
 
@@ -216,17 +279,22 @@ class ChannelsConfig:
 
         for account in accounts:
             name = account.get("name", "default")
+            if account.get("agent_config"):
+                logger.warning(
+                    f"[feishu:{name}] 'agent_config' found but per-channel agent config is "
+                    "not yet supported. Use the top-level 'agent:' section instead."
+                )
 
             # Build config with common fields + Feishu-specific fields
             common = self._build_common_config(account, "feishu", ChannelMode.WEBHOOK)
             config = ChannelConfig(
                 **common,
                 webhook_path=account.get("webhook_url"),
-                # Feishu-specific
-                app_id=self._resolve_env(account.get("app_id")),
-                app_secret=self._resolve_env(account.get("app_secret")),
-                verification_token=self._resolve_env(account.get("verification_token")),
-                encrypt_key=self._resolve_env(account.get("encrypt_key")),
+                # Feishu-specific (falls back to FEISHU_* env vars)
+                app_id=self._resolve_with_fallback(account.get("app_id"), "feishu", "app_id"),
+                app_secret=self._resolve_with_fallback(account.get("app_secret"), "feishu", "app_secret"),
+                verification_token=self._resolve_with_fallback(account.get("verification_token"), "feishu", "verification_token"),
+                encrypt_key=self._resolve_with_fallback(account.get("encrypt_key"), "feishu", "encrypt_key"),
             )
             configs.append((config, name))
 
@@ -258,6 +326,162 @@ class ChannelsConfig:
 
         return value
 
+    @classmethod
+    def _resolve_with_fallback(
+        cls, value: str | None, channel_type: str, field: str
+    ) -> str | None:
+        """
+        Resolve a credential value with env-var fallback.
+
+        Resolution order:
+          1. Explicit string value from YAML (returned as-is)
+          2. ``${VAR}`` syntax resolved via :meth:`_resolve_env`
+          3. Well-known env var from :attr:`_ENV_FALLBACKS`
+
+        Args:
+            value: Raw value from YAML (may be None, a literal, or ``${VAR}``).
+            channel_type: Channel kind (``telegram``, ``discord``, ``feishu``).
+            field: Field name (``token``, ``app_id``, …).
+
+        Returns:
+            Resolved credential string, or None if unavailable.
+        """
+        resolved = cls._resolve_env(value)
+        if resolved is not None:
+            return resolved
+        # Fall back to well-known env var
+        fallback_var = cls._ENV_FALLBACKS.get(channel_type, {}).get(field)
+        if fallback_var:
+            env_val = os.getenv(fallback_var)
+            if env_val:
+                logger.debug(
+                    f"[{channel_type}] {field}: using env var {fallback_var}"
+                )
+            return env_val
+        return None
+
+    def _auto_discover_channels(self) -> None:
+        """Auto-enable channels when env vars are set but YAML has no config.
+
+        Only creates a minimal default account entry so that
+        :meth:`_resolve_with_fallback` can pick up the credential later.
+        Channels explicitly set to ``enabled: false`` are NOT overridden.
+        """
+        # Telegram
+        if (
+            not self.telegram.get("enabled")
+            and self.telegram.get("enabled") is not False
+            and os.getenv("TELEGRAM_BOT_TOKEN")
+        ):
+            logger.info(
+                "Auto-discovered Telegram channel from TELEGRAM_BOT_TOKEN env var"
+            )
+            account: dict[str, Any] = {"name": "default", "mode": "polling"}
+            # Restrict access if TELEGRAM_USER_ID is set
+            user_id = os.getenv("TELEGRAM_USER_ID")
+            if user_id:
+                try:
+                    account["allowed_users"] = [int(user_id)]
+                except ValueError:
+                    logger.warning(
+                        f"TELEGRAM_USER_ID={user_id!r} is not a valid integer, ignoring"
+                    )
+            self.telegram = {"enabled": True, "accounts": [account]}
+
+        # Discord
+        if (
+            not self.discord.get("enabled")
+            and self.discord.get("enabled") is not False
+            and os.getenv("DISCORD_BOT_TOKEN")
+        ):
+            logger.info(
+                "Auto-discovered Discord channel from DISCORD_BOT_TOKEN env var"
+            )
+            account = {"name": "default"}
+            # Restrict access if DISCORD_GUILD_ID / DISCORD_USER_ID is set
+            guild_id = os.getenv("DISCORD_GUILD_ID")
+            if guild_id:
+                try:
+                    account["allowed_guilds"] = [int(guild_id)]
+                except ValueError:
+                    logger.warning(
+                        f"DISCORD_GUILD_ID={guild_id!r} is not a valid integer, ignoring"
+                    )
+            discord_user_id = os.getenv("DISCORD_USER_ID")
+            if discord_user_id:
+                try:
+                    account["allowed_users"] = [int(discord_user_id)]
+                except ValueError:
+                    logger.warning(
+                        f"DISCORD_USER_ID={discord_user_id!r} is not a valid integer, ignoring"
+                    )
+            self.discord = {"enabled": True, "accounts": [account]}
+
+        # Feishu — requires both app_id and app_secret
+        if (
+            not self.feishu.get("enabled")
+            and self.feishu.get("enabled") is not False
+            and os.getenv("FEISHU_APP_ID")
+            and os.getenv("FEISHU_APP_SECRET")
+        ):
+            logger.info(
+                "Auto-discovered Feishu channel from FEISHU_APP_ID/FEISHU_APP_SECRET env vars"
+            )
+            self.feishu = {
+                "enabled": True,
+                "accounts": [{"name": "default", "mode": "ws"}],
+            }
+
+
+def _find_and_load_yaml(config_path: str | Path | None = None) -> dict[str, Any]:
+    """
+    Locate and parse the YAML config file.
+
+    Resolution order:
+      1. Explicit ``config_path`` parameter
+      2. ``SPOON_BOT_CONFIG`` environment variable
+      3. ``~/.spoon-bot/config.yaml``
+      4. ``./config.yaml``
+
+    Args:
+        config_path: Explicit path (optional).
+
+    Returns:
+        Parsed YAML dictionary, or empty dict when no file is found.
+
+    Raises:
+        FileNotFoundError: If an explicit path is given but does not exist.
+        yaml.YAMLError: If the file cannot be parsed.
+    """
+    if config_path is None:
+        config_path = os.getenv("SPOON_BOT_CONFIG")
+
+    if config_path is None:
+        for candidate in [
+            Path.home() / ".spoon-bot" / "config.yaml",
+            Path("config.yaml"),
+        ]:
+            if candidate.exists():
+                config_path = candidate
+                break
+
+    if config_path is None:
+        return {}
+
+    config_path = Path(config_path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Invalid config file format: expected dict, got {type(data).__name__}"
+        )
+
+    return data
+
 
 def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfig:
     """
@@ -273,48 +497,83 @@ def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfi
         ChannelsConfig object
 
     Raises:
-        FileNotFoundError: If config file not found
-        yaml.YAMLError: If YAML parsing fails
+        FileNotFoundError: If an explicit config file is not found.
+        yaml.YAMLError: If YAML parsing fails.
     """
-    # Determine config path
-    if config_path is None:
-        config_path = os.getenv("SPOON_BOT_CONFIG")
+    try:
+        full_config = _find_and_load_yaml(config_path)
+    except FileNotFoundError:
+        raise
+    except Exception:
+        raise
 
-    if config_path is None:
-        # Try default locations
-        default_paths = [
-            Path.home() / ".spoon-bot" / "config.yaml",
-            Path("config.yaml"),
-        ]
-
-        for path in default_paths:
-            if path.exists():
-                config_path = path
-                break
-
-    if config_path is None:
-        # No config found, return empty config
+    if not full_config:
         logger.warning("No channels config file found, using defaults")
         return ChannelsConfig({})
 
-    config_path = Path(config_path)
+    logger.info(f"Loading channels config (path resolved internally)")
+    return ChannelsConfig(full_config.get("channels", {}))
 
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    logger.info(f"Loading channels config from: {config_path}")
+def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    """
+    Load the ``agent:`` section from the YAML config file.
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        full_config = yaml.safe_load(f) or {}
+    Uses the same file-resolution order as :func:`load_channels_config`.
 
-    # Validate config is a dictionary
-    if not isinstance(full_config, dict):
-        raise ValueError(f"Invalid config file format: expected dict, got {type(full_config).__name__}")
+    Priority for callers should be:
+      CLI args  >  values from this function  >  env vars  >  defaults.py
 
-    # Extract channels section
-    channels_dict = full_config.get("channels", {})
+    Supported fields in ``agent:``:
+      - model      : LLM model name
+      - provider   : LLM provider (anthropic, openai, openrouter, …)
+      - api_key    : API key (supports ${VAR} syntax)
+      - base_url   : Custom API base URL (supports ${VAR} syntax)
+      - workspace  : Workspace directory path
+      - max_iterations : int
+      - tool_profile   : str  (core / coding / research / full)
+      - enable_skills  : bool
+      - session_store_backend : str (file / sqlite / postgres)
+      - session_store_dsn     : str
+      - session_store_db_path : str
 
-    return ChannelsConfig(channels_dict)
+    Args:
+        config_path: Explicit path (optional).
+
+    Returns:
+        Dictionary with resolved agent config values.
+        Returns an empty dict if no config file or no ``agent:`` section.
+    """
+    try:
+        full_config = _find_and_load_yaml(config_path)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        logger.warning(f"Could not load agent config from YAML: {exc}")
+        return {}
+
+    if not full_config:
+        return {}
+
+    agent_raw: dict[str, Any] = full_config.get("agent", {})
+    if not agent_raw:
+        return {}
+
+    # Resolve ${VAR} substitutions for string fields that support it
+    _env_fields = ("api_key", "base_url", "workspace")
+    resolved: dict[str, Any] = {}
+    for key, value in agent_raw.items():
+        if key in _env_fields and isinstance(value, str):
+            resolved[key] = ChannelsConfig._resolve_env(value)
+        else:
+            resolved[key] = value
+
+    # Expand workspace tilde
+    if "workspace" in resolved and resolved["workspace"]:
+        resolved["workspace"] = str(Path(str(resolved["workspace"])).expanduser())
+
+    logger.debug(f"Loaded agent config from YAML: {list(resolved.keys())}")
+    return resolved
 
 
 def create_default_config(output_path: str | Path) -> None:
