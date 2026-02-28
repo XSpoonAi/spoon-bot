@@ -20,11 +20,13 @@ from spoon_bot.gateway.core_integration import (
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
+    from spoon_bot.channels.manager import ChannelManager
 
 
 # Global state (set during lifespan)
 _agent: SpoonCoreAgent | AgentLoop | None = None
 _connection_manager: ConnectionManager | None = None
+_channel_manager: ChannelManager | None = None
 _config: GatewayConfig | None = None
 _identity: SpoonCoreIdentity | None = None
 _payments: SpoonCorePayments | None = None

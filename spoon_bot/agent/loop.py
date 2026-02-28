@@ -69,14 +69,6 @@ from spoon_bot.exceptions import (
     user_friendly_error,
 )
 from spoon_bot.services.git import GitManager
-from spoon_bot.defaults import (
-    DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
-    DEFAULT_MAX_ITERATIONS,
-    DEFAULT_SHELL_TIMEOUT,
-    DEFAULT_MAX_OUTPUT,
-    DEFAULT_SESSION_KEY,
-)
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -111,10 +103,10 @@ class AgentLoop:
         provider: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_iterations: int = DEFAULT_MAX_ITERATIONS,
-        shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
-        max_output: int = DEFAULT_MAX_OUTPUT,
-        session_key: str = DEFAULT_SESSION_KEY,
+        max_iterations: int = 20,
+        shell_timeout: int = 60,
+        max_output: int = 10000,
+        session_key: str = "default",
         skill_paths: list[Path | str] | None = None,
         mcp_config: dict[str, dict[str, Any]] | None = None,
         system_prompt: str | None = None,
@@ -160,10 +152,10 @@ class AgentLoop:
             logger.error(f"Configuration validation failed: {e}")
             raise ValueError(f"Invalid AgentLoop configuration: {e}") from e
 
-        # Store config (apply defaults from spoon_bot.defaults if not provided)
+        # Store config — callers must provide model/provider explicitly
         self.workspace = self._config.workspace
-        self.model = model or DEFAULT_MODEL
-        self.provider = provider or DEFAULT_PROVIDER
+        self.model = model
+        self.provider = provider
         self.api_key = api_key
         self.base_url = base_url
         self.max_iterations = self._config.max_iterations
@@ -233,6 +225,17 @@ class AgentLoop:
         """Initialize spoon-core components."""
         if self._initialized:
             return
+
+        if not self.model:
+            raise ValueError(
+                "model is required but not set. "
+                "Configure agent.model in config.yaml or set SPOON_BOT_DEFAULT_MODEL env var."
+            )
+        if not self.provider:
+            raise ValueError(
+                "provider is required but not set. "
+                "Configure agent.provider in config.yaml or set SPOON_BOT_DEFAULT_PROVIDER env var."
+            )
 
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
@@ -889,10 +892,6 @@ async def create_agent(
         >>> agent = await create_agent()
         >>> agent.add_tool("web_search")
     """
-    # Apply defaults from spoon_bot.defaults
-    model = model or DEFAULT_MODEL
-    provider = provider or DEFAULT_PROVIDER
-
     agent = AgentLoop(
         model=model,
         provider=provider,

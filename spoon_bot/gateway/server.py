@@ -52,52 +52,24 @@ async def _lifespan(app: FastAPI):
     app_module._connection_manager = connection_manager
 
     # Auto-create agent.
-    # Priority: env vars > YAML agent section > built-in defaults.
-    # YAML is loaded when SPOON_BOT_CONFIG is set or config.yaml is found in default paths.
+    # All config resolution (YAML > env vars) is handled by load_agent_config().
+    from spoon_bot.channels.config import load_agent_config
+
     try:
-        from spoon_bot.channels.config import load_agent_config
-        yaml_agent: dict = load_agent_config()
-    except Exception as _yaml_err:
-        logger.debug(f"YAML agent config not loaded: {_yaml_err}")
-        yaml_agent = {}
+        agent_cfg = load_agent_config()
+    except Exception as _cfg_err:
+        logger.warning(f"Could not load agent config: {_cfg_err}")
+        agent_cfg = {}
 
-    provider = (
-        os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
-        or yaml_agent.get("provider")
-        or "anthropic"
-    )
-    model = (
-        os.environ.get("SPOON_BOT_DEFAULT_MODEL")
-        or yaml_agent.get("model")
-        or ""
-    )
-    workspace = (
-        os.environ.get("SPOON_BOT_WORKSPACE_PATH")
-        or yaml_agent.get("workspace")
-        or "/data/workspace"
-    )
+    provider = agent_cfg.get("provider")
+    model = agent_cfg.get("model")
+    if not provider or not model:
+        logger.error(
+            "Missing required config: model and provider must be set "
+            "in config.yaml or via SPOON_BOT_DEFAULT_MODEL / SPOON_BOT_DEFAULT_PROVIDER env vars"
+        )
 
-    # Resolve base URL from multiple env vars (provider-specific takes priority)
-    base_url = ""
-    if provider == "openai":
-        base_url = os.environ.get("OPENAI_BASE_URL", "") or os.environ.get("BASE_URL", "")
-    elif provider == "anthropic":
-        base_url = os.environ.get("ANTHROPIC_BASE_URL", "") or os.environ.get("BASE_URL", "")
-    else:
-        base_url = os.environ.get("BASE_URL", "")
-
-    # Determine default model per provider if not specified
-    if not model:
-        default_models = {
-            "anthropic": "claude-sonnet-4-20250514",
-            "openai": "gpt-4o",
-            "deepseek": "deepseek-chat",
-            "gemini": "gemini-2.0-flash",
-            "openrouter": "anthropic/claude-sonnet-4",
-        }
-        model = default_models.get(provider, "claude-sonnet-4-20250514")
-
-    # Log configuration
+    base_url = agent_cfg.get("base_url")
     if base_url:
         logger.info(f"Custom base URL: {base_url}")
     logger.info(f"Initializing agent: provider={provider}, model={model}")
@@ -105,25 +77,22 @@ async def _lifespan(app: FastAPI):
     try:
         from spoon_bot.agent.loop import create_agent
 
-        _skills_env = os.environ.get("SPOON_BOT_ENABLE_SKILLS")
-        enable_skills = (
-            _skills_env.lower() == "true" if _skills_env is not None
-            else yaml_agent.get("enable_skills", True)
-        )
+        enable_skills = agent_cfg.get("enable_skills", True)
         logger.info(f"Skills enabled: {enable_skills}")
 
         create_kwargs: dict = dict(
             model=model,
             provider=provider,
+            api_key=agent_cfg.get("api_key"),
             base_url=base_url or None,
-            workspace=workspace,
+            workspace=agent_cfg.get("workspace", "/data/workspace"),
             enable_skills=enable_skills,
             auto_commit=False,  # No git auto-commit in Docker gateway mode
         )
-        if yaml_agent.get("base_url"):
-            create_kwargs["base_url"] = yaml_agent["base_url"]
-        if yaml_agent.get("tool_profile"):
-            create_kwargs["tool_profile"] = yaml_agent["tool_profile"]
+        if agent_cfg.get("tool_profile"):
+            create_kwargs["tool_profile"] = agent_cfg["tool_profile"]
+        if agent_cfg.get("max_iterations"):
+            create_kwargs["max_iterations"] = int(agent_cfg["max_iterations"])
 
         agent = await create_agent(**create_kwargs)
         app_module._agent = agent
@@ -152,10 +121,49 @@ async def _lifespan(app: FastAPI):
     except Exception as e:
         logger.debug(f"Optional spoon-core services not available: {e}")
 
+    # ------------------------------------------------------------------
+    # Start channels (Telegram / Discord / Feishu) if configured.
+    # Channels run as asyncio tasks inside ChannelManager so they share
+    # the same event loop with the FastAPI server.
+    # ------------------------------------------------------------------
+    channel_manager = None
+    if app_module._agent is not None:
+        try:
+            from spoon_bot.bootstrap import init_channels
+
+            channel_manager = await init_channels(app_module._agent)
+            app_module._channel_manager = channel_manager
+            logger.info(
+                f"Channels loaded: {channel_manager.running_channels_count} running"
+            )
+        except FileNotFoundError:
+            logger.info("No channel config found, running gateway without channels")
+        except ImportError as e:
+            logger.warning(f"Channel dependencies missing: {e}")
+        except Exception as e:
+            logger.warning(f"Could not start channels: {e}")
+
+    # ---- Startup summary ----
+    logger.info("===== spoon-bot Docker gateway ready =====")
+    logger.info(f"  Provider : {agent_cfg.get('provider', '(not set)')}")
+    logger.info(f"  Model    : {agent_cfg.get('model', '(not set)')}")
+    logger.info(f"  Workspace: {agent_cfg.get('workspace', '/data/workspace')}")
+    if channel_manager:
+        logger.info(
+            f"  Channels : {channel_manager.running_channels_count} running "
+            f"({', '.join(channel_manager.channel_names) or 'none'})"
+        )
+    else:
+        logger.info("  Channels : none")
+    logger.info("==========================================")
+
     yield
 
     # Shutdown
     logger.info("Shutting down spoon-bot gateway...")
+    if channel_manager:
+        await channel_manager.stop()
+        logger.info("Channels stopped")
     if connection_manager:
         await connection_manager.stop()
 

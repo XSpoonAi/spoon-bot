@@ -10,14 +10,6 @@ import yaml
 from loguru import logger
 
 from spoon_bot.channels.base import ChannelConfig, ChannelMode
-from spoon_bot.defaults import (
-    DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
-    DEFAULT_RETRY_MAX_ATTEMPTS,
-    DEFAULT_RETRY_DELAY,
-    DEFAULT_HEALTH_CHECK_INTERVAL,
-    DEFAULT_MEDIA_MAX_MB,
-)
 
 
 class ConfigValidationError(ValueError):
@@ -150,7 +142,6 @@ class ChannelsConfig:
         Build common configuration fields shared across all channel types.
 
         This reduces duplication when constructing ChannelConfig objects.
-        Default values are imported from spoon_bot.defaults for consistency.
 
         Args:
             account: Raw account configuration dict
@@ -164,9 +155,9 @@ class ChannelsConfig:
             "name": channel_name,
             "mode": mode,
             "enabled": True,
-            "retry_max_attempts": account.get("retry_max_attempts", DEFAULT_RETRY_MAX_ATTEMPTS),
-            "retry_delay": account.get("retry_delay", DEFAULT_RETRY_DELAY),
-            "health_check_interval": account.get("health_check_interval", DEFAULT_HEALTH_CHECK_INTERVAL),
+            "retry_max_attempts": account.get("retry_max_attempts", 3),
+            "retry_delay": account.get("retry_delay", 1.0),
+            "health_check_interval": account.get("health_check_interval", 60.0),
             "agent_config": account.get("agent_config", {}),
         }
 
@@ -213,7 +204,7 @@ class ChannelsConfig:
                 token=self._resolve_with_fallback(account.get("token"), "telegram", "token"),
                 allowed_users=allowed_users,
                 groups=account.get("groups", {}),
-                media_max_mb=account.get("media_max_mb", DEFAULT_MEDIA_MAX_MB),
+                media_max_mb=account.get("media_max_mb", 20),
             )
             configs.append((config, name))
 
@@ -512,47 +503,40 @@ def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfi
 
 def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
     """
-    Load the ``agent:`` section from the YAML config file.
+    Load agent configuration from YAML and environment variables.
 
-    Uses the same file-resolution order as :func:`load_channels_config`.
+    This is the **single entry point** for all agent configuration resolution.
+    Callers (cli.py, server.py, core.py) should use this function instead of
+    reading environment variables themselves.
 
-    Priority for callers should be:
-      CLI args  >  values from this function  >  env vars  >  defaults.py
+    Resolution priority:  **YAML > env vars**  (no built-in defaults for
+    user-facing settings like model/provider).  Callers may overlay CLI args
+    on top of the returned dict.
 
-    Supported fields in ``agent:``:
-      - model      : LLM model name
-      - provider   : LLM provider (anthropic, openai, openrouter, …)
-      - api_key    : API key (supports ${VAR} syntax)
-      - base_url   : Custom API base URL (supports ${VAR} syntax)
-      - workspace  : Workspace directory path
-      - max_iterations : int
-      - tool_profile   : str  (core / coding / research / full)
-      - enable_skills  : bool
-      - session_store_backend : str (file / sqlite / postgres)
-      - session_store_dsn     : str
-      - session_store_db_path : str
+    Supported fields::
+
+        model, provider, api_key, base_url, workspace,
+        max_iterations, tool_profile, enable_skills
 
     Args:
-        config_path: Explicit path (optional).
+        config_path: Explicit path to YAML file (optional).
 
     Returns:
         Dictionary with resolved agent config values.
-        Returns an empty dict if no config file or no ``agent:`` section.
+        May be empty if nothing is configured.
     """
+    # ------------------------------------------------------------------
+    # 1. Read YAML
+    # ------------------------------------------------------------------
     try:
         full_config = _find_and_load_yaml(config_path)
     except FileNotFoundError:
         raise
     except Exception as exc:
         logger.warning(f"Could not load agent config from YAML: {exc}")
-        return {}
+        full_config = {}
 
-    if not full_config:
-        return {}
-
-    agent_raw: dict[str, Any] = full_config.get("agent", {})
-    if not agent_raw:
-        return {}
+    agent_raw: dict[str, Any] = full_config.get("agent", {}) if full_config else {}
 
     # Resolve ${VAR} substitutions for string fields that support it
     _env_fields = ("api_key", "base_url", "workspace")
@@ -563,11 +547,75 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         else:
             resolved[key] = value
 
-    # Expand workspace tilde
-    if "workspace" in resolved and resolved["workspace"]:
+    # ------------------------------------------------------------------
+    # 2. Overlay env vars for fields NOT already set by YAML
+    # ------------------------------------------------------------------
+    agent_env_map: dict[str, list[str]] = {
+        "provider":       ["SPOON_BOT_DEFAULT_PROVIDER", "SPOON_PROVIDER"],
+        "model":          ["SPOON_BOT_DEFAULT_MODEL", "SPOON_MODEL"],
+        "workspace":      ["SPOON_BOT_WORKSPACE_PATH"],
+        "max_iterations": ["SPOON_BOT_MAX_ITERATIONS", "SPOON_MAX_STEPS"],
+        "enable_skills":  ["SPOON_BOT_ENABLE_SKILLS"],
+    }
+    for field, env_vars in agent_env_map.items():
+        if not resolved.get(field):
+            for var in env_vars:
+                val = os.environ.get(var)
+                if val:
+                    if field == "max_iterations":
+                        resolved[field] = int(val)
+                    elif field == "enable_skills":
+                        resolved[field] = val.lower() == "true"
+                    else:
+                        resolved[field] = val
+                    logger.debug(f"Agent config: {field} from env var {var}")
+                    break
+
+    # ------------------------------------------------------------------
+    # 3. Resolve base_url from provider-specific env vars
+    # ------------------------------------------------------------------
+    if not resolved.get("base_url"):
+        provider = resolved.get("provider", "")
+        if provider == "openai":
+            resolved["base_url"] = os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
+        elif provider == "anthropic":
+            resolved["base_url"] = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
+        else:
+            resolved["base_url"] = os.environ.get("BASE_URL")
+
+    # ------------------------------------------------------------------
+    # 4. Resolve api_key from provider-specific env vars
+    # ------------------------------------------------------------------
+    if not resolved.get("api_key"):
+        provider = resolved.get("provider", "")
+        api_key_map: dict[str, str] = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+        }
+        env_var = api_key_map.get(provider)
+        if env_var:
+            resolved["api_key"] = os.environ.get(env_var)
+        # Generic fallback: try common API key env vars
+        if not resolved.get("api_key"):
+            resolved["api_key"] = (
+                os.environ.get("ANTHROPIC_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+            )
+
+    # ------------------------------------------------------------------
+    # 5. Expand workspace tilde
+    # ------------------------------------------------------------------
+    if resolved.get("workspace"):
         resolved["workspace"] = str(Path(str(resolved["workspace"])).expanduser())
 
-    logger.debug(f"Loaded agent config from YAML: {list(resolved.keys())}")
+    # Clean up None values
+    resolved = {k: v for k, v in resolved.items() if v is not None}
+
+    if resolved:
+        logger.debug(f"Resolved agent config keys: {list(resolved.keys())}")
     return resolved
 
 
@@ -581,14 +629,12 @@ def create_default_config(output_path: str | Path) -> None:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from spoon_bot.defaults import DEFAULT_MAX_ITERATIONS
-
     default_config = {
         "agent": {
-            "model": DEFAULT_MODEL,
-            "provider": DEFAULT_PROVIDER,
+            "model": "your-model-here",
+            "provider": "anthropic",
             "workspace": "~/.spoon-bot/workspace",
-            "max_iterations": DEFAULT_MAX_ITERATIONS,
+            "max_iterations": 20,
             "tool_profile": "core",
         },
         "sessions": {

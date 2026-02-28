@@ -31,7 +31,6 @@ Usage:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -73,17 +72,13 @@ except ImportError as e:
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
 
-# Import defaults from single source of truth
-from spoon_bot.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER
-
-
 @dataclass
 class SpoonBotConfig:
     """Configuration for SpoonBot."""
 
     # LLM settings
-    model: str = DEFAULT_MODEL
-    provider: str = DEFAULT_PROVIDER
+    model: str = ""
+    provider: str = ""
     api_key: str | None = None
     base_url: str | None = None
 
@@ -106,51 +101,22 @@ class SpoonBotConfig:
 
     @classmethod
     def from_env(cls) -> "SpoonBotConfig":
-        """Create config from environment variables.
+        """Create config from YAML + environment variables.
 
-        Supports both SPOON_* (original) and SPOON_BOT_* (gateway) env vars.
+        Uses the centralized load_agent_config() for resolution.
+        Priority: YAML > env vars. No silent defaults.
         """
-        provider = (
-            os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
-            or os.environ.get("SPOON_PROVIDER")
-            or DEFAULT_PROVIDER
-        )
-        model = (
-            os.environ.get("SPOON_BOT_DEFAULT_MODEL")
-            or os.environ.get("SPOON_MODEL")
-            or DEFAULT_MODEL
-        )
+        from spoon_bot.channels.config import load_agent_config
 
-        # Resolve API key based on provider
-        api_key = None
-        if provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY")
-        elif provider == "anthropic":
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
-
-        # Resolve base_url based on provider
-        base_url = None
-        if provider == "openai":
-            base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
-        elif provider == "anthropic":
-            base_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
-        else:
-            base_url = os.environ.get("BASE_URL")
-
-        max_steps = int(
-            os.environ.get("SPOON_BOT_MAX_ITERATIONS")
-            or os.environ.get("SPOON_MAX_STEPS")
-            or "15"
-        )
+        cfg = load_agent_config()
 
         return cls(
-            model=model,
-            provider=provider,
-            api_key=api_key,
-            base_url=base_url,
-            max_steps=max_steps,
+            model=cfg.get("model", ""),
+            provider=cfg.get("provider", ""),
+            api_key=cfg.get("api_key"),
+            base_url=cfg.get("base_url"),
+            max_steps=cfg.get("max_iterations", 15),
+            workspace=Path(cfg["workspace"]) if cfg.get("workspace") else Path.home() / ".spoon-bot" / "workspace",
         )
 
 
@@ -425,9 +391,16 @@ async def create_agent(
         ...     mcp_servers={"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}
         ... )
     """
+    # If model/provider not explicitly passed, resolve from YAML/env
+    if not model or not provider:
+        from spoon_bot.channels.config import load_agent_config
+        cfg = load_agent_config()
+        model = model or cfg.get("model", "")
+        provider = provider or cfg.get("provider", "")
+
     config = SpoonBotConfig(
-        model=model or DEFAULT_MODEL,
-        provider=provider or DEFAULT_PROVIDER,
+        model=model,
+        provider=provider,
         mcp_servers=mcp_servers or {},
         enable_skills=enable_skills,
         skill_paths=skill_paths or [],
