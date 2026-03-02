@@ -165,7 +165,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("crypto")
             logger.info(f"Loaded {len(tools)} crypto tools")
 
-        except ImportError as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits crypto tools not available: {e}")
 
         return tools
@@ -203,7 +203,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("blockchain")
             logger.info(f"Loaded {len(tools)} blockchain tools")
 
-        except (ImportError, AttributeError, Exception) as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits blockchain tools not available: {e}")
 
         return tools
@@ -254,7 +254,7 @@ class ToolkitAdapter:
             self._loaded_categories.add("security")
             logger.info(f"Loaded {len(tools)} security tools")
 
-        except ImportError as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits security tools not available: {e}")
 
         return tools
@@ -275,18 +275,65 @@ class ToolkitAdapter:
             self._loaded_categories.add("social")
             logger.info(f"Loaded {len(tools)} social tools")
 
-        except ImportError as e:
+        except Exception as e:
             logger.warning(f"spoon-toolkits social tools not available: {e}")
 
         return tools
 
-    def load_all(self) -> list[Tool]:
-        """Load all available toolkit tools."""
-        all_tools = []
-        all_tools.extend(self.load_crypto_tools())
-        all_tools.extend(self.load_blockchain_tools())
-        all_tools.extend(self.load_security_tools())
-        all_tools.extend(self.load_social_tools())
+    def load_all(self, timeout_per_category: float = 5.0) -> list[Tool]:
+        """Load all available toolkit tools **in parallel**.
+
+        All categories are submitted concurrently so the total wall-clock
+        time is bounded by the slowest category, not the sum of all.
+
+        Args:
+            timeout_per_category: Max seconds to spend loading each category.
+                Categories that exceed this are skipped silently so startup
+                is not blocked by slow network calls.
+        """
+        import concurrent.futures
+
+        all_tools: list[Tool] = []
+        loaders = [
+            ("crypto", self.load_crypto_tools),
+            ("blockchain", self.load_blockchain_tools),
+            ("security", self.load_security_tools),
+            ("social", self.load_social_tools),
+        ]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(loaders)) as pool:
+            future_map = {
+                pool.submit(loader_fn): category
+                for category, loader_fn in loaders
+            }
+
+            try:
+                for future in concurrent.futures.as_completed(
+                    future_map, timeout=timeout_per_category + 1.0
+                ):
+                    category = future_map[future]
+                    try:
+                        tools = future.result(timeout=0.1)
+                        all_tools.extend(tools)
+                    except concurrent.futures.TimeoutError:
+                        logger.warning(
+                            f"Toolkit '{category}' loading timed out "
+                            f"({timeout_per_category}s), skipping"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Toolkit '{category}' loading failed: {e}"
+                        )
+            except TimeoutError:
+                # Some categories didn't finish in time — log and move on
+                for future, category in future_map.items():
+                    if not future.done():
+                        logger.warning(
+                            f"Toolkit '{category}' loading timed out "
+                            f"({timeout_per_category}s), skipping"
+                        )
+                        future.cancel()
+
         return all_tools
 
     def get_loaded_tools(self) -> list[Tool]:

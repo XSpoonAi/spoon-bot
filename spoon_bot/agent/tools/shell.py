@@ -1,5 +1,7 @@
 """Shell execution tool with comprehensive security guards and rate limiting."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import re
@@ -50,6 +52,7 @@ class CommandValidator:
         "dd if=/dev/random",
         "format c:",
         "format d:",
+        "format e:",
         # Fork bombs and resource exhaustion
         ":(){ :|:& };:",
         # System modification
@@ -60,7 +63,6 @@ class CommandValidator:
         # Windows specific
         "del /f /s /q c:\\",
         "rd /s /q c:\\",
-        "format",
     })
 
     # Regex patterns for dangerous operations
@@ -86,6 +88,8 @@ class CommandValidator:
         re.compile(r";\s*\S"),  # command1; command2
         re.compile(r"\|\|"),    # command1 || command2
         re.compile(r"&&"),      # command1 && command2
+        # Newline / carriage-return multi-command injection
+        re.compile(r"[\r\n]+\s*\S"),
         # Pipes (can be dangerous but often legitimate - more lenient)
         # Command substitution
         re.compile(r"\$\("),    # $(command)
@@ -177,17 +181,35 @@ class CommandValidator:
         return base.lower()
 
     def _check_dangerous_commands(self, command: str) -> str | None:
-        """Check if command matches any dangerous command patterns."""
+        """Check if command matches any dangerous command patterns.
+
+        Uses word-boundary aware matching so that tokens appearing inside
+        URLs or quoted strings (e.g. ``curl ...?format=3``) are not
+        incorrectly flagged.
+        """
         cmd_lower = command.lower().strip()
 
-        # Check exact matches
+        # Check dangerous commands — match only when the dangerous string
+        # appears as the start of the command or after a shell separator,
+        # not inside an unrelated substring like a URL query parameter.
         for dangerous in self.DANGEROUS_COMMANDS:
-            if dangerous.lower() in cmd_lower:
+            d_lower = dangerous.lower()
+            # Quick substring pre-check
+            if d_lower not in cmd_lower:
+                continue
+            # Build a word-boundary regex so "format c:" matches but
+            # "?format=3" does not.
+            escaped = re.escape(d_lower)
+            if re.search(rf"(?:^|[\s;|&]){escaped}", cmd_lower):
                 return f"Blocked dangerous command: '{dangerous}'"
 
-        # Check custom blocklist
+        # Check custom blocklist with same boundary logic
         for blocked in self.custom_blocklist:
-            if blocked.lower() in cmd_lower:
+            b_lower = blocked.lower()
+            if b_lower not in cmd_lower:
+                continue
+            escaped = re.escape(b_lower)
+            if re.search(rf"(?:^|[\s;|&]){escaped}", cmd_lower):
                 return f"Blocked by custom blocklist: '{blocked}'"
 
         # Check regex patterns
@@ -436,6 +458,26 @@ class ShellTool(Tool):
             # Unix: use shlex.quote
             return shlex.quote(arg)
 
+    async def _communicate_with_timeout(
+        self,
+        process: asyncio.subprocess.Process,
+    ) -> tuple[bytes, bytes, int]:
+        """Communicate with process, killing it on timeout to avoid zombies."""
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.timeout,
+            )
+            return stdout, stderr, process.returncode or 0
+        except asyncio.TimeoutError:
+            # Kill the process to prevent zombie processes
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass  # Process already exited
+            await process.wait()
+            raise
+
     async def _execute_with_shell(
         self,
         command: str,
@@ -460,12 +502,7 @@ class ShellTool(Tool):
                 executable="/bin/sh",
             )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=self.timeout,
-        )
-
-        return stdout, stderr, process.returncode or 0
+        return await self._communicate_with_timeout(process)
 
     async def _execute_without_shell(
         self,
@@ -484,12 +521,7 @@ class ShellTool(Tool):
             cwd=cwd,
         )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=self.timeout,
-        )
-
-        return stdout, stderr, process.returncode or 0
+        return await self._communicate_with_timeout(process)
 
     async def execute(
         self,

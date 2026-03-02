@@ -149,6 +149,24 @@ class LLMTimeoutError(LLMError):
         return "The request took too long to complete. Please try again."
 
 
+class ContextOverflowError(LLMError):
+    """Context window exceeded and cannot be recovered by trimming."""
+
+    def __init__(self, estimated_tokens: int, max_tokens: int):
+        self.estimated_tokens = estimated_tokens
+        self.max_tokens = max_tokens
+        super().__init__(
+            f"Context overflow: ~{estimated_tokens:,} tokens exceeds {max_tokens:,} limit",
+            {"estimated_tokens": estimated_tokens, "max_tokens": max_tokens},
+        )
+
+    def user_message(self) -> str:
+        return (
+            "The conversation is too long for the current model's context window. "
+            "Please start a new session or clear the conversation history."
+        )
+
+
 # === MCP Errors ===
 
 

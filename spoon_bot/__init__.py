@@ -22,10 +22,18 @@ try:
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
     from spoon_ai.skills import SkillManager
 
     _SPOON_CORE_AVAILABLE = True
+
+    try:
+        from spoon_ai.tools.mcp_tool import MCPTool
+        MCP_TOOL_AVAILABLE = True
+        _MCP_TOOL_ERROR = None
+    except ImportError as e:
+        MCPTool = None
+        MCP_TOOL_AVAILABLE = False
+        _MCP_TOOL_ERROR = e
 
     # Import spoon-bot components that require spoon-core
     from spoon_bot.core import SpoonBot, SpoonBotConfig, create_agent as create_spoon_bot
@@ -43,6 +51,8 @@ except ImportError as e:
     ToolManager = None
     MCPTool = None
     SkillManager = None
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_ERROR = e
     SpoonBot = None
     SpoonBotConfig = None
     create_spoon_bot = None

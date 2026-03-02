@@ -21,6 +21,96 @@ from pydantic import (
 from pydantic_settings import BaseSettings
 
 
+# ---------------------------------------------------------------------------
+# Model context-window lookup (tokens)
+# Used to auto-configure context budget when the user doesn't specify one.
+# ---------------------------------------------------------------------------
+
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # ---- Anthropic ----
+    "claude-opus-4.6":       1_000_000,
+    "claude-sonnet-4.5":     1_000_000,
+    "claude-sonnet-4":       1_000_000,
+    "claude-opus-4.5":         200_000,
+    "claude-opus-4.1":         200_000,
+    "claude-opus-4":           200_000,
+    "claude-haiku-4.5":        200_000,
+    # ---- OpenAI ----
+    "gpt-5.2":                 400_000,
+    "gpt-5.2-codex":           400_000,
+    "gpt-5.2-chat":            128_000,
+    "gpt-5.2-pro":             400_000,
+    "gpt-5.1":                 400_000,
+    "gpt-5.1-codex":           400_000,
+    "gpt-5.1-codex-mini":      400_000,
+    "gpt-5":                   400_000,
+    "gpt-5-mini":              400_000,
+    "gpt-5-nano":              400_000,
+    "gpt-5-chat":              128_000,
+    "gpt-4o":                  128_000,
+    "gpt-4o-mini":             128_000,
+    "o4-mini":                 200_000,
+    "o3":                      200_000,
+    "o3-mini":                 200_000,
+    # ---- DeepSeek ----
+    "deepseek-v3.2":           163_840,
+    "deepseek-chat-v3.1":      32_768,
+    "deepseek-chat":           163_840,
+    "deepseek-r1":              64_000,
+    # ---- Google Gemini ----
+    "gemini-3-pro-preview":  1_048_576,
+    "gemini-3-flash-preview":1_048_576,
+    "gemini-2.5-pro":        1_048_576,
+    "gemini-2.5-flash":      1_048_576,
+    "gemini-2.5-flash-lite": 1_048_576,
+    "gemini-2.0-flash":      1_048_576,
+    # ---- Qwen (via OpenRouter) ----
+    "qwen3-max-thinking":      262_144,
+    "qwen3-coder-next":        262_144,
+    "qwen3-coder-plus":      1_000_000,
+    "qwen3-coder-flash":     1_000_000,
+    "qwen3-max":               262_144,
+    # ---- Moonshot ----
+    "kimi-k2.5":               262_144,
+    # ---- MiniMax ----
+    "minimax-m2.5":            204_800,
+}
+
+DEFAULT_CONTEXT_WINDOW = 128_000
+
+
+def resolve_context_window(model: str | None, explicit: int | None = None) -> int:
+    """Return the effective context window for a given model.
+
+    Priority:
+      1. ``explicit`` value (user override)
+      2. Lookup in ``MODEL_CONTEXT_WINDOWS`` (exact match, then suffix match)
+      3. ``DEFAULT_CONTEXT_WINDOW`` (128 000)
+    """
+    if explicit is not None:
+        return explicit
+
+    if model is None:
+        return DEFAULT_CONTEXT_WINDOW
+
+    # Exact match
+    if model in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[model]
+
+    # Strip provider prefix (e.g. "anthropic/claude-sonnet-4.5" -> "claude-sonnet-4.5")
+    short = model.rsplit("/", 1)[-1] if "/" in model else model
+
+    if short in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[short]
+
+    # Suffix / substring match (e.g. "claude-sonnet-4.5-20260101" -> "claude-sonnet-4.5")
+    for key, ctx in MODEL_CONTEXT_WINDOWS.items():
+        if short.startswith(key):
+            return ctx
+
+    return DEFAULT_CONTEXT_WINDOW
+
+
 class TransportType(str, Enum):
     """Supported MCP transport types."""
     STDIO = "stdio"
@@ -210,6 +300,59 @@ class ToolParameterSchema(BaseModel):
         return self
 
 
+class MemSearchConfig(BaseModel):
+    """Configuration for memsearch-based semantic memory."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable semantic memory search via memsearch"
+    )
+    embedding_provider: str = Field(
+        default="openai",
+        description="Embedding provider: 'openai' (OpenAI-compatible), 'local', 'ollama', etc."
+    )
+    embedding_model: str | None = Field(
+        default=None,
+        description="Embedding model name (provider default if None)"
+    )
+    embedding_api_key: str | None = Field(
+        default=None,
+        description="API key for the embedding provider (falls back to OPENAI_API_KEY env)"
+    )
+    embedding_base_url: str | None = Field(
+        default=None,
+        description="Base URL for the embedding API (falls back to OPENAI_BASE_URL env)"
+    )
+    milvus_uri: str | None = Field(
+        default=None,
+        description="Milvus connection URI (defaults to workspace/memsearch/milvus.db)"
+    )
+    collection: str = Field(
+        default="spoon_bot_memory",
+        description="Milvus collection name"
+    )
+
+    def get_embedding_api_key(self) -> str | None:
+        """Get API key: config > OPENAI_EMBEDDING_API_KEY > OPENAI_API_KEY."""
+        return (
+            self.embedding_api_key
+            or os.environ.get("OPENAI_EMBEDDING_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+
+    def get_embedding_base_url(self) -> str | None:
+        """Get base URL: config > OPENAI_EMBEDDING_BASE_URL > OPENAI_BASE_URL."""
+        return (
+            self.embedding_base_url
+            or os.environ.get("OPENAI_EMBEDDING_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        )
+
+    def get_embedding_model(self) -> str | None:
+        """Get model name: config > OPENAI_EMBEDDING_MODEL."""
+        return self.embedding_model or os.environ.get("OPENAI_EMBEDDING_MODEL")
+
+
 class AgentLoopConfig(BaseModel):
     """Configuration for AgentLoop with validation."""
 
@@ -258,6 +401,33 @@ class AgentLoopConfig(BaseModel):
     use_spoon_core_skills: bool = Field(
         default=True,
         description="Use spoon-core SkillManager if available"
+    )
+    context_window: int | None = Field(
+        default=None,
+        description=(
+            "Context window size in tokens. "
+            "If None, auto-resolved from model name (default 128K)."
+        ),
+    )
+
+    # Session persistence
+    session_store_backend: str = Field(
+        default="file",
+        description="Session storage backend: 'file' (JSONL), 'sqlite', or 'postgres'"
+    )
+    session_store_dsn: str | None = Field(
+        default=None,
+        description="Database connection string (required for 'postgres' backend)"
+    )
+    session_store_db_path: str | None = Field(
+        default=None,
+        description="SQLite database path (for 'sqlite' backend, default: workspace/sessions.db)"
+    )
+
+    # Semantic memory (memsearch)
+    memsearch: MemSearchConfig = Field(
+        default_factory=MemSearchConfig,
+        description="Semantic memory search configuration"
     )
 
     @field_validator("workspace", mode="before")

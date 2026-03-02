@@ -52,6 +52,10 @@ class ClientMethod(str, Enum):
     # Agent methods
     AGENT_STATUS = "agent.status"
 
+    # Audio streaming methods
+    AUDIO_STREAM_START = "audio.stream.start"
+    AUDIO_STREAM_END = "audio.stream.end"
+
     # Heartbeat
     PING = "ping"
 
@@ -81,6 +85,11 @@ class ServerEvent(str, Enum):
     METRICS_UPDATE = "metrics.update"
     RESOURCE_TOKEN_LIMIT = "resource.token_limit"
     RESOURCE_TIME_LIMIT = "resource.time_limit"
+
+    # Audio streaming events
+    AUDIO_STREAM_STARTED = "audio.stream.started"
+    AUDIO_STREAM_ERROR = "audio.stream.error"
+    AUDIO_STREAM_TRANSCRIPTION = "audio.stream.transcription"
 
     # Connection events
     CONNECTION_ESTABLISHED = "connection.established"
@@ -120,10 +129,16 @@ class WSRequest(WSMessage):
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WSRequest":
         """Create from dictionary."""
+        raw_params = data.get("params", {})
+        # Ensure params is always a dict – reject non-dict values (#14)
+        if not isinstance(raw_params, dict):
+            raise ValueError(
+                f"'params' must be a JSON object, got {type(raw_params).__name__}"
+            )
         return cls(
             id=data.get("id"),
             method=data.get("method", ""),
-            params=data.get("params", {}),
+            params=raw_params,
         )
 
 
