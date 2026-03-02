@@ -125,20 +125,29 @@ class TelegramChannel(BaseChannel):
             from telegram.request import HTTPXRequest
 
             # Create request with longer timeouts (important for unstable proxies)
-            request = HTTPXRequest(
-                connection_pool_size=8,
-                connect_timeout=30.0,
-                read_timeout=30.0,
-                write_timeout=30.0,
-                pool_timeout=30.0,
-            )
-
-            builder = Application.builder().token(self.token).request(request)
-
-            # Configure proxy if provided
+            request_kwargs: dict[str, Any] = {
+                "connection_pool_size": 8,
+                "connect_timeout": 30.0,
+                "read_timeout": 30.0,
+                "write_timeout": 30.0,
+                "pool_timeout": 30.0,
+            }
             if self.proxy_url:
+                request_kwargs["proxy"] = self.proxy_url
                 logger.info(f"[{self.full_name}] Using proxy: {self.proxy_url}")
-                builder = builder.proxy(self.proxy_url)
+
+            # Pass proxy via HTTPXRequest; do NOT also call builder.proxy()
+            # as python-telegram-bot forbids setting both request and proxy.
+            # HTTPXRequest is used for all bot API calls including get_updates.
+            request = HTTPXRequest(**request_kwargs)
+            get_updates_request = HTTPXRequest(**request_kwargs)
+
+            builder = (
+                Application.builder()
+                .token(self.token)
+                .request(request)
+                .get_updates_request(get_updates_request)
+            )
 
             self._app = builder.build()
             self._bot = self._app.bot

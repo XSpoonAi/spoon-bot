@@ -196,6 +196,13 @@ class ChannelsConfig:
                     except ValueError:
                         logger.warning(f"TELEGRAM_USER_ID={env_uid!r} is not a valid integer, ignoring")
 
+            # proxy_url: YAML > TELEGRAM_PROXY > HTTPS_PROXY
+            proxy_url = (
+                account.get("proxy_url")
+                or os.getenv("TELEGRAM_PROXY")
+                or os.getenv("HTTPS_PROXY")
+            )
+
             config = ChannelConfig(
                 **common,
                 webhook_path=account.get("webhook_url"),
@@ -205,6 +212,7 @@ class ChannelsConfig:
                 allowed_users=allowed_users,
                 groups=account.get("groups", {}),
                 media_max_mb=account.get("media_max_mb", 20),
+                proxy_url=proxy_url,
             )
             configs.append((config, name))
 
