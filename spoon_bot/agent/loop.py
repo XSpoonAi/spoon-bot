@@ -22,7 +22,6 @@ try:
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
     from spoon_ai.skills import SkillManager
 
     SPOON_CORE_AVAILABLE = True
@@ -32,9 +31,24 @@ except ImportError as e:
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
 
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    MCP_TOOL_AVAILABLE = True
+    _MCP_TOOL_IMPORT_ERROR: Exception | None = None
+except ImportError as e:
+    MCPTool = None  # type: ignore[assignment]
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_IMPORT_ERROR = e
+    logger.warning(
+        f"MCPTool import failed ({e}). MCP integrations are disabled; AgentLoop remains available."
+    )
+
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder
-from spoon_bot.agent.tools.registry import CORE_TOOLS, ToolRegistry
+from spoon_bot.agent.tools.registry import (
+    CORE_TOOLS,
+    ToolRegistry,
+)
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.filesystem import (
     ReadFileTool,
@@ -43,6 +57,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.self_config import (
+    ActivateToolTool,
     SelfConfigTool,
     MemoryManagementTool,
     SelfUpgradeTool,
@@ -55,13 +70,15 @@ from spoon_bot.agent.tools.web3 import (
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.agent.tools.document import DocumentParseTool
-from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
+from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
+from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
 from spoon_bot.exceptions import (
     SpoonBotError,
     APIKeyMissingError,
+    ContextOverflowError,
     LLMError,
     LLMConnectionError,
     LLMTimeoutError,
@@ -114,6 +131,11 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        session_store_backend: str = "file",
+        session_store_dsn: str | None = None,
+        session_store_db_path: str | None = None,
+        context_window: int | None = None,
+        memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -135,6 +157,10 @@ class AgentLoop:
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
             tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
+            session_store_dsn: PostgreSQL DSN for 'postgres' backend.
+            session_store_db_path: SQLite DB path for 'sqlite' backend.
+            context_window: Override context window in tokens (auto-resolved from model if None).
         """
         # Validate parameters
         try:
@@ -167,6 +193,10 @@ class AgentLoop:
         self._system_prompt = system_prompt
         self._auto_commit = auto_commit
 
+        # Context window — auto-resolved from model when not explicit
+        self.context_window = resolve_context_window(model, context_window)
+        logger.info(f"Context window: {self.context_window:,} tokens (model={model})")
+
         # spoon-core components (initialized later)
         self._chatbot: ChatBot | None = None
         self._agent: SpoonReactMCP | SpoonReactSkill | None = None
@@ -176,8 +206,52 @@ class AgentLoop:
         # spoon-bot components
         self.context = ContextBuilder(self.workspace)
         self.tools = ToolRegistry()
-        self.sessions = SessionManager(self.workspace)
-        self.memory = MemoryStore(self.workspace)
+
+        # Session persistence — configurable backend
+        _store_backend = session_store_backend or "file"
+        _store_db_path = session_store_db_path
+        if _store_backend == "sqlite" and not _store_db_path:
+            _store_db_path = str(self.workspace / "sessions.db")
+        try:
+            _session_store = create_session_store(
+                backend=_store_backend,
+                workspace=self.workspace,
+                db_path=_store_db_path,
+                dsn=session_store_dsn,
+            )
+            self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
+            logger.info(f"Session store: {_store_backend}")
+        except Exception as exc:
+            logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
+            self.sessions = SessionManager(self.workspace)
+
+        # Memory store — semantic (memsearch) or file-based
+        self._memsearch_config: MemSearchConfig | None = None
+        if memsearch_config is not None:
+            if isinstance(memsearch_config, dict):
+                self._memsearch_config = MemSearchConfig(**memsearch_config)
+            else:
+                self._memsearch_config = memsearch_config
+
+        if self._memsearch_config and self._memsearch_config.enabled:
+            try:
+                from spoon_bot.memory.semantic_store import SemanticMemoryStore
+                self.memory = SemanticMemoryStore(
+                    self.workspace,
+                    embedding_provider=self._memsearch_config.embedding_provider,
+                    embedding_model=self._memsearch_config.get_embedding_model(),
+                    embedding_api_key=self._memsearch_config.get_embedding_api_key(),
+                    embedding_base_url=self._memsearch_config.get_embedding_base_url(),
+                    milvus_uri=self._memsearch_config.milvus_uri,
+                    collection=self._memsearch_config.collection,
+                )
+                logger.info("Using SemanticMemoryStore (memsearch)")
+            except ImportError:
+                logger.warning("memsearch not installed, falling back to file-based memory")
+                self.memory = MemoryStore(self.workspace)
+        else:
+            self.memory = MemoryStore(self.workspace)
+
         self._git = GitManager(self.workspace) if auto_commit else None
 
         # Skill paths
@@ -237,23 +311,23 @@ class AgentLoop:
                 "Configure agent.provider in config.yaml or set SPOON_BOT_DEFAULT_PROVIDER env var."
             )
 
+        # Initialize semantic memory if enabled
+        if hasattr(self.memory, 'initialize'):
+            await self.memory.initialize()
+
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
+
+        # Context budget hint
+        system_prompt += (
+            f"\n\n[Context budget: {self.context_window:,} tokens. "
+            f"Be concise when context is limited.]\n"
+        )
 
         # Append available-tools summary so the LLM knows what can be loaded
         inactive_tools = self.tools.get_inactive_tools()
         if inactive_tools:
-            tool_lines = "\n".join(
-                f"- {t.name}: {t.description}"
-                for t in inactive_tools.values()
-            )
-            system_prompt += (
-                "\n\n## Dynamically Loadable Tools\n\n"
-                "The following tools are available but not currently loaded. "
-                "If you need any of them, tell the user which tool you need "
-                "and they can be loaded on demand.\n\n"
-                f"{tool_lines}"
-            )
+            system_prompt += self._build_dynamic_tools_prompt(inactive_tools)
 
         # Create ChatBot (spoon-core LLM interface)
         self._chatbot = ChatBot(
@@ -264,14 +338,62 @@ class AgentLoop:
             system_prompt=system_prompt,
         )
 
-        # Create MCP tools
+        # Warn about potential provider/model mismatch that may cause fallback noise
+        if self.provider and self.model:
+            model_lower = self.model.lower()
+            provider_lower = self.provider.lower()
+            _provider_model_hints = {
+                "anthropic": ["claude"],
+                "openai": ["gpt", "o1", "o3", "o4"],
+                "deepseek": ["deepseek"],
+                "gemini": ["gemini"],
+                "openrouter": [],  # openrouter supports all models
+            }
+            expected_prefixes = _provider_model_hints.get(provider_lower, [])
+            if expected_prefixes:
+                model_base = model_lower.rsplit("/", 1)[-1]
+                if not any(model_base.startswith(p) for p in expected_prefixes):
+                    logger.warning(
+                        f"Model '{self.model}' may not be native to provider "
+                        f"'{self.provider}'. If you see fallback errors in logs, "
+                        f"consider using 'openrouter' as provider or matching "
+                        f"the model to the provider."
+                    )
+
+        # Create MCP tools – expand each server into individual tools (#5)
+        if self._mcp_config and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP configuration provided but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP server setup."
+            )
         for name, config in self._mcp_config.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
+
             mcp_tool = MCPTool(
                 name=name,
                 description=f"MCP server: {name}",
                 mcp_config=config,
             )
-            self._mcp_tools.append(mcp_tool)
+            # Try to discover real server tools and create one MCPTool per tool
+            if hasattr(mcp_tool, "expand_server_tools"):
+                try:
+                    expanded = await mcp_tool.expand_server_tools()
+                    if expanded:
+                        self._mcp_tools.extend(expanded)
+                        logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
+                    else:
+                        # Fallback: keep proxy tool (server might be offline)
+                        self._mcp_tools.append(mcp_tool)
+                        logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
+                except Exception as exc:
+                    logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
+                    self._mcp_tools.append(mcp_tool)
+            else:
+                self._mcp_tools.append(mcp_tool)
+                logger.info(
+                    f"MCP server '{name}': expand_server_tools() unavailable in this spoon-core version; using proxy."
+                )
 
         # Only pass active (filtered) tools + MCP tools to the agent
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
@@ -287,11 +409,16 @@ class AgentLoop:
 
         # Create SkillManager if enabled
         if self._enable_skills:
-            self._skill_manager = SkillManager(
-                skill_paths=[str(p) for p in self._skill_paths],
-                llm=self._chatbot,
-                auto_discover=True,
-            )
+            import inspect
+            _sm_sig = inspect.signature(SkillManager.__init__)
+            _sm_kwargs: dict[str, Any] = {
+                "skill_paths": [str(p) for p in self._skill_paths],
+                "llm": self._chatbot,
+                "auto_discover": True,
+            }
+            if "include_default_paths" in _sm_sig.parameters:
+                _sm_kwargs["include_default_paths"] = False
+            self._skill_manager = SkillManager(**_sm_kwargs)
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
         else:
@@ -335,6 +462,15 @@ class AgentLoop:
         self.tools.register(memory_tool)
         self.tools.register(SelfUpgradeTool(workspace=self.workspace))
 
+        # Dynamic tool activation — lets the LLM load tools on demand
+        self.tools.register(ActivateToolTool(
+            activate_fn=self.add_tool,
+            list_inactive_fn=lambda: [
+                {"name": t.name, "description": t.description}
+                for t in self.tools.get_inactive_tools().values()
+            ],
+        ))
+
         # Background task tool
         self.tools.register(SpawnTool())
 
@@ -361,6 +497,44 @@ class AgentLoop:
             logger.debug("spoon-toolkits not available, skipping toolkit tools")
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
+
+    def _estimate_token_count(self) -> int:
+        """Rough token estimate for current session messages (~4 chars per token)."""
+        return sum(len(m.get("content", "")) for m in self._session.messages) // 4
+
+    def _trim_context_if_needed(self) -> None:
+        """Auto-trim oldest messages if context budget approaches the limit.
+
+        Keeps at minimum the two most recent messages (last user + assistant pair).
+        Raises ContextOverflowError if even after trimming the context is too large.
+        """
+        if not self._session.messages:
+            return
+
+        budget = int(self.context_window * 0.75)
+        estimated = self._estimate_token_count()
+
+        if estimated <= budget:
+            return
+
+        logger.warning(
+            f"Context approaching limit: ~{estimated:,} tokens "
+            f"(budget: {budget:,}, window: {self.context_window:,}). "
+            f"Trimming oldest messages."
+        )
+
+        messages = self._session.messages
+        while len(messages) > 2 and self._estimate_token_count() > budget:
+            removed = messages.pop(0)
+            logger.debug(
+                f"Trimmed message: role={removed.get('role')}, "
+                f"len={len(removed.get('content', ''))}"
+            )
+
+        # If still over the hard limit after trimming, raise
+        final_estimate = self._estimate_token_count()
+        if final_estimate > self.context_window:
+            raise ContextOverflowError(final_estimate, self.context_window)
 
     async def process(
         self,
@@ -397,6 +571,9 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to load memory context: {e}")
 
+        # Trim context if approaching window limit
+        self._trim_context_if_needed()
+
         # Run agent
         try:
             result = await self._agent.run(message)
@@ -412,7 +589,7 @@ class AgentLoop:
 
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
-            return f"I encountered an error: {user_friendly_error(e)}"
+            raise
 
         # Save to session
         try:
@@ -495,15 +672,90 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        kwargs: dict[str, Any] = {}
-        if thinking:
-            kwargs["thinking"] = True
-        if media:
-            kwargs["media"] = media
+        logger.info(f"Streaming message: {message[:100]}...")
+
+        # Refresh memory context
+        try:
+            memory_context = self.memory.get_memory_context()
+            if memory_context:
+                self.context.set_memory_context(memory_context)
+        except Exception as e:
+            logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+
+        # Trim context if approaching window limit
+        self._trim_context_if_needed()
+
+        # ------------------------------------------------------------------
+        # Streaming uses the spoon-core run+stream pattern:
+        #   1. Clear task_done + drain output_queue
+        #   2. Start run(message) in background — sets task_done on finish
+        #   3. Read chunks from output_queue until task_done AND queue empty
+        # ------------------------------------------------------------------
+
         try:
-            async for chunk in self._agent.stream(message, **kwargs):
+            # 1. Reset streaming state
+            self._agent.task_done.clear()
+            while not self._agent.output_queue.empty():
+                try:
+                    await asyncio.wait_for(self._agent.output_queue.get(), timeout=0.1)
+                except (asyncio.TimeoutError, Exception):
+                    break
+
+            # 2. Start run() in background
+            async def _run_and_signal() -> None:
+                try:
+                    await self._agent.run(request=message)
+                except Exception as exc:
+                    logger.error(f"Background agent run failed: {exc}")
+                    try:
+                        await self._agent.output_queue.put({
+                            "type": "error",
+                            "delta": str(exc),
+                            "metadata": {"error": str(exc), "error_code": type(exc).__name__},
+                        })
+                    except Exception:
+                        pass
+                finally:
+                    self._agent.task_done.set()
+
+            logger.debug(f"Creating bg task, agent state={self._agent.state}")
+            bg_task = asyncio.create_task(_run_and_signal())
+
+            # Force a yield to allow the background task to start
+            await asyncio.sleep(0)
+
+            # 3. Read output chunks (mirrors fixed BaseAgent.stream logic)
+            oq = self._agent.output_queue
+            td = self._agent.task_done
+            logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
+            stream_timeout = 120.0
+            deadline = asyncio.get_event_loop().time() + stream_timeout
+            chunk_count = 0
+
+            logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
+            while not (td.is_set() and oq.empty()):
+                if asyncio.get_event_loop().time() > deadline:
+                    logger.warning("Streaming deadline reached, stopping")
+                    break
+
+                try:
+                    # Use oq.get() without timeout kwarg — works for both
+                    # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
+                    # handled by the outer asyncio.wait_for.
+                    chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
+                    chunk_count += 1
+                    logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    logger.warning("Streaming cancelled")
+                    break
+                except Exception as e:
+                    logger.warning(f"Queue get error: {type(e).__name__}: {e}")
+                    continue
+
                 chunk_type = "content"
                 delta = ""
                 metadata: dict[str, Any] = {}
@@ -526,21 +778,41 @@ class AgentLoop:
 
                 # -- Dict chunks (tool_calls, structured events) --
                 elif isinstance(chunk, dict):
+                    if chunk.get("type") == "error":
+                        yield {
+                            "type": "error",
+                            "delta": chunk.get("delta", ""),
+                            "metadata": chunk.get("metadata", {}),
+                        }
+                        continue
+
                     if "tool_calls" in chunk and chunk["tool_calls"]:
                         for tc in chunk["tool_calls"]:
-                            fn = tc.get("function", {})
+                            # tc may be a ToolCall pydantic object or a dict
+                            if isinstance(tc, dict):
+                                fn = tc.get("function", {})
+                                tc_id = tc.get("id", "")
+                                fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                                fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                            else:
+                                tc_id = getattr(tc, "id", "")
+                                fn_obj = getattr(tc, "function", None)
+                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
                             yield {
                                 "type": "tool_call",
                                 "delta": "",
                                 "metadata": {
-                                    "id": tc.get("id", ""),
-                                    "name": fn.get("name", ""),
-                                    "arguments": fn.get("arguments", ""),
+                                    "id": tc_id,
+                                    "name": fn_name,
+                                    "arguments": fn_args,
                                 },
                             }
                         continue
-                    if "content" in chunk and chunk["content"]:
-                        delta = chunk["content"]
+                    # Support both "content" and "delta" keys (#10)
+                    text = chunk.get("content") or chunk.get("delta") or ""
+                    if text:
+                        delta = text
                         full_content += delta
 
                 # -- Object chunks with content --
@@ -556,11 +828,20 @@ class AgentLoop:
                 if delta:
                     yield {"type": chunk_type, "delta": delta, "metadata": metadata}
 
+            logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
+
+            # Ensure background task completes
+            try:
+                await asyncio.wait_for(bg_task, timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
             # Emit done
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
+            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
 
         # Save to session only if we got actual content
@@ -600,6 +881,9 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to load memory context: {e}")
 
+        # Trim context if approaching window limit
+        self._trim_context_if_needed()
+
         # Run agent with thinking enabled
         try:
             run_kwargs: dict[str, Any] = {"thinking": True}
@@ -623,7 +907,7 @@ class AgentLoop:
 
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
-            return f"I encountered an error: {user_friendly_error(e)}", None
+            raise
 
         # Save to session
         try:
@@ -642,6 +926,36 @@ class AgentLoop:
                 logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content, thinking_content
+
+    # ------------------------------------------------------------------
+    # Dynamic prompt helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_dynamic_tools_prompt(inactive_tools: dict[str, "Tool"]) -> str:
+        """Build the 'Dynamically Loadable Tools' system-prompt section.
+
+        Lists ALL inactive tools with their descriptions so the AI Agent
+        can autonomously decide which to activate. No hardcoded topic
+        mapping — the LLM reads tool descriptions and decides for itself.
+        """
+        lines: list[str] = [
+            "\n\n## Dynamically Loadable Tools\n\n"
+            "The following specialized tools are registered but not yet active. "
+            "Use `activate_tool(action='list')` to refresh this list at any time, "
+            "or `activate_tool(action='activate', tool_name='<name>')` to load "
+            "a tool. You can activate multiple tools in one call using "
+            "comma-separated names.\n\n"
+            "**Read each tool's description carefully and activate the ones "
+            "you need BEFORE answering the user's question. "
+            "Always prefer specialized tools over generic web_search when "
+            "a matching tool is available.**\n"
+        ]
+
+        for tool in inactive_tools.values():
+            lines.append(f"- `{tool.name}`: {tool.description}")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Dynamic tool management
@@ -852,6 +1166,7 @@ async def create_agent(
     auto_commit: bool = True,
     enabled_tools: set[str] | None = None,
     tool_profile: str | None = None,
+    memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -904,6 +1219,7 @@ async def create_agent(
         auto_commit=auto_commit,
         enabled_tools=enabled_tools,
         tool_profile=tool_profile,
+        memsearch_config=memsearch_config,
         **kwargs,
     )
 

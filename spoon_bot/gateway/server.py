@@ -34,6 +34,7 @@ from spoon_bot.gateway.core_integration import (
     is_spoon_core_available,
 )
 from spoon_bot.gateway import app as app_module
+from spoon_bot.agent.tools.web import close_shared_http_client
 
 
 @asynccontextmanager
@@ -72,6 +73,7 @@ async def _lifespan(app: FastAPI):
     base_url = agent_cfg.get("base_url")
     if base_url:
         logger.info(f"Custom base URL: {base_url}")
+
     logger.info(f"Initializing agent: provider={provider}, model={model}")
 
     try:
@@ -79,6 +81,15 @@ async def _lifespan(app: FastAPI):
 
         enable_skills = agent_cfg.get("enable_skills", True)
         logger.info(f"Skills enabled: {enable_skills}")
+
+        # Session persistence config from env
+        session_store_backend = os.environ.get("SESSION_STORE_BACKEND", "file")
+        session_store_dsn = os.environ.get("SESSION_STORE_DSN")
+        session_store_db_path = os.environ.get("SESSION_STORE_DB_PATH")
+
+        # Context window override (optional)
+        _ctx_env = os.environ.get("CONTEXT_WINDOW")
+        context_window = int(_ctx_env) if _ctx_env else None
 
         create_kwargs: dict = dict(
             model=model,
@@ -88,6 +99,10 @@ async def _lifespan(app: FastAPI):
             workspace=agent_cfg.get("workspace", "/data/workspace"),
             enable_skills=enable_skills,
             auto_commit=False,  # No git auto-commit in Docker gateway mode
+            session_store_backend=session_store_backend,
+            session_store_dsn=session_store_dsn,
+            session_store_db_path=session_store_db_path,
+            context_window=context_window,
         )
         if agent_cfg.get("tool_profile"):
             create_kwargs["tool_profile"] = agent_cfg["tool_profile"]
@@ -166,6 +181,7 @@ async def _lifespan(app: FastAPI):
         logger.info("Channels stopped")
     if connection_manager:
         await connection_manager.stop()
+    await close_shared_http_client()
 
 
 def create_app() -> FastAPI:

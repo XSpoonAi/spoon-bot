@@ -35,7 +35,6 @@ try:
     # Tools
     from spoon_ai.tools import BaseTool as CoreBaseTool
     from spoon_ai.tools import ToolManager as CoreToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
 
     # Skills
     from spoon_ai.skills import SkillManager as CoreSkillManager
@@ -51,6 +50,18 @@ except ImportError as e:
     raise ImportError(
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
+
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    MCP_TOOL_AVAILABLE = True
+    _MCP_TOOL_IMPORT_ERROR: Exception | None = None
+except ImportError as e:
+    MCPTool = None  # type: ignore[assignment]
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_IMPORT_ERROR = e
+    logger.warning(
+        f"MCPTool import failed ({e}). Gateway MCP integrations are disabled; core gateway features remain available."
+    )
 
 # Optional modules from spoon-core
 try:
@@ -145,7 +156,14 @@ class SpoonCoreAgent:
 
         # Create MCP tools
         mcp_tools = []
+        if self._mcp_servers and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP servers configured but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP tool creation."
+            )
         for name, config in self._mcp_servers.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
             mcp_tool = MCPTool(
                 name=name,
                 description=f"MCP server: {name}",

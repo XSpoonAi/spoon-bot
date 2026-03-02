@@ -1,12 +1,28 @@
-"""Session manager for persistent conversation history."""
+"""Session manager for persistent conversation history.
+
+The ``SessionManager`` is the public API consumed by ``AgentLoop``.
+It delegates all I/O to a pluggable ``SessionStore`` backend (file, sqlite,
+postgres) while keeping an in-memory LRU cache for hot sessions.
+"""
+
+from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import RLock
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from spoon_bot.session.store import SessionStore
+
+
+# ============================================================================
+# Session data-class  (unchanged public API)
+# ============================================================================
 
 
 @dataclass
@@ -64,177 +80,135 @@ class Session:
         )
 
 
+# ============================================================================
+# SessionManager  (public API — unchanged signatures)
+# ============================================================================
+
+
 class SessionManager:
     """
-    Manages conversation sessions with JSONL persistence.
+    Manages conversation sessions with pluggable persistence.
 
-    Sessions are stored as JSONL files (one JSON object per line per message).
+    By default uses the original JSONL-file store. Pass a ``SessionStore``
+    to switch to SQLite, PostgreSQL, or any custom backend.
+
+    Notes:
+        - Keeps an in-memory cache for hot sessions.
+        - Cache size is bounded by ``max_cached_sessions`` to avoid unbounded growth.
+        - Access is guarded with a reentrant lock for thread-safe callers.
+
+    Usage (file — default, backward-compatible)::
+
+        sm = SessionManager(workspace=Path("./workspace"))
+
+    Usage (sqlite)::
+
+        from spoon_bot.session.store import SQLiteSessionStore
+        sm = SessionManager(store=SQLiteSessionStore("sessions.db"))
+
+    Usage (factory helper)::
+
+        from spoon_bot.session.store import create_session_store
+        store = create_session_store("sqlite", db_path="sessions.db")
+        sm = SessionManager(store=store)
     """
 
-    def __init__(self, workspace: Path):
+    DEFAULT_MAX_CACHED_SESSIONS = 128
+
+    def __init__(
+        self,
+        workspace: Path | str | None = None,
+        *,
+        store: Optional["SessionStore"] = None,
+        max_cached_sessions: int = DEFAULT_MAX_CACHED_SESSIONS,
+    ) -> None:
         """
         Initialize session manager.
 
         Args:
-            workspace: Path to workspace directory.
+            workspace: Workspace directory (creates FileSessionStore if *store* is None).
+            store: Explicit session-store backend.  Takes precedence over *workspace*.
         """
-        self.workspace = Path(workspace).expanduser().resolve()
-        self.sessions_dir = self.workspace / "sessions"
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        if store is not None:
+            self._store = store
+        else:
+            if workspace is None:
+                raise ValueError("Either 'workspace' or 'store' must be provided")
+            from spoon_bot.session.store import FileSessionStore
+            ws = Path(workspace).expanduser().resolve()
+            sessions_dir = ws / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            self._store = FileSessionStore(sessions_dir)
+
+        # In-memory cache for fast repeated access
         self._sessions: dict[str, Session] = {}
+        self._lock = RLock()
+        self._max_cached_sessions = max(1, int(max_cached_sessions))
+
+        # Keep workspace for backward-compat (used by some callers)
+        self.workspace = Path(workspace).expanduser().resolve() if workspace else None
+        self.sessions_dir = (self.workspace / "sessions") if self.workspace else None
+
+    # ------------------------------------------------------------------
+    # Public API  (signatures unchanged)
+    # ------------------------------------------------------------------
 
     def get_or_create(self, session_key: str) -> Session:
-        """
-        Get an existing session or create a new one.
+        """Get an existing session or create a new one."""
+        with self._lock:
+            if session_key in self._sessions:
+                return self._sessions[session_key]
 
-        Args:
-            session_key: Unique session identifier.
+            session = self._store.load_session(session_key)
+            if session is None:
+                session = Session(session_key=session_key)
+                logger.debug(f"Created new session: {session_key}")
+            else:
+                logger.debug(f"Loaded existing session: {session_key}")
 
-        Returns:
-            Session instance.
-        """
-        if session_key in self._sessions:
-            return self._sessions[session_key]
-
-        # Try loading from disk
-        session = self._load_session(session_key)
-        if session is None:
-            session = Session(session_key=session_key)
-            logger.debug(f"Created new session: {session_key}")
-        else:
-            logger.debug(f"Loaded existing session: {session_key}")
-
-        self._sessions[session_key] = session
-        return session
+            self._sessions[session_key] = session
+            self._evict_if_needed()
+            return session
 
     def get(self, session_key: str) -> Session | None:
-        """
-        Get an existing session without creating a new one.
+        """Get an existing session without creating a new one."""
+        with self._lock:
+            if session_key in self._sessions:
+                return self._sessions[session_key]
 
-        Args:
-            session_key: Unique session identifier.
-
-        Returns:
-            Session instance if found, otherwise None.
-        """
-        if session_key in self._sessions:
-            return self._sessions[session_key]
-
-        session = self._load_session(session_key)
-        if session is not None:
-            self._sessions[session_key] = session
-        return session
+            session = self._store.load_session(session_key)
+            if session is not None:
+                self._sessions[session_key] = session
+                self._evict_if_needed()
+            return session
 
     def save(self, session: Session) -> None:
-        """
-        Save a session to disk.
-
-        Args:
-            session: Session to save.
-        """
-        session_file = self._get_session_path(session.session_key)
-
-        try:
-            with open(session_file, "w", encoding="utf-8") as f:
-                # Write each message as a separate line
-                for message in session.messages:
-                    f.write(json.dumps(message, ensure_ascii=False) + "\n")
-
-            # Also save metadata
-            meta_file = session_file.with_suffix(".meta.json")
-            with open(meta_file, "w", encoding="utf-8") as f:
-                json.dump({
-                    "session_key": session.session_key,
-                    "created_at": session.created_at.isoformat(),
-                    "updated_at": session.updated_at.isoformat(),
-                    "metadata": session.metadata,
-                    "message_count": len(session.messages),
-                }, f, indent=2)
-
-            logger.debug(f"Saved session: {session.session_key}")
-
-        except Exception as e:
-            logger.error(f"Error saving session {session.session_key}: {e}")
+        """Persist a session to the configured backend."""
+        with self._lock:
+            self._sessions[session.session_key] = session
+            self._evict_if_needed()
+            self._store.save_session(session)
 
     def delete(self, session_key: str) -> bool:
-        """
-        Delete a session.
-
-        Args:
-            session_key: Session to delete.
-
-        Returns:
-            True if deleted, False if not found.
-        """
-        if session_key in self._sessions:
-            del self._sessions[session_key]
-
-        session_file = self._get_session_path(session_key)
-        meta_file = session_file.with_suffix(".meta.json")
-
-        deleted = False
-        if session_file.exists():
-            session_file.unlink()
-            deleted = True
-        if meta_file.exists():
-            meta_file.unlink()
-            deleted = True
-
-        return deleted
+        """Delete a session from cache and backend."""
+        with self._lock:
+            self._sessions.pop(session_key, None)
+            return self._store.delete_session(session_key)
 
     def list_sessions(self) -> list[str]:
-        """List all session keys."""
-        sessions = set(self._sessions.keys())
+        """List all session keys (from cache + backend)."""
+        with self._lock:
+            keys = set(self._sessions.keys())
+            keys.update(self._store.list_session_keys())
+            return sorted(keys)
 
-        # Also check disk
-        for file in self.sessions_dir.glob("*.jsonl"):
-            sessions.add(file.stem)
+    def close(self) -> None:
+        """Release backend resources."""
+        with self._lock:
+            self._store.close()
 
-        return sorted(sessions)
-
-    def _get_session_path(self, session_key: str) -> Path:
-        """Get the file path for a session."""
-        # Sanitize session key for filename
-        safe_key = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_key)
-        return self.sessions_dir / f"{safe_key}.jsonl"
-
-    def _load_session(self, session_key: str) -> Session | None:
-        """Load a session from disk."""
-        session_file = self._get_session_path(session_key)
-        meta_file = session_file.with_suffix(".meta.json")
-
-        if not session_file.exists():
-            return None
-
-        try:
-            # Load messages from JSONL
-            messages = []
-            with open(session_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        messages.append(json.loads(line))
-
-            # Load metadata
-            metadata = {}
-            created_at = datetime.now()
-            updated_at = datetime.now()
-
-            if meta_file.exists():
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                    metadata = meta.get("metadata", {})
-                    created_at = datetime.fromisoformat(meta.get("created_at", datetime.now().isoformat()))
-                    updated_at = datetime.fromisoformat(meta.get("updated_at", datetime.now().isoformat()))
-
-            return Session(
-                session_key=session_key,
-                created_at=created_at,
-                updated_at=updated_at,
-                messages=messages,
-                metadata=metadata,
-            )
-
-        except Exception as e:
-            logger.error(f"Error loading session {session_key}: {e}")
-            return None
+    def _evict_if_needed(self) -> None:
+        """Bound in-memory cache size by evicting oldest inserted sessions."""
+        while len(self._sessions) > self._max_cached_sessions:
+            oldest_key = next(iter(self._sessions))
+            self._sessions.pop(oldest_key, None)

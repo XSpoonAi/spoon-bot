@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import time
+from enum import Enum
 from typing import Annotated, AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from logging import getLogger
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 
-from spoon_bot.gateway.app import get_agent
+from spoon_bot.gateway.app import get_agent, get_config
 from spoon_bot.gateway.auth.dependencies import CurrentUser
 from spoon_bot.gateway.models.requests import ChatRequest
 from spoon_bot.gateway.models.responses import (
@@ -18,6 +23,7 @@ from spoon_bot.gateway.models.responses import (
     MetaInfo,
     ChatResponse,
     StreamChunk,
+    TranscriptionInfo,
     UsageInfo,
     ToolCallInfo,
     StatusResponse,
@@ -26,22 +32,122 @@ from spoon_bot.gateway.models.responses import (
     ChannelStatusInfo,
 )
 
+logger = getLogger(__name__)
+
 router = APIRouter()
 
 
-async def _stream_sse(agent, message: str, media: list[str] | None, thinking: bool) -> AsyncGenerator[str, None]:
+# ---------------------------------------------------------------------------
+# Audio processing helper
+# ---------------------------------------------------------------------------
+
+async def _process_audio_input(
+    audio_data: str | bytes,
+    audio_format: str = "wav",
+    mime_type: str | None = None,
+    message: str = "",
+    language: str | None = None,
+) -> tuple[str, TranscriptionInfo | None]:
+    """Process audio input through the audio pipeline.
+
+    Returns (message_text, transcription_info).
+    """
+    config = get_config()
+    provider_obj = getattr(get_agent(), "config", None)
+    provider_name = getattr(provider_obj, "provider", "anthropic") if provider_obj else "anthropic"
+
+    try:
+        from spoon_bot.services.audio.pipeline import AudioPipeline
+
+        pipeline = AudioPipeline(
+            provider=provider_name,
+            stt_provider=config.audio.stt_provider,
+            stt_model=config.audio.stt_model,
+            native_audio_providers=frozenset(config.audio.native_audio_providers),
+        )
+
+        if isinstance(audio_data, str):
+            processed = await pipeline.process_base64(
+                b64_audio=audio_data,
+                audio_format=audio_format,
+                mime_type=mime_type,
+                text=message,
+                language=language,
+            )
+        else:
+            processed = await pipeline.process(
+                audio_data=audio_data,
+                audio_format=audio_format,
+                text=message,
+                language=language,
+            )
+
+        transcription_info = None
+        if processed.transcription:
+            transcription_info = TranscriptionInfo(
+                text=processed.transcription.text,
+                language=processed.transcription.language,
+                duration_seconds=processed.transcription.duration_seconds,
+                provider=processed.transcription.provider,
+            )
+        return processed.text, transcription_info
+
+    except Exception as e:
+        logger.error(f"Audio processing failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "AUDIO_PROCESSING_ERROR", "message": str(e)},
+        )
+
+
+def _switch_session(agent, session_key: str | None) -> None:
+    """Switch the agent's active session if the agent supports it."""
+    if not session_key or session_key == "default":
+        return
+    # AgentLoop stores sessions via SessionManager
+    if hasattr(agent, "sessions") and hasattr(agent, "_session"):
+        try:
+            agent._session = agent.sessions.get_or_create(session_key)
+            agent.session_key = session_key
+        except Exception:
+            pass  # Gracefully degrade — keep default session
+
+
+async def _stream_sse(
+    agent,
+    message: str,
+    media: list[str] | None,
+    thinking: bool,
+    *,
+    session_key: str | None = None,
+) -> AsyncGenerator[str, None]:
     """Generate SSE events from agent streaming."""
+    _switch_session(agent, session_key)
+
     kwargs = {"message": message, "thinking": thinking}
     if media:
         kwargs["media"] = media
 
     try:
         async for chunk_data in agent.stream(**kwargs):
-            # Filter out "done" chunks — clients use [DONE] as the completion signal
-            if chunk_data.get("type") == "done":
+            chunk_type = chunk_data.get("type", "content")
+
+            # Propagate error chunks to the client
+            if chunk_type == "error":
+                error_chunk = StreamChunk(
+                    type="error",
+                    delta=chunk_data.get("delta", ""),
+                    metadata=chunk_data.get("metadata", {}),
+                )
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
                 continue
+
+            # Filter out "done" chunks — clients use [DONE] as the completion signal
+            if chunk_type == "done":
+                continue
+
             chunk = StreamChunk(
-                type=chunk_data["type"],
+                type=chunk_type,
                 delta=chunk_data["delta"],
                 metadata=chunk_data.get("metadata", {}),
             )
@@ -78,15 +184,40 @@ async def chat(
     try:
         agent = get_agent()
 
-        # Get session key from user token or request
+        # Session key: request body takes priority over user token.
+        # Only use user's token session_key when request didn't provide
+        # a custom one (i.e., still has the default value).
         session_key = request.session_key
-        if hasattr(user, "session_key"):
+        if (
+            session_key == "default"
+            and hasattr(user, "session_key")
+            and user.session_key
+            and user.session_key != "default"
+        ):
             session_key = user.session_key
+
+        # Process audio input if provided
+        transcription_info = None
+        message = request.message
+        if request.audio_data:
+            message, transcription_info = await _process_audio_input(
+                audio_data=request.audio_data,
+                audio_format=request.audio_format or "wav",
+                mime_type=request.audio_mime_type,
+                message=request.message,
+                language=request.audio_language,
+            )
 
         # Streaming mode: return SSE
         if stream:
             return StreamingResponse(
-                _stream_sse(agent, request.message, request.media or None, thinking),
+                _stream_sse(
+                    agent,
+                    message,
+                    request.media or None,
+                    thinking,
+                    session_key=session_key,
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -95,8 +226,10 @@ async def chat(
                 },
             )
 
-        # Non-streaming mode
-        kwargs = {"message": request.message}
+        # Non-streaming mode — switch session before processing
+        _switch_session(agent, session_key)
+
+        kwargs = {"message": message}
         if request.media:
             kwargs["media"] = request.media
 
@@ -115,15 +248,71 @@ async def chat(
                 tool_calls=[],  # TODO: Extract tool calls from response
                 usage=None,  # TODO: Track usage
                 thinking_content=thinking_content,
+                transcription=transcription_info,
             ),
             meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
         )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "AGENT_ERROR", "message": str(e)},
         )
+
+
+# ---------------------------------------------------------------------------
+# In-process async task queue
+# ---------------------------------------------------------------------------
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclasses.dataclass
+class AsyncTask:
+    task_id: str
+    status: TaskStatus = TaskStatus.PENDING
+    result: str | None = None
+    error: str | None = None
+    created_at: float = dataclasses.field(default_factory=time.time)
+    completed_at: float | None = None
+    _cancel_event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    _bg_task: asyncio.Task | None = dataclasses.field(default=None, repr=False)
+
+
+# Simple in-memory task store (sufficient for single-process deployments)
+_task_store: dict[str, AsyncTask] = {}
+
+
+async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str | None = None):
+    """Background coroutine that drives agent processing for an async task."""
+    task.status = TaskStatus.RUNNING
+    try:
+        _switch_session(agent, session_key)
+        if task._cancel_event.is_set():
+            task.status = TaskStatus.CANCELLED
+            return
+        response = await agent.process(message=message)
+        if task._cancel_event.is_set():
+            task.status = TaskStatus.CANCELLED
+            return
+        task.result = response
+        task.status = TaskStatus.COMPLETED
+    except asyncio.CancelledError:
+        task.status = TaskStatus.CANCELLED
+    except Exception as exc:
+        task.error = str(exc)
+        task.status = TaskStatus.FAILED
+    finally:
+        task.completed_at = time.time()
 
 
 @router.post("/chat/async")
@@ -136,13 +325,30 @@ async def chat_async(
 
     Returns a task ID that can be polled for results.
     """
-    # TODO: Implement async task queue
     task_id = f"task_{uuid4().hex[:12]}"
+
+    try:
+        agent = get_agent()
+    except RuntimeError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "AGENT_NOT_READY", "message": "Agent is not initialized yet"},
+        )
+
+    session_key = request.session_key
+
+    task = AsyncTask(task_id=task_id)
+    _task_store[task_id] = task
+
+    bg = asyncio.create_task(
+        _run_async_task(task, agent, request.message, session_key=session_key)
+    )
+    task._bg_task = bg
 
     return {
         "task_id": task_id,
-        "status": "pending",
-        "message": "Async chat not yet implemented",
+        "status": task.status.value,
+        "created_at": task.created_at,
     }
 
 
@@ -152,12 +358,25 @@ async def get_task(
     user: CurrentUser,
 ) -> dict:
     """Get the status of an async task."""
-    # TODO: Implement task status lookup
-    return {
-        "task_id": task_id,
-        "status": "not_found",
-        "message": "Async tasks not yet implemented",
+    task = _task_store.get(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "TASK_NOT_FOUND", "message": f"Task '{task_id}' not found"},
+        )
+
+    payload: dict = {
+        "task_id": task.task_id,
+        "status": task.status.value,
+        "created_at": task.created_at,
     }
+    if task.result is not None:
+        payload["result"] = task.result
+    if task.error is not None:
+        payload["error"] = task.error
+    if task.completed_at is not None:
+        payload["completed_at"] = task.completed_at
+    return payload
 
 
 @router.post("/tasks/{task_id}/cancel")
@@ -166,8 +385,23 @@ async def cancel_task(
     user: CurrentUser,
 ) -> dict:
     """Cancel an async task."""
-    # TODO: Implement task cancellation
-    return {"cancelled": False, "message": "Async tasks not yet implemented"}
+    task = _task_store.get(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "TASK_NOT_FOUND", "message": f"Task '{task_id}' not found"},
+        )
+
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return {"cancelled": False, "message": f"Task already in terminal state: {task.status.value}"}
+
+    task._cancel_event.set()
+    if task._bg_task and not task._bg_task.done():
+        task._bg_task.cancel()
+    task.status = TaskStatus.CANCELLED
+    task.completed_at = time.time()
+
+    return {"cancelled": True, "task_id": task_id}
 
 
 @router.get("/status", response_model=APIResponse[StatusResponse])
@@ -194,6 +428,25 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
                 channels=ch_list,
             )
 
+        # Safely count tools and skills — AgentLoop exposes these as
+        # simple list[str] properties, not manager objects.
+        tools_count = 0
+        skills_count = 0
+        sessions_count = 0
+        try:
+            tools_count = len(agent.tools) if hasattr(agent, 'tools') and agent.tools else 0
+        except Exception:
+            pass
+        try:
+            skills_count = len(agent.skills) if hasattr(agent, 'skills') and agent.skills else 0
+        except Exception:
+            pass
+        try:
+            if hasattr(agent, 'sessions') and agent.sessions:
+                sessions_count = len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0
+        except Exception:
+            pass
+
         return APIResponse(
             success=True,
             data=StatusResponse(
@@ -202,9 +455,9 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
                 uptime=0,  # TODO: Track uptime
                 stats=AgentStats(
                     total_requests=0,
-                    active_sessions=len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0,
-                    tools_available=len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else len(agent.tools) if hasattr(agent.tools, '__len__') else 0,
-                    skills_loaded=len(agent.skills.list_skills()) if hasattr(agent.skills, 'list_skills') else len(agent.skills) if hasattr(agent.skills, '__len__') else 0,
+                    active_sessions=sessions_count,
+                    tools_available=tools_count,
+                    skills_loaded=skills_count,
                 ),
                 channels=channels_info,
             ),
@@ -216,3 +469,134 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "INTERNAL_ERROR", "message": str(e)},
         )
+
+
+# ---------------------------------------------------------------------------
+# Voice / audio endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/voice/transcribe")
+async def voice_transcribe(
+    audio: Annotated[UploadFile, File(description="Audio file to transcribe")],
+    language: Annotated[str | None, Form(description="ISO 639-1 language hint")] = None,
+    user: CurrentUser = None,
+):
+    """Transcribe an audio file to text (STT only, no agent processing)."""
+    request_id = f"req_{uuid4().hex[:12]}"
+    start_time = time.time()
+
+    config = get_config()
+    if not config.audio.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "AUDIO_DISABLED", "message": "Audio input is disabled"},
+        )
+
+    # Read and validate upload
+    audio_bytes = await audio.read()
+    max_bytes = config.audio.max_audio_size_mb * 1024 * 1024
+    if len(audio_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "AUDIO_TOO_LARGE",
+                "message": f"Audio file exceeds {config.audio.max_audio_size_mb}MB limit",
+            },
+        )
+
+    # Determine format from filename or content type
+    audio_format = None
+    if audio.filename:
+        ext = audio.filename.rsplit(".", 1)[-1].lower() if "." in audio.filename else None
+        if ext in {"wav", "mp3", "ogg", "webm", "flac", "m4a", "aac"}:
+            audio_format = ext
+
+    _, transcription_info = await _process_audio_input(
+        audio_data=audio_bytes,
+        audio_format=audio_format or "wav",
+        mime_type=audio.content_type,
+        message="",
+        language=language,
+    )
+
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    return APIResponse(
+        success=True,
+        data=transcription_info,
+        meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
+    )
+
+
+@router.post("/voice/chat")
+async def voice_chat(
+    audio: Annotated[UploadFile, File(description="Audio file")],
+    message: Annotated[str, Form(description="Optional text message")] = "",
+    session_key: Annotated[str, Form(description="Session key")] = "default",
+    language: Annotated[str | None, Form(description="ISO 639-1 language hint")] = None,
+    stream: Annotated[bool, Form(description="Stream response")] = False,
+    user: CurrentUser = None,
+):
+    """Send voice + optional text to the agent (multipart upload)."""
+    request_id = f"req_{uuid4().hex[:12]}"
+    start_time = time.time()
+
+    config = get_config()
+    if not config.audio.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "AUDIO_DISABLED", "message": "Audio input is disabled"},
+        )
+
+    agent = get_agent()
+
+    audio_bytes = await audio.read()
+    max_bytes = config.audio.max_audio_size_mb * 1024 * 1024
+    if len(audio_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={
+                "code": "AUDIO_TOO_LARGE",
+                "message": f"Audio file exceeds {config.audio.max_audio_size_mb}MB limit",
+            },
+        )
+
+    # Determine format
+    audio_format = None
+    if audio.filename:
+        ext = audio.filename.rsplit(".", 1)[-1].lower() if "." in audio.filename else None
+        if ext in {"wav", "mp3", "ogg", "webm", "flac", "m4a", "aac"}:
+            audio_format = ext
+
+    processed_message, transcription_info = await _process_audio_input(
+        audio_data=audio_bytes,
+        audio_format=audio_format or "wav",
+        mime_type=audio.content_type,
+        message=message,
+        language=language,
+    )
+
+    if stream:
+        return StreamingResponse(
+            _stream_sse(agent, processed_message, None, False, session_key=session_key),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Request-ID": request_id,
+            },
+        )
+
+    _switch_session(agent, session_key)
+    response_text = await agent.process(message=processed_message)
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    return APIResponse(
+        success=True,
+        data=ChatResponse(
+            response=response_text,
+            transcription=transcription_info,
+        ),
+        meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
+    )

@@ -41,7 +41,7 @@ toolkit = [
     "spoon-toolkits>=0.1.0",  # 40+ tools
 ]
 memory = [
-    "mem0ai>=0.0.1",  # Semantic memory
+    "memsearch>=0.1.11",  # Semantic memory search (Milvus hybrid search)
 ]
 web3 = [
     "web3>=6.0.0",
@@ -100,7 +100,7 @@ include = ["spoon_bot*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
