@@ -1,0 +1,48 @@
+# Spoon-Bot Configuration
+# All credentials are read from .env file via ${VAR} references.
+
+# Agent Configuration
+agent:
+  model: "anthropic/claude-sonnet-4"
+  provider: "openrouter"
+  workspace: "~/.spoon-bot/workspace"
+  max_iterations: 20
+  tool_profile: "core"
+
+# Session Configuration
+sessions:
+  default_timeout: 3600
+  max_sessions: 100
+  persistence: true
+
+# Channels Configuration
+channels:
+  # Telegram Bot
+  telegram:
+    enabled: true
+    accounts:
+      - name: "Irene_spoon_bot"
+        token: "${TELEGRAM_BOT_TOKEN}"
+        mode: "polling"
+
+        # allowed_users: set via TELEGRAM_USER_ID env var, or list IDs here
+        # allowed_users:
+        #   - 123456789
+
+        groups:
+          enabled: false
+          require_mention: true
+
+        media_max_mb: 20
+
+  # Discord Bot (not yet implemented)
+  discord:
+    enabled: false
+
+  # Feishu Bot (not yet implemented)
+  feishu:
+    enabled: false
+
+  # CLI
+  cli:
+    enabled: false

@@ -1,5 +1,7 @@
 """Shell execution tool with comprehensive security guards and rate limiting."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import re

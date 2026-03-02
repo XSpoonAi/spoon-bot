@@ -31,7 +31,6 @@ Usage:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -84,17 +83,14 @@ except ImportError as e:
         f"MCPTool import failed ({e}). MCP integrations are disabled; SpoonBot core remains available."
     )
 
-# Import defaults from single source of truth
-from spoon_bot.defaults import DEFAULT_MODEL, DEFAULT_PROVIDER
-
 
 @dataclass
 class SpoonBotConfig:
     """Configuration for SpoonBot."""
 
     # LLM settings
-    model: str = DEFAULT_MODEL
-    provider: str = DEFAULT_PROVIDER
+    model: str = ""
+    provider: str = ""
     api_key: str | None = None
     base_url: str | None = None
 
@@ -117,37 +113,22 @@ class SpoonBotConfig:
 
     @classmethod
     def from_env(cls) -> "SpoonBotConfig":
-        """Create config from environment variables.
+        """Create config from YAML + environment variables.
 
-        Supports both SPOON_* (original) and SPOON_BOT_* (gateway) env vars.
-
-        Provider-specific API key and base URL resolution is delegated to
-        spoon-core's LLMManager / ConfigurationManager, which natively
-        supports all registered providers (openai, anthropic, openrouter,
-        deepseek, gemini, ollama) and reads from standard env vars like
-        ``OPENROUTER_API_KEY``, ``OPENAI_BASE_URL``, etc.
+        Uses the centralized load_agent_config() for resolution.
+        Priority: YAML > env vars. No silent defaults.
         """
-        provider = (
-            os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
-            or os.environ.get("SPOON_PROVIDER")
-            or DEFAULT_PROVIDER
-        )
-        model = (
-            os.environ.get("SPOON_BOT_DEFAULT_MODEL")
-            or os.environ.get("SPOON_MODEL")
-            or DEFAULT_MODEL
-        )
+        from spoon_bot.channels.config import load_agent_config
 
-        max_steps = int(
-            os.environ.get("SPOON_BOT_MAX_ITERATIONS")
-            or os.environ.get("SPOON_MAX_STEPS")
-            or "15"
-        )
+        cfg = load_agent_config()
 
         return cls(
-            model=model,
-            provider=provider,
-            max_steps=max_steps,
+            model=cfg.get("model", ""),
+            provider=cfg.get("provider", ""),
+            api_key=cfg.get("api_key"),
+            base_url=cfg.get("base_url"),
+            max_steps=cfg.get("max_iterations", 15),
+            workspace=Path(cfg["workspace"]) if cfg.get("workspace") else Path.home() / ".spoon-bot" / "workspace",
         )
 
 
@@ -488,9 +469,16 @@ async def create_agent(
         ...     mcp_servers={"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}
         ... )
     """
+    # If model/provider not explicitly passed, resolve from YAML/env
+    if not model or not provider:
+        from spoon_bot.channels.config import load_agent_config
+        cfg = load_agent_config()
+        model = model or cfg.get("model", "")
+        provider = provider or cfg.get("provider", "")
+
     config = SpoonBotConfig(
-        model=model or DEFAULT_MODEL,
-        provider=provider or DEFAULT_PROVIDER,
+        model=model,
+        provider=provider,
         mcp_servers=mcp_servers or {},
         enable_skills=enable_skills,
         skill_paths=skill_paths or [],

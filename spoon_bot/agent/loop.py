@@ -86,14 +86,6 @@ from spoon_bot.exceptions import (
     user_friendly_error,
 )
 from spoon_bot.services.git import GitManager
-from spoon_bot.defaults import (
-    DEFAULT_MODEL,
-    DEFAULT_PROVIDER,
-    DEFAULT_MAX_ITERATIONS,
-    DEFAULT_SHELL_TIMEOUT,
-    DEFAULT_MAX_OUTPUT,
-    DEFAULT_SESSION_KEY,
-)
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -128,10 +120,10 @@ class AgentLoop:
         provider: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_iterations: int = DEFAULT_MAX_ITERATIONS,
-        shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
-        max_output: int = DEFAULT_MAX_OUTPUT,
-        session_key: str = DEFAULT_SESSION_KEY,
+        max_iterations: int = 20,
+        shell_timeout: int = 60,
+        max_output: int = 10000,
+        session_key: str = "default",
         skill_paths: list[Path | str] | None = None,
         mcp_config: dict[str, dict[str, Any]] | None = None,
         system_prompt: str | None = None,
@@ -186,10 +178,10 @@ class AgentLoop:
             logger.error(f"Configuration validation failed: {e}")
             raise ValueError(f"Invalid AgentLoop configuration: {e}") from e
 
-        # Store config (apply defaults from spoon_bot.defaults if not provided)
+        # Store config — callers must provide model/provider explicitly
         self.workspace = self._config.workspace
-        self.model = model or DEFAULT_MODEL
-        self.provider = provider or DEFAULT_PROVIDER
+        self.model = model
+        self.provider = provider
         self.api_key = api_key
         self.base_url = base_url
         self.max_iterations = self._config.max_iterations
@@ -293,6 +285,9 @@ class AgentLoop:
         # Track initialization state
         self._initialized = False
 
+        # Stop flag: set by stop_current_task(), cleared on next process() call
+        self._stop_requested = False
+
         active_count = len(self.tools)
         total_count = len(self.tools._tools)
         logger.info(
@@ -304,6 +299,17 @@ class AgentLoop:
         """Initialize spoon-core components."""
         if self._initialized:
             return
+
+        if not self.model:
+            raise ValueError(
+                "model is required but not set. "
+                "Configure agent.model in config.yaml or set SPOON_BOT_DEFAULT_MODEL env var."
+            )
+        if not self.provider:
+            raise ValueError(
+                "provider is required but not set. "
+                "Configure agent.provider in config.yaml or set SPOON_BOT_DEFAULT_PROVIDER env var."
+            )
 
         # Initialize semantic memory if enabled
         if hasattr(self.memory, 'initialize'):
@@ -545,6 +551,12 @@ class AgentLoop:
         Returns:
             The agent's response text.
         """
+        # Honour stop request from previous /stop command
+        if self._stop_requested:
+            self._stop_requested = False
+            logger.info("Task skipped due to stop request")
+            return "Task stopped."
+
         # Ensure initialized
         if not self._initialized:
             await self.initialize()
@@ -1050,6 +1062,80 @@ class AgentLoop:
             raise ValueError("Note content cannot be empty")
         self.memory.add_daily_note(content.strip())
 
+    # ------------------------------------------------------------------
+    # Session management helpers (new)
+    # ------------------------------------------------------------------
+
+    def stop_current_task(self) -> bool:
+        """Request the current or next agent task to stop.
+
+        Sets a flag that is checked at the start of the next ``process()``
+        call.  Cannot interrupt a task that is already mid-execution, but
+        will prevent the queued task from running.
+
+        Returns:
+            True (always succeeds in setting the flag).
+        """
+        self._stop_requested = True
+        logger.info("Stop requested — will be honoured on next process() call")
+        return True
+
+    def new_session(self, session_key: str | None = None) -> str:
+        """Switch to a brand-new conversation session.
+
+        Creates a new session in the configured backend and replaces the
+        current in-memory session.  The old session is preserved in storage.
+
+        Args:
+            session_key: Optional explicit key for the new session.
+                         Defaults to a UUID-based key.
+
+        Returns:
+            The new session key.
+        """
+        import uuid
+
+        new_key = session_key or f"session-{uuid.uuid4().hex[:8]}"
+        self._session = self.sessions.get_or_create(new_key)
+        self.session_key = new_key
+        logger.info(f"Switched to new session: {new_key}")
+        return new_key
+
+    def compact_session(self) -> int:
+        """Compact conversation history by keeping only first 2 and last 2 messages.
+
+        Useful for reducing context size when a session becomes very long.
+        The compacted history is immediately persisted.
+
+        Returns:
+            Number of messages removed.
+        """
+        history = self._session.get_history()
+        if len(history) <= 4:
+            return 0
+
+        removed = len(history) - 4
+        keep = history[:2] + history[-2:]
+        self._session.messages.clear()
+        for msg in keep:
+            self._session.add_message(msg["role"], msg["content"])
+        self.sessions.save(self._session)
+        logger.info(f"Session compacted: removed {removed} messages, kept {len(keep)}")
+        return removed
+
+    def get_usage(self) -> dict[str, Any]:
+        """Return basic usage statistics for the current session.
+
+        Returns:
+            Dictionary with message count, session key, and model.
+        """
+        history = self._session.get_history()
+        return {
+            "messages": len(history),
+            "session_key": self.session_key,
+            "model": self.model,
+        }
+
     @property
     def skills(self) -> list[str]:
         """Get available skill names."""
@@ -1121,10 +1207,6 @@ async def create_agent(
         >>> agent = await create_agent()
         >>> agent.add_tool("web_search")
     """
-    # Apply defaults from spoon_bot.defaults
-    model = model or DEFAULT_MODEL
-    provider = provider or DEFAULT_PROVIDER
-
     agent = AgentLoop(
         model=model,
         provider=provider,

@@ -7,6 +7,7 @@ Provides user-friendly CLI with:
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -90,6 +91,22 @@ def agent(
         None, "--model",
         help="Model to use (e.g., claude-sonnet-4-20250514)",
     ),
+    provider: Optional[str] = typer.Option(
+        None, "--provider",
+        help="LLM provider (anthropic/openai/openrouter/…) (overrides YAML agent.provider)",
+    ),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key",
+        help="API key for the LLM provider (overrides YAML / env var)",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url",
+        help="Custom LLM API base URL (overrides YAML agent.base_url)",
+    ),
+    tool_profile: Optional[str] = typer.Option(
+        None, "--tool-profile",
+        help="Tool profile (core/coding/research/full) (overrides YAML agent.tool_profile)",
+    ),
     workspace: Optional[Path] = typer.Option(
         None, "-w", "--workspace",
         help="Workspace directory",
@@ -104,10 +121,16 @@ def agent(
 
     If --message is provided, runs in one-shot mode.
     Otherwise, starts an interactive REPL.
+
+    Configuration priority: CLI args > YAML agent section > env vars.
     """
     asyncio.run(_run_agent(
         message=message,
         model=model,
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        tool_profile=tool_profile,
         workspace=workspace,
         max_iterations=max_iterations,
     ))
@@ -144,22 +167,62 @@ class AgentProgressContext:
 async def _run_agent(
     message: Optional[str],
     model: Optional[str],
+    provider: Optional[str],
+    api_key: Optional[str],
+    base_url: Optional[str],
+    tool_profile: Optional[str],
     workspace: Optional[Path],
     max_iterations: int,
 ) -> None:
-    """Internal async agent runner."""
+    """Internal async agent runner.
+
+    Configuration priority: CLI args > YAML > env vars.
+    All YAML/env resolution is handled by load_agent_config().
+    """
+    from dotenv import load_dotenv
+    from loguru import logger
+
+    load_dotenv(override=False)
+
     from spoon_bot.agent.loop import create_agent
+    from spoon_bot.channels.config import load_agent_config
 
-    workspace = workspace or get_workspace()
+    # ------------------------------------------------------------------
+    # 1. Load agent config (YAML > env vars) — centralized resolution
+    # ------------------------------------------------------------------
+    try:
+        agent_cfg = load_agent_config()
+    except Exception:
+        agent_cfg = {}
 
-    # Show startup panel
+    # ------------------------------------------------------------------
+    # 2. Overlay CLI args on top (CLI args take highest priority)
+    # ------------------------------------------------------------------
+    effective_provider = provider or agent_cfg.get("provider")
+    effective_model = model or agent_cfg.get("model")
+    effective_base_url = base_url or agent_cfg.get("base_url")
+    effective_api_key = api_key or agent_cfg.get("api_key")
+    effective_workspace = (
+        workspace
+        or (Path(agent_cfg["workspace"]) if agent_cfg.get("workspace") else None)
+        or get_workspace()
+    )
+    effective_tool_profile = tool_profile or agent_cfg.get("tool_profile")
+    effective_max_iterations = max_iterations or agent_cfg.get("max_iterations", 20)
+    effective_enable_skills = agent_cfg.get("enable_skills", True)
+
+    # ------------------------------------------------------------------
+    # 3. Show startup panel with effective values
+    # ------------------------------------------------------------------
     startup_info = Table.grid(padding=(0, 2))
     startup_info.add_column()
     startup_info.add_column()
-    startup_info.add_row("[dim]Workspace:[/dim]", str(workspace))
-    if model:
-        startup_info.add_row("[dim]Model:[/dim]", model)
-    startup_info.add_row("[dim]Max iterations:[/dim]", str(max_iterations))
+    startup_info.add_row("[dim]Provider:[/dim]", effective_provider or "(not set)")
+    startup_info.add_row("[dim]Model:[/dim]", effective_model or "(not set)")
+    startup_info.add_row("[dim]Workspace:[/dim]", str(effective_workspace))
+    startup_info.add_row("[dim]Max iterations:[/dim]", str(effective_max_iterations))
+    if effective_tool_profile:
+        startup_info.add_row("[dim]Tool profile:[/dim]", effective_tool_profile)
 
     console.print(Panel(
         startup_info,
@@ -167,15 +230,25 @@ async def _run_agent(
         border_style="blue",
     ))
 
-    # Initialize agent with progress indicator
+    # ------------------------------------------------------------------
+    # 4. Create agent with merged config
+    # ------------------------------------------------------------------
+    create_kwargs: dict = dict(
+        model=effective_model,
+        provider=effective_provider,
+        api_key=effective_api_key,
+        base_url=effective_base_url,
+        workspace=effective_workspace,
+        max_iterations=effective_max_iterations,
+        enable_skills=effective_enable_skills,
+    )
+    if effective_tool_profile is not None:
+        create_kwargs["tool_profile"] = effective_tool_profile
+
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]") as status:
             status.update("[bold blue]Loading LLM provider...[/bold blue]")
-            agent = await create_agent(
-                model=model,
-                workspace=workspace,
-                max_iterations=max_iterations,
-            )
+            agent = await create_agent(**create_kwargs)
             status.update("[bold blue]Loading tools...[/bold blue]")
 
         # Show loaded tools count
@@ -198,105 +271,135 @@ async def _run_agent(
         print_error(e)
         raise typer.Exit(1)
 
-    if message:
-        # One-shot mode
-        console.print(f"\n[bold cyan]You:[/bold cyan] {message}\n")
-
+    # ------------------------------------------------------------------
+    # Start channels in background (interactive REPL only).
+    # Channels (Telegram, Discord, etc.) run via asyncio tasks, so the
+    # event loop must not be blocked.  For one-shot mode channels are
+    # skipped because the process exits immediately after the response.
+    # ------------------------------------------------------------------
+    manager = None
+    if not message:
         try:
-            async with AgentProgressContext(console) as progress:
-                progress.update("Processing your request...")
-                response = await agent.process(message)
+            from spoon_bot.bootstrap import init_channels
 
-            console.print(Panel(
-                Markdown(response),
-                title="[bold green]Response[/bold green]",
-                border_style="green",
-                padding=(1, 2),
-            ))
+            manager = await init_channels(agent)
+            count = manager.running_channels_count
+            if count > 0:
+                print_info(f"Channels running: {count}")
+        except FileNotFoundError:
+            pass  # No config file — channels are optional in agent mode
+        except ImportError as e:
+            print_warning(f"Some channel dependencies missing: {e}")
         except Exception as e:
-            print_error(e)
-            raise typer.Exit(1)
-    else:
-        # Interactive REPL
-        console.print()
-        console.print(Panel(
-            "[dim]Type your message and press Enter. "
-            "Use [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.[/dim]",
-            title="[bold]Interactive Mode[/bold]",
-            border_style="dim",
-        ))
-        console.print()
+            logger.debug(f"Could not start channels: {e}")
 
-        while True:
+    try:
+        if message:
+            # One-shot mode
+            console.print(f"\n[bold cyan]You:[/bold cyan] {message}\n")
+
             try:
-                user_input = Prompt.ask("[bold cyan]You[/bold cyan]")
+                async with AgentProgressContext(console) as progress:
+                    progress.update("Processing your request...")
+                    response = await agent.process(message)
 
-                if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
-                    console.print("\n[dim]Goodbye! Thanks for using spoon-bot.[/dim]")
-                    break
+                console.print(Panel(
+                    Markdown(response),
+                    title="[bold green]Response[/bold green]",
+                    border_style="green",
+                    padding=(1, 2),
+                ))
+            except Exception as e:
+                print_error(e)
+                raise typer.Exit(1)
+        else:
+            # Interactive REPL
+            console.print()
+            console.print(Panel(
+                "[dim]Type your message and press Enter. "
+                "Use [bold]/help[/bold] for commands, [bold]/exit[/bold] to quit.[/dim]",
+                title="[bold]Interactive Mode[/bold]",
+                border_style="dim",
+            ))
+            console.print()
 
-                if user_input.lower() in ("/clear", "/reset"):
-                    agent.clear_history()
-                    print_success("Conversation history cleared.")
-                    continue
-
-                if user_input.lower() == "/help":
-                    help_table = Table(show_header=True, header_style="bold")
-                    help_table.add_column("Command")
-                    help_table.add_column("Description")
-                    help_table.add_row("/help", "Show this help message")
-                    help_table.add_row("/exit, /quit", "Exit the agent")
-                    help_table.add_row("/clear, /reset", "Clear conversation history")
-                    help_table.add_row("/status", "Show agent status")
-                    help_table.add_row("/tools", "List available tools")
-                    console.print(help_table)
-                    continue
-
-                if user_input.lower() == "/status":
-                    status_table = Table.grid(padding=(0, 2))
-                    status_table.add_row("[dim]Model:[/dim]", agent.model)
-                    status_table.add_row("[dim]Tools:[/dim]", str(len(agent.tools)))
-                    status_table.add_row("[dim]Skills:[/dim]", str(len(agent.skills)))
-                    status_table.add_row("[dim]History:[/dim]", f"{len(agent.get_history())} messages")
-                    console.print(Panel(status_table, title="[bold]Agent Status[/bold]"))
-                    continue
-
-                if user_input.lower() == "/tools":
-                    tools_list = agent.tools.list_tools()
-                    console.print(f"\n[bold]Available tools ({len(tools_list)}):[/bold]")
-                    for i, tool in enumerate(tools_list, 1):
-                        console.print(f"  [dim]{i}.[/dim] {tool}")
-                    console.print()
-                    continue
-
-                if not user_input.strip():
-                    continue
-
-                # Process with progress indicator
+            while True:
                 try:
-                    async with AgentProgressContext(console) as progress:
-                        progress.update("Thinking...")
-                        response = await agent.process(user_input)
+                    # Use asyncio.to_thread so that blocking input does not
+                    # stall the event loop — channels keep processing.
+                    user_input = await asyncio.to_thread(
+                        Prompt.ask, "[bold cyan]You[/bold cyan]",
+                    )
 
-                    console.print()
-                    console.print(Panel(
-                        Markdown(response),
-                        border_style="dim",
-                        padding=(0, 1),
-                    ))
-                    console.print()
+                    if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
+                        console.print("\n[dim]Goodbye! Thanks for using spoon-bot.[/dim]")
+                        break
 
-                except APIError as e:
-                    print_error(e)
-                except Exception as e:
-                    print_error(e, show_suggestions=False)
-                    console.print("[dim]Try rephrasing your request or use /help for commands.[/dim]")
+                    if user_input.lower() in ("/clear", "/reset"):
+                        agent.clear_history()
+                        print_success("Conversation history cleared.")
+                        continue
 
-            except KeyboardInterrupt:
-                console.print("\n[dim]Interrupted. Type '/exit' to quit or continue typing.[/dim]")
-            except EOFError:
-                console.print("\n[dim]Goodbye![/dim]")
-                break
+                    if user_input.lower() == "/help":
+                        help_table = Table(show_header=True, header_style="bold")
+                        help_table.add_column("Command")
+                        help_table.add_column("Description")
+                        help_table.add_row("/help", "Show this help message")
+                        help_table.add_row("/exit, /quit", "Exit the agent")
+                        help_table.add_row("/clear, /reset", "Clear conversation history")
+                        help_table.add_row("/status", "Show agent status")
+                        help_table.add_row("/tools", "List available tools")
+                        console.print(help_table)
+                        continue
+
+                    if user_input.lower() == "/status":
+                        status_table = Table.grid(padding=(0, 2))
+                        status_table.add_row("[dim]Model:[/dim]", agent.model)
+                        status_table.add_row("[dim]Tools:[/dim]", str(len(agent.tools)))
+                        status_table.add_row("[dim]Skills:[/dim]", str(len(agent.skills)))
+                        status_table.add_row("[dim]History:[/dim]", f"{len(agent.get_history())} messages")
+                        console.print(Panel(status_table, title="[bold]Agent Status[/bold]"))
+                        continue
+
+                    if user_input.lower() == "/tools":
+                        tools_list = agent.tools.list_tools()
+                        console.print(f"\n[bold]Available tools ({len(tools_list)}):[/bold]")
+                        for i, tool in enumerate(tools_list, 1):
+                            console.print(f"  [dim]{i}.[/dim] {tool}")
+                        console.print()
+                        continue
+
+                    if not user_input.strip():
+                        continue
+
+                    # Process with progress indicator
+                    try:
+                        async with AgentProgressContext(console) as progress:
+                            progress.update("Thinking...")
+                            response = await agent.process(user_input)
+
+                        console.print()
+                        console.print(Panel(
+                            Markdown(response),
+                            border_style="dim",
+                            padding=(0, 1),
+                        ))
+                        console.print()
+
+                    except APIError as e:
+                        print_error(e)
+                    except Exception as e:
+                        print_error(e, show_suggestions=False)
+                        console.print("[dim]Try rephrasing your request or use /help for commands.[/dim]")
+
+                except KeyboardInterrupt:
+                    console.print("\n[dim]Interrupted. Type '/exit' to quit or continue typing.[/dim]")
+                except EOFError:
+                    console.print("\n[dim]Goodbye![/dim]")
+                    break
+    finally:
+        if manager:
+            await manager.stop()
 
 
 @app.command()
@@ -433,17 +536,33 @@ def gateway(
         None, "--channels",
         help="Comma-separated list of channels to enable (e.g., telegram,discord)",
     ),
-    cli_enabled: bool = typer.Option(
-        True, "--cli/--no-cli",
-        help="Enable CLI channel",
+    cli_enabled: Optional[bool] = typer.Option(
+        None, "--cli/--no-cli",
+        help="Override CLI channel (default: use config)",
     ),
     model: Optional[str] = typer.Option(
         None, "--model",
-        help="Model to use",
+        help="LLM model name (overrides YAML agent.model)",
+    ),
+    provider: Optional[str] = typer.Option(
+        None, "--provider",
+        help="LLM provider (anthropic/openai/openrouter/…) (overrides YAML agent.provider)",
+    ),
+    api_key: Optional[str] = typer.Option(
+        None, "--api-key",
+        help="API key for the LLM provider (overrides YAML / env var)",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url",
+        help="Custom LLM API base URL (overrides YAML agent.base_url)",
+    ),
+    tool_profile: Optional[str] = typer.Option(
+        None, "--tool-profile",
+        help="Tool profile (core/coding/research/full) (overrides YAML agent.tool_profile)",
     ),
     workspace: Optional[Path] = typer.Option(
         None, "-w", "--workspace",
-        help="Workspace directory",
+        help="Workspace directory (overrides YAML agent.workspace)",
     ),
 ):
     """
@@ -452,14 +571,19 @@ def gateway(
     Gateway mode enables multi-platform communication with the agent.
     Supports Telegram, Discord, Feishu, and more.
 
+    Configuration priority: CLI args > YAML agent section > env vars > defaults.
+
     Examples:
-      # Load all channels from config file
+      # Load all channels + agent config from config.yaml
       spoon-bot gateway
+
+      # Override model at runtime
+      spoon-bot gateway --provider openrouter --model anthropic/claude-sonnet-4
 
       # Load specific channels
       spoon-bot gateway --channels telegram,discord
 
-      # Use custom config
+      # Use custom config file
       spoon-bot gateway --config my-config.yaml
     """
     asyncio.run(_run_gateway(
@@ -467,6 +591,10 @@ def gateway(
         channels=channels.split(',') if channels else None,
         cli_enabled=cli_enabled,
         model=model,
+        provider=provider,
+        api_key=api_key,
+        base_url=base_url,
+        tool_profile=tool_profile,
         workspace=workspace,
     ))
 
@@ -474,25 +602,70 @@ def gateway(
 async def _run_gateway(
     config: Optional[Path],
     channels: Optional[list[str]],
-    cli_enabled: bool,
+    cli_enabled: Optional[bool],
     model: Optional[str],
-    workspace: Optional[Path],
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    tool_profile: Optional[str] = None,
+    workspace: Optional[Path] = None,
 ) -> None:
-    """Internal async gateway runner."""
+    """Internal async gateway runner.
+
+    Configuration priority: CLI args > YAML > env vars.
+    All YAML/env resolution is handled by load_agent_config().
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
+
     from spoon_bot.agent.loop import create_agent
     from spoon_bot.channels.manager import ChannelManager
+    from spoon_bot.channels.config import load_agent_config
 
-    workspace = workspace or get_workspace()
+    # ------------------------------------------------------------------
+    # 1. Load agent config (YAML > env vars) — centralized resolution
+    # ------------------------------------------------------------------
+    try:
+        agent_cfg = load_agent_config(config)
+    except FileNotFoundError:
+        agent_cfg = {}
+    except Exception as exc:
+        print_warning(f"Could not read agent config: {exc}")
+        agent_cfg = {}
 
-    # Show startup panel
+    # ------------------------------------------------------------------
+    # 2. Overlay CLI args on top (CLI args take highest priority)
+    # ------------------------------------------------------------------
+    effective_provider = provider or agent_cfg.get("provider")
+    effective_model = model or agent_cfg.get("model")
+    effective_base_url = base_url or agent_cfg.get("base_url")
+    effective_api_key = api_key or agent_cfg.get("api_key")
+    effective_workspace = (
+        workspace
+        or (Path(agent_cfg["workspace"]) if agent_cfg.get("workspace") else None)
+        or get_workspace()
+    )
+    effective_tool_profile = tool_profile or agent_cfg.get("tool_profile")
+    effective_max_iterations = agent_cfg.get("max_iterations")
+    effective_enable_skills = agent_cfg.get("enable_skills", True)
+
+    # ------------------------------------------------------------------
+    # 3. Show startup panel with effective values
+    # ------------------------------------------------------------------
     startup_info = Table.grid(padding=(0, 2))
     startup_info.add_column()
     startup_info.add_column()
     startup_info.add_row("[dim]Mode:[/dim]", "Gateway (Multi-channel)")
-    startup_info.add_row("[dim]Workspace:[/dim]", str(workspace))
+    startup_info.add_row("[dim]Provider:[/dim]", effective_provider or "(not set)")
+    startup_info.add_row("[dim]Model:[/dim]", effective_model or "(not set)")
+    startup_info.add_row("[dim]Workspace:[/dim]", str(effective_workspace))
     if config:
         startup_info.add_row("[dim]Config:[/dim]", str(config))
-    startup_info.add_row("[dim]CLI:[/dim]", "Enabled" if cli_enabled else "Disabled")
+    if effective_tool_profile:
+        startup_info.add_row("[dim]Tool profile:[/dim]", effective_tool_profile)
+    cli_label = {True: "Force enabled", False: "Force disabled", None: "Config default"}[cli_enabled]
+    startup_info.add_row("[dim]CLI channel:[/dim]", cli_label)
 
     console.print(Panel(
         startup_info,
@@ -501,14 +674,26 @@ async def _run_gateway(
         border_style="blue",
     ))
 
-    # Create agent
+    # ------------------------------------------------------------------
+    # 4. Create agent with merged config
+    # ------------------------------------------------------------------
+    create_kwargs: dict = dict(
+        model=effective_model,
+        provider=effective_provider,
+        api_key=effective_api_key,
+        base_url=effective_base_url,
+        workspace=effective_workspace,
+        enable_skills=effective_enable_skills,
+    )
+    if effective_tool_profile is not None:
+        create_kwargs["tool_profile"] = effective_tool_profile
+    if effective_max_iterations is not None:
+        create_kwargs["max_iterations"] = int(effective_max_iterations)
+
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]"):
-            agent = await create_agent(
-                model=model,
-                workspace=workspace,
-            )
-        print_success(f"Agent initialized: {agent.model}")
+            agent = await create_agent(**create_kwargs)
+        print_success(f"Agent initialized: {agent.provider}/{agent.model}")
     except ValueError as e:
         print_error(ConfigurationError(
             str(e),
@@ -529,6 +714,13 @@ async def _run_gateway(
     try:
         with console.status("[bold blue]Loading channels...[/bold blue]"):
             await manager.load_from_config(config)
+
+        # Enforce --cli/--no-cli override (None = use config as-is)
+        if cli_enabled is False:
+            manager.remove_channel("cli:default")
+        elif cli_enabled is True and "cli:default" not in manager.channel_names:
+            from spoon_bot.channels.cli_channel import CLIChannel
+            manager.add_channel(CLIChannel())
 
         # Start specific channels if requested
         if channels:

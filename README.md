@@ -13,6 +13,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **Self-managing**: Self-configuration, self-upgrade, memory management tools
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem with dynamic tool activation
+- **Multi-channel**: Telegram bot integration with polling/webhook modes
 - **Multi-mode**: Agent / Interactive / Gateway (REST + WebSocket)
 
 ## Requirements
@@ -87,6 +88,40 @@ OPENROUTER_API_KEY=sk-or-xxx
 # Optional: web search
 TAVILY_API_KEY=tvly-xxx
 ```
+
+### Channel Configuration (config.yaml)
+
+To enable Telegram or other channel integrations, create a `config.yaml` in the project root:
+
+```yaml
+agent:
+  provider: anthropic
+  model: claude-sonnet-4-20250514
+  # api_key: sk-xxx  # Or use environment variable
+
+channels:
+  telegram:
+    enabled: true
+    accounts:
+      - name: my_bot
+        token: ${TELEGRAM_BOT_TOKEN}   # Reference env var
+        mode: polling                   # polling (default) or webhook
+        allowed_users: [123456789]      # Optional: restrict to specific user IDs
+        proxy_url: "http://127.0.0.1:7897"  # Optional: for restricted networks
+        groups:
+          enabled: false
+          require_mention: true
+```
+
+**Telegram setup:**
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) and get the token
+2. Set `TELEGRAM_BOT_TOKEN` in `.env` or directly in `config.yaml`
+3. Install the Telegram dependency: `uv sync --extra telegram`
+
+**Proxy configuration** (for networks that cannot access Telegram API directly):
+
+The proxy is resolved in priority order: `config.yaml proxy_url` > `TELEGRAM_PROXY` env var > `HTTPS_PROXY` env var. Users with unrestricted network access do not need this.
 
 ## Quick Start
 
@@ -515,10 +550,19 @@ Default workspace: `~/.spoon-bot/workspace/`
 ## CLI Commands
 
 ```bash
+# Agent mode (interactive REPL)
 spoon-bot agent                        # Interactive mode (default provider)
 spoon-bot agent --provider openai      # Use specific provider
 spoon-bot agent --model gpt-5.2       # Use specific model
 spoon-bot agent -m "message"           # One-shot mode
+
+# Gateway mode (multi-channel server)
+spoon-bot gateway                      # Start all configured channels
+spoon-bot gateway --channels telegram  # Start Telegram channel only
+spoon-bot gateway --no-cli             # Disable CLI input in gateway mode
+spoon-bot gateway --config path/to/config.yaml  # Custom config file
+
+# General
 spoon-bot onboard                      # Initialize workspace
 spoon-bot gateway                      # Start REST + WebSocket gateway
 spoon-bot status                       # Show status
@@ -539,7 +583,17 @@ uv sync --extra gateway
 pip install -e ".[gateway]"
 ```
 
-### Quick Start
+### Quick Start (CLI)
+
+```bash
+# Install gateway dependencies
+uv sync --extra gateway --extra telegram
+
+# Start gateway with Telegram channel
+spoon-bot gateway --channels telegram
+```
+
+### Quick Start (Programmatic)
 
 ```python
 import asyncio
@@ -569,10 +623,12 @@ asyncio.run(main())
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/health` | GET | Health check (includes channel status) |
+| `/ready` | GET | Readiness check |
 | `/v1/auth/login` | POST | Authenticate and get JWT tokens |
 | `/v1/agent/chat` | POST | Send message to agent (sync or streaming) |
 | `/v1/agent/chat/async` | POST | Async task-based chat |
-| `/v1/agent/status` | GET | Get agent status |
+| `/v1/agent/status` | GET | Agent and channel status |
 | `/v1/sessions` | GET/POST | Manage sessions |
 | `/v1/tools` | GET | List available tools |
 | `/v1/skills` | GET/POST | List and manage skills |
