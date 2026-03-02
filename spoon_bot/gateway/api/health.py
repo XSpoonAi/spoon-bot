@@ -21,16 +21,40 @@ async def health_check() -> HealthResponse:
     Health check endpoint.
 
     Returns basic health status for load balancers.
+    Includes channel health when channels are running.
     """
+    from spoon_bot.gateway.app import _agent, _channel_manager
+
     uptime = int(time.time() - _start_time)
 
+    checks = [
+        HealthCheck(name="gateway", status="healthy"),
+        HealthCheck(
+            name="agent",
+            status="healthy" if _agent is not None else "unhealthy",
+            message=None if _agent is not None else "Agent not initialized",
+        ),
+    ]
+
+    if _channel_manager is not None:
+        running = _channel_manager.running_channels_count
+        total = len(_channel_manager.channel_names)
+        ch_status = "healthy" if running == total else ("degraded" if running > 0 else "unhealthy")
+        checks.append(HealthCheck(
+            name="channels",
+            status=ch_status,
+            message=f"{running}/{total} running",
+        ))
+
+    overall = "healthy"
+    if any(c.status == "unhealthy" for c in checks):
+        overall = "degraded"
+
     return HealthResponse(
-        status="healthy",
+        status=overall,
         version="1.0.0",
         uptime=uptime,
-        checks=[
-            HealthCheck(name="gateway", status="healthy"),
-        ],
+        checks=checks,
     )
 
 
@@ -41,12 +65,15 @@ async def readiness_check() -> dict:
 
     Checks if the service is ready to accept requests.
     """
-    from spoon_bot.gateway.app import _agent
+    from spoon_bot.gateway.app import _agent, _channel_manager
 
-    checks = {
+    checks: dict[str, bool] = {
         "gateway": True,
         "agent": _agent is not None,
     }
+
+    if _channel_manager is not None:
+        checks["channels"] = _channel_manager.running_channels_count > 0
 
     all_ready = all(checks.values())
 

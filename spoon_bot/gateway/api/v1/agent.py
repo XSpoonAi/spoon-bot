@@ -22,6 +22,8 @@ from spoon_bot.gateway.models.responses import (
     ToolCallInfo,
     StatusResponse,
     AgentStats,
+    ChannelsInfo,
+    ChannelStatusInfo,
 )
 
 router = APIRouter()
@@ -170,11 +172,27 @@ async def cancel_task(
 
 @router.get("/status", response_model=APIResponse[StatusResponse])
 async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
-    """Get agent status and statistics."""
+    """Get agent status and statistics, including channel health."""
+    from spoon_bot.gateway.app import _channel_manager
+
     request_id = f"req_{uuid4().hex[:12]}"
 
     try:
         agent = get_agent()
+
+        # Build channel info if manager is available
+        channels_info = None
+        if _channel_manager is not None:
+            ch_list: list[ChannelStatusInfo] = []
+            for name in _channel_manager.channel_names:
+                ch = _channel_manager.get_channel(name)
+                ch_status = "running" if ch and ch.is_running else "stopped"
+                ch_list.append(ChannelStatusInfo(name=name, status=ch_status))
+            channels_info = ChannelsInfo(
+                running=_channel_manager.running_channels_count,
+                total=len(_channel_manager.channel_names),
+                channels=ch_list,
+            )
 
         return APIResponse(
             success=True,
@@ -186,8 +204,9 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
                     total_requests=0,
                     active_sessions=len(agent.sessions.list_sessions()) if hasattr(agent.sessions, 'list_sessions') else 0,
                     tools_available=len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else len(agent.tools) if hasattr(agent.tools, '__len__') else 0,
-                    skills_loaded=len(agent.skills.list_skills()) if hasattr(agent.skills, 'list_skills') else len(agent.skills) if hasattr(agent.skills, '__len__') else 0,  # Skills count via agent if available
+                    skills_loaded=len(agent.skills.list_skills()) if hasattr(agent.skills, 'list_skills') else len(agent.skills) if hasattr(agent.skills, '__len__') else 0,
                 ),
+                channels=channels_info,
             ),
             meta=MetaInfo(request_id=request_id),
         )

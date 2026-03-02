@@ -536,9 +536,9 @@ def gateway(
         None, "--channels",
         help="Comma-separated list of channels to enable (e.g., telegram,discord)",
     ),
-    cli_enabled: bool = typer.Option(
-        True, "--cli/--no-cli",
-        help="Enable CLI channel",
+    cli_enabled: Optional[bool] = typer.Option(
+        None, "--cli/--no-cli",
+        help="Override CLI channel (default: use config)",
     ),
     model: Optional[str] = typer.Option(
         None, "--model",
@@ -602,7 +602,7 @@ def gateway(
 async def _run_gateway(
     config: Optional[Path],
     channels: Optional[list[str]],
-    cli_enabled: bool,
+    cli_enabled: Optional[bool],
     model: Optional[str],
     provider: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -664,7 +664,8 @@ async def _run_gateway(
         startup_info.add_row("[dim]Config:[/dim]", str(config))
     if effective_tool_profile:
         startup_info.add_row("[dim]Tool profile:[/dim]", effective_tool_profile)
-    startup_info.add_row("[dim]CLI:[/dim]", "Enabled" if cli_enabled else "Disabled")
+    cli_label = {True: "Force enabled", False: "Force disabled", None: "Config default"}[cli_enabled]
+    startup_info.add_row("[dim]CLI channel:[/dim]", cli_label)
 
     console.print(Panel(
         startup_info,
@@ -713,6 +714,13 @@ async def _run_gateway(
     try:
         with console.status("[bold blue]Loading channels...[/bold blue]"):
             await manager.load_from_config(config)
+
+        # Enforce --cli/--no-cli override (None = use config as-is)
+        if cli_enabled is False:
+            manager.remove_channel("cli:default")
+        elif cli_enabled is True and "cli:default" not in manager.channel_names:
+            from spoon_bot.channels.cli_channel import CLIChannel
+            manager.add_channel(CLIChannel())
 
         # Start specific channels if requested
         if channels:

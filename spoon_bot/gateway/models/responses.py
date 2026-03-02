@@ -179,6 +179,22 @@ class AgentStats(BaseModel):
     skills_loaded: int = 0
 
 
+class ChannelStatusInfo(BaseModel):
+    """Status of a single channel."""
+
+    name: str
+    status: str  # "running", "stopped", "error"
+    message: str | None = None
+
+
+class ChannelsInfo(BaseModel):
+    """Aggregate channels status."""
+
+    running: int = 0
+    total: int = 0
+    channels: list[ChannelStatusInfo] = Field(default_factory=list)
+
+
 class StatusResponse(BaseModel):
     """Agent status response."""
 
@@ -186,6 +202,7 @@ class StatusResponse(BaseModel):
     current_task: str | None = None
     uptime: int  # seconds
     stats: AgentStats
+    channels: ChannelsInfo | None = None
 
 
 class HealthCheck(BaseModel):
