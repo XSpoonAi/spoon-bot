@@ -777,12 +777,12 @@ async def _run_gateway(
             # Extract suggestion from error message if available
             if "Install with:" in error_msg:
                 install_cmd = error_msg.split("Install with:")[1].strip()
-                console.print(f"  [cyan]{install_cmd}[/cyan]")
+                console.print(f"  {install_cmd}", highlight=False)
         else:
             console.print("\n[bold]Install missing channels:[/bold]")
-            console.print("  [cyan]uv pip install -e \".[telegram]\"[/cyan]  # Telegram")
-            console.print("  [cyan]uv pip install -e \".[discord]\"[/cyan]   # Discord")
-            console.print("  [cyan]uv pip install -e \".[all-channels]\"[/cyan]  # All")
+            console.print("  uv pip install -e \".\\[telegram]\"   # Telegram", highlight=False)
+            console.print("  uv pip install -e \".\\[discord]\"    # Discord", highlight=False)
+            console.print("  uv pip install -e \".\\[all-channels]\"  # All", highlight=False)
         raise typer.Exit(1)
     except Exception as e:
         print_error(e)
