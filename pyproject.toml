@@ -22,8 +22,8 @@ classifiers = [
 keywords = ["ai", "agent", "llm", "local", "assistant"]
 
 dependencies = [
-    # Required: spoon-core SDK for LLM, MCP, and skills (v0.4.0+)
-    "spoon-ai-sdk>=0.4.0",
+    # Required: track spoon-core SDK main branch directly.
+    "spoon-ai-sdk @ git+https://github.com/XSpoonAi/spoon-core.git@main",
     # CLI and utilities
     "typer>=0.9.0",
     "rich>=13.0.0",

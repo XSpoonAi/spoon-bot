@@ -553,6 +553,17 @@ class TestWsCancellationPropagation:
                     await handler._handle_chat({"message": "hi", "stream": False})
         assert handler._current_task is None
 
+    @pytest.mark.asyncio
+    async def test_disconnect_cleanup_cancels_background_task(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        handler = WebSocketHandler("conn_test")
+        handler._current_task = asyncio.create_task(asyncio.sleep(100))
+
+        cancelled = await handler._cancel_current_task_for_cleanup(timeout=0.2)
+        assert cancelled is True
+        assert handler._current_task is None
+
 
 class TestWsTimeoutErrorCodes:
     """WS agent.error events use standardized timeout codes."""
@@ -792,6 +803,23 @@ class TestChatSseTraceAndTiming:
             c = TestClient(app)
             resp = c.post("/v1/agent/chat", json={"message": "hello", "options": {"stream": True}})
         assert "x-trace-id" in resp.headers
+
+    def test_chat_sse_done_metadata_content_falls_back(self):
+        from fastapi.testclient import TestClient
+
+        async def done_only_stream(**kwargs):
+            yield {"type": "done", "delta": "", "metadata": {"content": "fallback from done metadata"}}
+
+        app = _create_rest_test_app()
+        agent = AsyncMock()
+        agent.stream = done_only_stream
+
+        with patch("spoon_bot.gateway.api.v1.agent.get_agent", return_value=agent):
+            c = TestClient(app)
+            resp = c.post("/v1/agent/chat", json={"message": "hello", "options": {"stream": True}})
+
+        assert resp.status_code == 200
+        assert "fallback from done metadata" in resp.text
 
 
 class TestRestTimeoutErrorCodes:

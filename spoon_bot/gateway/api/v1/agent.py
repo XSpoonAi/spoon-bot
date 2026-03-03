@@ -7,7 +7,7 @@ import dataclasses
 import json
 import time
 from enum import Enum
-from typing import Annotated, AsyncGenerator
+from typing import Any, Annotated, AsyncGenerator
 from uuid import uuid4
 
 from logging import getLogger
@@ -15,8 +15,14 @@ from logging import getLogger
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 
-from spoon_bot.gateway.app import get_agent, get_config
+from spoon_bot.gateway.app import (
+    get_agent,
+    get_config,
+    get_agent_execution_lock,
+    get_session_execution_lock,
+)
 from spoon_bot.gateway.auth.dependencies import CurrentUser
+from spoon_bot.gateway.errors import TimeoutCode, build_timeout_error_detail
 from spoon_bot.gateway.models.requests import ChatRequest
 from spoon_bot.gateway.models.responses import (
     APIResponse,
@@ -31,10 +37,34 @@ from spoon_bot.gateway.models.responses import (
     ChannelsInfo,
     ChannelStatusInfo,
 )
+from spoon_bot.gateway.observability.budget import BudgetExhaustedError
+from spoon_bot.gateway.observability.tracing import (
+    TimerSpan,
+    build_timing_payload,
+    new_trace_id,
+)
 
 logger = getLogger(__name__)
 
 router = APIRouter()
+
+
+def _format_sse_event(event: str, payload: dict[str, Any]) -> str:
+    """Format one SSE event frame."""
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _resolve_session_key(request_session_key: str, user: CurrentUser) -> str:
+    """Resolve session key using request override, then user default."""
+    session_key = request_session_key
+    if (
+        session_key == "default"
+        and hasattr(user, "session_key")
+        and user.session_key
+        and user.session_key != "default"
+    ):
+        session_key = user.session_key
+    return session_key
 
 
 # ---------------------------------------------------------------------------
@@ -120,46 +150,97 @@ async def _stream_sse(
     thinking: bool,
     *,
     session_key: str | None = None,
+    trace_id: str | None = None,
+    request_id: str | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE events from agent streaming."""
-    _switch_session(agent, session_key)
+    resolved_trace_id = trace_id or new_trace_id()
+    resolved_request_id = request_id or f"req_{uuid4().hex[:12]}"
+    span = TimerSpan("rest_sse")
+    streamed_content = ""
+    yield _format_sse_event(
+        "trace",
+        {
+            "trace_id": resolved_trace_id,
+            "request_id": resolved_request_id,
+        },
+    )
 
-    kwargs = {"message": message, "thinking": thinking}
-    if media:
-        kwargs["media"] = media
+    resolved_session_key = session_key or "default"
+    session_lock = get_session_execution_lock(resolved_session_key)
+    agent_lock = get_agent_execution_lock()
 
-    try:
-        async for chunk_data in agent.stream(**kwargs):
-            chunk_type = chunk_data.get("type", "content")
+    async with session_lock:
+        async with agent_lock:
+            _switch_session(agent, resolved_session_key)
 
-            # Propagate error chunks to the client
-            if chunk_type == "error":
+            kwargs = {"message": message, "thinking": thinking}
+            if media:
+                kwargs["media"] = media
+
+            try:
+                async for chunk_data in agent.stream(**kwargs):
+                    if cancel_event and cancel_event.is_set():
+                        break
+
+                    chunk_type = chunk_data.get("type", "content")
+
+                    # Propagate error chunks to the client
+                    if chunk_type == "error":
+                        error_chunk = StreamChunk(
+                            type="error",
+                            delta=chunk_data.get("delta", ""),
+                            metadata=chunk_data.get("metadata", {}),
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                        continue
+
+                    # Filter out "done" chunks — clients use [DONE] as the completion signal
+                    if chunk_type == "done":
+                        done_metadata = chunk_data.get("metadata", {})
+                        done_content = (
+                            done_metadata.get("content", "")
+                            if isinstance(done_metadata, dict)
+                            else ""
+                        )
+                        if not streamed_content and isinstance(done_content, str) and done_content:
+                            fallback_chunk = StreamChunk(
+                                type="content",
+                                delta=done_content,
+                                metadata={"fallback": "done_metadata_content"},
+                            )
+                            yield f"data: {fallback_chunk.model_dump_json()}\n\n"
+                            streamed_content = done_content
+                        continue
+
+                    chunk = StreamChunk(
+                        type=chunk_type,
+                        delta=chunk_data["delta"],
+                        metadata=chunk_data.get("metadata", {}),
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    if chunk_type == "content" and chunk.delta:
+                        streamed_content += chunk.delta
+            except Exception as e:
                 error_chunk = StreamChunk(
                     type="error",
-                    delta=chunk_data.get("delta", ""),
-                    metadata=chunk_data.get("metadata", {}),
+                    delta="",
+                    metadata={"error": str(e), "trace_id": resolved_trace_id},
                 )
                 yield f"data: {error_chunk.model_dump_json()}\n\n"
-                continue
 
-            # Filter out "done" chunks — clients use [DONE] as the completion signal
-            if chunk_type == "done":
-                continue
-
-            chunk = StreamChunk(
-                type=chunk_type,
-                delta=chunk_data["delta"],
-                metadata=chunk_data.get("metadata", {}),
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
-    except Exception as e:
-        error_chunk = StreamChunk(
-            type="error",
-            delta="",
-            metadata={"error": str(e)},
-        )
-        yield f"data: {error_chunk.model_dump_json()}\n\n"
-
+    span.stop()
+    yield _format_sse_event(
+        "timing",
+        build_timing_payload(
+            span,
+            extra={
+                "trace_id": resolved_trace_id,
+                "request_id": resolved_request_id,
+            },
+        ),
+    )
     yield "data: [DONE]\n\n"
 
 
@@ -176,6 +257,8 @@ async def chat(
     """
     request_id = f"req_{uuid4().hex[:12]}"
     start_time = time.time()
+    request_span = TimerSpan("rest_chat")
+    trace_id = new_trace_id()
 
     # Determine options
     stream = request.options.stream if request.options else False
@@ -185,16 +268,7 @@ async def chat(
         agent = get_agent()
 
         # Session key: request body takes priority over user token.
-        # Only use user's token session_key when request didn't provide
-        # a custom one (i.e., still has the default value).
-        session_key = request.session_key
-        if (
-            session_key == "default"
-            and hasattr(user, "session_key")
-            and user.session_key
-            and user.session_key != "default"
-        ):
-            session_key = user.session_key
+        session_key = _resolve_session_key(request.session_key, user)
 
         # Process audio input if provided
         transcription_info = None
@@ -217,29 +291,38 @@ async def chat(
                     request.media or None,
                     thinking,
                     session_key=session_key,
+                    trace_id=trace_id,
+                    request_id=request_id,
                 ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Request-ID": request_id,
+                    "X-Trace-ID": trace_id,
                 },
             )
 
-        # Non-streaming mode — switch session before processing
-        _switch_session(agent, session_key)
+        session_lock = get_session_execution_lock(session_key)
+        agent_lock = get_agent_execution_lock()
+        async with session_lock:
+            async with agent_lock:
+                # Non-streaming mode — switch session before processing
+                _switch_session(agent, session_key)
 
-        kwargs = {"message": message}
-        if request.media:
-            kwargs["media"] = request.media
+                kwargs = {"message": message}
+                if request.media:
+                    kwargs["media"] = request.media
 
-        thinking_content = None
-        if thinking:
-            response_text, thinking_content = await agent.process_with_thinking(**kwargs)
-        else:
-            response_text = await agent.process(**kwargs)
+                thinking_content = None
+                if thinking:
+                    response_text, thinking_content = await agent.process_with_thinking(**kwargs)
+                else:
+                    response_text = await agent.process(**kwargs)
 
         duration_ms = int((time.time() - start_time) * 1000)
+        request_span.stop()
+        timing = build_timing_payload(request_span, extra={"trace_id": trace_id})
 
         return APIResponse(
             success=True,
@@ -250,11 +333,46 @@ async def chat(
                 thinking_content=thinking_content,
                 transcription=transcription_info,
             ),
-            meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
+            meta=MetaInfo(
+                request_id=request_id,
+                duration_ms=duration_ms,
+                trace_id=trace_id,
+                timing=timing,
+            ),
         )
 
     except HTTPException:
         raise
+    except BudgetExhaustedError as exc:
+        request_span.stop()
+        limit_ms = exc.limit_ms
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={
+                "code": TimeoutCode.TIMEOUT_TOTAL.value,
+                "message": str(exc),
+                "details": {
+                    "budget_type": exc.budget_type,
+                    "elapsed_ms": exc.elapsed_ms,
+                    "limit_ms": limit_ms,
+                },
+            },
+        )
+    except asyncio.TimeoutError:
+        request_span.stop()
+        try:
+            request_limit_ms = get_config().budget.request_timeout_ms
+        except Exception:
+            request_limit_ms = 0
+        timeout_detail = build_timeout_error_detail(
+            TimeoutCode.TIMEOUT_UPSTREAM,
+            elapsed_ms=request_span.elapsed_ms,
+            limit_ms=request_limit_ms,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=timeout_detail.model_dump(),
+        )
 
     except Exception as e:
         raise HTTPException(
@@ -279,6 +397,7 @@ class TaskStatus(str, Enum):
 @dataclasses.dataclass
 class AsyncTask:
     task_id: str
+    owner_user_id: str
     status: TaskStatus = TaskStatus.PENDING
     result: str | None = None
     error: str | None = None
@@ -296,11 +415,16 @@ async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str
     """Background coroutine that drives agent processing for an async task."""
     task.status = TaskStatus.RUNNING
     try:
-        _switch_session(agent, session_key)
-        if task._cancel_event.is_set():
-            task.status = TaskStatus.CANCELLED
-            return
-        response = await agent.process(message=message)
+        resolved_session_key = session_key or "default"
+        session_lock = get_session_execution_lock(resolved_session_key)
+        agent_lock = get_agent_execution_lock()
+        async with session_lock:
+            async with agent_lock:
+                _switch_session(agent, resolved_session_key)
+                if task._cancel_event.is_set():
+                    task.status = TaskStatus.CANCELLED
+                    return
+                response = await agent.process(message=message)
         if task._cancel_event.is_set():
             task.status = TaskStatus.CANCELLED
             return
@@ -335,9 +459,10 @@ async def chat_async(
             detail={"code": "AGENT_NOT_READY", "message": "Agent is not initialized yet"},
         )
 
-    session_key = request.session_key
+    session_key = _resolve_session_key(request.session_key, user)
+    owner_user_id = getattr(user, "user_id", "anonymous")
 
-    task = AsyncTask(task_id=task_id)
+    task = AsyncTask(task_id=task_id, owner_user_id=owner_user_id)
     _task_store[task_id] = task
 
     bg = asyncio.create_task(
@@ -363,6 +488,12 @@ async def get_task(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "TASK_NOT_FOUND", "message": f"Task '{task_id}' not found"},
+        )
+    current_user_id = getattr(user, "user_id", "anonymous")
+    if task.owner_user_id != current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FORBIDDEN", "message": "Task does not belong to current user"},
         )
 
     payload: dict = {
@@ -390,6 +521,12 @@ async def cancel_task(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "TASK_NOT_FOUND", "message": f"Task '{task_id}' not found"},
+        )
+    current_user_id = getattr(user, "user_id", "anonymous")
+    if task.owner_user_id != current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FORBIDDEN", "message": "Task does not belong to current user"},
         )
 
     if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,8 @@ _config: GatewayConfig | None = None
 _identity: SpoonCoreIdentity | None = None
 _payments: SpoonCorePayments | None = None
 _auth_required: bool = True  # Can be set to False via GATEWAY_AUTH_REQUIRED=false
+_agent_execution_lock: asyncio.Lock | None = None
+_session_execution_locks: dict[str, asyncio.Lock] = {}
 
 
 def is_auth_required() -> bool:
@@ -58,6 +61,24 @@ def get_config() -> GatewayConfig:
     if _config is None:
         raise RuntimeError("Gateway config not initialized.")
     return _config
+
+
+def get_agent_execution_lock() -> asyncio.Lock:
+    """Get the shared lock guarding global agent execution."""
+    global _agent_execution_lock
+    if _agent_execution_lock is None:
+        _agent_execution_lock = asyncio.Lock()
+    return _agent_execution_lock
+
+
+def get_session_execution_lock(session_key: str) -> asyncio.Lock:
+    """Get/create a lock for a specific session key."""
+    key = session_key.strip() if isinstance(session_key, str) and session_key.strip() else "default"
+    lock = _session_execution_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_execution_locks[key] = lock
+    return lock
 
 
 def set_agent(agent: SpoonCoreAgent | AgentLoop) -> None:
@@ -149,9 +170,11 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     Returns:
         Configured FastAPI application.
     """
-    global _config
+    global _config, _agent_execution_lock, _session_execution_locks
 
     _config = config or GatewayConfig.from_env()
+    _agent_execution_lock = None
+    _session_execution_locks = {}
 
     app = FastAPI(
         title="spoon-bot Gateway",

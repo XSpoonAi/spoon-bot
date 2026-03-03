@@ -502,20 +502,20 @@ class AgentLoop:
         """Rough token estimate for current session messages (~4 chars per token)."""
         return sum(len(m.get("content", "")) for m in self._session.messages) // 4
 
-    def _trim_context_if_needed(self) -> None:
+    def _trim_context_if_needed(self) -> int:
         """Auto-trim oldest messages if context budget approaches the limit.
 
         Keeps at minimum the two most recent messages (last user + assistant pair).
         Raises ContextOverflowError if even after trimming the context is too large.
         """
         if not self._session.messages:
-            return
+            return 0
 
         budget = int(self.context_window * 0.75)
         estimated = self._estimate_token_count()
 
         if estimated <= budget:
-            return
+            return 0
 
         logger.warning(
             f"Context approaching limit: ~{estimated:,} tokens "
@@ -524,8 +524,10 @@ class AgentLoop:
         )
 
         messages = self._session.messages
+        trimmed_count = 0
         while len(messages) > 2 and self._estimate_token_count() > budget:
             removed = messages.pop(0)
+            trimmed_count += 1
             logger.debug(
                 f"Trimmed message: role={removed.get('role')}, "
                 f"len={len(removed.get('content', ''))}"
@@ -535,6 +537,60 @@ class AgentLoop:
         final_estimate = self._estimate_token_count()
         if final_estimate > self.context_window:
             raise ContextOverflowError(final_estimate, self.context_window)
+
+        return trimmed_count
+
+    async def _sync_runtime_history_from_session(self) -> int:
+        """Sync persisted session history into spoon-core runtime memory."""
+        if not self._agent:
+            return 0
+
+        memory = getattr(self._agent, "memory", None)
+        if memory is None or not hasattr(memory, "clear"):
+            return 0
+
+        try:
+            memory.clear()
+        except Exception as exc:
+            logger.warning(f"Failed to clear runtime memory before history sync: {exc}")
+            return 0
+
+        injected_count = 0
+        for msg in self._session.get_history():
+            role = str(msg.get("role", "")).strip().lower()
+            if role not in {"user", "assistant", "tool"}:
+                continue
+
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content = str(content)
+
+            try:
+                await self._agent.add_message(role, content)
+                injected_count += 1
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to inject session history message "
+                    f"(role={role}, index={injected_count}): {exc}"
+                )
+
+        return injected_count
+
+    async def _prepare_request_context(self) -> None:
+        """Prepare request context by trimming and injecting session history."""
+        trimmed_count = self._trim_context_if_needed()
+        injected_count = await self._sync_runtime_history_from_session()
+        estimated_tokens = self._estimate_token_count()
+
+        logger.info(
+            f"Session context prepared: session={self.session_key}, "
+            f"injected_messages={injected_count}, "
+            f"estimated_tokens~{estimated_tokens}, "
+            f"trimmed_messages={trimmed_count}"
+        )
 
     async def process(
         self,
@@ -571,8 +627,8 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to load memory context: {e}")
 
-        # Trim context if approaching window limit
-        self._trim_context_if_needed()
+        # Trim and inject persisted history into runtime memory
+        await self._prepare_request_context()
 
         # Run agent
         try:
@@ -684,8 +740,8 @@ class AgentLoop:
 
         full_content = ""
 
-        # Trim context if approaching window limit
-        self._trim_context_if_needed()
+        # Trim and inject persisted history into runtime memory
+        await self._prepare_request_context()
 
         # ------------------------------------------------------------------
         # Streaming uses the spoon-core run+stream pattern:
@@ -704,9 +760,18 @@ class AgentLoop:
                     break
 
             # 2. Start run() in background
+            run_result_text = ""
+
             async def _run_and_signal() -> None:
+                nonlocal run_result_text
                 try:
-                    await self._agent.run(request=message)
+                    result = await self._agent.run(request=message)
+                    if hasattr(result, "content"):
+                        run_result_text = result.content or ""
+                    elif isinstance(result, str):
+                        run_result_text = result
+                    elif result is not None:
+                        run_result_text = str(result)
                 except Exception as exc:
                     logger.error(f"Background agent run failed: {exc}")
                     try:
@@ -836,6 +901,20 @@ class AgentLoop:
             except (asyncio.TimeoutError, Exception):
                 pass
 
+            # Fallback: if run() completed but no stream chunks were emitted,
+            # use final run result as one content chunk to avoid empty output.
+            if not full_content and run_result_text:
+                logger.warning(
+                    "Stream produced no content chunks; "
+                    "falling back to run() result text."
+                )
+                full_content = run_result_text
+                yield {
+                    "type": "content",
+                    "delta": run_result_text,
+                    "metadata": {"fallback": "run_result_no_chunks"},
+                }
+
             # Emit done
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
@@ -881,8 +960,8 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to load memory context: {e}")
 
-        # Trim context if approaching window limit
-        self._trim_context_if_needed()
+        # Trim and inject persisted history into runtime memory
+        await self._prepare_request_context()
 
         # Run agent with thinking enabled
         try:

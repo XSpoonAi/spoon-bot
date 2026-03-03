@@ -17,9 +17,19 @@ from typing import Any, Callable, Coroutine
 from fastapi import WebSocket, WebSocketDisconnect, Query
 from loguru import logger
 
-from spoon_bot.gateway.app import get_agent, get_connection_manager, get_config, is_auth_required
+from spoon_bot.gateway.app import (
+    get_agent,
+    get_connection_manager,
+    get_config,
+    get_agent_execution_lock,
+    get_session_execution_lock,
+    is_auth_required,
+)
 from spoon_bot.gateway.auth.jwt import verify_token
 from spoon_bot.gateway.auth.api_key import verify_api_key
+from spoon_bot.gateway.errors import TimeoutCode, build_timeout_error_detail
+from spoon_bot.gateway.observability.budget import BudgetExhaustedError, check_budget
+from spoon_bot.gateway.observability.tracing import TimerSpan, build_timing_payload, new_trace_id
 from spoon_bot.gateway.websocket.protocol import (
     ClientMethod,
     ServerEvent,
@@ -184,6 +194,8 @@ async def websocket_endpoint(
                                     conn_id,
                                     WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
                                 )
+                            finally:
+                                handler._current_task = None
 
                         handler._current_task = asyncio.create_task(_run_chat())
                     else:
@@ -204,6 +216,9 @@ async def websocket_endpoint(
     except Exception as e:
         logger.error(f"WebSocket error for {conn_id}: {e}")
     finally:
+        cancelled = await handler._cancel_current_task_for_cleanup()
+        if cancelled:
+            logger.info(f"Cancelled background WS chat task on disconnect: {conn_id}")
         await manager.disconnect(conn_id)
 
 
@@ -291,6 +306,7 @@ class WebSocketHandler:
         """Execute chat request — uses the global AgentLoop."""
         agent = get_agent()
         manager = get_connection_manager()
+        config = get_config()
         conn = manager.get_connection(self.connection_id)
 
         if not conn:
@@ -308,103 +324,191 @@ class WebSocketHandler:
         stream = params.get("stream", False)
         thinking = params.get("thinking", False)
         task_id = f"task_{uuid4().hex[:8]}"
+        trace_id = new_trace_id()
+        span = TimerSpan("ws_chat")
         self._current_task_id = task_id
         self._cancel_requested = False
         had_error = False
 
-        # Switch agent session to the requested session_key (#11)
-        _switch_agent_session(agent, session_key)
+        session_lock = get_session_execution_lock(session_key)
+        agent_lock = get_agent_execution_lock()
 
-        # Emit thinking event
-        await manager.send_message(
-            self.connection_id,
-            WSEvent(event="agent.thinking", data={"task_id": task_id, "status": "processing"}),
-        )
+        try:
+            async with session_lock:
+                async with agent_lock:
+                    # Switch agent session to the requested session_key (#11)
+                    _switch_agent_session(agent, session_key)
 
-        if stream:
-            # Streaming mode: emit chunks via WSEvent
-            full_content = ""
-            async for chunk_data in agent.stream(message=message, thinking=thinking):
-                if self._cancel_requested:
-                    break
-
-                chunk_type = chunk_data.get("type", "content")
-                # Support both "delta" and "content" keys (#10)
-                delta = chunk_data.get("delta", "") or chunk_data.get("content", "")
-                metadata = chunk_data.get("metadata", {})
-
-                # Detect error chunks and propagate as agent.error event
-                if chunk_type == "error":
-                    had_error = True
+                    # Emit thinking event
                     await manager.send_message(
                         self.connection_id,
-                        WSEvent(event=ServerEvent.AGENT_ERROR.value, data={
+                        WSEvent(event="agent.thinking", data={
                             "task_id": task_id,
-                            "error": delta,
-                            "error_code": metadata.get("error_code", "AGENT_RUNTIME_ERROR"),
+                            "status": "processing",
+                            "trace_id": trace_id,
                         }),
                     )
-                    continue
+                    check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
-                if chunk_type == "done":
-                    # Send stream done event
-                    await manager.send_message(
-                        self.connection_id,
-                        WSEvent(event=ServerEvent.AGENT_STREAM_DONE.value, data={
-                            "task_id": task_id,
-                            "content": full_content,
-                        }),
-                    )
-                else:
-                    if chunk_type == "content" and delta:
-                        full_content += delta
+                    if stream:
+                        # Streaming mode: emit chunks via WSEvent
+                        full_content = ""
+                        async for chunk_data in agent.stream(message=message, thinking=thinking):
+                            check_budget("stream", config.budget.stream_timeout_ms, span.elapsed_ms)
+                            if self._cancel_requested:
+                                break
 
-                    # Send stream chunk event (even for non-content types like tool_call)
-                    if delta or chunk_type != "content":
-                        await manager.send_message(
-                            self.connection_id,
-                            WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
-                                "task_id": task_id,
-                                "type": chunk_type,
-                                "delta": delta,
-                                "metadata": metadata,
-                            }),
-                        )
+                            chunk_type = chunk_data.get("type", "content")
+                            # Support both "delta" and "content" keys (#10)
+                            delta = chunk_data.get("delta", "") or chunk_data.get("content", "")
+                            metadata = chunk_data.get("metadata", {})
 
-            response = full_content
-        else:
-            # Non-streaming mode
-            if thinking:
-                response, thinking_content = await agent.process_with_thinking(message=message)
-            else:
-                response = await agent.process(message=message)
-                thinking_content = None
+                            # Detect error chunks and propagate as agent.error event
+                            if chunk_type == "error":
+                                had_error = True
+                                await manager.send_message(
+                                    self.connection_id,
+                                    WSEvent(event=ServerEvent.AGENT_ERROR.value, data={
+                                        "task_id": task_id,
+                                        "trace_id": trace_id,
+                                        "timing": build_timing_payload(span),
+                                        "error": {
+                                            "code": metadata.get("error_code", "AGENT_RUNTIME_ERROR"),
+                                            "message": delta,
+                                        },
+                                    }),
+                                )
+                                continue
 
-        # Emit complete event
-        complete_data: dict[str, Any] = {
-            "task_id": task_id,
-            "status": "done",
-            "response": response[:200] if isinstance(response, str) else str(response)[:200],
-        }
-        if not stream and thinking and thinking_content:
-            complete_data["thinking_content"] = thinking_content
+                            if chunk_type == "done":
+                                done_content = (
+                                    metadata.get("content", "")
+                                    if isinstance(metadata, dict)
+                                    else ""
+                                )
+                                if not full_content and isinstance(done_content, str) and done_content:
+                                    full_content = done_content
+                                    await manager.send_message(
+                                        self.connection_id,
+                                        WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
+                                            "task_id": task_id,
+                                            "type": "content",
+                                            "delta": done_content,
+                                            "metadata": {"fallback": "done_metadata_content"},
+                                            "trace_id": trace_id,
+                                        }),
+                                    )
 
-        await manager.send_message(
-            self.connection_id,
-            WSEvent(event="agent.complete", data=complete_data),
-        )
+                                # Send stream done event
+                                await manager.send_message(
+                                    self.connection_id,
+                                    WSEvent(event=ServerEvent.AGENT_STREAM_DONE.value, data={
+                                        "task_id": task_id,
+                                        "content": full_content,
+                                        "trace_id": trace_id,
+                                        "timing": build_timing_payload(span),
+                                    }),
+                                )
+                            else:
+                                if chunk_type == "content" and delta:
+                                    full_content += delta
 
-        self._current_task_id = None
-        result: dict[str, Any] = {
-            "success": not had_error,
-            "task_id": task_id,
-            "content": response,
-            "session_key": session_key,
-        }
-        if not stream and thinking and thinking_content:
-            result["thinking_content"] = thinking_content
+                                # Send stream chunk event (even for non-content types like tool_call)
+                                if delta or chunk_type != "content":
+                                    await manager.send_message(
+                                        self.connection_id,
+                                        WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
+                                            "task_id": task_id,
+                                            "type": chunk_type,
+                                            "delta": delta,
+                                            "metadata": metadata,
+                                            "trace_id": trace_id,
+                                        }),
+                                    )
 
-        return result
+                        response = full_content
+                    else:
+                        # Non-streaming mode
+                        if thinking:
+                            response, thinking_content = await agent.process_with_thinking(message=message)
+                        else:
+                            response = await agent.process(message=message)
+                            thinking_content = None
+                        check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
+
+            # Emit complete event
+            span.stop()
+            timing = build_timing_payload(span)
+            complete_data: dict[str, Any] = {
+                "task_id": task_id,
+                "status": "done",
+                "response": response[:200] if isinstance(response, str) else str(response)[:200],
+                "trace_id": trace_id,
+                "timing": timing,
+            }
+            if not stream and thinking and thinking_content:
+                complete_data["thinking_content"] = thinking_content
+
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(event="agent.complete", data=complete_data),
+            )
+
+            result: dict[str, Any] = {
+                "success": not had_error,
+                "task_id": task_id,
+                "content": response,
+                "session_key": session_key,
+                "trace_id": trace_id,
+                "timing": timing,
+            }
+            if not stream and thinking and thinking_content:
+                result["thinking_content"] = thinking_content
+
+            return result
+        except BudgetExhaustedError as exc:
+            span.stop()
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AGENT_ERROR.value,
+                    data={
+                        "task_id": task_id,
+                        "trace_id": trace_id,
+                        "timing": build_timing_payload(span),
+                        "error": {
+                            "code": TimeoutCode.TIMEOUT_TOTAL.value,
+                            "message": str(exc),
+                            "budget_type": exc.budget_type,
+                            "elapsed_ms": exc.elapsed_ms,
+                            "limit_ms": exc.limit_ms,
+                        },
+                    },
+                ),
+            )
+            raise
+        except asyncio.TimeoutError:
+            span.stop()
+            timeout_detail = build_timeout_error_detail(
+                TimeoutCode.TIMEOUT_UPSTREAM,
+                elapsed_ms=span.elapsed_ms,
+                limit_ms=config.budget.request_timeout_ms,
+            )
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AGENT_ERROR.value,
+                    data={
+                        "task_id": task_id,
+                        "trace_id": trace_id,
+                        "timing": build_timing_payload(span),
+                        "error": timeout_detail.model_dump(),
+                    },
+                ),
+            )
+            raise
+        finally:
+            self._current_task_id = None
 
     async def _handle_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle cancel request (#13) — cancels both stream and non-stream."""
@@ -412,12 +516,34 @@ class WebSocketHandler:
         task_id = self._current_task_id
 
         # Also cancel the asyncio task if running (#13)
-        cancelled = False
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
-            cancelled = True
+        cancelled = await self._cancel_current_task_for_cleanup()
 
         return {"cancelled": True, "task_id": task_id, "task_interrupted": cancelled}
+
+    async def _cancel_current_task_for_cleanup(self, timeout: float = 2.0) -> bool:
+        """Cancel and await the current background chat task."""
+        task = self._current_task
+        if task is None:
+            return False
+
+        if task.done():
+            self._current_task = None
+            return False
+
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timed out waiting for WS task cleanup: conn={self.connection_id}, "
+                f"task_id={self._current_task_id}"
+            )
+        finally:
+            self._current_task = None
+
+        return True
 
     # ========== Confirmation ==========
 

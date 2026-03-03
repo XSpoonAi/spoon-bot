@@ -16,6 +16,8 @@ class MetaInfo(BaseModel):
     request_id: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     duration_ms: int | None = None
+    trace_id: str | None = None
+    timing: dict[str, Any] | None = None
 
 
 class ErrorDetail(BaseModel):

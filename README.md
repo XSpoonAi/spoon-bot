@@ -723,14 +723,17 @@ uv sync --extra dev
 # Or with pip
 pip install -e ".[dev]"
 
-# Run tests
-pytest tests/
+# Core regression suite (default, recommended for daily development)
+uv run python scripts/run_test_suite.py
 
-# Run specific test suites
-pytest tests/test_session_persistence.py    # Session backends
-pytest tests/test_gateway_ws_bugs.py        # WebSocket protocol
-pytest tests/test_gateway_tracing.py        # Tracing & error codes
-pytest tests/test_tools.py                  # Tool system
+# Core suite with extra pytest flags
+uv run python scripts/run_test_suite.py -- --maxfail=1 -q
+
+# Extended scenarios (e2e/live/capability + high-churn/platform-specific tests)
+uv run python scripts/run_test_suite.py --suite extended
+
+# Full suite (core + extended)
+uv run python scripts/run_test_suite.py --suite all
 
 # Lint
 ruff check spoon_bot/
