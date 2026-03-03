@@ -205,6 +205,7 @@ async def chat(
                 _stream_sse(
                     agent,
                     message,
+                    request.message,
                     request.media or None,
                     thinking,
                     session_key=session_key,
@@ -220,7 +221,7 @@ async def chat(
         # Non-streaming mode — switch session before processing
         _switch_session(agent, session_key)
 
-        kwargs = {"message": message}
+        kwargs = {"message": request.message}
         if request.media:
             kwargs["media"] = request.media
 
