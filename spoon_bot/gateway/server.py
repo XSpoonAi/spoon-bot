@@ -34,6 +34,7 @@ from spoon_bot.gateway.core_integration import (
     is_spoon_core_available,
 )
 from spoon_bot.gateway import app as app_module
+from spoon_bot.agent.tools.web import close_shared_http_client
 
 
 @asynccontextmanager
@@ -76,12 +77,25 @@ async def _lifespan(app: FastAPI):
         enable_skills = os.environ.get("SPOON_BOT_ENABLE_SKILLS", "true").lower() == "true"
         logger.info(f"Skills enabled: {enable_skills}")
 
+        # Session persistence config from env
+        session_store_backend = os.environ.get("SESSION_STORE_BACKEND", "file")
+        session_store_dsn = os.environ.get("SESSION_STORE_DSN")
+        session_store_db_path = os.environ.get("SESSION_STORE_DB_PATH")
+
+        # Context window override (optional)
+        _ctx_env = os.environ.get("CONTEXT_WINDOW")
+        context_window = int(_ctx_env) if _ctx_env else None
+
         agent = await create_agent(
             model=model,
             provider=provider,
             workspace=workspace,
             enable_skills=enable_skills,
             auto_commit=False,  # No git auto-commit in Docker gateway mode
+            session_store_backend=session_store_backend,
+            session_store_dsn=session_store_dsn,
+            session_store_db_path=session_store_db_path,
+            context_window=context_window,
         )
         app_module._agent = agent
 
@@ -115,6 +129,7 @@ async def _lifespan(app: FastAPI):
     logger.info("Shutting down spoon-bot gateway...")
     if connection_manager:
         await connection_manager.stop()
+    await close_shared_http_client()
 
 
 def create_app() -> FastAPI:
