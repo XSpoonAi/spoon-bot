@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-02-10 10:34 UTC.  
+> **Auto-generated** from source code on 2026-03-03 03:42 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:59`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:97`*
 
 ---
 
@@ -225,7 +225,7 @@ Get agent status and statistics.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:172`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:318`*
 
 ---
 
@@ -237,19 +237,19 @@ Get agent status and statistics.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:128`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:229`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:148`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:266`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:162`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:293`*
 
 ---
 
@@ -344,7 +344,7 @@ List all available skills.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:42`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:51`*
 
 ### `POST /v1/skills/{skill_name}/activate`
 
@@ -354,7 +354,7 @@ Activate a skill.
 
 **Request Body:** `SkillActivateRequest`
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:87`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:86`*
 
 ### `POST /v1/skills/{skill_name}/deactivate`
 
@@ -363,7 +363,7 @@ Deactivate a skill.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:134`*
+*Source: `spoon_bot/gateway/api/v1/skills.py:144`*
 
 ---
 
@@ -401,7 +401,7 @@ Handle chat.send / agent.chat
 
 #### `agent.cancel`
 
-Handle cancel request.
+Handle cancel request (#13)
 
 #### `agent.status`
 
@@ -409,7 +409,7 @@ Handle agent.status
 
 #### `session.switch`
 
-Handle session switch.
+Handle session switch (#15)
 
 #### `session.clear`
 
@@ -417,11 +417,11 @@ Handle session clear.
 
 #### `subscribe`
 
-Handle event subscription.
+Handle event subscription (#16)
 
 #### `unsubscribe`
 
-Handle event unsubscription.
+Handle event unsubscription (#16)
 
 ### Server Events (Server -> Client)
 
@@ -836,9 +836,6 @@ Health check response.
 |----------|---------|--------|
 | `SPOON_BOT_DEFAULT_PROVIDER` | `anthropic` | server.py |
 | `SPOON_BOT_DEFAULT_MODEL` | *(none)* | server.py |
-| `OPENAI_BASE_URL` | *(none)* | server.py |
-| `BASE_URL` | *(none)* | server.py |
-| `ANTHROPIC_BASE_URL` | *(none)* | server.py |
 | `SPOON_BOT_WORKSPACE_PATH` | `/data/workspace` | server.py |
 | `SPOON_BOT_ENABLE_SKILLS` | `true` | server.py |
 | `GATEWAY_API_KEY` | *(none)* | server.py |
@@ -858,6 +855,7 @@ Health check response.
 | `deepseek` | `deepseek-chat` |
 | `gemini` | `gemini-2.0-flash` |
 | `openrouter` | `anthropic/claude-sonnet-4` |
+| `ollama` | `llama3.2` |
 
 ---
 
