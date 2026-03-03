@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-03-03 03:42 UTC.  
+> **Auto-generated** from source code on 2026-03-03 03:44 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -838,6 +838,10 @@ Health check response.
 | `SPOON_BOT_DEFAULT_MODEL` | *(none)* | server.py |
 | `SPOON_BOT_WORKSPACE_PATH` | `/data/workspace` | server.py |
 | `SPOON_BOT_ENABLE_SKILLS` | `true` | server.py |
+| `SESSION_STORE_BACKEND` | `file` | server.py |
+| `SESSION_STORE_DSN` | *(none)* | server.py |
+| `SESSION_STORE_DB_PATH` | *(none)* | server.py |
+| `CONTEXT_WINDOW` | *(none)* | server.py |
 | `GATEWAY_API_KEY` | *(none)* | server.py |
 | `GATEWAY_AUTH_REQUIRED` | `true` | server.py |
 | `JWT_SECRET` | *(none)* | config.py |
