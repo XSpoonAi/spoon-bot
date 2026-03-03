@@ -9,6 +9,8 @@ Based on: docs/plans/2025-02-05-spoon-bot-api-design.md
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import defaultdict
 from uuid import uuid4
 from typing import Any, Callable, Coroutine
 
@@ -30,6 +32,56 @@ from spoon_bot.gateway.websocket.protocol import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter for WS auth attempts (#19)
+# ---------------------------------------------------------------------------
+
+class _AuthRateLimiter:
+    """Track failed auth attempts per IP and enforce cooldown."""
+
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 60):
+        self._max = max_attempts
+        self._window = window_seconds
+        # ip -> list of timestamps of failed attempts
+        self._attempts: dict[str, list[float]] = defaultdict(list)
+
+    def record_failure(self, ip: str) -> None:
+        now = time.monotonic()
+        self._attempts[ip].append(now)
+        # Prune old entries
+        cutoff = now - self._window
+        self._attempts[ip] = [t for t in self._attempts[ip] if t > cutoff]
+
+    def is_blocked(self, ip: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self._window
+        attempts = [t for t in self._attempts.get(ip, []) if t > cutoff]
+        self._attempts[ip] = attempts
+        return len(attempts) >= self._max
+
+    def clear(self, ip: str) -> None:
+        self._attempts.pop(ip, None)
+
+
+_auth_limiter = _AuthRateLimiter()
+
+
+# ---------------------------------------------------------------------------
+# Helper: switch agent session (mirrors agent.py _switch_session)
+# ---------------------------------------------------------------------------
+
+def _switch_agent_session(agent, session_key: str | None) -> None:
+    """Switch the agent's active session if supported (#11)."""
+    if not session_key or session_key == "default":
+        return
+    if hasattr(agent, "sessions") and hasattr(agent, "_session"):
+        try:
+            agent._session = agent.sessions.get_or_create(session_key)
+            agent.session_key = session_key
+        except Exception:
+            pass  # Gracefully degrade
+
+
 async def websocket_endpoint(
     websocket: WebSocket,
     token: str | None = Query(default=None),
@@ -45,6 +97,11 @@ async def websocket_endpoint(
     config = get_config()
     manager = get_connection_manager()
 
+    # Determine client IP for rate limiting
+    client_ip = "unknown"
+    if websocket.client:
+        client_ip = websocket.client.host
+
     # Authenticate
     user_id = None
     session_key = "default"
@@ -53,6 +110,13 @@ async def websocket_endpoint(
     if not is_auth_required():
         user_id = "anonymous"
     else:
+        # Rate-limit check (#19)
+        if _auth_limiter.is_blocked(client_ip):
+            # Accept then close so the client sees WS close code
+            await websocket.accept()
+            await websocket.close(code=4029, reason="Too many failed auth attempts. Try again later.")
+            return
+
         if token:
             token_data = verify_token(token, config.jwt.secret_key, config.jwt.algorithm, expected_type="access")
             if token_data:
@@ -65,8 +129,15 @@ async def websocket_endpoint(
                 user_id = api_key_data.user_id
 
     if not user_id:
+        # Accept first so the client can observe the WS close code (#17)
+        await websocket.accept()
+        _auth_limiter.record_failure(client_ip)
         await websocket.close(code=4001, reason="Authentication failed")
         return
+
+    # Successful auth — clear any rate-limit history for this IP
+    if is_auth_required():
+        _auth_limiter.clear(client_ip)
 
     # Connect
     conn_id = await manager.connect(websocket, user_id, session_key)
@@ -96,8 +167,28 @@ async def websocket_endpoint(
                     continue
 
                 if isinstance(message, WSRequest):
-                    response = await handler.handle_request(message)
-                    await manager.send_message(conn_id, response)
+                    # Run chat requests as background tasks so the message
+                    # loop stays free to process cancel / status requests.
+                    if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
+                        _req = message  # capture for closure
+
+                        async def _run_chat(req: WSRequest = _req) -> None:
+                            try:
+                                result = await handler._handle_chat(req.params)
+                                await manager.send_message(
+                                    conn_id, WSResponse(id=req.id, result=result),
+                                )
+                            except Exception as exc:
+                                logger.error(f"Chat error: {exc}")
+                                await manager.send_message(
+                                    conn_id,
+                                    WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
+                                )
+
+                        handler._current_task = asyncio.create_task(_run_chat())
+                    else:
+                        response = await handler.handle_request(message)
+                        await manager.send_message(conn_id, response)
 
             except ValueError as e:
                 await manager.send_message(
@@ -129,6 +220,7 @@ class WebSocketHandler:
         self.session_id = session_id or connection_id
         self._cancel_requested = False
         self._current_task_id: str | None = None
+        self._current_task: asyncio.Task | None = None
         self._pending_confirms: dict[str, asyncio.Future] = {}
 
         self._handlers: dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {
@@ -164,14 +256,22 @@ class WebSocketHandler:
             )
 
         try:
+            # Params are already validated as dict in parse_message / WSRequest.from_dict
             result = await handler(request.params)
             return WSResponse(id=request.id, result=result)
+        except ValueError as e:
+            # Business-logic validation errors → INVALID_PARAMS (#14)
+            return WSError(
+                id=request.id,
+                code="INVALID_PARAMS",
+                message=str(e),
+            )
         except Exception as e:
             logger.error(f"Error handling {request.method}: {e}")
             return WSError(
                 id=request.id,
                 code="HANDLER_ERROR",
-                message=str(e),
+                message="Internal handler error",  # Don't leak internals (#14)
             )
 
     # ========== Chat ==========
@@ -190,11 +290,18 @@ class WebSocketHandler:
             raise ValueError("Message is required")
 
         session_key = params.get("session_key", conn.session_key)
+        # Validate session_key type
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = conn.session_key
+
         stream = params.get("stream", False)
         thinking = params.get("thinking", False)
         task_id = f"task_{uuid4().hex[:8]}"
         self._current_task_id = task_id
         self._cancel_requested = False
+
+        # Switch agent session to the requested session_key (#11)
+        _switch_agent_session(agent, session_key)
 
         # Emit thinking event
         await manager.send_message(
@@ -210,7 +317,8 @@ class WebSocketHandler:
                     break
 
                 chunk_type = chunk_data.get("type", "content")
-                delta = chunk_data.get("delta", "")
+                # Support both "delta" and "content" keys (#10)
+                delta = chunk_data.get("delta", "") or chunk_data.get("content", "")
                 metadata = chunk_data.get("metadata", {})
 
                 if chunk_type == "done":
@@ -223,19 +331,20 @@ class WebSocketHandler:
                         }),
                     )
                 else:
-                    if chunk_type == "content":
+                    if chunk_type == "content" and delta:
                         full_content += delta
 
-                    # Send stream chunk event
-                    await manager.send_message(
-                        self.connection_id,
-                        WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
-                            "task_id": task_id,
-                            "type": chunk_type,
-                            "delta": delta,
-                            "metadata": metadata,
-                        }),
-                    )
+                    # Send stream chunk event (even for non-content types like tool_call)
+                    if delta or chunk_type != "content":
+                        await manager.send_message(
+                            self.connection_id,
+                            WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
+                                "task_id": task_id,
+                                "type": chunk_type,
+                                "delta": delta,
+                                "metadata": metadata,
+                            }),
+                        )
 
             response = full_content
         else:
@@ -273,10 +382,17 @@ class WebSocketHandler:
         return result
 
     async def _handle_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle cancel request."""
+        """Handle cancel request (#13) — cancels both stream and non-stream."""
         self._cancel_requested = True
         task_id = self._current_task_id
-        return {"cancelled": True, "task_id": task_id}
+
+        # Also cancel the asyncio task if running (#13)
+        cancelled = False
+        if self._current_task and not self._current_task.done():
+            self._current_task.cancel()
+            cancelled = True
+
+        return {"cancelled": True, "task_id": task_id, "task_interrupted": cancelled}
 
     # ========== Confirmation ==========
 
@@ -376,13 +492,23 @@ class WebSocketHandler:
     # ========== Sessions ==========
 
     async def _handle_session_switch(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle session switch."""
+        """Handle session switch (#15) — validates session_key is a non-empty string."""
         manager = get_connection_manager()
         conn = manager.get_connection(self.connection_id)
         if not conn:
             raise ValueError("Connection not found")
 
         new_session = params.get("session_key", "default")
+
+        # Validate session_key type (#15)
+        if not isinstance(new_session, str):
+            raise ValueError(
+                f"session_key must be a non-empty string, got {type(new_session).__name__}"
+            )
+        new_session = new_session.strip()
+        if not new_session:
+            raise ValueError("session_key must be a non-empty string")
+
         conn.session_key = new_session
         return {"session_key": new_session, "switched": True}
 
@@ -437,24 +563,77 @@ class WebSocketHandler:
         return {"success": True, "state": {"version": "1.0", "session_key": session_key, "messages": []}}
 
     async def _handle_session_import(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle session.import."""
+        """Handle session.import (#12) — actually persist imported messages."""
         state = params.get("state")
         if not state:
             raise ValueError("state is required")
-        return {"success": True, "restored": {"session_id": self.session_id}}
+
+        if not isinstance(state, dict):
+            raise ValueError("state must be a JSON object")
+
+        session_key = state.get("session_key", "default")
+        messages = state.get("messages", [])
+
+        if not isinstance(messages, list):
+            raise ValueError("state.messages must be an array")
+
+        agent = get_agent()
+
+        try:
+            session = agent.sessions.get_or_create(session_key)
+            # Replace messages with imported ones
+            session.messages.clear()
+            for msg in messages:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if role and content:
+                        session.add_message(role, content)
+            agent.sessions.save(session)
+
+            return {
+                "success": True,
+                "restored": {
+                    "session_key": session_key,
+                    "messages_imported": len(session.messages),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Session import failed: {e}")
+            return {
+                "success": False,
+                "error": f"Import failed: {e}",
+            }
 
     # ========== Subscriptions ==========
 
     async def _handle_subscribe(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle event subscription."""
+        """Handle event subscription (#16) — validates events is list[str]."""
         manager = get_connection_manager()
         events = params.get("events", [])
+
+        # Validate events is a list of strings (#16)
+        if not isinstance(events, list):
+            raise ValueError(
+                f"events must be a list of strings, got {type(events).__name__}"
+            )
+        # Ensure all items are strings
+        events = [str(e) for e in events if isinstance(e, str)]
+
         manager.subscribe(self.connection_id, events)
         return {"subscribed": events}
 
     async def _handle_unsubscribe(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle event unsubscription."""
+        """Handle event unsubscription (#16) — validates events is list[str]."""
         manager = get_connection_manager()
         events = params.get("events", [])
+
+        # Validate events is a list of strings (#16)
+        if not isinstance(events, list):
+            raise ValueError(
+                f"events must be a list of strings, got {type(events).__name__}"
+            )
+        events = [str(e) for e in events if isinstance(e, str)]
+
         manager.unsubscribe(self.connection_id, events)
         return {"unsubscribed": events}

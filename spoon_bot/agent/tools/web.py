@@ -2,33 +2,61 @@
 
 from __future__ import annotations
 
+import json as _json
 import os
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
+from loguru import logger
+
 from spoon_bot.agent.tools.base import Tool
+
+
+# Shared httpx client for connection pooling across web tools.
+# Created lazily on first use to avoid issues at import time.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Get or create a shared httpx.AsyncClient with connection pooling."""
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+            ),
+        )
+    return _shared_client
 
 
 class WebSearchTool(Tool):
     """
     Tool to search the web for information.
 
-    Supports multiple search providers (Google, DuckDuckGo, Brave).
-    Requires API key configuration for the chosen provider.
+    Supports multiple search providers.  Tavily is the recommended default
+    because it returns structured results out of the box.
     """
 
-    SUPPORTED_PROVIDERS = frozenset({"google", "duckduckgo", "brave", "serper"})
+    SUPPORTED_PROVIDERS = frozenset({
+        "tavily", "google", "duckduckgo", "brave", "serper",
+    })
 
-    def __init__(self, default_provider: str = "duckduckgo", max_results: int = 10):
-        """
-        Initialize web search tool.
+    _ENV_VAR_MAP: dict[str, str] = {
+        "tavily": "TAVILY_API_KEY",
+        "google": "GOOGLE_SEARCH_API_KEY",
+        "brave": "BRAVE_SEARCH_API_KEY",
+        "serper": "SERPER_API_KEY",
+        # DuckDuckGo doesn't require an API key for basic search
+    }
 
-        Args:
-            default_provider: Default search provider.
-            max_results: Maximum number of results to return.
-        """
+    def __init__(self, default_provider: str = "tavily", max_results: int = 5):
         self._default_provider = default_provider
         self._max_results = max_results
+
+    # ---- Tool interface ----------------------------------------------------
 
     @property
     def name(self) -> str:
@@ -37,9 +65,9 @@ class WebSearchTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Search the web for information. Returns a list of relevant results "
-            "with titles, URLs, and snippets. Useful for finding current information, "
-            "documentation, or researching topics."
+            "Search the web for real-time information. Returns relevant results "
+            "with titles, URLs, and content snippets. Use this for current events, "
+            "prices, news, documentation, or any question requiring up-to-date data."
         )
 
     @property
@@ -51,18 +79,14 @@ class WebSearchTool(Tool):
                     "type": "string",
                     "description": "Search query string",
                 },
-                "provider": {
-                    "type": "string",
-                    "description": "Search provider (default: duckduckgo)",
-                    "enum": list(self.SUPPORTED_PROVIDERS),
-                },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of results (default: 10, max: 50)",
+                    "description": f"Maximum number of results (default: {self._max_results}, max: 20)",
                 },
-                "site": {
+                "topic": {
                     "type": "string",
-                    "description": "Limit search to specific site (e.g., 'github.com')",
+                    "description": "Search topic: 'general' or 'news'",
+                    "enum": ["general", "news"],
                 },
                 "time_range": {
                     "type": "string",
@@ -73,128 +97,115 @@ class WebSearchTool(Tool):
             "required": ["query"],
         }
 
-    def _get_api_key(self, provider: str) -> str | None:
-        """Get API key for the specified provider."""
-        env_var_map = {
-            "google": "GOOGLE_SEARCH_API_KEY",
-            "brave": "BRAVE_SEARCH_API_KEY",
-            "serper": "SERPER_API_KEY",
-            # DuckDuckGo doesn't require an API key for basic search
-        }
-        env_var = env_var_map.get(provider)
-        return os.environ.get(env_var) if env_var else None
-
-    def _get_google_cx(self) -> str | None:
-        """Get Google Custom Search Engine ID."""
-        return os.environ.get("GOOGLE_SEARCH_CX")
+    # ---- Execution ---------------------------------------------------------
 
     async def execute(
         self,
         query: str,
-        provider: str | None = None,
         max_results: int | None = None,
-        site: str | None = None,
+        topic: str | None = None,
         time_range: str | None = None,
+        provider: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """
-        Search the web.
-
-        Args:
-            query: Search query.
-            provider: Search provider to use.
-            max_results: Maximum number of results.
-            site: Limit to specific site.
-            time_range: Time range filter.
-
-        Returns:
-            Search results or error message.
-        """
         provider = provider or self._default_provider
-        max_results = min(max_results or self._max_results, 50)
+        max_results = min(max_results or self._max_results, 20)
 
-        # Validate provider
         if provider not in self.SUPPORTED_PROVIDERS:
-            return f"Error: Unsupported provider '{provider}'. Supported: {', '.join(sorted(self.SUPPORTED_PROVIDERS))}"
+            return (
+                f"Error: Unsupported provider '{provider}'. "
+                f"Supported: {', '.join(sorted(self.SUPPORTED_PROVIDERS))}"
+            )
 
-        # Build search query with site filter
-        full_query = query
-        if site:
-            full_query = f"site:{site} {query}"
+        # Dispatch
+        if provider == "tavily":
+            return await self._search_tavily(query, max_results, topic, time_range)
 
-        # Check API key for providers that require it
-        if provider in ("google", "brave", "serper"):
-            api_key = self._get_api_key(provider)
-            if not api_key:
-                env_var_map = {
-                    "google": "GOOGLE_SEARCH_API_KEY",
-                    "brave": "BRAVE_SEARCH_API_KEY",
-                    "serper": "SERPER_API_KEY",
-                }
-                env_var = env_var_map[provider]
-                return (
-                    f"Error: {provider.title()} Search API key not configured. "
-                    f"Set {env_var} environment variable.\n\n"
-                    f"To get an API key:\n"
-                    + self._get_api_setup_instructions(provider)
-                )
+        # Fallback: stub for other providers (can be implemented later)
+        return await self._search_stub(query, provider, max_results, time_range)
 
-            # Google also needs CX
-            if provider == "google" and not self._get_google_cx():
-                return (
-                    "Error: Google Custom Search Engine ID not configured. "
-                    "Set GOOGLE_SEARCH_CX environment variable.\n\n"
-                    "To set up Google Custom Search:\n"
-                    "  1. Go to https://programmablesearchengine.google.com/\n"
-                    "  2. Create a search engine\n"
-                    "  3. Get the Search Engine ID (CX)"
-                )
+    # ---- Tavily implementation ---------------------------------------------
 
-        # Stub implementation
-        return (
-            f"[STUB] Web search would execute:\n"
-            f"  Query: {full_query}\n"
-            f"  Provider: {provider}\n"
-            f"  Max Results: {max_results}\n"
-            f"  Time Range: {time_range or 'any'}\n\n"
-            f"To enable web search functionality, install the required packages:\n"
-            f"  pip install httpx beautifulsoup4\n\n"
-            f"And configure API keys for your preferred provider:\n"
-            + self._get_api_setup_instructions(provider)
-        )
+    async def _search_tavily(
+        self,
+        query: str,
+        max_results: int,
+        topic: str | None,
+        time_range: str | None,
+    ) -> str:
+        api_key = os.environ.get("TAVILY_API_KEY")
+        if not api_key:
+            return (
+                "Error: Tavily API key not configured. "
+                "Set TAVILY_API_KEY in your .env file.\n"
+                "Get a free key at https://tavily.com"
+            )
 
-    def _get_api_setup_instructions(self, provider: str) -> str:
-        """Get setup instructions for a provider."""
-        instructions = {
-            "google": (
-                "  Google Custom Search:\n"
-                "    1. Go to https://console.cloud.google.com/\n"
-                "    2. Enable Custom Search API\n"
-                "    3. Create credentials (API Key)\n"
-                "    4. Set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX"
-            ),
-            "brave": (
-                "  Brave Search:\n"
-                "    1. Go to https://brave.com/search/api/\n"
-                "    2. Sign up for API access\n"
-                "    3. Get your API key\n"
-                "    4. Set BRAVE_SEARCH_API_KEY"
-            ),
-            "serper": (
-                "  Serper (Google Search API):\n"
-                "    1. Go to https://serper.dev/\n"
-                "    2. Sign up for an account\n"
-                "    3. Get your API key\n"
-                "    4. Set SERPER_API_KEY"
-            ),
-            "duckduckgo": (
-                "  DuckDuckGo:\n"
-                "    No API key required for basic search.\n"
-                "    Install duckduckgo-search package:\n"
-                "    pip install duckduckgo-search"
-            ),
+        payload: dict[str, Any] = {
+            "query": query,
+            "max_results": max_results,
+            "include_answer": "basic",
+            "search_depth": "basic",
         }
-        return instructions.get(provider, "  See provider documentation for API setup.")
+        if topic:
+            payload["topic"] = topic
+        if time_range:
+            payload["time_range"] = time_range
+
+        try:
+            client = _get_http_client()
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"Tavily API error: {exc.response.status_code} {exc.response.text[:300]}")
+            return f"Error: Tavily search failed ({exc.response.status_code})"
+        except Exception as exc:
+            logger.error(f"Tavily request error: {exc}")
+            return f"Error: Web search failed — {exc}"
+
+        # Format results
+        parts: list[str] = []
+
+        answer = data.get("answer")
+        if answer:
+            parts.append(f"**Answer:** {answer}\n")
+
+        results = data.get("results", [])
+        if results:
+            parts.append(f"**Search results ({len(results)}):**\n")
+            for i, r in enumerate(results, 1):
+                title = r.get("title", "")
+                url = r.get("url", "")
+                content = r.get("content", "")
+                parts.append(f"{i}. **{title}**\n   {url}\n   {content}\n")
+        elif not answer:
+            parts.append("No results found.")
+
+        return "\n".join(parts)
+
+    # ---- Stub for unimplemented providers ----------------------------------
+
+    async def _search_stub(
+        self,
+        query: str,
+        provider: str,
+        max_results: int,
+        time_range: str | None,
+    ) -> str:
+        env_var = self._ENV_VAR_MAP.get(provider, "")
+        return (
+            f"Error: Provider '{provider}' is not yet implemented. "
+            f"Use 'tavily' (default) instead.\n"
+            f"Or set {env_var} to configure this provider."
+        )
 
 
 class WebFetchTool(Tool):
@@ -353,19 +364,72 @@ class WebFetchTool(Tool):
         if headers:
             request_headers.update(headers)
 
-        # Stub implementation
-        return (
-            f"[STUB] Web fetch would execute:\n"
-            f"  URL: {url}\n"
-            f"  Method: {method}\n"
-            f"  Extract Text: {extract_text}\n"
-            f"  Selector: {selector or '(none)'}\n"
-            f"  Headers: {request_headers}\n"
-            f"  Body: {body[:100] + '...' if body and len(body) > 100 else body or '(none)'}\n\n"
-            f"To enable web fetch functionality, install the required packages:\n"
-            f"  pip install httpx beautifulsoup4 lxml\n\n"
-            f"This is a stub - no actual request was made."
-        )
+        try:
+            client = _get_http_client()
+            resp = await client.request(
+                method=method,
+                url=url,
+                headers=request_headers,
+                content=body.encode() if body else None,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("content-type", "")
+            raw = resp.text
+
+            # Truncate very large responses
+            if len(raw) > self._max_content_size:
+                raw = raw[: self._max_content_size] + "\n\n[Content truncated]"
+
+            # JSON response — return formatted
+            if "json" in content_type:
+                try:
+                    data = resp.json()
+                    return _json.dumps(data, ensure_ascii=False, indent=2)
+                except Exception:
+                    return raw
+
+            # HTML — try to extract readable text
+            if "html" in content_type and extract_text:
+                return self._extract_text_from_html(raw, selector)
+
+            # Plain text / other
+            return raw
+
+        except httpx.HTTPStatusError as exc:
+            return f"Error: HTTP {exc.response.status_code} for {url}"
+        except httpx.TimeoutException:
+            return f"Error: Request timed out after {self._timeout}s for {url}"
+        except Exception as exc:
+            return f"Error fetching {url}: {exc}"
+
+    @staticmethod
+    def _extract_text_from_html(html: str, selector: str | None = None) -> str:
+        """Extract readable text from HTML, optionally scoped to a CSS selector."""
+        try:
+            from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Remove scripts, styles, nav, footer
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+
+            if selector:
+                target = soup.select_one(selector)
+                if target:
+                    return target.get_text(separator="\n", strip=True)
+                return f"No element matching selector '{selector}' found."
+
+            return soup.get_text(separator="\n", strip=True)
+
+        except ImportError:
+            # bs4 not installed — return raw with tags stripped naively
+            import re
+            text = re.sub(r"<[^>]+>", " ", html)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:8000] if len(text) > 8000 else text
 
 
 class WebBrowserTool(Tool):

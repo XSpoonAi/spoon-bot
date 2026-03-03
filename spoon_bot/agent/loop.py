@@ -34,7 +34,10 @@ except ImportError as e:
 
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder
-from spoon_bot.agent.tools.registry import CORE_TOOLS, ToolRegistry
+from spoon_bot.agent.tools.registry import (
+    CORE_TOOLS,
+    ToolRegistry,
+)
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.filesystem import (
     ReadFileTool,
@@ -43,6 +46,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.self_config import (
+    ActivateToolTool,
     SelfConfigTool,
     MemoryManagementTool,
     SelfUpgradeTool,
@@ -229,17 +233,7 @@ class AgentLoop:
         # Append available-tools summary so the LLM knows what can be loaded
         inactive_tools = self.tools.get_inactive_tools()
         if inactive_tools:
-            tool_lines = "\n".join(
-                f"- {t.name}: {t.description}"
-                for t in inactive_tools.values()
-            )
-            system_prompt += (
-                "\n\n## Dynamically Loadable Tools\n\n"
-                "The following tools are available but not currently loaded. "
-                "If you need any of them, tell the user which tool you need "
-                "and they can be loaded on demand.\n\n"
-                f"{tool_lines}"
-            )
+            system_prompt += self._build_dynamic_tools_prompt(inactive_tools)
 
         # Create ChatBot (spoon-core LLM interface)
         self._chatbot = ChatBot(
@@ -250,14 +244,26 @@ class AgentLoop:
             system_prompt=system_prompt,
         )
 
-        # Create MCP tools
+        # Create MCP tools – expand each server into individual tools (#5)
         for name, config in self._mcp_config.items():
             mcp_tool = MCPTool(
                 name=name,
                 description=f"MCP server: {name}",
                 mcp_config=config,
             )
-            self._mcp_tools.append(mcp_tool)
+            # Try to discover real server tools and create one MCPTool per tool
+            try:
+                expanded = await mcp_tool.expand_server_tools()
+                if expanded:
+                    self._mcp_tools.extend(expanded)
+                    logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
+                else:
+                    # Fallback: keep proxy tool (server might be offline)
+                    self._mcp_tools.append(mcp_tool)
+                    logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
+            except Exception as exc:
+                logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
+                self._mcp_tools.append(mcp_tool)
 
         # Only pass active (filtered) tools + MCP tools to the agent
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
@@ -321,6 +327,15 @@ class AgentLoop:
         memory_tool.set_memory_store(self.memory)
         self.tools.register(memory_tool)
         self.tools.register(SelfUpgradeTool(workspace=self.workspace))
+
+        # Dynamic tool activation — lets the LLM load tools on demand
+        self.tools.register(ActivateToolTool(
+            activate_fn=self.add_tool,
+            list_inactive_fn=lambda: [
+                {"name": t.name, "description": t.description}
+                for t in self.tools.get_inactive_tools().values()
+            ],
+        ))
 
         # Background task tool
         self.tools.register(SpawnTool())
@@ -433,15 +448,83 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        kwargs: dict[str, Any] = {}
-        if thinking:
-            kwargs["thinking"] = True
-        if media:
-            kwargs["media"] = media
+        logger.info(f"Streaming message: {message[:100]}...")
+
+        # Refresh memory context
+        try:
+            memory_context = self.memory.get_memory_context()
+            if memory_context:
+                self.context.set_memory_context(memory_context)
+        except Exception as e:
+            logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+
+        # ------------------------------------------------------------------
+        # Streaming uses the spoon-core run+stream pattern:
+        #   1. Clear task_done + drain output_queue
+        #   2. Start run(message) in background — sets task_done on finish
+        #   3. Read chunks from output_queue until task_done AND queue empty
+        # ------------------------------------------------------------------
+
         try:
-            async for chunk in self._agent.stream(message, **kwargs):
+            # 1. Reset streaming state
+            self._agent.task_done.clear()
+            while not self._agent.output_queue.empty():
+                try:
+                    await asyncio.wait_for(self._agent.output_queue.get(), timeout=0.1)
+                except (asyncio.TimeoutError, Exception):
+                    break
+
+            # 2. Start run() in background
+            async def _run_and_signal() -> None:
+                try:
+                    await self._agent.run(request=message)
+                except Exception as exc:
+                    logger.error(f"Background agent run failed: {exc}")
+                    try:
+                        await self._agent.output_queue.put(f"Error: {exc}")
+                    except Exception:
+                        pass
+                finally:
+                    self._agent.task_done.set()
+
+            logger.debug(f"Creating bg task, agent state={self._agent.state}")
+            bg_task = asyncio.create_task(_run_and_signal())
+
+            # Force a yield to allow the background task to start
+            await asyncio.sleep(0)
+
+            # 3. Read output chunks (mirrors fixed BaseAgent.stream logic)
+            oq = self._agent.output_queue
+            td = self._agent.task_done
+            logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
+            stream_timeout = 120.0
+            deadline = asyncio.get_event_loop().time() + stream_timeout
+            chunk_count = 0
+
+            logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
+            while not (td.is_set() and oq.empty()):
+                if asyncio.get_event_loop().time() > deadline:
+                    logger.warning("Streaming deadline reached, stopping")
+                    break
+
+                try:
+                    # Use oq.get() without timeout kwarg — works for both
+                    # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
+                    # handled by the outer asyncio.wait_for.
+                    chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
+                    chunk_count += 1
+                    logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    logger.warning("Streaming cancelled")
+                    break
+                except Exception as e:
+                    logger.warning(f"Queue get error: {type(e).__name__}: {e}")
+                    continue
+
                 chunk_type = "content"
                 delta = ""
                 metadata: dict[str, Any] = {}
@@ -466,19 +549,31 @@ class AgentLoop:
                 elif isinstance(chunk, dict):
                     if "tool_calls" in chunk and chunk["tool_calls"]:
                         for tc in chunk["tool_calls"]:
-                            fn = tc.get("function", {})
+                            # tc may be a ToolCall pydantic object or a dict
+                            if isinstance(tc, dict):
+                                fn = tc.get("function", {})
+                                tc_id = tc.get("id", "")
+                                fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                                fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                            else:
+                                tc_id = getattr(tc, "id", "")
+                                fn_obj = getattr(tc, "function", None)
+                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
                             yield {
                                 "type": "tool_call",
                                 "delta": "",
                                 "metadata": {
-                                    "id": tc.get("id", ""),
-                                    "name": fn.get("name", ""),
-                                    "arguments": fn.get("arguments", ""),
+                                    "id": tc_id,
+                                    "name": fn_name,
+                                    "arguments": fn_args,
                                 },
                             }
                         continue
-                    if "content" in chunk and chunk["content"]:
-                        delta = chunk["content"]
+                    # Support both "content" and "delta" keys (#10)
+                    text = chunk.get("content") or chunk.get("delta") or ""
+                    if text:
+                        delta = text
                         full_content += delta
 
                 # -- Object chunks with content --
@@ -494,11 +589,20 @@ class AgentLoop:
                 if delta:
                     yield {"type": chunk_type, "delta": delta, "metadata": metadata}
 
+            logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
+
+            # Ensure background task completes
+            try:
+                await asyncio.wait_for(bg_task, timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
             # Emit done
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
+            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
 
         # Save to session only if we got actual content
@@ -580,6 +684,36 @@ class AgentLoop:
                 logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content, thinking_content
+
+    # ------------------------------------------------------------------
+    # Dynamic prompt helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_dynamic_tools_prompt(inactive_tools: dict[str, "Tool"]) -> str:
+        """Build the 'Dynamically Loadable Tools' system-prompt section.
+
+        Lists ALL inactive tools with their descriptions so the AI Agent
+        can autonomously decide which to activate. No hardcoded topic
+        mapping — the LLM reads tool descriptions and decides for itself.
+        """
+        lines: list[str] = [
+            "\n\n## Dynamically Loadable Tools\n\n"
+            "The following specialized tools are registered but not yet active. "
+            "Use `activate_tool(action='list')` to refresh this list at any time, "
+            "or `activate_tool(action='activate', tool_name='<name>')` to load "
+            "a tool. You can activate multiple tools in one call using "
+            "comma-separated names.\n\n"
+            "**Read each tool's description carefully and activate the ones "
+            "you need BEFORE answering the user's question. "
+            "Always prefer specialized tools over generic web_search when "
+            "a matching tool is available.**\n"
+        ]
+
+        for tool in inactive_tools.values():
+            lines.append(f"- `{tool.name}`: {tool.description}")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Dynamic tool management

@@ -127,9 +127,15 @@ def verify_token(
             logger.warning(f"Token type mismatch: expected {expected_type}, got {token_type}")
             return None
 
+        # Validate session claim is a string (#18)
+        raw_session = payload.get("session", "default")
+        if not isinstance(raw_session, str) or not raw_session.strip():
+            logger.warning(f"JWT session claim is not a valid string: {type(raw_session).__name__}")
+            raw_session = "default"
+
         return TokenData(
             user_id=payload["sub"],
-            session_key=payload.get("session", "default"),
+            session_key=raw_session,
             token_type=token_type,
             scopes=payload.get("scope", []),
             issued_at=datetime.fromtimestamp(payload["iat"], tz=timezone.utc),

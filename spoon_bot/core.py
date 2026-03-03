@@ -106,6 +106,12 @@ class SpoonBotConfig:
         """Create config from environment variables.
 
         Supports both SPOON_* (original) and SPOON_BOT_* (gateway) env vars.
+
+        Provider-specific API key and base URL resolution is delegated to
+        spoon-core's LLMManager / ConfigurationManager, which natively
+        supports all registered providers (openai, anthropic, openrouter,
+        deepseek, gemini, ollama) and reads from standard env vars like
+        ``OPENROUTER_API_KEY``, ``OPENAI_BASE_URL``, etc.
         """
         provider = (
             os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
@@ -118,24 +124,6 @@ class SpoonBotConfig:
             or "claude-sonnet-4-20250514"
         )
 
-        # Resolve API key based on provider
-        api_key = None
-        if provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY")
-        elif provider == "anthropic":
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
-
-        # Resolve base_url based on provider
-        base_url = None
-        if provider == "openai":
-            base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
-        elif provider == "anthropic":
-            base_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
-        else:
-            base_url = os.environ.get("BASE_URL")
-
         max_steps = int(
             os.environ.get("SPOON_BOT_MAX_ITERATIONS")
             or os.environ.get("SPOON_MAX_STEPS")
@@ -145,8 +133,6 @@ class SpoonBotConfig:
         return cls(
             model=model,
             provider=provider,
-            api_key=api_key,
-            base_url=base_url,
             max_steps=max_steps,
         )
 
@@ -183,35 +169,60 @@ class SpoonBot:
         self.config.workspace.mkdir(parents=True, exist_ok=True)
 
         # Create ChatBot (spoon-core's LLM interface)
-        self._chatbot = ChatBot(
-            model_name=self.config.model,
-            llm_provider=self.config.provider,
-            api_key=self.config.api_key,
-            base_url=self.config.base_url,
-            system_prompt=self.config.system_prompt,
-        )
+        # Only pass api_key / base_url if explicitly set; otherwise let
+        # spoon-core's ConfigurationManager auto-resolve from env vars
+        # (e.g. OPENROUTER_API_KEY, OPENAI_BASE_URL, etc.)
+        chatbot_kwargs: dict[str, Any] = {
+            "model_name": self.config.model,
+            "llm_provider": self.config.provider,
+        }
+        if self.config.api_key:
+            chatbot_kwargs["api_key"] = self.config.api_key
+        if self.config.base_url:
+            chatbot_kwargs["base_url"] = self.config.base_url
+        if self.config.system_prompt:
+            chatbot_kwargs["system_prompt"] = self.config.system_prompt
 
-        # Create MCP tools
-        for name, mcp_config in self.config.mcp_servers.items():
-            mcp_tool = MCPTool(
-                name=name,
-                description=f"MCP server: {name}",
-                mcp_config=mcp_config,
-            )
-            self._mcp_tools.append(mcp_tool)
+        self._chatbot = ChatBot(**chatbot_kwargs)
+
+        # Create MCP tools — each server exposes multiple tools with their
+        # own names.  Use server_name as the config key but let MCPTool
+        # handle individual tool discovery internally.
+        for server_name, mcp_config in self.config.mcp_servers.items():
+            try:
+                mcp_tool = MCPTool(
+                    name=server_name,
+                    description=f"MCP server: {server_name}",
+                    mcp_config=mcp_config,
+                )
+                self._mcp_tools.append(mcp_tool)
+                logger.info(f"Created MCP tool for server: {server_name}")
+            except Exception as exc:
+                logger.error(f"Failed to create MCP tool '{server_name}': {exc}")
 
         # Create ToolManager
         if self._mcp_tools:
             self._tool_manager = ToolManager(self._mcp_tools)
 
         # Create SkillManager if enabled
+        # Check signature at runtime to avoid passing unsupported
+        # parameters to older spoon-core versions.
         if self.config.enable_skills:
+            import inspect
             skill_paths = self.config.skill_paths or [str(self.config.workspace / "skills")]
-            self._skill_manager = SkillManager(
-                skill_paths=skill_paths,
-                llm=self._chatbot,
-                auto_discover=True,
-            )
+
+            sm_sig = inspect.signature(SkillManager.__init__)
+            sm_params = set(sm_sig.parameters.keys())
+
+            sm_kwargs: dict[str, Any] = {"skill_paths": skill_paths}
+            if "llm" in sm_params:
+                sm_kwargs["llm"] = self._chatbot
+            if "auto_discover" in sm_params:
+                sm_kwargs["auto_discover"] = True
+            if "include_default_paths" in sm_params:
+                sm_kwargs["include_default_paths"] = False
+
+            self._skill_manager = SkillManager(**sm_kwargs)
 
         # Create appropriate agent based on configuration
         if self.config.enable_skills and self._skill_manager:
@@ -228,8 +239,35 @@ class SpoonBot:
                 max_steps=self.config.max_steps,
             )
 
+        # Patch missing _map_mcp_tool_name on agents that don't have it.
+        # Some spoon-core versions require this method for MCP tool dispatch
+        # but SpoonReactSkill may not implement it.
+        if not hasattr(self._agent, "_map_mcp_tool_name"):
+            def _map_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
+                """Map an MCP tool call name back to (server_name, actual_tool_name).
+
+                Convention: MCP tools are named ``<server>__<tool>`` or just ``<tool>``.
+                Falls back to scanning all registered MCP tools.
+                """
+                if "__" in tool_name:
+                    parts = tool_name.split("__", 1)
+                    return (parts[0], parts[1])
+                # Fallback: try each MCP tool server
+                for mcp_tool in self._mcp_tools:
+                    return (mcp_tool.name, tool_name)
+                return None
+            self._agent._map_mcp_tool_name = _map_mcp_tool_name
+
         # Initialize agent
         await self._agent.initialize()
+
+        # Patch ScriptTool parameters to match skill input_schema (Bug #8)
+        if self._skill_manager:
+            try:
+                from spoon_bot.skills.script_tool_patch import patch_all_script_tools
+                patch_all_script_tools(self._skill_manager)
+            except Exception as exc:
+                logger.debug(f"ScriptTool patching skipped: {exc}")
 
         self._initialized = True
         logger.info(
@@ -261,23 +299,25 @@ class SpoonBot:
 
     async def stream(self, message: str, **kwargs: Any) -> AsyncGenerator[str, None]:
         """
-        Stream a response.
+        Stream a response using token-level streaming from the ChatBot.
+
+        Uses spoon-core's ``ChatBot.astream()`` which yields
+        ``LLMResponseChunk`` objects with ``.delta`` (new text per chunk).
 
         Args:
             message: User message.
-            **kwargs: Additional arguments.
+            **kwargs: Additional arguments passed to astream.
 
         Yields:
-            Response chunks.
+            Response text chunks (delta strings).
         """
         if not self._initialized:
             await self.initialize()
 
-        async for chunk in self._agent.stream(message, **kwargs):
-            if hasattr(chunk, "content") and chunk.content:
-                yield chunk.content
-            elif isinstance(chunk, str):
-                yield chunk
+        messages = [{"role": "user", "content": message}]
+        async for chunk in self._chatbot.astream(messages, **kwargs):
+            if hasattr(chunk, "delta") and chunk.delta:
+                yield chunk.delta
 
     async def ask_with_tools(
         self,
