@@ -82,6 +82,9 @@ class TelegramChannel(BaseChannel):
         # Per-user state (think/verbose)
         self._user_states: dict[int, dict] = {}
 
+        # Typing indicator tasks: chat_id -> asyncio.Task
+        self._typing_tasks: dict[int, asyncio.Task] = {}
+
         # Sub-handlers (lazy-imported to avoid circular deps at module level)
         self._commands: Any = None
         self._callbacks: Any = None
@@ -111,6 +114,38 @@ class TelegramChannel(BaseChannel):
             self._commands.set_agent(agent)
         if self._callbacks:
             self._callbacks.set_agent(agent)
+
+    # ------------------------------------------------------------------
+    # Typing indicator
+    # ------------------------------------------------------------------
+
+    async def _typing_loop(self, chat_id: int) -> None:
+        """Send 'typing' chat action every 5 seconds until cancelled."""
+        try:
+            while True:
+                if self._bot:
+                    try:
+                        await self._bot.send_chat_action(chat_id=chat_id, action="typing")
+                    except Exception as e:
+                        logger.debug(f"[{self.full_name}] typing action failed: {e}")
+                        break
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+
+    def _start_typing(self, chat_id: int) -> None:
+        """Start the typing indicator for a chat."""
+        # Cancel any existing typing task for this chat
+        self._stop_typing(chat_id)
+        self._typing_tasks[chat_id] = asyncio.create_task(
+            self._typing_loop(chat_id), name=f"typing-{chat_id}"
+        )
+
+    def _stop_typing(self, chat_id: int) -> None:
+        """Stop the typing indicator for a chat."""
+        task = self._typing_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -195,6 +230,10 @@ class TelegramChannel(BaseChannel):
             return
 
         try:
+            # Cancel all typing indicator tasks
+            for chat_id in list(self._typing_tasks):
+                self._stop_typing(chat_id)
+
             # Stop health check
             if self._health_check_task:
                 self._health_check_task.cancel()
@@ -241,6 +280,9 @@ class TelegramChannel(BaseChannel):
         if not chat_id:
             logger.error(f"[{self.full_name}] No chat_id in message metadata")
             return
+
+        # Stop typing indicator — response is ready
+        self._stop_typing(int(chat_id))
 
         # Telegram message limit is 4096 characters
         MAX_LENGTH = 4000  # Leave some margin
@@ -401,6 +443,7 @@ class TelegramChannel(BaseChannel):
             },
         )
 
+        self._start_typing(chat_id)
         await self.publish(inbound)
 
     # ------------------------------------------------------------------
@@ -439,6 +482,7 @@ class TelegramChannel(BaseChannel):
             ],
         )
 
+        self._start_typing(message.chat_id)
         await self.publish(inbound)
 
     async def _handle_document(self, update: Update, context: Any) -> None:
@@ -482,6 +526,7 @@ class TelegramChannel(BaseChannel):
             ],
         )
 
+        self._start_typing(message.chat_id)
         await self.publish(inbound)
 
     async def _handle_audio(self, update: Update, context: Any) -> None:
@@ -513,6 +558,7 @@ class TelegramChannel(BaseChannel):
             ],
         )
 
+        self._start_typing(message.chat_id)
         await self.publish(inbound)
 
     async def _handle_video(self, update: Update, context: Any) -> None:
@@ -551,6 +597,7 @@ class TelegramChannel(BaseChannel):
             ],
         )
 
+        self._start_typing(message.chat_id)
         await self.publish(inbound)
 
     async def _handle_voice(self, update: Update, context: Any) -> None:
@@ -582,6 +629,7 @@ class TelegramChannel(BaseChannel):
             ],
         )
 
+        self._start_typing(message.chat_id)
         await self.publish(inbound)
 
     # ------------------------------------------------------------------
