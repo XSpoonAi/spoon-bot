@@ -242,7 +242,12 @@ class WebSocketHandler:
             # Subscription
             "subscribe": self._handle_subscribe,
             "unsubscribe": self._handle_unsubscribe,
+            # Audio streaming
+            "audio.stream.start": self._handle_audio_stream_start,
+            "audio.stream.end": self._handle_audio_stream_end,
         }
+
+        self._audio_stream_manager = None  # Lazy-init
 
     async def handle_request(self, request: WSRequest) -> WSResponse | WSError:
         """Route and handle a request."""
@@ -637,3 +642,104 @@ class WebSocketHandler:
 
         manager.unsubscribe(self.connection_id, events)
         return {"unsubscribed": events}
+
+    # ========== Audio Streaming ==========
+
+    def _get_audio_stream_manager(self):
+        """Lazy-init the audio stream manager."""
+        if self._audio_stream_manager is None:
+            try:
+                from spoon_bot.services.audio.factory import create_transcriber
+                from spoon_bot.services.audio.streaming import AudioStreamManager
+
+                config = get_config()
+                transcriber = create_transcriber(
+                    provider=config.audio.stt_provider,
+                    model=config.audio.stt_model,
+                )
+                self._audio_stream_manager = AudioStreamManager(
+                    transcriber=transcriber,
+                    max_stream_duration_seconds=config.audio.max_audio_duration_seconds,
+                    max_audio_size_bytes=config.audio.max_audio_size_mb * 1024 * 1024,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize audio stream manager: {e}")
+                raise ValueError(f"Audio streaming unavailable: {e}")
+        return self._audio_stream_manager
+
+    async def _handle_audio_stream_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle audio.stream.start — begin buffering audio chunks."""
+        manager = self._get_audio_stream_manager()
+
+        audio_format = params.get("format", "wav")
+        language = params.get("language")
+        sample_rate = params.get("sample_rate", 16000)
+        channels = params.get("channels", 1)
+        text_message = params.get("message", "")
+
+        if not isinstance(audio_format, str):
+            raise ValueError("format must be a string")
+
+        session = manager.start_session(
+            connection_id=self.connection_id,
+            audio_format=audio_format,
+            language=language,
+            sample_rate=sample_rate,
+            channels=channels,
+            text_message=text_message,
+        )
+
+        return {
+            "streaming": True,
+            "session_id": session.session_id,
+            "format": audio_format,
+        }
+
+    async def handle_audio_binary(self, data: bytes) -> None:
+        """Handle incoming binary audio chunk data."""
+        if self._audio_stream_manager is None:
+            return  # No active stream — ignore
+        try:
+            self._audio_stream_manager.add_chunk(self.connection_id, data)
+        except ValueError as e:
+            logger.warning(f"Audio chunk rejected: {e}")
+            manager = get_connection_manager()
+            await manager.send_to(
+                self.connection_id,
+                WSEvent(
+                    event="audio.stream.error",
+                    data={"error": str(e)},
+                ).to_dict(),
+            )
+
+    async def _handle_audio_stream_end(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle audio.stream.end — transcribe buffered audio."""
+        if self._audio_stream_manager is None:
+            raise ValueError("No audio stream active")
+
+        try:
+            result = await self._audio_stream_manager.end_session(self.connection_id)
+
+            # Optionally process through agent
+            process = params.get("process", True)
+            if process and result.text:
+                agent = get_agent()
+                text_message = params.get("message", "")
+                combined = f"{text_message}\n\n[Voice input]: {result.text}" if text_message else result.text
+                response = await agent.process(message=combined)
+            else:
+                response = None
+
+            return {
+                "transcription": {
+                    "text": result.text,
+                    "language": result.language,
+                    "duration_seconds": result.duration_seconds,
+                    "provider": result.provider,
+                },
+                "response": response,
+            }
+        except Exception as e:
+            logger.error(f"Audio stream end failed: {e}")
+            self._audio_stream_manager.cancel_session(self.connection_id)
+            raise ValueError(f"Audio transcription failed: {e}")
