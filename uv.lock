@@ -4282,7 +4282,7 @@ wheels = [
 [[package]]
 name = "spoon-ai-sdk"
 version = "0.4.0"
-source = { git = "https://github.com/veithly/spoon-core.git?rev=fix%2Frealtime-streaming-gemini-async#e16f651871b4b0dbc0ab3a59e613eb0351806b20" }
+source = { git = "https://github.com/veithly/spoon-core.git?rev=fix%2Frealtime-streaming-gemini-async#e578bf79297d2134307d38e652194108917a1424" }
 dependencies = [
     { name = "aiohappyeyeballs" },
     { name = "aiohttp" },
