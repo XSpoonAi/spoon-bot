@@ -390,6 +390,22 @@ class _NoChunkRuntimeAgent:
         return type("RunResult", (), {"content": self._final_content})()
 
 
+class _ChunkedRuntimeAgent:
+    """Runtime agent that emits real incremental chunks through output_queue."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._chunks = chunks
+
+    async def run(self, **kwargs):
+        for chunk in self._chunks:
+            await self.output_queue.put({"content": chunk})
+            await asyncio.sleep(0)
+        return type("RunResult", (), {"content": "".join(self._chunks)})()
+
+
 class TestAgentLoopStreamFallback:
     @pytest.mark.asyncio
     async def test_stream_falls_back_to_run_result_when_no_chunks(self):
@@ -421,6 +437,34 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[-1]["role"] == "assistant"
         assert loop._session.messages[-1]["content"] == "fallback from run result"
         loop.sessions.save.assert_called_once_with(loop._session)
+
+    @pytest.mark.asyncio
+    async def test_stream_preserves_incremental_queue_chunks(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _ChunkedRuntimeAgent(["Hel", "lo"])
+        loop._session = Session(session_key="stream_incremental")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="hello"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        deltas = [c["delta"] for c in content_chunks]
+
+        assert deltas == ["Hel", "lo"]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "Hello"
+        assert loop._session.messages[-1]["content"] == "Hello"
 
 
 # ============================================================================

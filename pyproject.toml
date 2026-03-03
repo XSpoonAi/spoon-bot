@@ -22,8 +22,8 @@ classifiers = [
 keywords = ["ai", "agent", "llm", "local", "assistant"]
 
 dependencies = [
-    # Required: track spoon-core SDK main branch directly.
-    "spoon-ai-sdk @ git+https://github.com/XSpoonAi/spoon-core.git@main",
+    # Temporary: track the spoon-core streaming-fix branch until upstream main includes PR #261.
+    "spoon-ai-sdk @ git+https://github.com/veithly/spoon-core.git@fix/realtime-streaming-gemini-async",
     # CLI and utilities
     "typer>=0.9.0",
     "rich>=13.0.0",

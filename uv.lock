@@ -4281,8 +4281,8 @@ wheels = [
 
 [[package]]
 name = "spoon-ai-sdk"
-version = "0.4.1"
-source = { git = "https://github.com/XSpoonAi/spoon-core.git?rev=main#c4ff9e62642260aeabb3a2b234e0c04ffd94e0b7" }
+version = "0.4.0"
+source = { git = "https://github.com/veithly/spoon-core.git?rev=fix%2Frealtime-streaming-gemini-async#e16f651871b4b0dbc0ab3a59e613eb0351806b20" }
 dependencies = [
     { name = "aiohappyeyeballs" },
     { name = "aiohttp" },
@@ -4448,7 +4448,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
-    { name = "spoon-ai-sdk", git = "https://github.com/XSpoonAi/spoon-core.git?rev=main" },
+    { name = "spoon-ai-sdk", git = "https://github.com/veithly/spoon-core.git?rev=fix%2Frealtime-streaming-gemini-async" },
     { name = "spoon-bot", extras = ["telegram", "discord", "feishu"], marker = "extra == 'all-channels'" },
     { name = "spoon-bot", extras = ["toolkit", "memory", "web3", "document", "gateway", "all-channels"], marker = "extra == 'all'" },
     { name = "spoon-toolkits", marker = "extra == 'toolkit'", specifier = ">=0.1.0" },
