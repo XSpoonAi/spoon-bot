@@ -129,6 +129,12 @@ class ChannelManager:
         """
         Check if an ImportError is due to a missing external dependency.
 
+        Handles two cases:
+        1. Real import failures (error.name is set by Python import machinery)
+        2. Manually raised ImportError/ModuleNotFoundError in __init__ when
+           AVAILABLE flag is False (error.name may be None; fall back to
+           matching the error message against known package names)
+
         Args:
             kind: Channel type name
             error: The ImportError to check
@@ -136,18 +142,31 @@ class ChannelManager:
         Returns:
             True if this is a missing dependency, False if it's an internal error
         """
-        # Check if the missing module is a known external package
+        registry_entry = self._CHANNEL_REGISTRY.get(kind, {})
+        known_packages = registry_entry.get("packages", set())
+
+        # Case 1: Real import failure — error.name is set by Python
         missing_name = getattr(error, "name", None)
         if missing_name:
-            registry_entry = self._CHANNEL_REGISTRY.get(kind, {})
-            known_packages = registry_entry.get("packages", set())
-            # Direct package name match
             if missing_name in known_packages:
                 return True
-            # Check if it's a submodule of a known package
             for pkg in known_packages:
                 if missing_name.startswith(f"{pkg}."):
                     return True
+
+        # Case 2: Manually raised ImportError from __init__ (e.g.
+        # "python-telegram-bot is required ...", "discord.py is required ...")
+        # when the module-level import already failed silently.
+        if missing_name is None:
+            msg = str(error).lower()
+            for pkg in known_packages:
+                if pkg.lower() in msg:
+                    return True
+            # Also match the pip package name (e.g. "python-telegram-bot")
+            pip_pkg = registry_entry.get("pip_package", "")
+            if pip_pkg and pip_pkg.split(">=")[0].split("[")[0].lower() in msg:
+                return True
+
         return False
 
     def _load_channel_type(
@@ -189,13 +208,12 @@ class ChannelManager:
                     if kind not in missing_deps:
                         missing_deps.append(kind)
                 else:
-                    # Internal import error - log full traceback for debugging
+                    # Internal import error - log with full traceback but
+                    # do NOT crash; skip this channel and continue loading others.
                     logger.error(
                         f"Internal import error in {kind} channel module:\n"
                         f"{traceback.format_exc()}"
                     )
-                    # Re-raise to make it clear this is a code issue, not missing deps
-                    raise
 
     def _build_install_hint(self, missing_deps: list[str]) -> str:
         """
@@ -266,9 +284,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Failed to load CLI channel: {e}")
 
-        # Raise if any configured channels are missing dependencies
+        # Warn (but don't crash) if some configured channels are missing dependencies
         if missing_deps:
-            raise ImportError(self._build_install_hint(missing_deps))
+            logger.warning(self._build_install_hint(missing_deps))
 
         logger.info(f"Loaded {len(self._channels)} channels from configuration")
 

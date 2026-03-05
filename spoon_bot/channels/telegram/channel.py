@@ -57,7 +57,10 @@ class TelegramChannel(BaseChannel):
             account_id: Account identifier (bot name)
         """
         if not TELEGRAM_AVAILABLE:
-            raise ImportError("python-telegram-bot is required for Telegram channel")
+            raise ModuleNotFoundError(
+                "python-telegram-bot is required for Telegram channel",
+                name="telegram",
+            )
 
         super().__init__(config, account_id)
 
