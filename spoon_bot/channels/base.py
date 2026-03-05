@@ -171,16 +171,21 @@ class BaseChannel(ABC):
         """
         pass
 
-    async def publish(self, message: InboundMessage) -> None:
+    async def publish(self, message: InboundMessage) -> bool:
         """
         Publish a message to the bus.
 
         Args:
             message: Inbound message to publish.
+
+        Returns:
+            True if the message was enqueued, False if the queue is full.
         """
         if self._bus:
-            await self._bus.publish(message)
-            self._update_heartbeat()
+            result = await self._bus.publish(message)
+            if result:
+                self._update_heartbeat()
+            return result
         else:
             raise RuntimeError(f"Channel {self.full_name} not attached to bus")
 
@@ -207,14 +212,28 @@ class BaseChannel(ABC):
         max_attempts = self.config.retry_max_attempts
         delay = self.config.retry_delay
 
+        # Per-attempt timeout prevents indefinite hangs on network calls
+        # (e.g. Discord REST API through an unstable proxy).
+        per_attempt_timeout = 30.0
+
         for attempt in range(1, max_attempts + 1):
             try:
-                result = await send_func(*args, **kwargs)
+                result = await asyncio.wait_for(
+                    send_func(*args, **kwargs),
+                    timeout=per_attempt_timeout,
+                )
                 if attempt > 1:
                     logger.info(
                         f"[{self.full_name}] Send succeeded on attempt {attempt}"
                     )
                 return result
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{self.full_name}] Send timed out (attempt {attempt}/{max_attempts}, "
+                    f"{per_attempt_timeout}s)"
+                )
+                if attempt == max_attempts:
+                    raise
             except Exception as e:
                 if attempt == max_attempts:
                     logger.error(
@@ -281,6 +300,21 @@ class BaseChannel(ABC):
             logger.error(f"[{self.full_name}] Reconnect failed: {e}")
             self._status = ChannelStatus.ERROR
             self._error = e
+
+    async def on_processing_start(self, message: "InboundMessage") -> None:
+        """Called by ChannelManager when message processing actually begins.
+
+        Override in subclasses to show typing indicators, status updates, etc.
+        This is intentionally separate from message receipt — it fires only
+        after the bus semaphore is acquired, so the agent is truly working.
+        """
+
+    async def on_processing_end(self, message: "InboundMessage") -> None:
+        """Called by ChannelManager when message processing ends (success or error).
+
+        Override in subclasses to stop typing indicators, clean up state, etc.
+        Always called via ``finally``, guaranteed to run even on exceptions.
+        """
 
     def _update_heartbeat(self) -> None:
         """Update last heartbeat timestamp."""

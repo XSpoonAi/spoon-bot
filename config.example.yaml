@@ -22,7 +22,7 @@ channels:
   telegram:
     enabled: false  # Set to true to enable
     accounts:
-      - name: "main_bot"
+      - name: "your_bot_name"
         token: "${TELEGRAM_BOT_TOKEN}"  # Get from @BotFather
         mode: "polling"  # Options: polling, webhook
 
@@ -59,7 +59,7 @@ channels:
   discord:
     enabled: false  # Set to true to enable
     accounts:
-      - name: "dev_bot"
+      - name: "your_bot_name"
         token: "${DISCORD_BOT_TOKEN}"  # From Discord Developer Portal
 
         # Discord Intents (what events bot can receive)
@@ -86,7 +86,7 @@ channels:
   feishu:
     enabled: false  # Set to true to enable
     accounts:
-      - name: "enterprise_bot"
+      - name: "your_bot_name"
         app_id: "${FEISHU_APP_ID}"
         app_secret: "${FEISHU_APP_SECRET}"
         verification_token: "${FEISHU_VERIFICATION_TOKEN}"
