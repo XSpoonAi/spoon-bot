@@ -73,3 +73,6 @@ generated_images/
 run_spoon.sh
 spoon_run.sh
 test_spoon.py
+
+# Config file with credentials
+config.yaml

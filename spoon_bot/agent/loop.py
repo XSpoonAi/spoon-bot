@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
@@ -136,6 +137,7 @@ class AgentLoop:
         session_store_db_path: str | None = None,
         context_window: int | None = None,
         memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
+        agent_pool_size: int = 4,
     ) -> None:
         """
         Initialize the agent loop.
@@ -161,6 +163,7 @@ class AgentLoop:
             session_store_dsn: PostgreSQL DSN for 'postgres' backend.
             session_store_db_path: SQLite DB path for 'sqlite' backend.
             context_window: Override context window in tokens (auto-resolved from model if None).
+            agent_pool_size: Number of pre-initialized agent instances in the pool (default 4).
         """
         # Validate parameters
         try:
@@ -288,11 +291,27 @@ class AgentLoop:
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
 
+        # Per-session-key asyncio locks — ensures same-chat messages are serial
+        # while messages from different chats can run in parallel.
+        self._session_locks: dict[str, asyncio.Lock] = {}
+
+        # Agent pool — fixed N pre-initialized agent instances shared across all
+        # sessions.  Each request borrows one agent from the pool, injects session
+        # history, calls agent.run(), saves complete messages back to session store,
+        # then clears and returns the agent.  Session store is the single source of
+        # truth; agent memory is a temporary execution container only.
+        self._pool_size: int = max(1, agent_pool_size)
+        self._agent_pool: asyncio.Queue = asyncio.Queue(maxsize=self._pool_size)
+        self._agent_kwargs: dict[str, Any] = {}  # saved after first agent creation
+        # Tracks session_key → agent currently in use (for add_tool/remove_tool)
+        self._active_agents: dict[str, SpoonReactMCP | SpoonReactSkill] = {}
+
         active_count = len(self.tools)
         total_count = len(self.tools._tools)
         logger.info(
             f"AgentLoop created: model={model}, provider={provider}, "
-            f"tools={active_count}/{total_count}, session={session_key}"
+            f"tools={active_count}/{total_count}, session={session_key}, "
+            f"pool_size={self._pool_size}"
         )
 
     async def initialize(self) -> None:
@@ -424,12 +443,25 @@ class AgentLoop:
         else:
             self._agent = SpoonReactMCP(**agent_kwargs)
 
-        # Initialize agent
-        await self._agent.initialize()
+        # Save kwargs for creating additional agent instances later.
+        # Note: _create_agent() overrides kwargs["llm"] with an independent
+        # ChatBot, so the shared self._chatbot in agent_kwargs is only a
+        # template — pool agents never use it for LLM calls.
+        self._agent_kwargs = agent_kwargs.copy()
 
-        # Increase default step timeout for proxy/custom endpoints
+        # Initialize the reference agent (used for setup validation only;
+        # it is NOT placed in the pool).
+        await self._agent.initialize()
         if self.base_url:
             self._agent._default_timeout = 300.0
+
+        # Fill the agent pool: every slot gets an agent with its own
+        # independent ChatBot → LLMManager → HTTP client, enabling true
+        # parallel LLM calls across sessions.
+        for i in range(self._pool_size):
+            pool_agent = await self._create_agent()
+            await self._agent_pool.put(pool_agent)
+            logger.debug(f"[pool] Created agent #{i+1}/{self._pool_size} with independent LLMManager")
 
         self._initialized = True
         active_count = len(self.tools.get_active_tools())
@@ -437,7 +469,8 @@ class AgentLoop:
         logger.info(
             f"AgentLoop initialized: tools={active_count}/{total_count}, "
             f"mcp_servers={len(self._mcp_tools)}, "
-            f"skills_enabled={self._enable_skills}"
+            f"skills_enabled={self._enable_skills}, "
+            f"agent_pool={self._pool_size}"
         )
 
     def _register_native_tools(self) -> None:
@@ -498,24 +531,179 @@ class AgentLoop:
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
 
-    def _estimate_token_count(self) -> int:
-        """Rough token estimate for current session messages (~4 chars per token)."""
-        return sum(len(m.get("content", "")) for m in self._session.messages) // 4
+    def _get_session_lock(self, key: str) -> asyncio.Lock:
+        """Return (or create) the asyncio.Lock for the given session key."""
+        if key not in self._session_locks:
+            self._session_locks[key] = asyncio.Lock()
+        return self._session_locks[key]
 
-    def _trim_context_if_needed(self) -> int:
+    def _create_independent_chatbot(self) -> ChatBot:
+        """Create a ChatBot with its own LLMManager and provider instances.
+
+        Each ChatBot gets an independent LLMManager backed by a fresh provider
+        registry.  The fresh registry shares CLASS registrations (from the
+        ``@register_provider`` decorators) with the global registry but holds
+        its own provider INSTANCES — meaning each ChatBot creates a separate
+        HTTP client to the LLM provider.
+
+        This is the key enabler for true parallel LLM calls: without it, all
+        pool agents funnel through a single HTTP client in the shared singleton
+        LLMManager, serialising requests at the transport layer even though the
+        agent pool allows logical concurrency (openclaw-style pattern).
+        """
+        # Graceful fallback: if the reference ChatBot is a test fake without
+        # llm_manager, just create a plain ChatBot (no independent manager).
+        if not hasattr(self._chatbot, 'llm_manager') or self._chatbot.llm_manager is None:
+            return ChatBot(
+                model_name=self.model,
+                llm_provider=self.provider,
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+
+        from spoon_ai.llm.registry import LLMProviderRegistry, get_global_registry
+        from spoon_ai.llm.manager import LLMManager
+
+        # Clone provider CLASS registrations (NOT instances) from global registry.
+        # The global registry already has all classes registered via decorators
+        # that fired during the first LLMManager initialisation.
+        global_registry = get_global_registry()
+        fresh_registry = LLMProviderRegistry()
+        fresh_registry._providers = global_registry._providers.copy()
+
+        # Create an independent LLMManager.  Sharing config_manager is safe
+        # because config is effectively read-only after initial setup; each
+        # manager gets its own provider instances via the fresh registry.
+        reference_manager = self._chatbot.llm_manager
+        fresh_manager = LLMManager(
+            config_manager=reference_manager.config_manager,
+            registry=fresh_registry,
+        )
+
+        # Create ChatBot — its __init__ calls get_llm_manager() (singleton),
+        # but we immediately override with our independent manager.
+        chatbot = ChatBot(
+            model_name=self.model,
+            llm_provider=self.provider,
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
+        chatbot.llm_manager = fresh_manager
+
+        return chatbot
+
+    async def _create_agent(self) -> "SpoonReactMCP | SpoonReactSkill":
+        """Create a new agent instance with an independent ChatBot / LLMManager.
+
+        Each pool agent gets its own HTTP connection to the LLM provider,
+        enabling true parallel LLM calls (openclaw-style stateless pattern).
+        ToolManager and SkillManager are shared — they are stateless containers.
+        """
+        # Independent ChatBot → independent LLMManager → independent HTTP client
+        independent_chatbot = self._create_independent_chatbot()
+
+        kwargs = self._agent_kwargs.copy()
+        kwargs["llm"] = independent_chatbot
+
+        if self._enable_skills:
+            agent = SpoonReactSkill(**kwargs)
+        else:
+            agent = SpoonReactMCP(**kwargs)
+        await agent.initialize()
+        if self.base_url:
+            agent._default_timeout = 300.0
+        return agent
+
+    @asynccontextmanager
+    async def _borrow_agent(self, session: "Session", session_key: str):
+        """Borrow an agent from the pool, inject session history, yield, then clear and return.
+
+        Pattern (openclaw-style):
+          - Session store is the single source of truth for conversation history.
+          - Agent memory is a temporary execution container only.
+          - On borrow: inject complete session history (including tool_calls metadata).
+          - On return: call agent.clear() to reset memory + state machine + step counter.
+
+        Blocks if all pool agents are in use (natural back-pressure).
+        """
+        agent = await self._agent_pool.get()
+        self._active_agents[session_key] = agent
+        try:
+            # Inject complete session history so LLM sees the full conversation.
+            # Memory.max_messages is set generously; _trim_context_if_needed already
+            # ensured session.messages fits within the context budget.
+            for msg in session.messages:
+                role = msg.get("role", "user")
+                content = msg.get("content") or ""
+                tool_calls_raw = msg.get("tool_calls")
+                tool_call_id = msg.get("tool_call_id")
+                name = msg.get("name")
+                agent.memory.add_message(
+                    Message(
+                        role=role,
+                        content=content,
+                        tool_calls=tool_calls_raw,
+                        tool_call_id=tool_call_id,
+                        name=name,
+                    )
+                )
+            if session.messages:
+                logger.debug(
+                    f"[pool] Injected {len(session.messages)} messages "
+                    f"for session '{session_key}'"
+                )
+            yield agent
+        finally:
+            self._active_agents.pop(session_key, None)
+            # Reset agent to clean state: memory + state machine + step counter +
+            # MCP tool cache.  This is ToolCallAgent.clear().
+            try:
+                agent.clear()
+            except Exception as e:
+                logger.warning(f"[pool] agent.clear() failed: {e}")
+            await self._agent_pool.put(agent)
+            logger.debug(f"[pool] Agent returned for session '{session_key}'")
+
+    def _iter_all_agents(self):
+        """Yield all agent instances: those in use + those waiting in the pool.
+
+        Used by add_tool() / remove_tool() to propagate tool changes immediately.
+        The pool agents are temporarily drained and re-queued synchronously.
+        """
+        # Active (borrowed) agents
+        yield from self._active_agents.values()
+        # Pool agents — drain, yield, re-queue
+        pool_agents: list = []
+        while True:
+            try:
+                a = self._agent_pool.get_nowait()
+                pool_agents.append(a)
+            except asyncio.QueueEmpty:
+                break
+        for a in pool_agents:
+            yield a
+            self._agent_pool.put_nowait(a)
+
+    def _estimate_token_count(self, session=None) -> int:
+        """Rough token estimate for session messages (~4 chars per token)."""
+        s = session if session is not None else self._session
+        return sum(len(m.get("content", "")) for m in s.messages) // 4
+
+    def _trim_context_if_needed(self, session=None) -> None:
         """Auto-trim oldest messages if context budget approaches the limit.
 
         Keeps at minimum the two most recent messages (last user + assistant pair).
         Raises ContextOverflowError if even after trimming the context is too large.
         """
-        if not self._session.messages:
-            return 0
+        s = session if session is not None else self._session
+        if not s.messages:
+            return
 
         budget = int(self.context_window * 0.75)
-        estimated = self._estimate_token_count()
+        estimated = self._estimate_token_count(s)
 
         if estimated <= budget:
-            return 0
+            return
 
         logger.warning(
             f"Context approaching limit: ~{estimated:,} tokens "
@@ -523,79 +711,24 @@ class AgentLoop:
             f"Trimming oldest messages."
         )
 
-        messages = self._session.messages
-        trimmed_count = 0
-        while len(messages) > 2 and self._estimate_token_count() > budget:
+        messages = s.messages
+        while len(messages) > 2 and self._estimate_token_count(s) > budget:
             removed = messages.pop(0)
-            trimmed_count += 1
             logger.debug(
                 f"Trimmed message: role={removed.get('role')}, "
                 f"len={len(removed.get('content', ''))}"
             )
 
         # If still over the hard limit after trimming, raise
-        final_estimate = self._estimate_token_count()
+        final_estimate = self._estimate_token_count(s)
         if final_estimate > self.context_window:
             raise ContextOverflowError(final_estimate, self.context_window)
-
-        return trimmed_count
-
-    async def _sync_runtime_history_from_session(self) -> int:
-        """Sync persisted session history into spoon-core runtime memory."""
-        if not self._agent:
-            return 0
-
-        memory = getattr(self._agent, "memory", None)
-        if memory is None or not hasattr(memory, "clear"):
-            return 0
-
-        try:
-            memory.clear()
-        except Exception as exc:
-            logger.warning(f"Failed to clear runtime memory before history sync: {exc}")
-            return 0
-
-        injected_count = 0
-        for msg in self._session.get_history():
-            role = str(msg.get("role", "")).strip().lower()
-            if role not in {"user", "assistant", "tool"}:
-                continue
-
-            content = msg.get("content", "")
-            if not isinstance(content, str):
-                try:
-                    content = json.dumps(content, ensure_ascii=False)
-                except Exception:
-                    content = str(content)
-
-            try:
-                await self._agent.add_message(role, content)
-                injected_count += 1
-            except Exception as exc:
-                logger.warning(
-                    f"Failed to inject session history message "
-                    f"(role={role}, index={injected_count}): {exc}"
-                )
-
-        return injected_count
-
-    async def _prepare_request_context(self) -> None:
-        """Prepare request context by trimming and injecting session history."""
-        trimmed_count = self._trim_context_if_needed()
-        injected_count = await self._sync_runtime_history_from_session()
-        estimated_tokens = self._estimate_token_count()
-
-        logger.info(
-            f"Session context prepared: session={self.session_key}, "
-            f"injected_messages={injected_count}, "
-            f"estimated_tokens~{estimated_tokens}, "
-            f"trimmed_messages={trimmed_count}"
-        )
 
     async def process(
         self,
         message: str,
         media: list[str] | None = None,
+        session_key: str | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -603,6 +736,9 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Per-chat session key for isolation. When provided,
+                         messages for different sessions run concurrently while
+                         messages within the same session remain serial.
 
         Returns:
             The agent's response text.
@@ -617,51 +753,88 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        logger.info(f"Processing message: {message[:100]}...")
+        # Resolve the session to use for this call
+        session = (
+            self.sessions.get_or_create(session_key)
+            if session_key
+            else self._session
+        )
+        lock = self._get_session_lock(session.session_key)
 
-        # Refresh memory context
-        try:
-            memory_context = self.memory.get_memory_context()
-            if memory_context:
-                self.context.set_memory_context(memory_context)
-        except Exception as e:
-            logger.warning(f"Failed to load memory context: {e}")
+        async with lock:
+            logger.info(f"Processing message: {message[:100]}...")
 
-        # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
-
-        # Run agent
-        try:
-            result = await self._agent.run(message)
-
-            # Extract content
-            if hasattr(result, "content"):
-                final_content = result.content
-            else:
-                final_content = str(result)
-
-            # Filter out technical execution steps (Step 1:, Step 2:, etc.)
-            final_content = self._filter_execution_steps(final_content)
-
-        except Exception as e:
-            logger.error(f"Agent processing error: {e}")
-            raise
-
-        # Save to session
-        try:
-            self._session.add_message("user", message)
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
-        except Exception as e:
-            logger.warning(f"Failed to save session: {e}")
-
-        # Auto-commit workspace changes
-        if self._auto_commit and self._git:
+            # Refresh memory context
             try:
-                if self._git.has_changes():
-                    self._git.commit(message)
+                memory_context = self.memory.get_memory_context()
+                if memory_context:
+                    self.context.set_memory_context(memory_context)
             except Exception as e:
-                logger.warning(f"Failed to auto-commit: {e}")
+                logger.warning(f"Failed to load memory context: {e}")
+
+            # Trim context before injecting into agent memory
+            self._trim_context_if_needed(session)
+
+            # Borrow agent from pool, inject session history, run, then return.
+            async with self._borrow_agent(session, session.session_key) as agent:
+                # Record how many messages exist before run() adds new ones
+                pre_run_count = len(agent.memory.messages)
+
+                try:
+                    run_timeout = getattr(agent, "_default_timeout", None) or 180.0
+                    result = await asyncio.wait_for(
+                        agent.run(message), timeout=run_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Agent run timed out after {run_timeout}s "
+                        f"for session '{session.session_key}'"
+                    )
+                    raise
+                except Exception as e:
+                    logger.error(f"Agent processing error: {e}")
+                    raise
+
+                # Extract final content
+                if hasattr(result, "content"):
+                    final_content = result.content
+                else:
+                    final_content = str(result)
+                final_content = self._filter_execution_steps(final_content)
+
+                # Save ALL messages produced by this run (user prompt + tool_calls +
+                # tool results + assistant final) so the session store is the complete
+                # source of truth and can faithfully restore agent memory next time.
+                try:
+                    new_messages = agent.memory.messages[pre_run_count:]
+                    for msg in new_messages:
+                        kwargs: dict[str, Any] = {}
+                        if getattr(msg, "tool_calls", None):
+                            kwargs["tool_calls"] = [
+                                tc.model_dump() if hasattr(tc, "model_dump") else tc
+                                for tc in msg.tool_calls
+                            ]
+                        if getattr(msg, "tool_call_id", None):
+                            kwargs["tool_call_id"] = msg.tool_call_id
+                        if getattr(msg, "name", None):
+                            kwargs["name"] = msg.name
+                        content_str = (
+                            msg.text_content
+                            if hasattr(msg, "text_content")
+                            else str(msg.content or "")
+                        )
+                        session.add_message(role=msg.role, content=content_str, **kwargs)
+                    self.sessions.save(session)
+                except Exception as e:
+                    logger.warning(f"Failed to save session: {e}")
+
+            # Auto-commit workspace changes
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content
 
@@ -710,6 +883,7 @@ class AgentLoop:
         message: str,
         media: list[str] | None = None,
         thinking: bool = False,
+        session_key: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Stream a response with typed chunks.
@@ -718,6 +892,7 @@ class AgentLoop:
             message: User message.
             media: Optional media files.
             thinking: Whether to include thinking output.
+            session_key: Per-chat session key for isolation.
 
         Yields:
             Dicts with keys:
@@ -730,6 +905,13 @@ class AgentLoop:
 
         logger.info(f"Streaming message: {message[:100]}...")
 
+        session = (
+            self.sessions.get_or_create(session_key)
+            if session_key
+            else self._session
+        )
+        lock = self._get_session_lock(session.session_key)
+
         # Refresh memory context
         try:
             memory_context = self.memory.get_memory_context()
@@ -740,202 +922,201 @@ class AgentLoop:
 
         full_content = ""
 
-        # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        async with lock:
+            # Trim context before injecting into agent memory
+            self._trim_context_if_needed(session)
 
-        # ------------------------------------------------------------------
-        # Streaming uses the spoon-core run+stream pattern:
-        #   1. Clear task_done + drain output_queue
-        #   2. Start run(message) in background — sets task_done on finish
-        #   3. Read chunks from output_queue until task_done AND queue empty
-        # ------------------------------------------------------------------
-
-        try:
-            # 1. Reset streaming state
-            self._agent.task_done.clear()
-            while not self._agent.output_queue.empty():
-                try:
-                    await asyncio.wait_for(self._agent.output_queue.get(), timeout=0.1)
-                except (asyncio.TimeoutError, Exception):
-                    break
-
-            # 2. Start run() in background
-            run_result_text = ""
-
-            async def _run_and_signal() -> None:
-                nonlocal run_result_text
-                try:
-                    result = await self._agent.run(request=message)
-                    if hasattr(result, "content"):
-                        run_result_text = result.content or ""
-                    elif isinstance(result, str):
-                        run_result_text = result
-                    elif result is not None:
-                        run_result_text = str(result)
-                except Exception as exc:
-                    logger.error(f"Background agent run failed: {exc}")
-                    try:
-                        await self._agent.output_queue.put({
-                            "type": "error",
-                            "delta": str(exc),
-                            "metadata": {"error": str(exc), "error_code": type(exc).__name__},
-                        })
-                    except Exception:
-                        pass
-                finally:
-                    self._agent.task_done.set()
-
-            logger.debug(f"Creating bg task, agent state={self._agent.state}")
-            bg_task = asyncio.create_task(_run_and_signal())
-
-            # Force a yield to allow the background task to start
-            await asyncio.sleep(0)
-
-            # 3. Read output chunks (mirrors fixed BaseAgent.stream logic)
-            oq = self._agent.output_queue
-            td = self._agent.task_done
-            logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
-            stream_timeout = 120.0
-            deadline = asyncio.get_event_loop().time() + stream_timeout
-            chunk_count = 0
-
-            logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
-            while not (td.is_set() and oq.empty()):
-                if asyncio.get_event_loop().time() > deadline:
-                    logger.warning("Streaming deadline reached, stopping")
-                    break
+            # ------------------------------------------------------------------
+            # Streaming uses the spoon-core run+stream pattern:
+            #   1. Clear task_done + drain output_queue
+            #   2. Start run(message) in background — sets task_done on finish
+            #   3. Read chunks from output_queue until task_done AND queue empty
+            # The borrow context keeps the agent held for the full duration.
+            # ------------------------------------------------------------------
+            async with self._borrow_agent(session, session.session_key) as agent:
+                pre_run_count = len(agent.memory.messages)
 
                 try:
-                    # Use oq.get() without timeout kwarg — works for both
-                    # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
-                    # handled by the outer asyncio.wait_for.
-                    chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
-                    chunk_count += 1
-                    logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    logger.warning("Streaming cancelled")
-                    break
-                except Exception as e:
-                    logger.warning(f"Queue get error: {type(e).__name__}: {e}")
-                    continue
+                    # 1. Reset streaming state
+                    agent.task_done.clear()
+                    while not agent.output_queue.empty():
+                        try:
+                            await asyncio.wait_for(agent.output_queue.get(), timeout=0.1)
+                        except (asyncio.TimeoutError, Exception):
+                            break
 
-                chunk_type = "content"
-                delta = ""
-                metadata: dict[str, Any] = {}
+                    # 2. Start run() in background
+                    async def _run_and_signal() -> None:
+                        try:
+                            run_timeout = getattr(agent, "_default_timeout", None) or 180.0
+                            await asyncio.wait_for(
+                                agent.run(request=message), timeout=run_timeout
+                            )
+                        except Exception as exc:
+                            logger.error(f"Background agent run failed: {exc}")
+                            try:
+                                await agent.output_queue.put({
+                                    "type": "error",
+                                    "delta": str(exc),
+                                    "metadata": {"error": str(exc), "error_code": type(exc).__name__},
+                                })
+                            except Exception:
+                                pass
+                        finally:
+                            agent.task_done.set()
 
-                # -- Thinking chunks --
-                if hasattr(chunk, "type") and chunk.type == "thinking":
-                    chunk_type = "thinking"
-                    delta = chunk.content if hasattr(chunk, "content") else str(chunk)
-                elif (
-                    hasattr(chunk, "metadata")
-                    and isinstance(chunk.metadata, dict)
-                    and chunk.metadata.get("type") == "thinking"
-                ):
-                    chunk_type = "thinking"
-                    delta = (
-                        getattr(chunk, "delta", None)
-                        or getattr(chunk, "content", None)
-                        or str(chunk)
+                    logger.debug(f"Creating bg task, agent state={agent.state}")
+                    bg_task = asyncio.create_task(_run_and_signal())
+
+                    # Force a yield to allow the background task to start
+                    await asyncio.sleep(0)
+
+                    # 3. Read output chunks
+                    oq = agent.output_queue
+                    td = agent.task_done
+                    logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
+                    stream_timeout = 120.0
+                    deadline = asyncio.get_event_loop().time() + stream_timeout
+                    chunk_count = 0
+
+                    logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
+                    while not (td.is_set() and oq.empty()):
+                        if asyncio.get_event_loop().time() > deadline:
+                            logger.warning("Streaming deadline reached, stopping")
+                            break
+
+                        try:
+                            chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
+                            chunk_count += 1
+                            logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
+                        except asyncio.TimeoutError:
+                            continue
+                        except asyncio.CancelledError:
+                            logger.warning("Streaming cancelled")
+                            break
+                        except Exception as e:
+                            logger.warning(f"Queue get error: {type(e).__name__}: {e}")
+                            continue
+
+                        chunk_type = "content"
+                        delta = ""
+                        metadata: dict[str, Any] = {}
+
+                        # -- Thinking chunks --
+                        if hasattr(chunk, "type") and chunk.type == "thinking":
+                            chunk_type = "thinking"
+                            delta = chunk.content if hasattr(chunk, "content") else str(chunk)
+                        elif (
+                            hasattr(chunk, "metadata")
+                            and isinstance(chunk.metadata, dict)
+                            and chunk.metadata.get("type") == "thinking"
+                        ):
+                            chunk_type = "thinking"
+                            delta = (
+                                getattr(chunk, "delta", None)
+                                or getattr(chunk, "content", None)
+                                or str(chunk)
+                            )
+
+                        # -- Dict chunks (tool_calls, structured events) --
+                        elif isinstance(chunk, dict):
+                            if chunk.get("type") == "error":
+                                yield {
+                                    "type": "error",
+                                    "delta": chunk.get("delta", ""),
+                                    "metadata": chunk.get("metadata", {}),
+                                }
+                                continue
+
+                            if "tool_calls" in chunk and chunk["tool_calls"]:
+                                for tc in chunk["tool_calls"]:
+                                    if isinstance(tc, dict):
+                                        fn = tc.get("function", {})
+                                        tc_id = tc.get("id", "")
+                                        fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                                        fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                                    else:
+                                        tc_id = getattr(tc, "id", "")
+                                        fn_obj = getattr(tc, "function", None)
+                                        fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                                        fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                                    yield {
+                                        "type": "tool_call",
+                                        "delta": "",
+                                        "metadata": {
+                                            "id": tc_id,
+                                            "name": fn_name,
+                                            "arguments": fn_args,
+                                        },
+                                    }
+                                continue
+                            text = chunk.get("content") or chunk.get("delta") or ""
+                            if text:
+                                delta = text
+                                full_content += delta
+
+                        # -- Object chunks with content --
+                        elif hasattr(chunk, "content") and chunk.content:
+                            delta = chunk.content
+                            full_content += delta
+
+                        # -- Plain string chunks --
+                        elif isinstance(chunk, str):
+                            delta = chunk
+                            full_content += delta
+
+                        if delta:
+                            yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+
+                    logger.debug(
+                        f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, "
+                        f"chunks_received={chunk_count}, full_content_len={len(full_content)}"
                     )
 
-                # -- Dict chunks (tool_calls, structured events) --
-                elif isinstance(chunk, dict):
-                    if chunk.get("type") == "error":
-                        yield {
-                            "type": "error",
-                            "delta": chunk.get("delta", ""),
-                            "metadata": chunk.get("metadata", {}),
-                        }
-                        continue
+                    # Ensure background task completes
+                    try:
+                        await asyncio.wait_for(bg_task, timeout=5.0)
+                    except (asyncio.TimeoutError, Exception):
+                        pass
 
-                    if "tool_calls" in chunk and chunk["tool_calls"]:
-                        for tc in chunk["tool_calls"]:
-                            # tc may be a ToolCall pydantic object or a dict
-                            if isinstance(tc, dict):
-                                fn = tc.get("function", {})
-                                tc_id = tc.get("id", "")
-                                fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
-                                fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
-                            else:
-                                tc_id = getattr(tc, "id", "")
-                                fn_obj = getattr(tc, "function", None)
-                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
-                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
-                            yield {
-                                "type": "tool_call",
-                                "delta": "",
-                                "metadata": {
-                                    "id": tc_id,
-                                    "name": fn_name,
-                                    "arguments": fn_args,
-                                },
-                            }
-                        continue
-                    # Support both "content" and "delta" keys (#10)
-                    text = chunk.get("content") or chunk.get("delta") or ""
-                    if text:
-                        delta = text
-                        full_content += delta
+                    # Emit done
+                    yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
-                # -- Object chunks with content --
-                elif hasattr(chunk, "content") and chunk.content:
-                    delta = chunk.content
-                    full_content += delta
+                except Exception as e:
+                    logger.error(f"Streaming error: {e}")
+                    yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
+                    yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
 
-                # -- Plain string chunks --
-                elif isinstance(chunk, str):
-                    delta = chunk
-                    full_content += delta
-
-                if delta:
-                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
-
-            logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
-
-            # Ensure background task completes
-            try:
-                await asyncio.wait_for(bg_task, timeout=5.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
-
-            # Fallback: if run() completed but no stream chunks were emitted,
-            # use final run result as one content chunk to avoid empty output.
-            if not full_content and run_result_text:
-                logger.warning(
-                    "Stream produced no content chunks; "
-                    "falling back to run() result text."
-                )
-                full_content = run_result_text
-                yield {
-                    "type": "content",
-                    "delta": run_result_text,
-                    "metadata": {"fallback": "run_result_no_chunks"},
-                }
-
-            # Emit done
-            yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
-
-        except Exception as e:
-            logger.error(f"Streaming error: {e}")
-            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
-            yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
-
-        # Save to session only if we got actual content
-        if full_content:
-            try:
-                self._session.add_message("user", message)
-                self._session.add_message("assistant", full_content)
-                self.sessions.save(self._session)
-            except Exception as e:
-                logger.warning(f"Failed to save session after streaming: {e}")
+                # Save complete messages to session store
+                if full_content:
+                    try:
+                        new_messages = agent.memory.messages[pre_run_count:]
+                        for msg in new_messages:
+                            kwargs: dict[str, Any] = {}
+                            if getattr(msg, "tool_calls", None):
+                                kwargs["tool_calls"] = [
+                                    tc.model_dump() if hasattr(tc, "model_dump") else tc
+                                    for tc in msg.tool_calls
+                                ]
+                            if getattr(msg, "tool_call_id", None):
+                                kwargs["tool_call_id"] = msg.tool_call_id
+                            if getattr(msg, "name", None):
+                                kwargs["name"] = msg.name
+                            content_str = (
+                                msg.text_content
+                                if hasattr(msg, "text_content")
+                                else str(msg.content or "")
+                            )
+                            session.add_message(role=msg.role, content=content_str, **kwargs)
+                        self.sessions.save(session)
+                    except Exception as e:
+                        logger.warning(f"Failed to save session after streaming: {e}")
 
     async def process_with_thinking(
         self,
         message: str,
         media: list[str] | None = None,
+        session_key: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -943,6 +1124,7 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Per-chat session key for isolation.
 
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
@@ -950,59 +1132,94 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        logger.info(f"Processing message (with thinking): {message[:100]}...")
+        # Resolve the session to use for this call
+        session = (
+            self.sessions.get_or_create(session_key)
+            if session_key
+            else self._session
+        )
+        lock = self._get_session_lock(session.session_key)
 
-        # Refresh memory context
-        try:
-            memory_context = self.memory.get_memory_context()
-            if memory_context:
-                self.context.set_memory_context(memory_context)
-        except Exception as e:
-            logger.warning(f"Failed to load memory context: {e}")
+        async with lock:
+            logger.info(f"Processing message (with thinking): {message[:100]}...")
 
-        # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+            # Refresh memory context
+            try:
+                memory_context = self.memory.get_memory_context()
+                if memory_context:
+                    self.context.set_memory_context(memory_context)
+            except Exception as e:
+                logger.warning(f"Failed to load memory context: {e}")
 
-        # Run agent with thinking enabled
-        try:
-            run_kwargs: dict[str, Any] = {"thinking": True}
-            if media:
-                run_kwargs["media"] = media
-            result = await self._agent.run(message, **run_kwargs)
-
-            # Extract content and thinking
-            if hasattr(result, "content"):
-                final_content = result.content
-            else:
-                final_content = str(result)
+            # Trim context before injecting into agent memory
+            self._trim_context_if_needed(session)
 
             thinking_content = None
-            if hasattr(result, "thinking_content"):
-                thinking_content = result.thinking_content
-            elif hasattr(result, "thinking"):
-                thinking_content = result.thinking
-            elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
-                thinking_content = result.metadata.get("thinking")
+            async with self._borrow_agent(session, session.session_key) as agent:
+                pre_run_count = len(agent.memory.messages)
 
-        except Exception as e:
-            logger.error(f"Agent processing error: {e}")
-            raise
+                try:
+                    run_kwargs: dict[str, Any] = {"thinking": True}
+                    if media:
+                        run_kwargs["media"] = media
+                    run_timeout = getattr(agent, "_default_timeout", None) or 180.0
+                    result = await asyncio.wait_for(
+                        agent.run(message, **run_kwargs), timeout=run_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"Agent run timed out after {run_timeout}s "
+                        f"for session '{session.session_key}'"
+                    )
+                    raise
+                except Exception as e:
+                    logger.error(f"Agent processing error: {e}")
+                    raise
 
-        # Save to session
-        try:
-            self._session.add_message("user", message)
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
-        except Exception as e:
-            logger.warning(f"Failed to save session: {e}")
+                # Extract content and thinking
+                if hasattr(result, "content"):
+                    final_content = result.content
+                else:
+                    final_content = str(result)
 
-        # Auto-commit workspace changes
-        if self._auto_commit and self._git:
-            try:
-                if self._git.has_changes():
-                    self._git.commit(message)
-            except Exception as e:
-                logger.warning(f"Failed to auto-commit: {e}")
+                if hasattr(result, "thinking_content"):
+                    thinking_content = result.thinking_content
+                elif hasattr(result, "thinking"):
+                    thinking_content = result.thinking
+                elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
+                    thinking_content = result.metadata.get("thinking")
+
+                # Save all messages produced by this run to session store
+                try:
+                    new_messages = agent.memory.messages[pre_run_count:]
+                    for msg in new_messages:
+                        kwargs: dict[str, Any] = {}
+                        if getattr(msg, "tool_calls", None):
+                            kwargs["tool_calls"] = [
+                                tc.model_dump() if hasattr(tc, "model_dump") else tc
+                                for tc in msg.tool_calls
+                            ]
+                        if getattr(msg, "tool_call_id", None):
+                            kwargs["tool_call_id"] = msg.tool_call_id
+                        if getattr(msg, "name", None):
+                            kwargs["name"] = msg.name
+                        content_str = (
+                            msg.text_content
+                            if hasattr(msg, "text_content")
+                            else str(msg.content or "")
+                        )
+                        session.add_message(role=msg.role, content=content_str, **kwargs)
+                    self.sessions.save(session)
+                except Exception as e:
+                    logger.warning(f"Failed to save session: {e}")
+
+            # Auto-commit workspace changes
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
 
         return final_content, thinking_content
 
@@ -1063,12 +1280,16 @@ class AgentLoop:
             logger.debug(f"add_tool: '{name}' is already active")
             return False
 
-        # If the agent is initialized, inject the tool into its ToolManager
-        if self._agent and hasattr(self._agent, "available_tools"):
-            tm: ToolManager = self._agent.available_tools
-            if name not in tm.tool_map:
-                tm.add_tool(tool)
-                logger.info(f"Injected tool '{name}' into running agent")
+        # Inject the tool into all agent instances (active + pooled)
+        injected = 0
+        for agent in self._iter_all_agents():
+            if hasattr(agent, "available_tools"):
+                tm: ToolManager = agent.available_tools
+                if name not in tm.tool_map:
+                    tm.add_tool(tool)
+                    injected += 1
+        if injected:
+            logger.info(f"Injected tool '{name}' into {injected} agent(s)")
 
         return True
 
@@ -1101,12 +1322,16 @@ class AgentLoop:
         if not self.tools.deactivate_tool(name):
             return False
 
-        # Remove from agent's ToolManager if running
-        if self._agent and hasattr(self._agent, "available_tools"):
-            tm: ToolManager = self._agent.available_tools
-            if name in tm.tool_map:
-                tm.remove_tool(name)
-                logger.info(f"Removed tool '{name}' from running agent")
+        # Remove from all agent instances (active + pooled)
+        removed = 0
+        for agent in self._iter_all_agents():
+            if hasattr(agent, "available_tools"):
+                tm: ToolManager = agent.available_tools
+                if name in tm.tool_map:
+                    tm.remove_tool(name)
+                    removed += 1
+        if removed:
+            logger.info(f"Removed tool '{name}' from {removed} agent(s)")
 
         return True
 
