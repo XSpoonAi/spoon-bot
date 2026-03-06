@@ -393,21 +393,22 @@ class MemoryManagementTool(Tool):
 
 class SelfUpgradeTool(Tool):
     """
-    Tool for agent self-upgrading.
+    Tool for agent runtime management: reload skills, MCP servers, and status.
 
-    Manages skills and checks for updates.
+    This is a lean runtime tool — marketplace actions (search, install, remove)
+    are provided by the ``skill-manager`` skill instead.
     """
 
     def __init__(self, workspace: Path | str | None = None):
-        """
-        Initialize self-upgrade tool.
-
-        Args:
-            workspace: Workspace directory path.
-        """
         self._workspace = Path(workspace) if workspace else (
             Path.home() / ".spoon-bot" / "workspace"
         )
+        # Injected by AgentLoop after construction.
+        self._agent_loop: Any = None
+
+    def set_agent_loop(self, agent_loop: Any) -> None:
+        """Inject the owning AgentLoop so reload actions can call back."""
+        self._agent_loop = agent_loop
 
     @property
     def name(self) -> str:
@@ -415,10 +416,15 @@ class SelfUpgradeTool(Tool):
 
     @property
     def description(self) -> str:
-        return """Manage agent capabilities and updates. Actions:
-- check_update: Check for new versions
-- list_skills: List installed skills
-- skill_info <skill_name>: Get skill details"""
+        return (
+            "Agent runtime management — reload skills/MCP and check status.\n"
+            "Actions:\n"
+            "- reload_skills: Re-discover skills from disk and update the running agent\n"
+            "- reload_mcp: Shutdown existing MCP connections and re-initialize them\n"
+            "- reload_all: Reload both skills and MCP servers\n"
+            "- list_skills: List currently loaded skills\n"
+            "- status: Show current runtime status (model, tools, skills, session)"
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -427,53 +433,162 @@ class SelfUpgradeTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["check_update", "list_skills", "skill_info"],
+                    "enum": [
+                        "reload_skills", "reload_mcp", "reload_all",
+                        "list_skills", "status",
+                    ],
                     "description": "Action to perform",
-                },
-                "skill_name": {
-                    "type": "string",
-                    "description": "Skill name for skill_info action",
                 },
             },
             "required": ["action"],
         }
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _do_reload_skills(self) -> str:
+        """Call agent_loop.reload_skills() and format the result.
+
+        When new skills are added, their SKILL.md is included so the agent
+        knows how to use them immediately.  Most skills are script-based —
+        the agent should use the ``shell`` tool to run commands described in
+        the SKILL.md rather than looking for a separate Python tool.
+        """
+        if not self._agent_loop:
+            return "Warning: agent loop not available for reload."
+        result = await self._agent_loop.reload_skills()
+        after = result.get("after", [])
+        added = result.get("added", [])
+        removed = result.get("removed", [])
+        parts = [f"Skills reloaded. Total: {len(after)}"]
+        if added:
+            parts.append(f"  Added: {', '.join(added)}")
+        if removed:
+            parts.append(f"  Removed: {', '.join(removed)}")
+
+        # Include SKILL.md content for newly added skills so the agent
+        # knows how to use them right away.
+        if added:
+            for skill_name in added:
+                skill_md = self._read_skill_md(skill_name)
+                if skill_md:
+                    parts.append("")
+                    parts.append(f"--- {skill_name} SKILL.md ---")
+                    parts.append(skill_md)
+                    parts.append(f"--- end {skill_name} ---")
+            parts.append("")
+            parts.append(
+                "NOTE: To use a newly added skill, read its SKILL.md above "
+                "and follow the instructions. Use the `shell` tool to run "
+                "any commands or scripts described in the skill. You do NOT "
+                "need a special Python tool — `shell` is sufficient for "
+                "executing any commands the skill requires."
+            )
+
+        return "\n".join(parts)
+
+    def _read_skill_md(self, skill_name: str) -> str | None:
+        """Read the SKILL.md for a given skill from known skill paths."""
+        # Check runtime workspace first, then bundled paths
+        candidates = [self._workspace / "skills" / skill_name / "SKILL.md"]
+        bundled = Path(__file__).resolve().parent.parent.parent / "workspace" / "skills"
+        candidates.append(bundled / skill_name / "SKILL.md")
+
+        for path in candidates:
+            if path.exists():
+                try:
+                    return path.read_text(encoding="utf-8")
+                except Exception:
+                    pass
+        return None
+
+    # ------------------------------------------------------------------
+    # execute
+    # ------------------------------------------------------------------
+
     async def execute(self, **kwargs: Any) -> str:
         action = kwargs.get("action", "list_skills")
-        skill_name = kwargs.get("skill_name")
 
-        if action == "check_update":
-            # In a real implementation, this would check PyPI or a registry
-            return "spoon-bot v0.1.0 is the latest version"
+        if action == "reload_skills":
+            if not self._agent_loop:
+                return "Error: agent loop not available for reload"
+            try:
+                return await self._do_reload_skills()
+            except Exception as e:
+                logger.error(f"reload_skills failed: {e}")
+                return f"Error reloading skills: {e}"
+
+        elif action == "reload_mcp":
+            if not self._agent_loop:
+                return "Error: agent loop not available for reload"
+            try:
+                result = await self._agent_loop.reload_mcp()
+                before = result.get("before", [])
+                after = result.get("after", [])
+                added = set(after) - set(before)
+                removed = set(before) - set(after)
+                parts = [f"MCP servers reloaded. Total: {len(after)}"]
+                if added:
+                    parts.append(f"  Added: {', '.join(added)}")
+                if removed:
+                    parts.append(f"  Removed: {', '.join(removed)}")
+                return "\n".join(parts)
+            except Exception as e:
+                logger.error(f"reload_mcp failed: {e}")
+                return f"Error reloading MCP: {e}"
+
+        elif action == "reload_all":
+            if not self._agent_loop:
+                return "Error: agent loop not available for reload"
+            try:
+                result = await self._agent_loop.reload_all()
+                skills_r = result.get("skills", {})
+                mcp_r = result.get("mcp", {})
+                return (
+                    f"Full reload complete.\n"
+                    f"  Skills: {len(skills_r.get('after', []))} loaded\n"
+                    f"  MCP servers: {len(mcp_r.get('after', []))} connected"
+                )
+            except Exception as e:
+                logger.error(f"reload_all failed: {e}")
+                return f"Error during full reload: {e}"
+
+        elif action == "status":
+            parts = ["Agent runtime status:"]
+            if self._agent_loop:
+                al = self._agent_loop
+                parts.append(f"  Model: {al.model}")
+                parts.append(f"  Provider: {al.provider}")
+                parts.append(f"  Active tools: {len(al.tools.get_active_tools())}")
+                parts.append(f"  Total tools: {len(al.tools._tools)}")
+                parts.append(f"  MCP tools: {len(al._mcp_tools)}")
+                skills = al.skills
+                parts.append(
+                    f"  Skills: {len(skills)} "
+                    f"({', '.join(skills) if skills else 'none'})"
+                )
+                parts.append(f"  Session: {al.session_key}")
+            else:
+                parts.append("  Agent loop not available")
+            return "\n".join(parts)
 
         elif action == "list_skills":
+            if self._agent_loop and self._agent_loop.skills:
+                skills = self._agent_loop.skills
+                return "Loaded skills:\n" + "\n".join(f"  - {s}" for s in skills)
+
             skills_dir = self._workspace / "skills"
             if not skills_dir.exists():
                 return "No skills installed"
 
-            skills = []
-            for skill_path in skills_dir.iterdir():
-                if skill_path.is_dir():
-                    skill_md = skill_path / "SKILL.md"
-                    if skill_md.exists():
-                        skills.append(skill_path.name)
-
+            skills = [
+                p.name
+                for p in skills_dir.iterdir()
+                if p.is_dir() and (p / "SKILL.md").exists()
+            ]
             if skills:
                 return "Installed skills:\n" + "\n".join(f"  - {s}" for s in skills)
             return "No skills installed"
 
-        elif action == "skill_info":
-            if not skill_name:
-                return "Error: 'skill_name' is required for 'skill_info' action"
-
-            skill_dir = self._workspace / "skills" / skill_name
-            skill_md = skill_dir / "SKILL.md"
-
-            if not skill_md.exists():
-                return f"Skill '{skill_name}' not found"
-
-            content = skill_md.read_text(encoding="utf-8")
-            # Return first 500 chars
-            return f"Skill: {skill_name}\n\n{content[:500]}..."
-
-        return f"Unknown action: {action}"
+        return f"Unknown action: {action!r}"

@@ -356,6 +356,78 @@ async def _ws_test_chat_non_stream():
             _fail("WS chat non-stream", f"no content. events={[e.get('type') for e in events]}")
 
 
+async def _ws_test_chat_stream():
+    """WS stream chat must emit chunks and done before final response."""
+    import websockets
+
+    async with websockets.connect(WS_URL) as ws:
+        await ws.recv()
+
+        await ws.send(json.dumps({
+            "type": "request", "id": "c2", "method": "chat.send",
+            "params": {
+                "message": "Explain streaming in one short sentence.",
+                "session_key": "e2e-session-stream",
+                "stream": True,
+            },
+        }))
+
+        chunks: list[str] = []
+        done_content = ""
+        response_content = ""
+        seen_done = False
+        seen_response = False
+        deadline = time.time() + 120
+
+        while time.time() < deadline and not (seen_done and seen_response):
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=30)
+            except asyncio.TimeoutError:
+                break
+
+            msg = json.loads(raw)
+            event = msg.get("event", "")
+            if event == "agent.stream.chunk":
+                data = msg.get("data", {})
+                chunk_type = data.get("type", "content")
+                delta = data.get("delta", "")
+                if chunk_type == "content" and isinstance(delta, str) and delta:
+                    chunks.append(delta)
+            elif event == "agent.stream.done":
+                seen_done = True
+                data = msg.get("data", {})
+                content = data.get("content", "")
+                if isinstance(content, str):
+                    done_content = content
+            elif msg.get("type") == "response" and msg.get("id") == "c2":
+                seen_response = True
+                result = msg.get("result", {})
+                content = result.get("content", "")
+                if isinstance(content, str):
+                    response_content = content
+
+        stream_content = "".join(chunks)
+        final_content = response_content or done_content
+
+        if not seen_done:
+            _fail("WS chat stream", "missing agent.stream.done")
+            return
+        if not seen_response:
+            _fail("WS chat stream", "missing final response")
+            return
+        if not stream_content:
+            _fail("WS chat stream", "no streamed content chunks")
+            return
+        if final_content and stream_content != final_content:
+            _fail(
+                "WS chat stream",
+                f"chunk content mismatch (chunks={len(stream_content)} final={len(final_content)})",
+            )
+            return
+
+        _ok("WS chat stream")
+
+
 async def _ws_test_cancel():
     """#13: WS cancel reports task_interrupted."""
     import websockets
@@ -430,6 +502,7 @@ def run_ws_tests():
         _ws_test_session_import,
         _ws_test_cancel,
         _ws_test_chat_non_stream,
+        _ws_test_chat_stream,
         _ws_test_shell_format_safe,
     ]
 

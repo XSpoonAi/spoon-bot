@@ -71,6 +71,7 @@ from spoon_bot.agent.tools.web3 import (
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.agent.tools.document import DocumentParseTool
 from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
+from spoon_bot.services.hotreload import HotReloadService
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
@@ -136,6 +137,9 @@ class AgentLoop:
         session_store_db_path: str | None = None,
         context_window: int | None = None,
         memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
+        auto_reload: bool = False,
+        auto_reload_interval: float = 5.0,
+        config_path: Path | str | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -254,8 +258,11 @@ class AgentLoop:
 
         self._git = GitManager(self.workspace) if auto_commit else None
 
-        # Skill paths
+        # Skill paths: runtime workspace + bundled skills shipped with spoon-bot
         self._skill_paths = [self.workspace / "skills"]
+        _bundled_skills = Path(__file__).resolve().parent.parent.parent / "workspace" / "skills"
+        if _bundled_skills.is_dir() and _bundled_skills != self._skill_paths[0]:
+            self._skill_paths.append(_bundled_skills)
         if skill_paths:
             self._skill_paths.extend([Path(p) for p in skill_paths])
 
@@ -282,8 +289,17 @@ class AgentLoop:
             # dynamically via add_tool().
             self.tools.set_tool_filter(enabled_tools=set(CORE_TOOLS))
 
+        # Hot-reload service
+        self._auto_reload = auto_reload
+        self._auto_reload_interval = auto_reload_interval
+        self._config_path = Path(config_path) if config_path else None
+        self._hot_reload: HotReloadService | None = None
+
         # Track initialization state
         self._initialized = False
+
+        # Skill tool names registered via _register_skill_tools() — for cleanup on reload
+        self._skill_tool_names: set[str] = set()
 
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
@@ -324,10 +340,8 @@ class AgentLoop:
             f"Be concise when context is limited.]\n"
         )
 
-        # Append available-tools summary so the LLM knows what can be loaded
-        inactive_tools = self.tools.get_inactive_tools()
-        if inactive_tools:
-            system_prompt += self._build_dynamic_tools_prompt(inactive_tools)
+        # NOTE: inactive-tools prompt is built later, after skill tools are
+        # registered so that skill-provided tools are included in the list.
 
         # Create ChatBot (spoon-core LLM interface)
         self._chatbot = ChatBot(
@@ -361,39 +375,7 @@ class AgentLoop:
                     )
 
         # Create MCP tools – expand each server into individual tools (#5)
-        if self._mcp_config and not MCP_TOOL_AVAILABLE:
-            logger.warning(
-                "MCP configuration provided but MCPTool is unavailable "
-                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP server setup."
-            )
-        for name, config in self._mcp_config.items():
-            if not MCP_TOOL_AVAILABLE:
-                break
-
-            mcp_tool = MCPTool(
-                name=name,
-                description=f"MCP server: {name}",
-                mcp_config=config,
-            )
-            # Try to discover real server tools and create one MCPTool per tool
-            if hasattr(mcp_tool, "expand_server_tools"):
-                try:
-                    expanded = await mcp_tool.expand_server_tools()
-                    if expanded:
-                        self._mcp_tools.extend(expanded)
-                        logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
-                    else:
-                        # Fallback: keep proxy tool (server might be offline)
-                        self._mcp_tools.append(mcp_tool)
-                        logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
-                except Exception as exc:
-                    logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
-                    self._mcp_tools.append(mcp_tool)
-            else:
-                self._mcp_tools.append(mcp_tool)
-                logger.info(
-                    f"MCP server '{name}': expand_server_tools() unavailable in this spoon-core version; using proxy."
-                )
+        await self._init_mcp_tools()
 
         # Only pass active (filtered) tools + MCP tools to the agent
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
@@ -419,10 +401,20 @@ class AgentLoop:
             if "include_default_paths" in _sm_sig.parameters:
                 _sm_kwargs["include_default_paths"] = False
             self._skill_manager = SkillManager(**_sm_kwargs)
+            # Pre-load skill tools into the ToolRegistry as inactive
+            self._register_skill_tools()
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
         else:
             self._agent = SpoonReactMCP(**agent_kwargs)
+
+        # Build dynamic-tools prompt now that all tools (native + skill) are registered
+        inactive_tools = self.tools.get_inactive_tools()
+        if inactive_tools:
+            system_prompt += self._build_dynamic_tools_prompt(inactive_tools)
+            # Update the agent's system prompt with the full list
+            if hasattr(self._agent, "system_prompt"):
+                self._agent.system_prompt = system_prompt
 
         # Initialize agent
         await self._agent.initialize()
@@ -440,13 +432,25 @@ class AgentLoop:
             f"skills_enabled={self._enable_skills}"
         )
 
+        # Start background hot-reload service if enabled
+        if self._auto_reload:
+            self._hot_reload = HotReloadService(
+                agent=self,
+                poll_interval=self._auto_reload_interval,
+                watch_skills=self._enable_skills,
+                watch_config=self._config_path is not None,
+                config_path=self._config_path,
+            )
+            await self._hot_reload.start()
+
     def _register_native_tools(self) -> None:
         """Register the default native OS tools."""
-        # Shell tool
+        # Shell tool — allow_chaining lets the agent compose multi-step ops
         self.tools.register(ShellTool(
             timeout=self.shell_timeout,
             max_output=self.max_output,
             working_dir=str(self.workspace),
+            allow_chaining=True,
         ))
 
         # Filesystem tools
@@ -460,7 +464,11 @@ class AgentLoop:
         memory_tool = MemoryManagementTool()
         memory_tool.set_memory_store(self.memory)
         self.tools.register(memory_tool)
-        self.tools.register(SelfUpgradeTool(workspace=self.workspace))
+
+        # Self-upgrade tool — with agent loop reference for hot-reload
+        upgrade_tool = SelfUpgradeTool(workspace=self.workspace)
+        upgrade_tool.set_agent_loop(self)
+        self.tools.register(upgrade_tool)
 
         # Dynamic tool activation — lets the LLM load tools on demand
         self.tools.register(ActivateToolTool(
@@ -497,6 +505,240 @@ class AgentLoop:
             logger.debug("spoon-toolkits not available, skipping toolkit tools")
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
+
+    def _register_skill_tools(self) -> None:
+        """Load tools from discovered skill directories and register as inactive.
+
+        Scans ``self._skill_paths`` for skill directories containing ``tools.py``,
+        loads their ``BaseTool`` subclasses via the SkillManager's loader, wraps
+        each in a :class:`SkillToolBridge`, and registers them in the ToolRegistry
+        as **inactive** tools.  This makes them visible via ``activate_tool list``
+        so the agent can dynamically load them on demand.
+        """
+        from spoon_bot.agent.tools.skill_bridge import SkillToolBridge
+
+        # Unregister previously registered skill tools (handles reload)
+        for name in list(self._skill_tool_names):
+            self.tools.unregister(name)
+        self._skill_tool_names.clear()
+
+        if not self._skill_manager:
+            return
+
+        loader = getattr(self._skill_manager, "_loader", None)
+        if loader is None:
+            return
+
+        for skill_path in self._skill_paths:
+            if not skill_path.is_dir():
+                continue
+            for skill_dir in sorted(skill_path.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                if not (skill_dir / "tools.py").exists():
+                    continue
+                try:
+                    tools = loader.load_tools(skill_dir)
+                    for base_tool in tools:
+                        if base_tool.name not in self.tools:
+                            bridge = SkillToolBridge(base_tool)
+                            self.tools.register(bridge)
+                            self._skill_tool_names.add(base_tool.name)
+                except Exception as exc:
+                    logger.debug(f"Skill tools from {skill_dir.name}: {exc}")
+
+        if self._skill_tool_names:
+            logger.info(
+                f"Registered {len(self._skill_tool_names)} skill tool(s) "
+                f"as inactive: {sorted(self._skill_tool_names)}"
+            )
+
+    async def _init_mcp_tools(self) -> None:
+        """Discover and create MCP tools from ``self._mcp_config``.
+
+        Populates ``self._mcp_tools``.  Safe to call multiple times — the
+        caller is responsible for cleaning up old tools first.
+        """
+        if self._mcp_config and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP configuration provided but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP server setup."
+            )
+        for name, config in self._mcp_config.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
+
+            mcp_tool = MCPTool(
+                name=name,
+                description=f"MCP server: {name}",
+                mcp_config=config,
+            )
+            # Try to discover real server tools and create one MCPTool per tool
+            if hasattr(mcp_tool, "expand_server_tools"):
+                try:
+                    expanded = await mcp_tool.expand_server_tools()
+                    if expanded:
+                        self._mcp_tools.extend(expanded)
+                        logger.info(f"MCP server '{name}': expanded to {len(expanded)} tools")
+                    else:
+                        self._mcp_tools.append(mcp_tool)
+                        logger.warning(f"MCP server '{name}': no tools discovered, keeping proxy")
+                except Exception as exc:
+                    logger.warning(f"MCP server '{name}': expansion failed ({exc}), keeping proxy")
+                    self._mcp_tools.append(mcp_tool)
+            else:
+                self._mcp_tools.append(mcp_tool)
+                logger.info(
+                    f"MCP server '{name}': expand_server_tools() unavailable in this spoon-core version; using proxy."
+                )
+
+    # ------------------------------------------------------------------
+    # Hot-reload: skills / MCP / all
+    # ------------------------------------------------------------------
+
+    async def reload_skills(self) -> dict[str, Any]:
+        """Re-discover skills from skill paths and swap into the running agent.
+
+        Returns:
+            Summary dict with ``before``, ``after``, ``added``, ``removed``.
+        """
+        old_skills: list[str] = []
+        if self._skill_manager:
+            try:
+                old_skills = list(self._skill_manager.list())
+            except Exception:
+                pass
+
+        if not self._enable_skills:
+            return {"before": old_skills, "after": old_skills, "added": [], "removed": []}
+
+        # Create a fresh SkillManager with the same paths
+        import inspect
+        _sm_sig = inspect.signature(SkillManager.__init__)
+        _sm_kwargs: dict[str, Any] = {
+            "skill_paths": [str(p) for p in self._skill_paths],
+            "llm": self._chatbot,
+            "auto_discover": True,
+        }
+        if "include_default_paths" in _sm_sig.parameters:
+            _sm_kwargs["include_default_paths"] = False
+
+        new_sm = SkillManager(**_sm_kwargs)
+        self._skill_manager = new_sm
+
+        # Re-register skill tools from the new SkillManager
+        self._register_skill_tools()
+
+        # Inject into the running agent
+        if self._agent and isinstance(self._agent, SpoonReactSkill):
+            # Try common attribute names across spoon-core versions
+            for attr in ("skill_manager", "_skill_manager"):
+                if hasattr(self._agent, attr):
+                    setattr(self._agent, attr, new_sm)
+                    break
+
+        new_skills: list[str] = []
+        try:
+            new_skills = list(new_sm.list())
+        except Exception:
+            pass
+
+        added = [s for s in new_skills if s not in old_skills]
+        removed = [s for s in old_skills if s not in new_skills]
+        logger.info(f"Skills reloaded: {len(old_skills)} -> {len(new_skills)} (added={added}, removed={removed})")
+        return {"before": old_skills, "after": new_skills, "added": added, "removed": removed}
+
+    async def reload_mcp(self, new_config: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Shutdown existing MCP tools and re-initialize from config.
+
+        Args:
+            new_config: Optional new MCP config dict.  If ``None`` the
+                existing ``self._mcp_config`` is reused.
+
+        Returns:
+            Summary dict with ``before`` and ``after`` server names.
+        """
+        old_names = [getattr(t, "name", "?") for t in self._mcp_tools]
+
+        # Cleanup existing MCP tools
+        for mcp_tool in self._mcp_tools:
+            for method in ("close", "cleanup", "shutdown"):
+                fn = getattr(mcp_tool, method, None)
+                if fn and callable(fn):
+                    try:
+                        result = fn()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as exc:
+                        logger.debug(f"MCP cleanup ({method}) for '{getattr(mcp_tool, 'name', '?')}': {exc}")
+                    break
+
+        # Remove old MCP tools from the agent's ToolManager
+        if self._agent and hasattr(self._agent, "available_tools"):
+            tm: ToolManager = self._agent.available_tools
+            for mcp_tool in self._mcp_tools:
+                name = getattr(mcp_tool, "name", None)
+                if name and name in tm.tool_map:
+                    tm.remove_tool(name)
+
+        self._mcp_tools.clear()
+
+        # Apply new config if provided
+        if new_config is not None:
+            self._mcp_config = new_config
+
+        # Re-init MCP tools
+        await self._init_mcp_tools()
+
+        # Inject new tools into the running agent
+        if self._agent and hasattr(self._agent, "available_tools"):
+            tm = self._agent.available_tools
+            for mcp_tool in self._mcp_tools:
+                name = getattr(mcp_tool, "name", None)
+                if name and name not in tm.tool_map:
+                    tm.add_tool(mcp_tool)
+
+        new_names = [getattr(t, "name", "?") for t in self._mcp_tools]
+        logger.info(f"MCP reloaded: {old_names} -> {new_names}")
+        return {"before": old_names, "after": new_names}
+
+    async def reload_all(self) -> dict[str, Any]:
+        """Reload both skills and MCP servers.
+
+        Returns:
+            Combined summary with ``skills`` and ``mcp`` keys.
+        """
+        skills_result = await self.reload_skills()
+        mcp_result = await self.reload_mcp()
+        return {"skills": skills_result, "mcp": mcp_result}
+
+    async def cleanup(self) -> None:
+        """Shut down all managed resources (MCP tools, skills, etc.)."""
+        # Cleanup MCP tools
+        for mcp_tool in self._mcp_tools:
+            for method in ("close", "cleanup", "shutdown"):
+                fn = getattr(mcp_tool, method, None)
+                if fn and callable(fn):
+                    try:
+                        result = fn()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as exc:
+                        logger.debug(f"MCP cleanup ({method}): {exc}")
+                    break
+        self._mcp_tools.clear()
+
+        # Deactivate skills
+        if self._skill_manager:
+            try:
+                result = self._skill_manager.deactivate_all()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.debug(f"Skill deactivate_all: {exc}")
+
+        self._initialized = False
+        logger.info("AgentLoop cleanup complete")
 
     def _estimate_token_count(self) -> int:
         """Rough token estimate for current session messages (~4 chars per token)."""
@@ -1246,6 +1488,9 @@ async def create_agent(
     enabled_tools: set[str] | None = None,
     tool_profile: str | None = None,
     memsearch_config: MemSearchConfig | dict[str, Any] | None = None,
+    auto_reload: bool = False,
+    auto_reload_interval: float = 5.0,
+    config_path: Path | str | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -1299,6 +1544,9 @@ async def create_agent(
         enabled_tools=enabled_tools,
         tool_profile=tool_profile,
         memsearch_config=memsearch_config,
+        auto_reload=auto_reload,
+        auto_reload_interval=auto_reload_interval,
+        config_path=config_path,
         **kwargs,
     )
 

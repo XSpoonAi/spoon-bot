@@ -128,6 +128,8 @@ class SpoonBotConfig:
             api_key=cfg.get("api_key"),
             base_url=cfg.get("base_url"),
             max_steps=cfg.get("max_iterations", 15),
+            mcp_servers=cfg.get("mcp_config", {}) or {},
+            enable_skills=cfg.get("enable_skills", True),
             workspace=Path(cfg["workspace"]) if cfg.get("workspace") else Path.home() / ".spoon-bot" / "workspace",
         )
 

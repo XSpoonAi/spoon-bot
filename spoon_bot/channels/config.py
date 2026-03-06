@@ -175,11 +175,6 @@ class ChannelsConfig:
 
         for account in accounts:
             name = account.get("name", "default")
-            if account.get("agent_config"):
-                logger.warning(
-                    f"[telegram:{name}] 'agent_config' found but per-channel agent config is "
-                    "not yet supported. Use the top-level 'agent:' section instead."
-                )
             mode_str = account.get("mode", "polling")
             mode = ChannelMode.WEBHOOK if mode_str == "webhook" else ChannelMode.POLLING
 
@@ -228,11 +223,6 @@ class ChannelsConfig:
 
         for account in accounts:
             name = account.get("name", "default")
-            if account.get("agent_config"):
-                logger.warning(
-                    f"[discord:{name}] 'agent_config' found but per-channel agent config is "
-                    "not yet supported. Use the top-level 'agent:' section instead."
-                )
 
             # Build config with common fields + Discord-specific fields
             common = self._build_common_config(account, "discord", ChannelMode.GATEWAY)
@@ -278,11 +268,6 @@ class ChannelsConfig:
 
         for account in accounts:
             name = account.get("name", "default")
-            if account.get("agent_config"):
-                logger.warning(
-                    f"[feishu:{name}] 'agent_config' found but per-channel agent config is "
-                    "not yet supported. Use the top-level 'agent:' section instead."
-                )
 
             # Build config with common fields + Feishu-specific fields
             common = self._build_common_config(account, "feishu", ChannelMode.WEBHOOK)
@@ -524,7 +509,10 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
     Supported fields::
 
         model, provider, api_key, base_url, workspace,
-        max_iterations, tool_profile, enable_skills
+        max_iterations, tool_profile, enabled_tools, enable_skills,
+        shell_timeout, max_output, context_window,
+        session_store_backend, session_store_dsn, session_store_db_path,
+        mcp_config (alias: mcp_servers)
 
     Args:
         config_path: Explicit path to YAML file (optional).
@@ -546,14 +534,118 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
     agent_raw: dict[str, Any] = full_config.get("agent", {}) if full_config else {}
 
-    # Resolve ${VAR} substitutions for string fields that support it
-    _env_fields = ("api_key", "base_url", "workspace")
-    resolved: dict[str, Any] = {}
-    for key, value in agent_raw.items():
-        if key in _env_fields and isinstance(value, str):
-            resolved[key] = ChannelsConfig._resolve_env(value)
-        else:
-            resolved[key] = value
+    def _resolve_env_deep(value: Any) -> Any:
+        """Resolve ${VAR} in nested dict/list values."""
+        if isinstance(value, str):
+            return ChannelsConfig._resolve_env(value)
+        if isinstance(value, list):
+            return [_resolve_env_deep(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _resolve_env_deep(v) for k, v in value.items()}
+        return value
+
+    resolved: dict[str, Any] = _resolve_env_deep(agent_raw) if isinstance(agent_raw, dict) else {}
+
+    # Backward-compatible alias: mcp_servers -> mcp_config
+    if "mcp_config" not in resolved and isinstance(resolved.get("mcp_servers"), dict):
+        resolved["mcp_config"] = resolved.pop("mcp_servers")
+
+    # Merge channel account-level agent overrides into effective global config.
+    # Current runtime uses one shared agent for all channels, so we merge these
+    # settings rather than applying them per-account.
+    channels_cfg = full_config.get("channels", {}) if isinstance(full_config, dict) else {}
+    if isinstance(channels_cfg, dict):
+        profile_rank = {"core": 0, "research": 1, "web3": 1, "coding": 2, "full": 3}
+        selected_profile: str | None = None
+        selected_profile_source: str | None = None
+        merged_enabled_tools: set[str] = set()
+        merged_mcp_config: dict[str, Any] = {}
+        scalar_fields = {
+            "max_iterations",
+            "enable_skills",
+            "shell_timeout",
+            "max_output",
+            "context_window",
+            "session_store_backend",
+            "session_store_dsn",
+            "session_store_db_path",
+        }
+
+        for channel_name, channel_cfg in channels_cfg.items():
+            if not isinstance(channel_cfg, dict):
+                continue
+            if not channel_cfg.get("enabled", False):
+                continue
+            accounts = channel_cfg.get("accounts", [])
+            if not isinstance(accounts, list):
+                continue
+
+            for account in accounts:
+                if not isinstance(account, dict):
+                    continue
+                account_name = account.get("name", "default")
+                agent_override_raw = account.get("agent_config")
+                if not isinstance(agent_override_raw, dict) or not agent_override_raw:
+                    continue
+
+                agent_override = _resolve_env_deep(agent_override_raw)
+                source = f"{channel_name}:{account_name}"
+
+                profile = agent_override.get("tool_profile")
+                if isinstance(profile, str):
+                    rank = profile_rank.get(profile, -1)
+                    current_rank = profile_rank.get(selected_profile, -1) if selected_profile else -1
+                    if rank >= current_rank:
+                        selected_profile = profile
+                        selected_profile_source = source
+
+                enabled_tools = agent_override.get("enabled_tools")
+                if isinstance(enabled_tools, list):
+                    for name in enabled_tools:
+                        if isinstance(name, str) and name.strip():
+                            merged_enabled_tools.add(name.strip())
+
+                override_mcp = agent_override.get("mcp_config")
+                if override_mcp is None:
+                    override_mcp = agent_override.get("mcp_servers")
+                if isinstance(override_mcp, dict):
+                    for server_name, server_cfg in override_mcp.items():
+                        if isinstance(server_cfg, dict):
+                            merged_mcp_config[server_name] = server_cfg
+
+                for field in scalar_fields:
+                    if field not in agent_override:
+                        continue
+                    value = agent_override.get(field)
+                    if field in resolved and resolved[field] != value:
+                        logger.info(
+                            f"Agent config field '{field}' overridden by channel account "
+                            f"'{source}'"
+                        )
+                    resolved[field] = value
+
+        if selected_profile:
+            if "tool_profile" in resolved and resolved["tool_profile"] != selected_profile:
+                logger.info(
+                    f"Agent tool_profile overridden by channel account "
+                    f"'{selected_profile_source}' -> '{selected_profile}'"
+                )
+            resolved["tool_profile"] = selected_profile
+
+        if merged_enabled_tools:
+            existing = resolved.get("enabled_tools", [])
+            if isinstance(existing, list):
+                for name in existing:
+                    if isinstance(name, str) and name.strip():
+                        merged_enabled_tools.add(name.strip())
+            resolved["enabled_tools"] = sorted(merged_enabled_tools)
+
+        if merged_mcp_config:
+            base_mcp = {}
+            if isinstance(resolved.get("mcp_config"), dict):
+                base_mcp = dict(resolved["mcp_config"])
+            base_mcp.update(merged_mcp_config)
+            resolved["mcp_config"] = base_mcp
 
     # ------------------------------------------------------------------
     # 2. Overlay env vars for fields NOT already set by YAML
@@ -564,13 +656,16 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         "workspace":      ["SPOON_BOT_WORKSPACE_PATH"],
         "max_iterations": ["SPOON_BOT_MAX_ITERATIONS", "SPOON_MAX_STEPS"],
         "enable_skills":  ["SPOON_BOT_ENABLE_SKILLS"],
+        "shell_timeout":  ["SPOON_BOT_SHELL_TIMEOUT"],
+        "max_output":     ["SPOON_BOT_MAX_OUTPUT"],
+        "context_window": ["CONTEXT_WINDOW"],
     }
     for field, env_vars in agent_env_map.items():
         if not resolved.get(field):
             for var in env_vars:
                 val = os.environ.get(var)
                 if val:
-                    if field == "max_iterations":
+                    if field in {"max_iterations", "shell_timeout", "max_output", "context_window"}:
                         resolved[field] = int(val)
                     elif field == "enable_skills":
                         resolved[field] = val.lower() == "true"

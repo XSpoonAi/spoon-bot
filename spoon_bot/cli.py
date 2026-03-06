@@ -242,8 +242,22 @@ async def _run_agent(
         max_iterations=effective_max_iterations,
         enable_skills=effective_enable_skills,
     )
+    if agent_cfg.get("mcp_config") is not None:
+        create_kwargs["mcp_config"] = agent_cfg["mcp_config"]
+    if agent_cfg.get("shell_timeout") is not None:
+        create_kwargs["shell_timeout"] = int(agent_cfg["shell_timeout"])
+    if agent_cfg.get("max_output") is not None:
+        create_kwargs["max_output"] = int(agent_cfg["max_output"])
+    if agent_cfg.get("context_window") is not None:
+        create_kwargs["context_window"] = int(agent_cfg["context_window"])
+    if agent_cfg.get("enabled_tools") is not None:
+        create_kwargs["enabled_tools"] = set(agent_cfg["enabled_tools"])
     if effective_tool_profile is not None:
         create_kwargs["tool_profile"] = effective_tool_profile
+    if agent_cfg.get("auto_reload"):
+        create_kwargs["auto_reload"] = True
+        if agent_cfg.get("auto_reload_interval") is not None:
+            create_kwargs["auto_reload_interval"] = float(agent_cfg["auto_reload_interval"])
 
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]") as status:
@@ -685,10 +699,31 @@ async def _run_gateway(
         workspace=effective_workspace,
         enable_skills=effective_enable_skills,
     )
+    if agent_cfg.get("mcp_config") is not None:
+        create_kwargs["mcp_config"] = agent_cfg["mcp_config"]
+    if agent_cfg.get("shell_timeout") is not None:
+        create_kwargs["shell_timeout"] = int(agent_cfg["shell_timeout"])
+    if agent_cfg.get("max_output") is not None:
+        create_kwargs["max_output"] = int(agent_cfg["max_output"])
+    if agent_cfg.get("context_window") is not None:
+        create_kwargs["context_window"] = int(agent_cfg["context_window"])
+    if agent_cfg.get("enabled_tools") is not None:
+        create_kwargs["enabled_tools"] = set(agent_cfg["enabled_tools"])
+    if agent_cfg.get("session_store_backend") is not None:
+        create_kwargs["session_store_backend"] = agent_cfg["session_store_backend"]
+    if agent_cfg.get("session_store_dsn") is not None:
+        create_kwargs["session_store_dsn"] = agent_cfg["session_store_dsn"]
+    if agent_cfg.get("session_store_db_path") is not None:
+        create_kwargs["session_store_db_path"] = agent_cfg["session_store_db_path"]
     if effective_tool_profile is not None:
         create_kwargs["tool_profile"] = effective_tool_profile
     if effective_max_iterations is not None:
         create_kwargs["max_iterations"] = int(effective_max_iterations)
+    # Auto-reload is especially useful in long-running gateway mode
+    if agent_cfg.get("auto_reload"):
+        create_kwargs["auto_reload"] = True
+        if agent_cfg.get("auto_reload_interval") is not None:
+            create_kwargs["auto_reload_interval"] = float(agent_cfg["auto_reload_interval"])
 
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]"):

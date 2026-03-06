@@ -141,6 +141,7 @@ class CommandValidator:
         custom_whitelist: set[str] | None = None,
         custom_blocklist: set[str] | None = None,
         allow_pipes: bool = True,
+        allow_chaining: bool = False,
         strict_mode: bool = False,
     ):
         """
@@ -151,6 +152,9 @@ class CommandValidator:
             custom_whitelist: Additional commands to whitelist.
             custom_blocklist: Additional commands/patterns to block.
             allow_pipes: If True, allow pipe (|) in commands.
+            allow_chaining: If True, allow command chaining (&&, ||, ;).
+                This lets the agent compose multi-step shell operations
+                while still blocking dangerous commands and substitution.
             strict_mode: If True, block all potentially dangerous patterns.
         """
         self.whitelist_mode = whitelist_mode
@@ -160,6 +164,7 @@ class CommandValidator:
 
         self.custom_blocklist = custom_blocklist or set()
         self.allow_pipes = allow_pipes
+        self.allow_chaining = allow_chaining
         self.strict_mode = strict_mode
 
     def _extract_base_command(self, command: str) -> str:
@@ -219,9 +224,21 @@ class CommandValidator:
 
         return None
 
+    # Patterns that represent command chaining (&&, ||, ;, newline).
+    # Skipped when allow_chaining is True.
+    _CHAINING_PATTERNS: frozenset[str] = frozenset({
+        r";\s*\S",
+        r"\|\|",
+        r"&&",
+        r"[\r\n]+\s*\S",
+    })
+
     def _check_injection_patterns(self, command: str) -> str | None:
         """Check for shell injection patterns."""
         for pattern in self.INJECTION_PATTERNS:
+            # Skip chaining patterns when allow_chaining is enabled
+            if self.allow_chaining and pattern.pattern in self._CHAINING_PATTERNS:
+                continue
             match = pattern.search(command)
             if match:
                 return f"Potential command injection detected: '{match.group()}'"
@@ -322,6 +339,7 @@ class ShellTool(Tool):
         custom_whitelist: set[str] | None = None,
         custom_blocklist: set[str] | None = None,
         allow_pipes: bool = True,
+        allow_chaining: bool = False,
         strict_mode: bool = False,
         use_shell: bool = True,
         rate_limit_config: RateLimitConfig | None = None,
@@ -337,6 +355,7 @@ class ShellTool(Tool):
             custom_whitelist: Additional commands to whitelist.
             custom_blocklist: Additional commands/patterns to block.
             allow_pipes: If True, allow pipe (|) in commands.
+            allow_chaining: If True, allow && ; || for multi-step commands.
             strict_mode: If True, block all potentially dangerous patterns.
             use_shell: If True, use shell execution; if False, use direct exec.
             rate_limit_config: Configuration for rate limiting shell commands.
@@ -352,6 +371,7 @@ class ShellTool(Tool):
             custom_whitelist=custom_whitelist,
             custom_blocklist=custom_blocklist,
             allow_pipes=allow_pipes,
+            allow_chaining=allow_chaining,
             strict_mode=strict_mode,
         )
 

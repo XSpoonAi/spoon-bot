@@ -52,8 +52,15 @@ class TestConfigPriority:
         assert result["model"] == "claude-sonnet"  # from YAML
         assert result["provider"] == "openai"       # from env
 
-    def test_no_hidden_defaults_for_model_provider(self, tmp_path):
+    def test_no_hidden_defaults_for_model_provider(self, tmp_path, monkeypatch):
         """model/provider must not have silent fallback values."""
+        for var in (
+            "SPOON_BOT_DEFAULT_PROVIDER",
+            "SPOON_PROVIDER",
+            "SPOON_BOT_DEFAULT_MODEL",
+            "SPOON_MODEL",
+        ):
+            monkeypatch.delenv(var, raising=False)
         cfg_path = self._write_yaml(tmp_path, """\
             agent:
               workspace: /tmp/test
@@ -107,6 +114,78 @@ class TestConfigPriority:
         result = load_agent_config(cfg_path)
         assert result["provider"] == "openrouter"
         assert result["model"] == "mistral-large"
+
+    def test_channel_agent_config_overrides_tool_profile(self, tmp_path):
+        """Enabled channel account agent_config should override top-level tool_profile."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              provider: openrouter
+              model: anthropic/claude-sonnet-4
+              tool_profile: core
+            channels:
+              telegram:
+                enabled: true
+                accounts:
+                  - name: spoon
+                    token: "fake-token"
+                    agent_config:
+                      tool_profile: full
+        """)
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["tool_profile"] == "full"
+
+    def test_channel_agent_config_merges_enabled_tools_and_mcp(self, tmp_path):
+        """Channel agent_config should merge enabled_tools + mcp_config into agent config."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              provider: openrouter
+              model: anthropic/claude-sonnet-4
+              enabled_tools: ["shell"]
+              mcp_servers:
+                top:
+                  command: npx
+                  args: ["-y", "top-server"]
+            channels:
+              telegram:
+                enabled: true
+                accounts:
+                  - name: spoon
+                    token: "fake-token"
+                    agent_config:
+                      enabled_tools: ["self_upgrade", "shell"]
+                      mcp_config:
+                        github:
+                          command: npx
+                          args: ["-y", "@modelcontextprotocol/server-github"]
+        """)
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["enabled_tools"] == ["self_upgrade", "shell"]
+        assert set(result["mcp_config"].keys()) == {"top", "github"}
+
+    def test_mcp_servers_alias_and_env_resolution(self, tmp_path, monkeypatch):
+        """Top-level mcp_servers should map to mcp_config with ${VAR} resolution."""
+        monkeypatch.setenv("MCP_FS_ROOT", "C:/workspace")
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              provider: openrouter
+              model: anthropic/claude-sonnet-4
+              mcp_servers:
+                filesystem:
+                  command: npx
+                  args: ["-y", "@modelcontextprotocol/server-filesystem", "${MCP_FS_ROOT}"]
+        """)
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert "mcp_servers" not in result
+        assert result["mcp_config"]["filesystem"]["args"][-1] == "C:/workspace"
 
 
 # ---------------------------------------------------------------------------

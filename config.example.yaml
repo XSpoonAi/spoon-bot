@@ -9,6 +9,19 @@ agent:
   workspace: "~/.spoon-bot/workspace"
   max_iterations: 20
   tool_profile: "core"  # Options: core, coding, web3, research, full
+  # enabled_tools:        # Optional fine-grained override
+  #   - shell
+  #   - read_file
+  #   - write_file
+  # mcp_servers:          # Alias: mcp_config
+  #   filesystem:
+  #     command: "npx"
+  #     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+  # shell_timeout: 60
+  # max_output: 10000
+  # context_window: 200000
+  # auto_reload: false          # Watch skill paths & config for changes, auto-reload
+  # auto_reload_interval: 5     # Poll interval in seconds (1-300)
 
 # Session Configuration
 sessions:

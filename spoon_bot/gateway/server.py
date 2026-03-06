@@ -104,6 +104,22 @@ async def _lifespan(app: FastAPI):
             session_store_db_path=session_store_db_path,
             context_window=context_window,
         )
+        if agent_cfg.get("mcp_config") is not None:
+            create_kwargs["mcp_config"] = agent_cfg["mcp_config"]
+        if agent_cfg.get("shell_timeout") is not None:
+            create_kwargs["shell_timeout"] = int(agent_cfg["shell_timeout"])
+        if agent_cfg.get("max_output") is not None:
+            create_kwargs["max_output"] = int(agent_cfg["max_output"])
+        if agent_cfg.get("enabled_tools") is not None:
+            create_kwargs["enabled_tools"] = set(agent_cfg["enabled_tools"])
+        if agent_cfg.get("session_store_backend") is not None:
+            create_kwargs["session_store_backend"] = agent_cfg["session_store_backend"]
+        if agent_cfg.get("session_store_dsn") is not None:
+            create_kwargs["session_store_dsn"] = agent_cfg["session_store_dsn"]
+        if agent_cfg.get("session_store_db_path") is not None:
+            create_kwargs["session_store_db_path"] = agent_cfg["session_store_db_path"]
+        if agent_cfg.get("context_window") is not None:
+            create_kwargs["context_window"] = int(agent_cfg["context_window"])
         if agent_cfg.get("tool_profile"):
             create_kwargs["tool_profile"] = agent_cfg["tool_profile"]
         if agent_cfg.get("max_iterations"):

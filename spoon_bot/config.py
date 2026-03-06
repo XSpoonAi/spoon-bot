@@ -430,6 +430,18 @@ class AgentLoopConfig(BaseModel):
         description="Semantic memory search configuration"
     )
 
+    # Hot-reload
+    auto_reload: bool = Field(
+        default=False,
+        description="Enable background file watching for auto-reload of skills and MCP"
+    )
+    auto_reload_interval: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=300.0,
+        description="Polling interval in seconds for auto-reload file watcher (1-300)"
+    )
+
     @field_validator("workspace", mode="before")
     @classmethod
     def coerce_workspace_path(cls, v: Path | str | None) -> Path:
