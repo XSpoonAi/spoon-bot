@@ -501,6 +501,14 @@ class ChannelManager:
             logger.error("No agent set")
             return None
 
+        # Notify channel that processing is starting (typing indicators, etc.)
+        channel = self._channels.get(message.channel)
+        if channel:
+            try:
+                await channel.on_processing_start(message)
+            except Exception as e:
+                logger.debug(f"on_processing_start failed: {e}")
+
         try:
             logger.debug(
                 f"[{message.channel}] Processing message from {message.sender_id}: "
@@ -544,6 +552,13 @@ class ChannelManager:
                 reply_to=message.message_id,
                 metadata=message.metadata.copy(),
             )
+        finally:
+            # Always stop typing indicators, even on error
+            if channel:
+                try:
+                    await channel.on_processing_end(message)
+                except Exception as e:
+                    logger.debug(f"on_processing_end failed: {e}")
 
     @property
     def channel_names(self) -> list[str]:
