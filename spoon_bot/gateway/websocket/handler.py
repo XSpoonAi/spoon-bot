@@ -258,6 +258,8 @@ class WebSocketHandler:
             # Subscription
             "subscribe": self._handle_subscribe,
             "unsubscribe": self._handle_unsubscribe,
+            # Workspace
+            "workspace.tree": self._handle_workspace_tree,
             # Audio streaming
             "audio.stream.start": self._handle_audio_stream_start,
             "audio.stream.end": self._handle_audio_stream_end,
@@ -806,6 +808,29 @@ class WebSocketHandler:
 
         manager.unsubscribe(self.connection_id, events)
         return {"unsubscribed": events}
+
+    # ========== Workspace ==========
+
+    async def _handle_workspace_tree(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return workspace directory tree."""
+        from spoon_bot.gateway.api.v1.workspace import _build_tree, TreeNode
+        from pathlib import Path
+
+        agent = get_agent()
+        workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+
+        sub_path = params.get("path", "")
+        depth = min(max(int(params.get("depth", 3)), 1), 10)
+        include_hidden = bool(params.get("include_hidden", False))
+
+        target = (workspace / sub_path).resolve()
+        if not str(target).startswith(str(workspace.resolve())):
+            raise ValueError("Path is outside workspace boundary")
+        if not target.exists():
+            raise ValueError(f"Path not found: {sub_path}")
+
+        nodes = _build_tree(target, max_depth=depth, include_hidden=include_hidden)
+        return {"tree": [n.model_dump() for n in nodes]}
 
     # ========== Audio Streaming ==========
 

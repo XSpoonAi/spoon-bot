@@ -52,6 +52,9 @@ class ClientMethod(str, Enum):
     # Agent methods
     AGENT_STATUS = "agent.status"
 
+    # Workspace methods
+    WORKSPACE_TREE = "workspace.tree"
+
     # Audio streaming methods
     AUDIO_STREAM_START = "audio.stream.start"
     AUDIO_STREAM_END = "audio.stream.end"
