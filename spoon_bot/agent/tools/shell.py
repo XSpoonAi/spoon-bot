@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import shlex
+import subprocess
 import sys
 from typing import Any
 
@@ -97,10 +98,10 @@ class CommandValidator:
         # Process substitution
         re.compile(r"<\("),     # <(command)
         re.compile(r">\("),     # >(command)
-        # Dangerous redirections
-        re.compile(r">\s*/etc/"),        # Write to /etc/
-        re.compile(r">\s*/dev/"),        # Write to /dev/
-        re.compile(r">\s*~/.ssh/"),      # Write to SSH config
+        # Dangerous redirections (exclude fd-prefixed like 2>/dev/null)
+        re.compile(r">\s*/etc/"),           # Write to /etc/
+        re.compile(r"(?<!\d)>\s*/dev/"),    # Write to /dev/ (but not 2>/dev/null)
+        re.compile(r">\s*~/.ssh/"),         # Write to SSH config
         re.compile(r">\s*~/.bashrc"),    # Modify bashrc
         re.compile(r">\s*~/.profile"),   # Modify profile
         re.compile(r">\s*/root/"),       # Write to root home
@@ -498,50 +499,67 @@ class ShellTool(Tool):
             await process.wait()
             raise
 
-    async def _execute_with_shell(
+    @staticmethod
+    def _find_bash() -> str | None:
+        """Find a usable bash executable on the system."""
+        import shutil
+
+        bash = shutil.which("bash")
+        if bash:
+            return bash
+        for candidate in (
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Windows\System32\bash.exe",
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _run_sync(
         self,
         command: str,
         cwd: str,
     ) -> tuple[bytes, bytes, int]:
-        """Execute command using shell."""
+        """Synchronous subprocess execution (called via run_in_executor)."""
         if sys.platform == "win32":
-            # Use cmd.exe on Windows
-            process = await asyncio.create_subprocess_shell(
+            bash = self._find_bash()
+            if bash:
+                cwd = cwd.replace("\\", "/")
+                result = subprocess.run(
+                    [bash, "--login", "-c", command],
+                    capture_output=True,
+                    cwd=cwd,
+                    timeout=self.timeout,
+                )
+            else:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    shell=True,
+                    cwd=cwd,
+                    timeout=self.timeout,
+                )
+        elif self.use_shell:
+            result = subprocess.run(
                 command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                capture_output=True,
+                shell=True,
+                executable="/bin/sh",
                 cwd=cwd,
+                timeout=self.timeout,
             )
         else:
-            # Use /bin/sh on Unix with proper escaping
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            args = self._parse_command_args(command)
+            if not args:
+                raise ValueError("Empty command after parsing")
+            result = subprocess.run(
+                args,
+                capture_output=True,
                 cwd=cwd,
-                executable="/bin/sh",
+                timeout=self.timeout,
             )
-
-        return await self._communicate_with_timeout(process)
-
-    async def _execute_without_shell(
-        self,
-        command: str,
-        cwd: str,
-    ) -> tuple[bytes, bytes, int]:
-        """Execute command without shell (safer)."""
-        args = self._parse_command_args(command)
-        if not args:
-            raise ValueError("Empty command after parsing")
-
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-        )
-
-        return await self._communicate_with_timeout(process)
+        return result.stdout, result.stderr, result.returncode
 
     async def execute(
         self,
@@ -578,14 +596,10 @@ class ShellTool(Tool):
             return f"Error: Working directory not found: {cwd}"
 
         try:
-            if self.use_shell:
-                stdout, stderr, returncode = await self._execute_with_shell(
-                    command, cwd
-                )
-            else:
-                stdout, stderr, returncode = await self._execute_without_shell(
-                    command, cwd
-                )
+            loop = asyncio.get_running_loop()
+            stdout, stderr, returncode = await loop.run_in_executor(
+                None, self._run_sync, command, cwd
+            )
 
             output_parts = []
 
@@ -610,7 +624,7 @@ class ShellTool(Tool):
 
             return result
 
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
             return f"Error: Command timed out after {self.timeout} seconds"
         except FileNotFoundError as e:
             return f"Error: Command or file not found: {e}"
@@ -619,7 +633,8 @@ class ShellTool(Tool):
         except ValueError as e:
             return f"Error: Invalid command format: {e}"
         except Exception as e:
-            return f"Error executing command: {str(e)}"
+            logger.error(f"Shell execute error ({type(e).__name__}): {e!r}")
+            return f"Error executing command: {type(e).__name__}: {e}"
 
 
 class SafeShellTool(ShellTool):

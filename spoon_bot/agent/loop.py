@@ -9,15 +9,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging as stdlib_logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
 from loguru import logger
 
+
+class _InterceptHandler(stdlib_logging.Handler):
+    """Route stdlib logging into loguru so spoon-core agent logs are visible."""
+
+    def emit(self, record: stdlib_logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        frame, depth = stdlib_logging.currentframe(), 2
+        while frame and frame.f_code.co_filename == stdlib_logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
+stdlib_logging.basicConfig(handlers=[_InterceptHandler()], level=stdlib_logging.INFO, force=True)
+for _noisy in ("httpx", "httpcore", "urllib3", "hpack", "h2", "openai._base_client"):
+    stdlib_logging.getLogger(_noisy).setLevel(stdlib_logging.WARNING)
+
 # Import spoon-core SDK components (required)
 try:
     from spoon_ai.chat import ChatBot
-    from spoon_ai.schema import Message, ToolCall as CoreToolCall
+    from spoon_ai.schema import Message, ToolCall as CoreToolCall, AgentState
     from spoon_ai.llm.interface import LLMResponse
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
@@ -62,14 +83,7 @@ from spoon_bot.agent.tools.self_config import (
     MemoryManagementTool,
     SelfUpgradeTool,
 )
-from spoon_bot.agent.tools.web3 import (
-    BalanceCheckTool,
-    TransferTool,
-    SwapTool,
-    ContractCallTool,
-)
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
-from spoon_bot.agent.tools.document import DocumentParseTool
 from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.hotreload import HotReloadService
 from spoon_bot.services.spawn import SpawnTool
@@ -104,14 +118,15 @@ class AgentLoop:
     - spoon-bot's native OS tools (shell, filesystem, etc.)
     """
 
-    # Task-agnostic next_step_prompt that replaces the crypto-centric default.
-    # The original spoon-core template ("You can interact with the Neo blockchain …
-    # Pick tools by matching the user's request to the tool names …") is injected
-    # as a USER message every step, causing the LLM to waste iterations echoing
-    # policy text instead of doing useful work.  This minimal version avoids that.
+    # Injected as a USER message at each agent step to steer tool usage.
+    # Must be concise (it's repeated every iteration) but directive enough
+    # to prevent hallucination and ensure the model calls tools.
     DEFAULT_NEXT_STEP_PROMPT = (
-        "Continue with the next step. "
-        "When the task is fully complete, provide your final answer."
+        "Pick the best tool for the next step and call it. "
+        "Do NOT skip tool calls — if a tool can help, you MUST call it. "
+        "Do NOT fabricate output or pretend to run commands. "
+        "NEVER ask the user questions — make default choices autonomously. "
+        "Only stop when you can show a CONCRETE result (key, address, file path, etc.)."
     )
 
     def __init__(
@@ -334,11 +349,8 @@ class AgentLoop:
         # Build system prompt (spoon-bot context + available tool summaries)
         system_prompt = self._system_prompt or self.context.build_system_prompt()
 
-        # Context budget hint
-        system_prompt += (
-            f"\n\n[Context budget: {self.context_window:,} tokens. "
-            f"Be concise when context is limited.]\n"
-        )
+        # Context budget hint (compact)
+        system_prompt += f"\n\n[Context: {self.context_window:,} tokens — be concise.]\n"
 
         # NOTE: inactive-tools prompt is built later, after skill tools are
         # registered so that skill-provided tools are included in the list.
@@ -377,19 +389,8 @@ class AgentLoop:
         # Create MCP tools – expand each server into individual tools (#5)
         await self._init_mcp_tools()
 
-        # Only pass active (filtered) tools + MCP tools to the agent
-        active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
-
-        # Common agent kwargs
-        agent_kwargs: dict[str, Any] = {
-            "llm": self._chatbot,
-            "tools": ToolManager(active_tools) if active_tools else None,
-            "max_steps": self.max_iterations,
-            "system_prompt": system_prompt,
-            "next_step_prompt": self.DEFAULT_NEXT_STEP_PROMPT,
-        }
-
-        # Create SkillManager if enabled
+        # Create SkillManager if enabled — BEFORE building active_tools
+        # so that skill tools are included in the agent's ToolManager.
         if self._enable_skills:
             import inspect
             _sm_sig = inspect.signature(SkillManager.__init__)
@@ -401,12 +402,35 @@ class AgentLoop:
             if "include_default_paths" in _sm_sig.parameters:
                 _sm_kwargs["include_default_paths"] = False
             self._skill_manager = SkillManager(**_sm_kwargs)
-            # Pre-load skill tools into the ToolRegistry as inactive
+            # Load skill tools into the ToolRegistry
             self._register_skill_tools()
+            # Auto-activate skill tools so the agent can use them immediately
+            for skill_tool_name in self._skill_tool_names:
+                self.tools.activate_tool(skill_tool_name)
+
+        # Build active tools list AFTER skill tools are registered and activated
+        active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
+
+        # Common agent kwargs
+        agent_kwargs: dict[str, Any] = {
+            "llm": self._chatbot,
+            "tools": ToolManager(active_tools) if active_tools else None,
+            "max_steps": self.max_iterations,
+            "system_prompt": system_prompt,
+            "next_step_prompt": self.DEFAULT_NEXT_STEP_PROMPT,
+        }
+
+        if self._enable_skills:
             agent_kwargs["skill_manager"] = self._skill_manager
             self._agent = SpoonReactSkill(**agent_kwargs)
         else:
             self._agent = SpoonReactMCP(**agent_kwargs)
+
+        # Force-set the next_step_prompt so _refresh_prompts() won't overwrite
+        # it with spoon-core's default template (which duplicates tool lists
+        # and can cause the model to summarize instead of continue).
+        self._agent.next_step_prompt = self.DEFAULT_NEXT_STEP_PROMPT
+        self._agent._custom_next_step_prompt = True
 
         # Build dynamic-tools prompt now that all tools (native + skill) are registered
         inactive_tools = self.tools.get_inactive_tools()
@@ -486,24 +510,6 @@ class AgentLoop:
         self.tools.register(WebSearchTool())
         self.tools.register(WebFetchTool())
 
-        # Document processing tools
-        self.tools.register(DocumentParseTool(workspace=self.workspace))
-
-        # Web3 tools
-        self.tools.register(BalanceCheckTool())
-        self.tools.register(TransferTool())
-        self.tools.register(SwapTool())
-        self.tools.register(ContractCallTool())
-
-        # Toolkit tools (optional)
-        try:
-            from spoon_bot.toolkit.adapter import ToolkitAdapter
-            toolkit = ToolkitAdapter()
-            for tool in toolkit.load_all():
-                self.tools.register(tool)
-        except ImportError:
-            logger.debug("spoon-toolkits not available, skipping toolkit tools")
-
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
 
     def _register_skill_tools(self) -> None:
@@ -549,8 +555,8 @@ class AgentLoop:
 
         if self._skill_tool_names:
             logger.info(
-                f"Registered {len(self._skill_tool_names)} skill tool(s) "
-                f"as inactive: {sorted(self._skill_tool_names)}"
+                f"Registered {len(self._skill_tool_names)} skill tool(s): "
+                f"{sorted(self._skill_tool_names)}"
             )
 
     async def _init_mcp_tools(self) -> None:
@@ -626,8 +632,14 @@ class AgentLoop:
         new_sm = SkillManager(**_sm_kwargs)
         self._skill_manager = new_sm
 
+        # Remember old skill tool names before re-registering
+        old_skill_tool_names = set(self._skill_tool_names)
+
         # Re-register skill tools from the new SkillManager
         self._register_skill_tools()
+        # Auto-activate skill tools so the agent can use them immediately
+        for skill_tool_name in self._skill_tool_names:
+            self.tools.activate_tool(skill_tool_name)
 
         # Inject into the running agent
         if self._agent and isinstance(self._agent, SpoonReactSkill):
@@ -636,6 +648,21 @@ class AgentLoop:
                 if hasattr(self._agent, attr):
                     setattr(self._agent, attr, new_sm)
                     break
+
+        # Sync skill tools with the running agent's ToolManager
+        # (similar to how reload_mcp() syncs MCP tools)
+        if self._agent and hasattr(self._agent, "available_tools"):
+            tm: ToolManager = self._agent.available_tools
+            # Remove old skill tools that are no longer registered
+            for old_name in old_skill_tool_names - self._skill_tool_names:
+                if old_name in tm.tool_map:
+                    tm.remove_tool(old_name)
+            # Add newly registered skill tools
+            for skill_name in self._skill_tool_names:
+                tool = self.tools.get(skill_name)
+                if tool and skill_name not in tm.tool_map:
+                    tm.add_tool(tool)
+                    logger.info(f"Added skill tool '{skill_name}' to running agent")
 
         new_skills: list[str] = []
         try:
@@ -872,9 +899,34 @@ class AgentLoop:
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
 
+        # Defensive: reset agent state if stuck from a previous run
+        if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
+            logger.warning(
+                f"Agent {self._agent.name} was in {self._agent.state} state, "
+                f"resetting to IDLE before processing"
+            )
+            self._agent.state = AgentState.IDLE
+            self._agent.current_step = 0
+
+        # Clear shutdown flag so the agent loop can run
+        if hasattr(self._agent, '_shutdown_event') and self._agent._shutdown_event.is_set():
+            logger.info("Clearing previous shutdown signal before processing")
+            self._agent._shutdown_event.clear()
+
         # Run agent
         try:
             result = await self._agent.run(message)
+
+            logger.debug(f"Agent result type: {type(result)}, attrs: {[a for a in dir(result) if not a.startswith('_')]}")
+            if hasattr(result, 'content'):
+                logger.info(f"Agent result.content (first 500): {str(result.content)[:500]}")
+            if hasattr(result, 'steps'):
+                logger.info(f"Agent steps count: {len(result.steps) if result.steps else 0}")
+                for i, step in enumerate(result.steps or []):
+                    step_str = str(step)[:200]
+                    logger.debug(f"  Step {i}: {step_str}")
+            if hasattr(result, 'tool_calls'):
+                logger.info(f"Agent tool_calls: {result.tool_calls}")
 
             # Extract content
             if hasattr(result, "content"):
@@ -888,6 +940,14 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             raise
+        finally:
+            # Always ensure agent is back in IDLE state after processing
+            if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
+                logger.warning(
+                    f"Post-run cleanup: resetting agent from {self._agent.state} to IDLE"
+                )
+                self._agent.state = AgentState.IDLE
+                self._agent.current_step = 0
 
         # Save to session
         try:
@@ -1261,16 +1321,9 @@ class AgentLoop:
         mapping — the LLM reads tool descriptions and decides for itself.
         """
         lines: list[str] = [
-            "\n\n## Dynamically Loadable Tools\n\n"
-            "The following specialized tools are registered but not yet active. "
-            "Use `activate_tool(action='list')` to refresh this list at any time, "
-            "or `activate_tool(action='activate', tool_name='<name>')` to load "
-            "a tool. You can activate multiple tools in one call using "
-            "comma-separated names.\n\n"
-            "**Read each tool's description carefully and activate the ones "
-            "you need BEFORE answering the user's question. "
-            "Always prefer specialized tools over generic web_search when "
-            "a matching tool is available.**\n"
+            "\n\n## Inactive Tools (activate on demand)\n\n"
+            "Call `activate_tool(action='activate', tool_name='<name>')` to load any of these. "
+            "Activate what you need BEFORE answering.\n"
         ]
 
         for tool in inactive_tools.values():

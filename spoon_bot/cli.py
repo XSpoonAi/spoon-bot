@@ -10,7 +10,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -115,6 +115,10 @@ def agent(
         20, "--max-iterations",
         help="Maximum tool call iterations",
     ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Show detailed step-by-step agent logs",
+    ),
 ):
     """
     Run the spoon-bot agent.
@@ -124,6 +128,7 @@ def agent(
 
     Configuration priority: CLI args > YAML agent section > env vars.
     """
+    _configure_logging(verbose)
     asyncio.run(_run_agent(
         message=message,
         model=model,
@@ -162,6 +167,143 @@ class AgentProgressContext:
         """Update the progress description."""
         if self.task_id is not None:
             self.progress.update(self.task_id, description=description)
+
+
+import re as _re
+
+_STEP_RE = _re.compile(r"Agent \S+ is running step (\d+)/(\d+)")
+_TOOL_CALL_RE = _re.compile(r"Tool call: (\S+)\((.*)?\)", _re.DOTALL)
+_TOOL_RESULT_RE = _re.compile(r"Tool (\S+) executed with result: (.+)", _re.DOTALL)
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
+_OBSERVED_PREFIX = _re.compile(r"^Observed output of cmd \S+ execution:\s*")
+
+
+def _tui_step_filter(record):
+    """Only pass through agent step/tool messages in TUI mode."""
+    msg = record["message"]
+    return bool(
+        _STEP_RE.search(msg)
+        or _TOOL_CALL_RE.search(msg)
+        or _TOOL_RESULT_RE.search(msg)
+    )
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _truncate(text: str, max_len: int = 120) -> str:
+    text = _strip_ansi(text)
+    text = _OBSERVED_PREFIX.sub("", text)
+    first_line = text.split("\n", 1)[0].strip()
+    if len(first_line) > max_len:
+        return first_line[: max_len - 3] + "..."
+    return first_line
+
+
+def _format_tool_args(tool_name: str, raw_args: str) -> str:
+    """Extract a concise, human-readable summary from raw JSON tool args."""
+    import json as _json
+
+    if not raw_args:
+        return ""
+    try:
+        obj = _json.loads(raw_args)
+    except (ValueError, TypeError):
+        return f"[dim]{_truncate(raw_args, 60)}[/dim]"
+
+    if not isinstance(obj, dict):
+        return f"[dim]{_truncate(raw_args, 60)}[/dim]"
+
+    # Show the most meaningful argument for common tools
+    if tool_name == "shell":
+        cmd = obj.get("command", "")
+        return f"[dim]$ {_truncate(cmd, 70)}[/dim]"
+    if tool_name == "skill_marketplace":
+        action = obj.get("action", "")
+        url = obj.get("url", "")
+        if url:
+            return f"[dim]{action} → {_truncate(url, 60)}[/dim]"
+        return f"[dim]{action}[/dim]"
+    if tool_name == "read_text_file":
+        path = obj.get("path", "")
+        return f"[dim]{_truncate(path, 70)}[/dim]"
+    if tool_name == "write_file":
+        path = obj.get("path", obj.get("file_path", ""))
+        return f"[dim]→ {_truncate(path, 70)}[/dim]"
+    if tool_name == "edit_file":
+        path = obj.get("path", "")
+        return f"[dim]{_truncate(path, 70)}[/dim]"
+    if tool_name == "list_directory":
+        path = obj.get("path", "")
+        return f"[dim]{_truncate(path, 70)}[/dim]"
+    if tool_name == "self_upgrade":
+        return f"[dim]{obj.get('action', '')}[/dim]"
+
+    # Generic: show keys and abbreviated values
+    parts = []
+    for k, v in list(obj.items())[:3]:
+        sv = str(v)
+        if len(sv) > 30:
+            sv = sv[:27] + "..."
+        parts.append(f"{k}={sv}")
+    return "[dim]" + ", ".join(parts) + "[/dim]"
+
+
+def _tui_step_sink(message):
+    """Render agent step logs as compact TUI lines (opencode-style)."""
+    text = message.record["message"]
+
+    m = _STEP_RE.search(text)
+    if m:
+        cur, total = m.group(1), m.group(2)
+        console.print(f"\n  [bold cyan]●[/bold cyan] [bold]Step {cur}/{total}[/bold]", highlight=False)
+        return
+
+    m = _TOOL_CALL_RE.search(text)
+    if m:
+        name = m.group(1)
+        args = (m.group(2) or "").strip()
+        args_display = _format_tool_args(name, args)
+        if args_display:
+            console.print(f"    [dim]╭─[/dim] [yellow]{name}[/yellow] {args_display}", highlight=False)
+        else:
+            console.print(f"    [dim]╭─[/dim] [yellow]{name}[/yellow]", highlight=False)
+        return
+
+    m = _TOOL_RESULT_RE.search(text)
+    if m:
+        raw = m.group(2).strip()
+        result = _truncate(raw, 90)
+        if not result:
+            return
+        if raw.startswith("```diff") or raw.startswith("---"):
+            console.print("    [dim]╰→[/dim] [green]edit applied[/green]", highlight=False)
+        elif "Error" in result or "failed" in result.lower():
+            console.print(f"    [dim]╰→[/dim] [red]{result}[/red]", highlight=False)
+        elif "SUCCESS" in result or "Successfully" in result:
+            console.print(f"    [dim]╰→[/dim] [green]{result}[/green]", highlight=False)
+        else:
+            console.print(f"    [dim]╰→[/dim] {result}", highlight=False)
+        return
+
+
+
+def _configure_logging(verbose: bool = False) -> None:
+    """Set loguru output level based on verbosity."""
+    import sys as _sys
+    from loguru import logger as _logger
+
+    _logger.remove()
+    if verbose:
+        _logger.add(_sys.stderr, level="DEBUG")
+    else:
+        _logger.add(
+            _tui_step_sink,
+            level="INFO",
+            filter=_tui_step_filter,
+            format="{message}",
+        )
 
 
 async def _run_agent(
@@ -212,23 +354,18 @@ async def _run_agent(
     effective_enable_skills = agent_cfg.get("enable_skills", True)
 
     # ------------------------------------------------------------------
-    # 3. Show startup panel with effective values
+    # 3. Show startup header (opencode-style compact)
     # ------------------------------------------------------------------
-    startup_info = Table.grid(padding=(0, 2))
-    startup_info.add_column()
-    startup_info.add_column()
-    startup_info.add_row("[dim]Provider:[/dim]", effective_provider or "(not set)")
-    startup_info.add_row("[dim]Model:[/dim]", effective_model or "(not set)")
-    startup_info.add_row("[dim]Workspace:[/dim]", str(effective_workspace))
-    startup_info.add_row("[dim]Max iterations:[/dim]", str(effective_max_iterations))
-    if effective_tool_profile:
-        startup_info.add_row("[dim]Tool profile:[/dim]", effective_tool_profile)
-
-    console.print(Panel(
-        startup_info,
-        title="[bold blue]spoon-bot[/bold blue] - Local AI Agent",
-        border_style="blue",
-    ))
+    _model_display = effective_model or "(not set)"
+    _provider_display = effective_provider or ""
+    _ws_short = str(effective_workspace).replace(str(Path.home()), "~")
+    console.print()
+    console.rule("[bold blue]spoon-bot[/bold blue]", style="dim")
+    if _provider_display:
+        console.print(f"  [dim]{_provider_display} /[/dim] [bold]{_model_display}[/bold]", highlight=False)
+    else:
+        console.print(f"  [bold]{_model_display}[/bold]", highlight=False)
+    console.print(f"  [dim]{_ws_short}[/dim]", highlight=False)
 
     # ------------------------------------------------------------------
     # 4. Create agent with merged config
@@ -260,15 +397,12 @@ async def _run_agent(
             create_kwargs["auto_reload_interval"] = float(agent_cfg["auto_reload_interval"])
 
     try:
-        with console.status("[bold blue]Initializing agent...[/bold blue]") as status:
-            status.update("[bold blue]Loading LLM provider...[/bold blue]")
-            agent = await create_agent(**create_kwargs)
-            status.update("[bold blue]Loading tools...[/bold blue]")
-
-        # Show loaded tools count
+        console.print("  [dim]Initializing...[/dim]", end="")
+        agent = await create_agent(**create_kwargs)
         tool_count = len(agent.tools)
         skill_count = len(agent.skills)
-        print_info(f"Loaded {tool_count} tools, {skill_count} skills")
+        console.print(f"\r  [green]Ready[/green] — {tool_count} tools · {skill_count} skills")
+        console.rule(style="dim")
 
     except ValueError as e:
         # Configuration error (likely missing API key)
@@ -310,19 +444,18 @@ async def _run_agent(
     try:
         if message:
             # One-shot mode
-            console.print(f"\n[bold cyan]You:[/bold cyan] {message}\n")
+            console.print(f"\n  [bold cyan]>[/bold cyan] {message}\n")
 
             try:
                 async with AgentProgressContext(console) as progress:
                     progress.update("Processing your request...")
                     response = await agent.process(message)
 
-                console.print(Panel(
-                    Markdown(response),
-                    title="[bold green]Response[/bold green]",
-                    border_style="green",
-                    padding=(1, 2),
-                ))
+                console.print()
+                console.rule(style="dim")
+                console.print()
+                console.print(Markdown(response), highlight=False)
+                console.print()
             except Exception as e:
                 print_error(e)
                 raise typer.Exit(1)
@@ -414,6 +547,8 @@ async def _run_agent(
     finally:
         if manager:
             await manager.stop()
+        # Clean up agent resources (MCP connections, skills, etc.)
+        await agent.cleanup()
 
 
 @app.command()
@@ -825,18 +960,57 @@ async def _run_gateway(
 
     console.print("\n[dim]Gateway running. Press Ctrl+C to stop.[/dim]\n")
 
-    # Keep running
-    try:
-        while manager.is_running:
-            await asyncio.sleep(1)
+    # Graceful shutdown: use signal handler so Ctrl+C cleanly stops the
+    # gateway.  On Windows, loop.add_signal_handler is unsupported so we
+    # use signal.signal + loop.call_soon_threadsafe to set an asyncio
+    # Event from the signal-handler context.  Double Ctrl+C forces exit.
+    import signal
 
-    except KeyboardInterrupt:
-        console.print("\n[dim]Shutting down gracefully...[/dim]")
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+    _force_next = False
+
+    def _on_signal(*_args: Any) -> None:
+        nonlocal _force_next
+        if _force_next:
+            # Second Ctrl+C — force-kill immediately
+            os._exit(1)
+        _force_next = True
+        # Schedule set() on the event loop (signal-handler safe)
+        loop.call_soon_threadsafe(shutdown_event.set)
+
+    original_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _on_signal)
+    try:
+        signal.signal(signal.SIGTERM, _on_signal)
+    except (OSError, ValueError):
+        pass  # SIGTERM may not exist on Windows
+
+    # Keep running until shutdown is requested
+    try:
+        while manager.is_running and not shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass  # Caught by signal handler above
     except Exception as e:
         print_error(e)
     finally:
+        console.print("\n[dim]Shutting down gracefully...[/dim]")
+        # Signal agent to stop any in-progress work
+        if hasattr(agent, '_agent') and agent._agent:
+            if hasattr(agent._agent, '_shutdown_event'):
+                agent._agent._shutdown_event.set()
+        # Stop all channels, message bus, and clean up resources
         with console.status("[bold blue]Stopping channels...[/bold blue]"):
             await manager.stop()
+        with console.status("[bold blue]Cleaning up agent...[/bold blue]"):
+            await agent.cleanup()
+        # Restore original signal handler
+        signal.signal(signal.SIGINT, original_sigint)
 
     print_success("Gateway stopped")
 

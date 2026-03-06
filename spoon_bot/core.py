@@ -62,7 +62,7 @@ try:
         X402PaymentService = None
 
     SPOON_CORE_AVAILABLE = True
-    logger.info("spoon-core SDK loaded successfully")
+    logger.debug("spoon-core SDK loaded")
 
 except ImportError as e:
     logger.error(f"spoon-core SDK is required but not installed: {e}")

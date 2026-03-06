@@ -470,7 +470,10 @@ class SelfUpgradeTool(Tool):
         # Include SKILL.md content for newly added skills so the agent
         # knows how to use them right away.
         if added:
+            ws = str(self._workspace).replace("\\", "/")
             for skill_name in added:
+                skill_dir = f"{ws}/skills/{skill_name}"
+                parts.append(f"  Installed at: {skill_dir}")
                 skill_md = self._read_skill_md(skill_name)
                 if skill_md:
                     parts.append("")
@@ -479,11 +482,11 @@ class SelfUpgradeTool(Tool):
                     parts.append(f"--- end {skill_name} ---")
             parts.append("")
             parts.append(
-                "NOTE: To use a newly added skill, read its SKILL.md above "
-                "and follow the instructions. Use the `shell` tool to run "
-                "any commands or scripts described in the skill. You do NOT "
-                "need a special Python tool — `shell` is sufficient for "
-                "executing any commands the skill requires."
+                f"NOTE: Skill scripts are at {ws}/skills/<skill_name>/scripts/. "
+                "Use ABSOLUTE paths when running scripts via `shell`, e.g.: "
+                f"bash {ws}/skills/{added[0]}/scripts/<script>.sh. "
+                "Use the `shell` tool to run any commands or scripts. "
+                "You do NOT need a special Python tool."
             )
 
         return "\n".join(parts)
