@@ -11,25 +11,45 @@ Install with: pip install spoon-ai
 __version__ = "0.1.0"
 __author__ = "XSpoon Team"
 
+import warnings as _warnings
+import sys as _sys
+from loguru import logger as _logger
+_logger.remove()
+if _sys.stderr and hasattr(_sys.stderr, "write"):
+    _logger.add(_sys.stderr, level="WARNING")
+
 # Check for spoon-core SDK availability
 _SPOON_CORE_AVAILABLE = False
 _SPOON_CORE_ERROR = None
 
 try:
-    from spoon_ai.chat import ChatBot
-    from spoon_ai.schema import Message
-    from spoon_ai.llm.interface import LLMResponse
-    from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
-    from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
-    from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
-    from spoon_ai.skills import SkillManager
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", DeprecationWarning)
+        from spoon_ai.chat import ChatBot
+        from spoon_ai.schema import Message
+        from spoon_ai.llm.interface import LLMResponse
+        from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
+        from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
+        from spoon_ai.tools import BaseTool, ToolManager
+        from spoon_ai.skills import SkillManager
 
     _SPOON_CORE_AVAILABLE = True
 
-    # Import spoon-bot components that require spoon-core
-    from spoon_bot.core import SpoonBot, SpoonBotConfig, create_agent as create_spoon_bot
-    from spoon_bot.agent.loop import AgentLoop, create_agent
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", DeprecationWarning)
+            from spoon_ai.tools.mcp_tool import MCPTool
+        MCP_TOOL_AVAILABLE = True
+        _MCP_TOOL_ERROR = None
+    except ImportError as e:
+        MCPTool = None
+        MCP_TOOL_AVAILABLE = False
+        _MCP_TOOL_ERROR = e
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", DeprecationWarning)
+        from spoon_bot.core import SpoonBot, SpoonBotConfig, create_agent as create_spoon_bot
+        from spoon_bot.agent.loop import AgentLoop, create_agent
 
 except ImportError as e:
     _SPOON_CORE_ERROR = e
@@ -43,6 +63,8 @@ except ImportError as e:
     ToolManager = None
     MCPTool = None
     SkillManager = None
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_ERROR = e
     SpoonBot = None
     SpoonBotConfig = None
     create_spoon_bot = None

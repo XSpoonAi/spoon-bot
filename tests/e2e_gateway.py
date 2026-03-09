@@ -315,21 +315,50 @@ async def _ws_tests():
                 "method": "chat.send",
                 "params": {"message": "Say hi briefly.", "stream": True},
             }))
-            chunks = []
-            done = False
+            chunks: list[str] = []
+            done_content = ""
+            seen_stream_done = False
+            seen_response = False
+            response_content = ""
             deadline = time.time() + 60
-            while time.time() < deadline and not done:
+            while time.time() < deadline and not (seen_stream_done and seen_response):
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
                 evt = msg.get("event", "")
                 if evt == "agent.stream.chunk":
-                    c = msg.get("data", {}).get("content", "")
-                    if c:
-                        chunks.append(c)
-                elif evt in ("agent.stream.done", "agent.complete"):
-                    done = True
+                    data = msg.get("data", {})
+                    chunk_type = data.get("type", "content")
+                    delta = data.get("delta", "")
+                    if chunk_type == "content" and isinstance(delta, str) and delta:
+                        chunks.append(delta)
+                elif evt == "agent.stream.done":
+                    seen_stream_done = True
+                    data = msg.get("data", {})
+                    content = data.get("content", "")
+                    if isinstance(content, str):
+                        done_content = content
                 elif msg.get("type") == "response" and msg.get("id") == "t2":
-                    done = True
-            ok("WS chat (stream)", f"{len(chunks)} chunks, {len(''.join(chunks))} chars")
+                    seen_response = True
+                    result = msg.get("result", {})
+                    content = result.get("content", "")
+                    if isinstance(content, str):
+                        response_content = content
+
+            stream_content = "".join(chunks)
+            final_content = response_content or done_content
+
+            if not seen_stream_done:
+                fail("WS chat (stream)", "missing agent.stream.done")
+            elif not seen_response:
+                fail("WS chat (stream)", "missing final response")
+            elif not stream_content:
+                fail("WS chat (stream)", "no streamed content chunks")
+            elif final_content and stream_content != final_content:
+                fail(
+                    "WS chat (stream)",
+                    f"chunk content mismatch (chunks={len(stream_content)} final={len(final_content)})",
+                )
+            else:
+                ok("WS chat (stream)", f"{len(chunks)} chunks, {len(stream_content)} chars")
     except Exception as e:
         fail("WS chat (stream)", str(e))
 

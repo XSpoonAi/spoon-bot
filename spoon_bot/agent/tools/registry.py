@@ -16,7 +16,7 @@ from spoon_bot.agent.tools.base import Tool, ToolSchema
 # ---------------------------------------------------------------------------
 CORE_TOOLS: frozenset[str] = frozenset({
     "shell", "read_file", "write_file", "edit_file", "list_dir",
-    "web_search", "web_fetch", "activate_tool",
+    "self_config", "memory", "activate_tool", "self_upgrade",
 })
 
 # ---------------------------------------------------------------------------
@@ -27,21 +27,15 @@ TOOL_PROFILES: dict[str, frozenset[str]] = {
     "core": CORE_TOOLS,
     "coding": frozenset({
         "shell", "read_file", "write_file", "edit_file", "list_dir",
-        "web_search", "web_fetch", "document_parse",
-    }),
-    "web3": frozenset({
-        "balance_check", "transfer", "swap", "contract_call",
         "web_search", "web_fetch",
     }),
     "research": frozenset({
         "web_search", "web_fetch", "read_file", "list_dir",
-        "document_parse",
     }),
     "full": frozenset({
         "shell", "read_file", "write_file", "edit_file", "list_dir",
-        "self_config", "memory", "self_upgrade", "spawn",
-        "web_search", "web_fetch", "document_parse",
-        "balance_check", "transfer", "swap", "contract_call",
+        "self_config", "memory", "self_upgrade", "activate_tool", "spawn",
+        "web_search", "web_fetch",
     }),
 }
 

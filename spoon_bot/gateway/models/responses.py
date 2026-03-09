@@ -16,6 +16,8 @@ class MetaInfo(BaseModel):
     request_id: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     duration_ms: int | None = None
+    trace_id: str | None = None
+    timing: dict[str, Any] | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -69,6 +71,15 @@ class ToolCallInfo(BaseModel):
     result: str | None = None
 
 
+class TranscriptionInfo(BaseModel):
+    """Audio transcription information."""
+
+    text: str
+    language: str | None = None
+    duration_seconds: float | None = None
+    provider: str = "whisper"
+
+
 class ChatResponse(BaseModel):
     """Chat response model."""
 
@@ -76,6 +87,7 @@ class ChatResponse(BaseModel):
     tool_calls: list[ToolCallInfo] = Field(default_factory=list)
     usage: UsageInfo | None = None
     thinking_content: str | None = None
+    transcription: TranscriptionInfo | None = None
 
 
 class StreamChunk(BaseModel):
@@ -179,6 +191,22 @@ class AgentStats(BaseModel):
     skills_loaded: int = 0
 
 
+class ChannelStatusInfo(BaseModel):
+    """Status of a single channel."""
+
+    name: str
+    status: str  # "running", "stopped", "error"
+    message: str | None = None
+
+
+class ChannelsInfo(BaseModel):
+    """Aggregate channels status."""
+
+    running: int = 0
+    total: int = 0
+    channels: list[ChannelStatusInfo] = Field(default_factory=list)
+
+
 class StatusResponse(BaseModel):
     """Agent status response."""
 
@@ -186,6 +214,7 @@ class StatusResponse(BaseModel):
     current_task: str | None = None
     uptime: int  # seconds
     stats: AgentStats
+    channels: ChannelsInfo | None = None
 
 
 class HealthCheck(BaseModel):

@@ -7,12 +7,13 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **Multi-Provider LLM**: Supports Anthropic, OpenAI, DeepSeek, Gemini, OpenRouter (400+ models), and more
 - **Agent-centric**: Autonomous execution with safety rails and dynamic tool loading
 - **OS-native**: Built-in shell/filesystem tools as priority
-- **Memory-first**: Four-layer memory system (file + short-term + Mem0 + checkpointer)
+- **Memory-first**: Four-layer memory system (file + semantic search via memsearch + short-term + checkpointer)
 - **Session Persistence**: Pluggable backends — JSONL files (default), SQLite, or PostgreSQL
 - **Web Search**: Built-in Tavily integration for real-time information retrieval
 - **Self-managing**: Self-configuration, self-upgrade, memory management tools
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem with dynamic tool activation
+- **Multi-channel**: Telegram bot integration with polling/webhook modes
 - **Multi-mode**: Agent / Interactive / Gateway (REST + WebSocket)
 
 ## Requirements
@@ -87,6 +88,40 @@ OPENROUTER_API_KEY=sk-or-xxx
 # Optional: web search
 TAVILY_API_KEY=tvly-xxx
 ```
+
+### Channel Configuration (config.yaml)
+
+To enable Telegram or other channel integrations, create a `config.yaml` in the project root:
+
+```yaml
+agent:
+  provider: anthropic
+  model: claude-sonnet-4-20250514
+  # api_key: sk-xxx  # Or use environment variable
+
+channels:
+  telegram:
+    enabled: true
+    accounts:
+      - name: my_bot
+        token: ${TELEGRAM_BOT_TOKEN}   # Reference env var
+        mode: polling                   # polling (default) or webhook
+        allowed_users: [123456789]      # Optional: restrict to specific user IDs
+        proxy_url: "http://127.0.0.1:7897"  # Optional: for restricted networks
+        groups:
+          enabled: false
+          require_mention: true
+```
+
+**Telegram setup:**
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) and get the token
+2. Set `TELEGRAM_BOT_TOKEN` in `.env` or directly in `config.yaml`
+3. Install the Telegram dependency: `uv sync --extra telegram`
+
+**Proxy configuration** (for networks that cannot access Telegram API directly):
+
+The proxy is resolved in priority order: `config.yaml proxy_url` > `TELEGRAM_PROXY` env var > `HTTPS_PROXY` env var. Users with unrestricted network access do not need this.
 
 ## Quick Start
 
@@ -327,6 +362,99 @@ When running the gateway server, session persistence is configured via environme
 SESSION_STORE_BACKEND=sqlite SESSION_STORE_DB_PATH=./sessions.db spoon-bot gateway
 ```
 
+## Semantic Memory (memsearch)
+
+spoon-bot supports semantic memory search via [memsearch](https://github.com/zilliztech/memsearch), which provides hybrid search (dense vector + BM25 full-text) over the agent's Markdown memory files using Milvus Lite.
+
+### Setup
+
+Install the `memory` extra:
+
+```bash
+# With uv
+uv sync --extra memory
+
+# With pip
+pip install -e ".[memory]"
+```
+
+> **Note:** Milvus Lite requires **Linux or macOS**. On Windows, use WSL.
+
+### Environment Variables
+
+Embedding credentials use `OPENAI_EMBEDDING_*` variables to avoid conflicts with standard `OPENAI_*` keys (which may be used for Whisper STT/TTS or the OpenAI LLM provider). If `OPENAI_EMBEDDING_*` variables are not set, the system falls back to the standard `OPENAI_*` variables.
+
+```bash
+# Embedding API (OpenAI-compatible endpoint)
+OPENAI_EMBEDDING_API_KEY=your-embedding-api-key
+OPENAI_EMBEDDING_BASE_URL=https://ai.gitee.com/v1   # or https://api.openai.com/v1
+OPENAI_EMBEDDING_MODEL=Qwen3-Embedding-0.6B          # or text-embedding-3-small
+
+# These are used as fallback if OPENAI_EMBEDDING_* are not set:
+# OPENAI_API_KEY=sk-xxx
+# OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+### Programmatic Usage
+
+```python
+from pathlib import Path
+from spoon_bot.memory.semantic_store import SemanticMemoryStore
+
+store = SemanticMemoryStore(
+    workspace=Path("./workspace"),
+    embedding_provider="openai",
+    embedding_model="Qwen3-Embedding-0.6B",
+    embedding_api_key="your-key",           # or set OPENAI_EMBEDDING_API_KEY env
+    embedding_base_url="https://ai.gitee.com/v1",  # or set OPENAI_EMBEDDING_BASE_URL env
+)
+
+# Index existing memory files
+await store.initialize()
+
+# Semantic search
+results = await store.async_search("Redis caching configuration")
+for r in results:
+    print(f"[{r['heading']}] score={r['score']:.3f}  {r['content'][:80]}")
+
+# File-based operations still work as before
+store.add_memory("API uses JWT RS256 tokens", category="Architecture Decisions")
+store.add_daily_note("Deployed v2.1.0 to staging")
+```
+
+### AgentLoop Integration
+
+Enable semantic memory in the agent loop via `MemSearchConfig`:
+
+```python
+from spoon_bot.agent.loop import create_agent
+from spoon_bot.config import MemSearchConfig
+
+agent = await create_agent(
+    provider="openrouter",
+    model="google/gemini-3-flash-preview",
+    memsearch_config=MemSearchConfig(
+        enabled=True,
+        embedding_provider="openai",
+        # Model, API key, and base URL are read from env if not set here:
+        #   OPENAI_EMBEDDING_MODEL, OPENAI_EMBEDDING_API_KEY, OPENAI_EMBEDDING_BASE_URL
+    ),
+)
+
+# Or pass as a dict:
+agent = await create_agent(
+    provider="openrouter",
+    model="google/gemini-3-flash-preview",
+    memsearch_config={
+        "enabled": True,
+        "embedding_provider": "openai",
+        "embedding_model": "Qwen3-Embedding-0.6B",
+    },
+)
+```
+
+When enabled, the `memory` tool's `search` action automatically uses semantic search instead of basic text matching.
+
 ## Web Search
 
 spoon-bot includes a built-in web search tool powered by Tavily. The agent autonomously decides when to search the web for real-time information.
@@ -422,10 +550,19 @@ Default workspace: `~/.spoon-bot/workspace/`
 ## CLI Commands
 
 ```bash
+# Agent mode (interactive REPL)
 spoon-bot agent                        # Interactive mode (default provider)
 spoon-bot agent --provider openai      # Use specific provider
 spoon-bot agent --model gpt-5.2       # Use specific model
 spoon-bot agent -m "message"           # One-shot mode
+
+# Gateway mode (multi-channel server)
+spoon-bot gateway                      # Start all configured channels
+spoon-bot gateway --channels telegram  # Start Telegram channel only
+spoon-bot gateway --no-cli             # Disable CLI input in gateway mode
+spoon-bot gateway --config path/to/config.yaml  # Custom config file
+
+# General
 spoon-bot onboard                      # Initialize workspace
 spoon-bot gateway                      # Start REST + WebSocket gateway
 spoon-bot status                       # Show status
@@ -446,7 +583,17 @@ uv sync --extra gateway
 pip install -e ".[gateway]"
 ```
 
-### Quick Start
+### Quick Start (CLI)
+
+```bash
+# Install gateway dependencies
+uv sync --extra gateway --extra telegram
+
+# Start gateway with Telegram channel
+spoon-bot gateway --channels telegram
+```
+
+### Quick Start (Programmatic)
 
 ```python
 import asyncio
@@ -476,10 +623,12 @@ asyncio.run(main())
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/health` | GET | Health check (includes channel status) |
+| `/ready` | GET | Readiness check |
 | `/v1/auth/login` | POST | Authenticate and get JWT tokens |
 | `/v1/agent/chat` | POST | Send message to agent (sync or streaming) |
 | `/v1/agent/chat/async` | POST | Async task-based chat |
-| `/v1/agent/status` | GET | Get agent status |
+| `/v1/agent/status` | GET | Agent and channel status |
 | `/v1/sessions` | GET/POST | Manage sessions |
 | `/v1/tools` | GET | List available tools |
 | `/v1/skills` | GET/POST | List and manage skills |
@@ -574,14 +723,17 @@ uv sync --extra dev
 # Or with pip
 pip install -e ".[dev]"
 
-# Run tests
-pytest tests/
+# Core regression suite (default, recommended for daily development)
+uv run python scripts/run_test_suite.py
 
-# Run specific test suites
-pytest tests/test_session_persistence.py    # Session backends
-pytest tests/test_gateway_ws_bugs.py        # WebSocket protocol
-pytest tests/test_gateway_tracing.py        # Tracing & error codes
-pytest tests/test_tools.py                  # Tool system
+# Core suite with extra pytest flags
+uv run python scripts/run_test_suite.py -- --maxfail=1 -q
+
+# Extended scenarios (e2e/live/capability + high-churn/platform-specific tests)
+uv run python scripts/run_test_suite.py --suite extended
+
+# Full suite (core + extended)
+uv run python scripts/run_test_suite.py --suite all
 
 # Lint
 ruff check spoon_bot/
@@ -598,6 +750,9 @@ ruff check spoon_bot/
 | `GEMINI_API_KEY` | — | Google Gemini API key |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key |
 | `TAVILY_API_KEY` | — | Tavily web search API key |
+| `OPENAI_EMBEDDING_API_KEY` | — | Embedding provider API key (falls back to `OPENAI_API_KEY`) |
+| `OPENAI_EMBEDDING_BASE_URL` | — | Embedding provider base URL (falls back to `OPENAI_BASE_URL`) |
+| `OPENAI_EMBEDDING_MODEL` | — | Embedding model name (e.g. `Qwen3-Embedding-0.6B`) |
 | `SESSION_STORE_BACKEND` | `file` | Session backend: `file`, `sqlite`, `postgres` |
 | `SESSION_STORE_DB_PATH` | `./workspace/sessions.db` | SQLite database path |
 | `SESSION_STORE_DSN` | — | PostgreSQL connection string |

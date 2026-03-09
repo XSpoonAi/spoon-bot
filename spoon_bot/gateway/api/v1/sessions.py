@@ -84,6 +84,7 @@ async def create_session(
 
     # Create session
     session = sessions_manager.get_or_create(request.key)
+    sessions_manager.save(session)
 
     return APIResponse(
         success=True,

@@ -31,7 +31,6 @@ Usage:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -48,7 +47,6 @@ try:
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
     from spoon_ai.agents.skill_mixin import SkillEnabledMixin
     from spoon_ai.tools import BaseTool, ToolManager
-    from spoon_ai.tools.mcp_tool import MCPTool
     from spoon_ai.skills import SkillManager
     from spoon_ai.graph import StateGraph
 
@@ -64,7 +62,7 @@ try:
         X402PaymentService = None
 
     SPOON_CORE_AVAILABLE = True
-    logger.info("spoon-core SDK loaded successfully")
+    logger.debug("spoon-core SDK loaded")
 
 except ImportError as e:
     logger.error(f"spoon-core SDK is required but not installed: {e}")
@@ -73,14 +71,26 @@ except ImportError as e:
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
     ) from e
 
+try:
+    from spoon_ai.tools.mcp_tool import MCPTool
+    MCP_TOOL_AVAILABLE = True
+    _MCP_TOOL_IMPORT_ERROR: Exception | None = None
+except ImportError as e:
+    MCPTool = None  # type: ignore[assignment]
+    MCP_TOOL_AVAILABLE = False
+    _MCP_TOOL_IMPORT_ERROR = e
+    logger.warning(
+        f"MCPTool import failed ({e}). MCP integrations are disabled; SpoonBot core remains available."
+    )
+
 
 @dataclass
 class SpoonBotConfig:
     """Configuration for SpoonBot."""
 
     # LLM settings
-    model: str = "claude-sonnet-4-20250514"
-    provider: str = "anthropic"
+    model: str = ""
+    provider: str = ""
     api_key: str | None = None
     base_url: str | None = None
 
@@ -103,37 +113,24 @@ class SpoonBotConfig:
 
     @classmethod
     def from_env(cls) -> "SpoonBotConfig":
-        """Create config from environment variables.
+        """Create config from YAML + environment variables.
 
-        Supports both SPOON_* (original) and SPOON_BOT_* (gateway) env vars.
-
-        Provider-specific API key and base URL resolution is delegated to
-        spoon-core's LLMManager / ConfigurationManager, which natively
-        supports all registered providers (openai, anthropic, openrouter,
-        deepseek, gemini, ollama) and reads from standard env vars like
-        ``OPENROUTER_API_KEY``, ``OPENAI_BASE_URL``, etc.
+        Uses the centralized load_agent_config() for resolution.
+        Priority: YAML > env vars. No silent defaults.
         """
-        provider = (
-            os.environ.get("SPOON_BOT_DEFAULT_PROVIDER")
-            or os.environ.get("SPOON_PROVIDER")
-            or "anthropic"
-        )
-        model = (
-            os.environ.get("SPOON_BOT_DEFAULT_MODEL")
-            or os.environ.get("SPOON_MODEL")
-            or "claude-sonnet-4-20250514"
-        )
+        from spoon_bot.channels.config import load_agent_config
 
-        max_steps = int(
-            os.environ.get("SPOON_BOT_MAX_ITERATIONS")
-            or os.environ.get("SPOON_MAX_STEPS")
-            or "15"
-        )
+        cfg = load_agent_config()
 
         return cls(
-            model=model,
-            provider=provider,
-            max_steps=max_steps,
+            model=cfg.get("model", ""),
+            provider=cfg.get("provider", ""),
+            api_key=cfg.get("api_key"),
+            base_url=cfg.get("base_url"),
+            max_steps=cfg.get("max_iterations", 15),
+            mcp_servers=cfg.get("mcp_config", {}) or {},
+            enable_skills=cfg.get("enable_skills", True),
+            workspace=Path(cfg["workspace"]) if cfg.get("workspace") else Path.home() / ".spoon-bot" / "workspace",
         )
 
 
@@ -188,7 +185,14 @@ class SpoonBot:
         # Create MCP tools — each server exposes multiple tools with their
         # own names.  Use server_name as the config key but let MCPTool
         # handle individual tool discovery internally.
+        if self.config.mcp_servers and not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                "MCP server configs were provided but MCPTool is unavailable "
+                f"({_MCP_TOOL_IMPORT_ERROR}); skipping MCP initialization."
+            )
         for server_name, mcp_config in self.config.mcp_servers.items():
+            if not MCP_TOOL_AVAILABLE:
+                break
             try:
                 mcp_tool = MCPTool(
                     name=server_name,
@@ -360,6 +364,11 @@ class SpoonBot:
     def add_mcp_server(self, name: str, config: dict[str, Any]) -> None:
         """Add an MCP server configuration."""
         self.config.mcp_servers[name] = config
+        if not MCP_TOOL_AVAILABLE:
+            logger.warning(
+                f"MCPTool unavailable ({_MCP_TOOL_IMPORT_ERROR}); stored config for '{name}' but did not create MCP tool."
+            )
+            return
         mcp_tool = MCPTool(name=name, description=f"MCP server: {name}", mcp_config=config)
         self._mcp_tools.append(mcp_tool)
         if self._tool_manager:
@@ -429,8 +438,8 @@ class SpoonBot:
 
 
 async def create_agent(
-    model: str = "claude-sonnet-4-20250514",
-    provider: str = "anthropic",
+    model: str | None = None,
+    provider: str | None = None,
     mcp_servers: dict[str, dict[str, Any]] | None = None,
     enable_skills: bool = True,
     skill_paths: list[str] | None = None,
@@ -462,6 +471,13 @@ async def create_agent(
         ...     mcp_servers={"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"]}}
         ... )
     """
+    # If model/provider not explicitly passed, resolve from YAML/env
+    if not model or not provider:
+        from spoon_bot.channels.config import load_agent_config
+        cfg = load_agent_config()
+        model = model or cfg.get("model", "")
+        provider = provider or cfg.get("provider", "")
+
     config = SpoonBotConfig(
         model=model,
         provider=provider,

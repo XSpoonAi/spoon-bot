@@ -5,6 +5,8 @@ Provides automatic git repository management:
 - Auto-commit changes after agent processes requests
 """
 
+from __future__ import annotations
+
 import asyncio
 import subprocess
 from pathlib import Path

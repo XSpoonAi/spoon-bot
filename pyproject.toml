@@ -22,8 +22,8 @@ classifiers = [
 keywords = ["ai", "agent", "llm", "local", "assistant"]
 
 dependencies = [
-    # Required: spoon-core SDK for LLM, MCP, and skills (v0.4.0+)
-    "spoon-ai-sdk>=0.4.0",
+    # Required: track spoon-core SDK default branch directly.
+    "spoon-ai-sdk @ git+https://github.com/XSpoonAi/spoon-core.git",
     # CLI and utilities
     "typer>=0.9.0",
     "rich>=13.0.0",
@@ -41,7 +41,7 @@ toolkit = [
     "spoon-toolkits>=0.1.0",  # 40+ tools
 ]
 memory = [
-    "mem0ai>=0.0.1",  # Semantic memory
+    "memsearch>=0.1.11",  # Semantic memory search (Milvus hybrid search)
 ]
 web3 = [
     "web3>=6.0.0",
@@ -58,8 +58,27 @@ gateway = [
     "PyJWT>=2.8.0",
     "websockets>=12.0",
 ]
+# Multi-platform channel integrations (added in v0.2.0)
+telegram = [
+    "python-telegram-bot[all]>=21.0",
+]
+discord = [
+    "discord.py>=2.3.0",
+    "aiohttp>=3.9.0",
+]
+feishu = [
+    "lark-oapi>=1.2.0",
+]
+# Convenience extra for all channel integrations
+all-channels = [
+    "spoon-bot[telegram,discord,feishu]",
+]
+# MIGRATION NOTE (v0.2.0): The 'all' extra now includes channel integrations.
+# Previously 'all' only included core extras (toolkit, memory, web3, document, gateway).
+# If you need the previous behavior without channels, use individual extras instead:
+#   pip install spoon-bot[toolkit,memory,web3,document,gateway]
 all = [
-    "spoon-bot[toolkit,memory,web3,document,gateway]",
+    "spoon-bot[toolkit,memory,web3,document,gateway,all-channels]",
 ]
 dev = [
     "pytest>=7.0.0",

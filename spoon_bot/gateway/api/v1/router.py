@@ -7,6 +7,7 @@ from spoon_bot.gateway.api.v1.agent import router as agent_router
 from spoon_bot.gateway.api.v1.sessions import router as sessions_router
 from spoon_bot.gateway.api.v1.tools import router as tools_router
 from spoon_bot.gateway.api.v1.skills import router as skills_router
+from spoon_bot.gateway.api.v1.workspace import router as workspace_router
 
 router = APIRouter()
 
@@ -16,3 +17,4 @@ router.include_router(agent_router, prefix="/agent", tags=["agent"])
 router.include_router(sessions_router, prefix="/sessions", tags=["sessions"])
 router.include_router(tools_router, prefix="/tools", tags=["tools"])
 router.include_router(skills_router, prefix="/skills", tags=["skills"])
+router.include_router(workspace_router, prefix="/workspace", tags=["workspace"])

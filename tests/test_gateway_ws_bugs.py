@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -92,6 +93,21 @@ def _make_mock_agent():
 
     agent.stream = _fake_stream
     return agent
+
+
+def _auth_headers(
+    user_id: str,
+    *,
+    session_key: str = "default",
+    scopes: list[str] | None = None,
+) -> dict[str, str]:
+    token = create_access_token(
+        user_id=user_id,
+        session_key=session_key,
+        scopes=scopes or ["agent:read", "agent:write"],
+        secret_key="test-secret-key-for-jwt",
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
@@ -709,6 +725,110 @@ class TestAsyncTaskAPI:
         # Should either be cancelled or already in terminal state
         assert "cancelled" in data
 
+    def test_task_owner_enforced_for_get_and_cancel(self, client_auth):
+        """Task read/cancel should be forbidden for non-owner users."""
+        owner_headers = _auth_headers("owner-user")
+        other_headers = _auth_headers("other-user")
+
+        create_resp = client_auth.post(
+            "/v1/agent/chat/async",
+            json={"message": "owner task"},
+            headers=owner_headers,
+        )
+        assert create_resp.status_code == 200
+        task_id = create_resp.json()["task_id"]
+
+        get_other = client_auth.get(f"/v1/agent/tasks/{task_id}", headers=other_headers)
+        assert get_other.status_code == 403
+
+        cancel_other = client_auth.post(f"/v1/agent/tasks/{task_id}/cancel", headers=other_headers)
+        assert cancel_other.status_code == 403
+
+        get_owner = client_auth.get(f"/v1/agent/tasks/{task_id}", headers=owner_headers)
+        assert get_owner.status_code == 200
+
+
+class TestSessionPersistenceAPI:
+    """Session API persistence behavior."""
+
+    def test_create_session_calls_save(self, client):
+        """POST /v1/sessions should persist session immediately."""
+        agent = app_module._agent
+        assert agent is not None
+
+        created = MagicMock()
+        created.session_key = "persist_now"
+        created.created_at = datetime.now(timezone.utc)
+        created.messages = []
+
+        agent.sessions.get.side_effect = lambda key: None
+        agent.sessions.get_or_create.side_effect = lambda key: created
+
+        resp = client.post("/v1/sessions", json={"key": "persist_now"})
+        assert resp.status_code == 200
+        assert agent.sessions.save.call_count >= 1
+
+
+class TestRESTSessionRouting:
+    """REST chat session key routing semantics."""
+
+    def test_explicit_session_key_not_overridden_by_token(self, client_auth):
+        """Request session_key should beat token session claim when explicit."""
+        agent = app_module._agent
+        assert agent is not None
+
+        def _session_factory(key: str):
+            session = MagicMock()
+            session.session_key = key
+            session.messages = []
+            session.add_message = MagicMock()
+            return session
+
+        agent.sessions.get_or_create.side_effect = _session_factory
+
+        resp = client_auth.post(
+            "/v1/agent/chat",
+            json={"message": "hello", "session_key": "explicit-session"},
+            headers=_auth_headers("routing-user", session_key="token-session"),
+        )
+        assert resp.status_code == 200
+        assert agent.session_key == "explicit-session"
+
+
+class TestRESTConcurrency:
+    """REST chat concurrency behavior against shared global agent."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_session_requests_are_serialized(self, app):
+        """Concurrent /chat requests should not produce non-IDLE 500 errors."""
+        agent = _make_mock_agent()
+        set_agent(agent)
+
+        busy = False
+
+        async def _contention_sensitive_process(*, message: str):
+            nonlocal busy
+            if busy:
+                raise RuntimeError("Agent spoon_react_skill is not in the IDLE state")
+            busy = True
+            try:
+                await asyncio.sleep(0.05)
+                return f"ok:{message}"
+            finally:
+                busy = False
+
+        agent.process = AsyncMock(side_effect=_contention_sensitive_process)
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            r1, r2 = await asyncio.gather(
+                ac.post("/v1/agent/chat", json={"message": "m1", "session_key": "same-session"}),
+                ac.post("/v1/agent/chat", json={"message": "m2", "session_key": "same-session"}),
+            )
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
 
 # ===================================================================
 # #10 — WS streaming content (integration)
@@ -786,6 +906,47 @@ class TestWSStreamingContent:
             assert response is not None
             assert response["result"]["content"] == "Hello from test agent"
             assert response["result"]["success"] is True
+
+    def test_stream_done_metadata_falls_back_to_content(self, client):
+        """If no chunk delta is emitted, done.metadata.content should still reach clients."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _done_only_stream(**kwargs):
+            yield {"type": "done", "delta": "", "metadata": {"content": "fallback done content"}}
+
+        agent.stream = _done_only_stream
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_done_fallback",
+                "method": "chat.send",
+                "params": {
+                    "message": "hello stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            response = next((e for e in events if e.get("type") == "response"), None)
+            assert response is not None
+            assert response["result"]["content"] == "fallback done content"
+
+            done_events = [
+                e for e in events
+                if e.get("type") == "event" and e.get("event") == "agent.stream.done"
+            ]
+            assert len(done_events) >= 1
+            assert done_events[0]["data"]["content"] == "fallback done content"
 
 
 # ===================================================================

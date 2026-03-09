@@ -13,12 +13,14 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Generator
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -335,6 +337,134 @@ class TestSessionManagerWithStore:
         sm.get_or_create("s2")
         sm.get_or_create("s3")
         assert len(sm._sessions) == 2
+
+
+class _FakeRuntimeMemory:
+    def __init__(self) -> None:
+        self.cleared = False
+
+    def clear(self) -> None:
+        self.cleared = True
+
+
+class _FakeRuntimeAgent:
+    def __init__(self) -> None:
+        self.memory = _FakeRuntimeMemory()
+        self.calls: list[tuple[str, str]] = []
+
+    async def add_message(self, role: str, content: str, **kwargs) -> None:
+        self.calls.append((role, content))
+
+
+class TestAgentLoopSessionHydration:
+    @pytest.mark.asyncio
+    async def test_runtime_history_injected_from_persisted_session(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message("user", "我叫Alice，请记住")
+        loop._session.add_message("assistant", "好的，我会记住你叫Alice。")
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert loop._agent.memory.cleared is True
+        assert injected == 2
+        assert loop._agent.calls == [
+            ("user", "我叫Alice，请记住"),
+            ("assistant", "好的，我会记住你叫Alice。"),
+        ]
+
+
+class _NoChunkRuntimeAgent:
+    """Runtime agent that finishes run() but never emits queue chunks."""
+
+    def __init__(self, final_content: str) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._final_content = final_content
+
+    async def run(self, **kwargs):
+        return type("RunResult", (), {"content": self._final_content})()
+
+
+class _ChunkedRuntimeAgent:
+    """Runtime agent that emits real incremental chunks through output_queue."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._chunks = chunks
+
+    async def run(self, **kwargs):
+        for chunk in self._chunks:
+            await self.output_queue.put({"content": chunk})
+            await asyncio.sleep(0)
+        return type("RunResult", (), {"content": "".join(self._chunks)})()
+
+
+class TestAgentLoopStreamFallback:
+    @pytest.mark.asyncio
+    async def test_stream_falls_back_to_run_result_when_no_chunks(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _NoChunkRuntimeAgent("fallback from run result")
+        loop._session = Session(session_key="stream_fallback")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="hello"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert len(content_chunks) >= 1
+        assert content_chunks[-1]["delta"] == "fallback from run result"
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "fallback from run result"
+
+        assert loop._session.messages[-1]["role"] == "assistant"
+        assert loop._session.messages[-1]["content"] == "fallback from run result"
+        loop.sessions.save.assert_called_once_with(loop._session)
+
+    @pytest.mark.asyncio
+    async def test_stream_preserves_incremental_queue_chunks(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _ChunkedRuntimeAgent(["Hel", "lo"])
+        loop._session = Session(session_key="stream_incremental")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="hello"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        deltas = [c["delta"] for c in content_chunks]
+
+        assert deltas == ["Hel", "lo"]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "Hello"
+        assert loop._session.messages[-1]["content"] == "Hello"
 
 
 # ============================================================================

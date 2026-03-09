@@ -300,6 +300,59 @@ class ToolParameterSchema(BaseModel):
         return self
 
 
+class MemSearchConfig(BaseModel):
+    """Configuration for memsearch-based semantic memory."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable semantic memory search via memsearch"
+    )
+    embedding_provider: str = Field(
+        default="openai",
+        description="Embedding provider: 'openai' (OpenAI-compatible), 'local', 'ollama', etc."
+    )
+    embedding_model: str | None = Field(
+        default=None,
+        description="Embedding model name (provider default if None)"
+    )
+    embedding_api_key: str | None = Field(
+        default=None,
+        description="API key for the embedding provider (falls back to OPENAI_API_KEY env)"
+    )
+    embedding_base_url: str | None = Field(
+        default=None,
+        description="Base URL for the embedding API (falls back to OPENAI_BASE_URL env)"
+    )
+    milvus_uri: str | None = Field(
+        default=None,
+        description="Milvus connection URI (defaults to workspace/memsearch/milvus.db)"
+    )
+    collection: str = Field(
+        default="spoon_bot_memory",
+        description="Milvus collection name"
+    )
+
+    def get_embedding_api_key(self) -> str | None:
+        """Get API key: config > OPENAI_EMBEDDING_API_KEY > OPENAI_API_KEY."""
+        return (
+            self.embedding_api_key
+            or os.environ.get("OPENAI_EMBEDDING_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+
+    def get_embedding_base_url(self) -> str | None:
+        """Get base URL: config > OPENAI_EMBEDDING_BASE_URL > OPENAI_BASE_URL."""
+        return (
+            self.embedding_base_url
+            or os.environ.get("OPENAI_EMBEDDING_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        )
+
+    def get_embedding_model(self) -> str | None:
+        """Get model name: config > OPENAI_EMBEDDING_MODEL."""
+        return self.embedding_model or os.environ.get("OPENAI_EMBEDDING_MODEL")
+
+
 class AgentLoopConfig(BaseModel):
     """Configuration for AgentLoop with validation."""
 
@@ -369,6 +422,24 @@ class AgentLoopConfig(BaseModel):
     session_store_db_path: str | None = Field(
         default=None,
         description="SQLite database path (for 'sqlite' backend, default: workspace/sessions.db)"
+    )
+
+    # Semantic memory (memsearch)
+    memsearch: MemSearchConfig = Field(
+        default_factory=MemSearchConfig,
+        description="Semantic memory search configuration"
+    )
+
+    # Hot-reload
+    auto_reload: bool = Field(
+        default=False,
+        description="Enable background file watching for auto-reload of skills and MCP"
+    )
+    auto_reload_interval: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=300.0,
+        description="Polling interval in seconds for auto-reload file watcher (1-300)"
     )
 
     @field_validator("workspace", mode="before")

@@ -20,10 +20,28 @@ class ChatOptions(BaseModel):
 class ChatRequest(BaseModel):
     """Chat request model."""
 
-    message: str = Field(..., min_length=1, max_length=100000)
+    message: str = Field(default="", max_length=100000)
     session_key: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     media: list[str] = Field(default_factory=list, max_length=10)
     options: ChatOptions | None = None
+
+    # Audio fields (alternative to text message)
+    audio_data: str | None = Field(
+        default=None,
+        description="Base64-encoded audio data or data URL",
+    )
+    audio_format: str | None = Field(
+        default=None,
+        description="Audio format: wav, mp3, ogg, webm, flac, m4a, aac",
+    )
+    audio_mime_type: str | None = Field(
+        default=None,
+        description="MIME type (e.g. audio/wav). Used for format detection.",
+    )
+    audio_language: str | None = Field(
+        default=None,
+        description="ISO 639-1 language hint for transcription (e.g. en, zh)",
+    )
 
     @field_validator("message")
     @classmethod
