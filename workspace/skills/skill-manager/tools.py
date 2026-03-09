@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -44,60 +46,78 @@ def _parse_github_url(url: str) -> tuple[str, str, str, str]:
     )
 
 
-async def _find_skill_subpath(
-    owner: str, repo: str, skill_id: str, branch: str
-) -> str:
-    """Locate a skill directory inside a repo via GitHub Contents API."""
-    import httpx
-
+def _github_headers() -> dict[str, str]:
+    """Build GitHub API headers, including auth token if available."""
     headers = {"Accept": "application/vnd.github+json"}
-    base_api = f"https://api.github.com/repos/{owner}/{repo}/contents"
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
-    async def search_dir(
-        api_path: str, client: httpx.AsyncClient, depth: int = 0
-    ) -> str | None:
-        if depth > 6:
-            return None
-        url = (
-            f"{base_api}/{api_path}?ref={branch}"
-            if api_path
-            else f"{base_api}?ref={branch}"
+
+async def _download_via_git(
+    owner: str, repo: str, branch: str, subpath: str, target: Path
+) -> int:
+    """Download skill files using git sparse-checkout. Returns file count.
+
+    This avoids GitHub API rate limits by using git protocol directly.
+    """
+    clone_url = f"https://github.com/{owner}/{repo}.git"
+    tmp_dir = Path(tempfile.mkdtemp(prefix="spoon_skill_"))
+
+    try:
+        # git clone with sparse checkout — only download the subpath we need
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", "--depth=1", "--filter=blob:none",
+            "--sparse", "--branch", branch,
+            clone_url, str(tmp_dir / "repo"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return None
-        items: list[dict[str, Any]] = resp.json()
-        for item in items:
-            if item.get("type") == "dir":
-                if item.get("name", "").lower() == skill_id.lower():
-                    chk = await client.get(
-                        f"{base_api}/{item['path']}/SKILL.md?ref={branch}",
-                        headers=headers,
-                    )
-                    if chk.status_code == 200:
-                        return item["path"]
-                found = await search_dir(item["path"], client, depth + 1)
-                if found is not None:
-                    return found
-        return None
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            raise RuntimeError(f"git clone failed: {stderr.decode().strip()}")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        result = await search_dir("", client)
-    if result is None:
-        raise ValueError(
-            f"Skill '{skill_id}' not found in {owner}/{repo}@{branch}. "
-            "Check the skillId or provide the full GitHub URL."
-        )
-    return result
+        repo_dir = tmp_dir / "repo"
+
+        # Set sparse-checkout to only include the skill subpath
+        if subpath:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "sparse-checkout", "set", subpath,
+                cwd=str(repo_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=30)
+
+        # Copy skill files to target
+        source = repo_dir / subpath if subpath else repo_dir
+        if not source.is_dir():
+            raise RuntimeError(f"Path '{subpath}' not found in {owner}/{repo}@{branch}")
+
+        target.mkdir(parents=True, exist_ok=True)
+        total_files = 0
+        for item in source.rglob("*"):
+            if item.is_file() and ".git" not in item.parts:
+                rel = item.relative_to(source)
+                dest = target / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(item), str(dest))
+                total_files += 1
+
+        return total_files
+
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
-async def _download_skill_files(
+async def _download_via_api(
     owner: str, repo: str, branch: str, subpath: str, target: Path
 ) -> int:
     """Download skill files via GitHub Contents API. Returns file count."""
     import httpx
 
-    headers = {"Accept": "application/vnd.github+json"}
+    headers = _github_headers()
     base_api = f"https://api.github.com/repos/{owner}/{repo}/contents"
     raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}"
     total_files = 0
@@ -130,7 +150,32 @@ async def _download_skill_files(
     async with httpx.AsyncClient(timeout=30) as client:
         await download_dir(subpath, target, client)
 
-    if total_files == 0:
+    return total_files
+
+
+async def _download_skill_files(
+    owner: str, repo: str, branch: str, subpath: str, target: Path
+) -> int:
+    """Download skill files. Tries git sparse-checkout first, falls back to API."""
+
+    # Try git clone first (avoids API rate limits)
+    try:
+        count = await _download_via_git(owner, repo, branch, subpath, target)
+        if count > 0 and (target / "SKILL.md").exists():
+            logger.info(f"Downloaded {count} files via git sparse-checkout")
+            return count
+        # Git succeeded but no files or no SKILL.md — clean up and try API
+        if target.exists():
+            shutil.rmtree(str(target), ignore_errors=True)
+    except Exception as e:
+        logger.debug(f"git download failed ({e}), falling back to API")
+        if target.exists():
+            shutil.rmtree(str(target), ignore_errors=True)
+
+    # Fallback: GitHub Contents API
+    count = await _download_via_api(owner, repo, branch, subpath, target)
+
+    if count == 0:
         shutil.rmtree(str(target), ignore_errors=True)
         raise RuntimeError(
             f"No files found under '{subpath}' in {owner}/{repo}@{branch}"
@@ -140,7 +185,7 @@ async def _download_skill_files(
         shutil.rmtree(str(target), ignore_errors=True)
         raise RuntimeError("No SKILL.md found — not a valid skill directory")
 
-    return total_files
+    return count
 
 
 class SkillMarketplaceTool(BaseTool):
@@ -148,13 +193,14 @@ class SkillMarketplaceTool(BaseTool):
 
     name: str = "skill_marketplace"
     description: str = (
-        "Skill marketplace — search, install, and remove skills.\n"
-        "Actions:\n"
-        "- search_skills <query>: Search skills.sh for available skills\n"
-        "- install_skill <url>: Install from GitHub URL or 'owner/repo/skillId'\n"
-        "- remove_skill <skill_name>: Remove an installed skill\n"
-        "- skill_info <skill_name>: Show SKILL.md of an installed skill\n\n"
-        "After install/remove, call self_upgrade reload_skills to activate changes."
+        "Install, remove, or search skills. "
+        "WHEN THE USER GIVES A GITHUB URL, call this tool with action='install_skill' and url=<the URL>. "
+        "Actions: "
+        "install_skill (url required) — install a skill from GitHub URL like https://github.com/owner/repo/tree/branch/path; "
+        "search_skills (query required) — search skills.sh; "
+        "remove_skill (skill_name required) — remove installed skill; "
+        "skill_info (skill_name required) — show SKILL.md. "
+        "After install/remove, call self_upgrade(action='reload_skills') to activate."
     )
     parameters: dict = {
         "type": "object",
@@ -176,9 +222,9 @@ class SkillMarketplaceTool(BaseTool):
             "url": {
                 "type": "string",
                 "description": (
-                    "For install_skill: full GitHub URL "
-                    "(https://github.com/owner/repo/tree/branch/path) "
-                    "or shorthand 'owner/repo/skillId'"
+                    "GitHub URL to install from. Pass the EXACT URL the user gave you, "
+                    "e.g. 'https://github.com/openclaw/skills/tree/main/skills/tezatezaz/clawcast-wallet'. "
+                    "Also accepts 'owner/repo/skillId' shorthand."
                 ),
             },
             "skill_name": {
@@ -240,8 +286,18 @@ class SkillMarketplaceTool(BaseTool):
             if not url:
                 return "Error: 'url' is required for install_skill"
             try:
-                if url.startswith("http://") or url.startswith("https://"):
-                    owner, repo, branch, subpath = _parse_github_url(url)
+                # Normalise: add https:// if the LLM passed a bare
+                # github.com/... URL (common with some models).
+                _url = url
+                if not _url.startswith(("http://", "https://")):
+                    if "github.com" in _url:
+                        _url = "https://" + _url.lstrip("/")
+                    elif "/tree/" in _url:
+                        # Looks like a GitHub path fragment — prepend origin
+                        _url = "https://github.com/" + _url.lstrip("/")
+
+                if _url.startswith(("http://", "https://")):
+                    owner, repo, branch, subpath = _parse_github_url(_url)
                     skill_name_derived = (
                         subpath.rsplit("/", 1)[-1] if subpath else repo
                     )
@@ -254,15 +310,14 @@ class SkillMarketplaceTool(BaseTool):
                         )
                     owner, repo = parts[0], parts[1]
                     branch = "main"
-                    skill_id = parts[2] if len(parts) > 2 else ""
-                    if skill_id:
-                        subpath = await _find_skill_subpath(
-                            owner, repo, skill_id, branch
-                        )
-                        skill_name_derived = skill_id
-                    else:
-                        subpath = ""
-                        skill_name_derived = repo
+                    # Skip /tree/<branch>/... if present in shorthand
+                    rest = parts[2:]
+                    if rest and rest[0] == "tree":
+                        branch = rest[1] if len(rest) > 1 else "main"
+                        rest = rest[2:]
+                    skill_id = rest[-1] if rest else ""
+                    subpath = "/".join(rest) if rest else ""
+                    skill_name_derived = skill_id or repo
 
                 target = workspace / "skills" / skill_name_derived
                 if target.exists():
@@ -283,17 +338,14 @@ class SkillMarketplaceTool(BaseTool):
                     skill_md_content = skill_md_path.read_text(encoding="utf-8")
 
                 result_parts = [
-                    f"Skill '{skill_name_derived}' installed successfully "
-                    f"from {owner}/{repo} ({count} files).",
+                    f"SUCCESS: Skill '{skill_name_derived}' installed ({count} files).",
                     "",
-                    "IMPORTANT: To activate the new skill, first activate "
-                    "the self_upgrade tool using "
-                    "`activate_tool(action='activate', tool_name='self_upgrade')`, "
-                    "then call `self_upgrade(action='reload_skills')`.",
+                    "NEXT STEP: Call `self_upgrade(action='reload_skills')` now "
+                    "to activate the new skill's tools.",
                 ]
                 if skill_md_content:
                     result_parts.append("")
-                    result_parts.append("--- Installed SKILL.md ---")
+                    result_parts.append("--- SKILL.md (follow these instructions after reload) ---")
                     result_parts.append(skill_md_content)
 
                 return "\n".join(result_parts)

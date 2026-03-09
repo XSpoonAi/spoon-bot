@@ -5,24 +5,23 @@ version: 1.0.0
 tags: [management, skills, marketplace]
 triggers:
   - type: keyword
-    keywords: [install skill, search skill, find skill, remove skill, uninstall skill, skill marketplace, skills.sh, search_skills, install_skill, remove_skill]
+    keywords: [install skill, search skill, find skill, remove skill, uninstall skill, skill marketplace, skills.sh, search_skills, install_skill, remove_skill, github.com]
     priority: 90
 composable: true
 ---
 
 # Skill Manager
 
-Search the skills.sh directory, install skills from GitHub, and manage installed skills.
+Install skills from GitHub URLs, search skills.sh, and manage installed skills.
 
-## Workflow
+## Install a skill from GitHub
 
-1. **Search** for skills using `skill_marketplace` tool with `action=search_skills`
-2. **Install** a skill with `action=install_skill` and a GitHub URL or `owner/repo/skillId` shorthand
-3. After installation, **activate** the `self_upgrade` tool and call `reload_skills` to load the new skill into the running agent
-4. **Remove** a skill with `action=remove_skill`
+1. Call `skill_marketplace(action='install_skill', url='<github_url>')` — downloads the skill files
+2. Call `self_upgrade(action='reload_skills')` — loads the new skill into the agent
+3. Follow the instructions from the installed skill's SKILL.md (included in the install result)
 
-## Important
+## Other actions
 
-After installing or removing a skill:
-1. First activate the `self_upgrade` tool: `activate_tool(action='activate', tool_name='self_upgrade')`
-2. Then reload skills: `self_upgrade(action='reload_skills')`
+- `skill_marketplace(action='search_skills', query='...')` — search skills.sh
+- `skill_marketplace(action='remove_skill', skill_name='...')` — remove an installed skill
+- `skill_marketplace(action='skill_info', skill_name='...')` — show skill details
