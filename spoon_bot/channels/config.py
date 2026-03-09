@@ -246,6 +246,13 @@ class ChannelsConfig:
                     except ValueError:
                         logger.warning(f"DISCORD_USER_ID={env_uid!r} is not a valid integer, ignoring")
 
+            # proxy_url: YAML > DISCORD_PROXY > HTTPS_PROXY
+            proxy_url = (
+                account.get("proxy_url")
+                or os.getenv("DISCORD_PROXY")
+                or os.getenv("HTTPS_PROXY")
+            )
+
             config = ChannelConfig(
                 **common,
                 # Discord-specific (falls back to DISCORD_BOT_TOKEN env var)
@@ -253,6 +260,9 @@ class ChannelsConfig:
                 intents=account.get("intents", []),
                 allowed_guilds=allowed_guilds,
                 allowed_users=allowed_users,
+                proxy_url=proxy_url,
+                require_mention=account.get("require_mention", True),
+                allow_dm=account.get("allow_dm", True),
             )
             configs.append((config, name))
 
@@ -269,8 +279,21 @@ class ChannelsConfig:
         for account in accounts:
             name = account.get("name", "default")
 
+            # mode: "ws" (WebSocket, default) -> GATEWAY, "webhook" -> WEBHOOK
+            mode_str = account.get("mode", "ws")
+            mode = ChannelMode.WEBHOOK if mode_str == "webhook" else ChannelMode.GATEWAY
+
             # Build config with common fields + Feishu-specific fields
-            common = self._build_common_config(account, "feishu", ChannelMode.WEBHOOK)
+            common = self._build_common_config(account, "feishu", mode)
+
+            # allowed_chats / allowed_users: YAML takes priority; fall back to env vars
+            allowed_chats = account.get("allowed_chats", [])
+            allowed_users = account.get("allowed_users", [])
+            if not allowed_users:
+                env_uid = os.getenv("FEISHU_USER_ID")
+                if env_uid:
+                    allowed_users = [env_uid]
+
             config = ChannelConfig(
                 **common,
                 webhook_path=account.get("webhook_url"),
@@ -279,6 +302,10 @@ class ChannelsConfig:
                 app_secret=self._resolve_with_fallback(account.get("app_secret"), "feishu", "app_secret"),
                 verification_token=self._resolve_with_fallback(account.get("verification_token"), "feishu", "verification_token"),
                 encrypt_key=self._resolve_with_fallback(account.get("encrypt_key"), "feishu", "encrypt_key"),
+                domain=account.get("domain", "feishu"),
+                allowed_chats=allowed_chats,
+                allowed_users=allowed_users,
+                require_mention=account.get("require_mention", True),
             )
             configs.append((config, name))
 

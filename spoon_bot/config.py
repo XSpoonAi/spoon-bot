@@ -424,6 +424,14 @@ class AgentLoopConfig(BaseModel):
         description="SQLite database path (for 'sqlite' backend, default: workspace/sessions.db)"
     )
 
+    # Agent pool
+    agent_pool_size: int = Field(
+        default=4,
+        ge=1,
+        le=32,
+        description="Number of pre-initialized agent instances in the pool (1-32)"
+    )
+
     # Semantic memory (memsearch)
     memsearch: MemSearchConfig = Field(
         default_factory=MemSearchConfig,

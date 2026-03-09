@@ -590,10 +590,12 @@ class TestAgentLoopProcessWithThinking:
         result.content = "The answer is 42"
         result.thinking_content = "I need to think about this..."
 
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.run = AsyncMock(return_value=result)
+
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.run = AsyncMock(return_value=result)
+        agent._get_or_create_agent = AsyncMock(return_value=mock_inner_agent)
         agent._session = MagicMock()
         agent._session.add_message = MagicMock()
         agent.sessions = MagicMock()
@@ -618,10 +620,12 @@ class TestAgentLoopProcessWithThinking:
         result.content = "Answer"
         result.thinking = "My thought process"
 
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.run = AsyncMock(return_value=result)
+
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.run = AsyncMock(return_value=result)
+        agent._get_or_create_agent = AsyncMock(return_value=mock_inner_agent)
         agent._session = MagicMock()
         agent._session.add_message = MagicMock()
         agent.sessions = MagicMock()
@@ -643,10 +647,12 @@ class TestAgentLoopProcessWithThinking:
         result.content = "Answer"
         result.metadata = {"thinking": "Metadata thought"}
 
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.run = AsyncMock(return_value=result)
+
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.run = AsyncMock(return_value=result)
+        agent._get_or_create_agent = AsyncMock(return_value=mock_inner_agent)
         agent._session = MagicMock()
         agent._session.add_message = MagicMock()
         agent.sessions = MagicMock()
@@ -661,13 +667,15 @@ class TestAgentLoopProcessWithThinking:
 
     @pytest.mark.asyncio
     async def test_error_returns_friendly_message(self):
-        """Should return error message and None thinking on failure."""
+        """Should raise on agent error (caller handles it)."""
         from spoon_bot.agent.loop import AgentLoop
+
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.run = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.run = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
+        agent._get_or_create_agent = AsyncMock(return_value=mock_inner_agent)
         agent._session = MagicMock()
         agent.sessions = MagicMock()
         agent.memory = MagicMock()
@@ -676,9 +684,8 @@ class TestAgentLoopProcessWithThinking:
         agent._auto_commit = False
         agent._git = None
 
-        response, thinking = await AgentLoop.process_with_thinking(agent, message="test")
-        assert "error" in response.lower() or "Error" in response
-        assert thinking is None
+        with pytest.raises(RuntimeError, match="LLM unavailable"):
+            await AgentLoop.process_with_thinking(agent, message="test")
 
 
 # ============================================================

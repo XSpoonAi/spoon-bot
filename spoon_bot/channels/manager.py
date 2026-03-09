@@ -17,6 +17,62 @@ if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
 
 
+class _CircuitBreaker:
+    """Simple circuit breaker for LLM calls.
+
+    States:
+    - CLOSED (normal): requests pass through.
+    - OPEN (tripped): requests are rejected immediately.
+    - HALF_OPEN: one probe request is allowed to test recovery.
+
+    Transitions:
+    - CLOSED → OPEN when ``failure_threshold`` consecutive failures occur.
+    - OPEN → HALF_OPEN after ``recovery_timeout`` seconds.
+    - HALF_OPEN → CLOSED on success, → OPEN on failure.
+    """
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        recovery_timeout: float = 30.0,
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._state = self.CLOSED
+        self._consecutive_failures = 0
+        self._last_failure_time: float = 0.0
+
+    @property
+    def state(self) -> str:
+        if self._state == self.OPEN:
+            import time
+            if time.monotonic() - self._last_failure_time >= self.recovery_timeout:
+                self._state = self.HALF_OPEN
+        return self._state
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._state = self.CLOSED
+
+    def record_failure(self) -> None:
+        import time
+        self._consecutive_failures += 1
+        self._last_failure_time = time.monotonic()
+        if self._consecutive_failures >= self.failure_threshold:
+            self._state = self.OPEN
+            logger.warning(
+                f"Circuit breaker OPEN after {self._consecutive_failures} "
+                f"consecutive failures (recovery in {self.recovery_timeout}s)"
+            )
+
+    def allow_request(self) -> bool:
+        return self.state != self.OPEN
+
+
 class ChannelManager:
     """
     Enhanced manager for multiple communication channels.
@@ -43,6 +99,7 @@ class ChannelManager:
         self._agent: AgentLoop | None = None
         self._running = False
         self._health_check_task: asyncio.Task | None = None
+        self._circuit_breaker = _CircuitBreaker()
 
     def set_agent(self, agent: AgentLoop) -> None:
         """
@@ -53,6 +110,15 @@ class ChannelManager:
         """
         self._agent = agent
         self._bus.set_handler(self._handle_message)
+
+        # Align bus concurrency with agent pool size so neither is wasted.
+        pool_size = getattr(agent, "_pool_size", None)
+        if pool_size is not None and pool_size != self._bus.max_concurrency:
+            self._bus.set_max_concurrency(pool_size)
+            logger.info(
+                f"Bus max_concurrency aligned to agent pool size: {pool_size}"
+            )
+
         # Propagate agent reference to all existing channels
         for channel in self._channels.values():
             channel.set_agent(agent)
@@ -501,32 +567,72 @@ class ChannelManager:
             logger.error("No agent set")
             return None
 
+        # Circuit breaker: reject immediately if LLM is known to be down
+        if not self._circuit_breaker.allow_request():
+            logger.warning(
+                f"[{message.channel}] Circuit breaker OPEN, rejecting message"
+            )
+            return OutboundMessage(
+                content=(
+                    "The AI service is temporarily unavailable. "
+                    "Please try again in a moment."
+                ),
+                channel=message.channel,
+                reply_to=message.message_id,
+                metadata=message.metadata.copy(),
+            )
+
+        # Notify channel that processing is starting (typing indicators, etc.)
+        channel = self._channels.get(message.channel)
+        if channel:
+            try:
+                await channel.on_processing_start(message)
+            except Exception as e:
+                logger.debug(f"on_processing_start failed: {e}")
+
         try:
-            logger.debug(
-                f"[{message.channel}] Processing message from {message.sender_id}: "
+            logger.info(
+                f"[{message.channel}] Agent processing message from {message.sender_id}: "
                 f"{message.content[:50]}..."
             )
+
+            # Inject sender name prefix for group chats so the LLM can
+            # distinguish who is speaking in multi-user conversations.
+            content = message.content
+            chat_type = message.metadata.get("chat_type", "")
+            is_dm = message.metadata.get("is_dm", False)
+            if message.sender_name and not is_dm and chat_type != "dm":
+                content = f"[{message.sender_name}]: {content}"
 
             # Route based on think/verbose metadata from channel
             think_level = message.metadata.get("think_level", "off")
             media = message.media if message.has_media else None
+            session_key = message.session_key or None
 
             if think_level != "off":
                 response_text, thinking_content = await self._agent.process_with_thinking(
-                    message=message.content,
+                    message=content,
                     media=media,
+                    session_key=session_key,
                 )
                 # Include thinking content in verbose mode
                 if message.metadata.get("verbose") and thinking_content:
                     response_text = (
-                        f"💭 *Thinking:*\n{thinking_content}\n\n"
+                        f"\ud83d\udcad *Thinking:*\n{thinking_content}\n\n"
                         f"---\n\n{response_text}"
                     )
             else:
                 response_text = await self._agent.process(
-                    message=message.content,
+                    message=content,
                     media=media,
+                    session_key=session_key,
                 )
+
+            self._circuit_breaker.record_success()
+            logger.info(
+                f"[{message.channel}] Agent response ready "
+                f"({len(response_text)} chars) for {message.sender_id}"
+            )
 
             # Create outbound message
             return OutboundMessage(
@@ -537,13 +643,28 @@ class ChannelManager:
             )
 
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            self._circuit_breaker.record_failure()
+            logger.error(f"Error handling message: {e}", exc_info=True)
+            # Use a generic user-facing message to avoid leaking internal
+            # details (file paths, API keys, tracebacks).
+            try:
+                from spoon_bot.exceptions import user_friendly_error
+                friendly = user_friendly_error(e)
+            except Exception:
+                friendly = "Sorry, an unexpected error occurred. Please try again."
             return OutboundMessage(
-                content=f"Sorry, I encountered an error: {str(e)}",
+                content=friendly,
                 channel=message.channel,
                 reply_to=message.message_id,
                 metadata=message.metadata.copy(),
             )
+        finally:
+            # Always stop typing indicators, even on error
+            if channel:
+                try:
+                    await channel.on_processing_end(message)
+                except Exception as e:
+                    logger.debug(f"on_processing_end failed: {e}")
 
     @property
     def channel_names(self) -> list[str]:
