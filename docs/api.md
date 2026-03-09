@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-03-03 03:44 UTC.  
+> **Auto-generated** from source code on 2026-03-09 02:41 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -102,14 +102,14 @@ Health check endpoint.
 Readiness check endpoint.
 
 
-*Source: `spoon_bot/gateway/api/health.py:38`*
+*Source: `spoon_bot/gateway/api/health.py:62`*
 
 ### `GET /`
 
 Root endpoint with API information.
 
 
-*Source: `spoon_bot/gateway/api/health.py:61`*
+*Source: `spoon_bot/gateway/api/health.py:88`*
 
 ---
 
@@ -171,7 +171,60 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:97`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:248`*
+
+### `POST /v1/agent/voice/chat`
+
+Send voice + optional text to the agent (multipart upload).
+
+**Auth Required:** Yes
+
+**Request Example:**
+```json
+{
+  "message": "Help me write a Python script",
+  "session_key": "default",
+  "media": [],
+  "options": {
+    "max_iterations": 20,
+    "stream": false,
+    "thinking": false,
+    "model": null
+  }
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `message` | string | Yes | - | User message (1-100,000 chars) |
+| `session_key` | string | No | `"default"` | Session identifier (`^[a-zA-Z0-9_-]{1,64}$`) |
+| `media` | string[] | No | `[]` | Media file paths (max 10) |
+| `options.max_iterations` | int | No | `20` | Max tool call iterations (1-100) |
+| `options.stream` | bool | No | `false` | Enable SSE streaming (see Section 4) |
+| `options.thinking` | bool | No | `false` | Include extended thinking output |
+| `options.model` | string | No | `null` | Override default LLM model |
+
+**Response (non-streaming):** `APIResponse[ChatResponse]`
+```json
+{
+  "success": true,
+  "data": {
+    "response": "...",
+    "tool_calls": [],
+    "usage": null,
+    "thinking_content": null
+  },
+  "meta": {
+    "request_id": "req_a1b2c3d4e5f6",
+    "timestamp": "2026-02-09T07:00:00.000000",
+    "duration_ms": 2500
+  }
+}
+```
+
+*Source: `spoon_bot/gateway/api/v1/agent.py:670`*
 
 ---
 
@@ -219,13 +272,13 @@ X-Request-ID: req_a1b2c3d4e5f6
 
 ### `GET /v1/agent/status`
 
-Get agent status and statistics.
+Get agent status and statistics, including channel health.
 
 **Auth Required:** Yes
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:318`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:545`*
 
 ---
 
@@ -237,19 +290,19 @@ Get agent status and statistics.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:229`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:443`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:266`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:481`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:293`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:514`*
 
 ---
 
@@ -281,7 +334,7 @@ Get session details.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:102`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:103`*
 
 ### `DELETE /v1/sessions/{session_key}`
 
@@ -290,7 +343,7 @@ Delete a session.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:137`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:138`*
 
 ### `POST /v1/sessions/{session_key}/clear`
 
@@ -299,7 +352,7 @@ Clear session history.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:156`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:157`*
 
 ---
 
@@ -423,6 +476,18 @@ Handle event subscription (#16)
 
 Handle event unsubscription (#16)
 
+#### `workspace.tree`
+
+Return workspace directory tree.
+
+#### `audio.stream.start`
+
+Handle audio.stream.start
+
+#### `audio.stream.end`
+
+Handle audio.stream.end
+
 ### Server Events (Server -> Client)
 
 | Event | Category | Description |
@@ -444,6 +509,9 @@ Handle event unsubscription (#16)
 | `metrics.update` | Resource | Metrics Update |
 | `resource.token_limit` | Resource | Resource Token Limit |
 | `resource.time_limit` | Resource | Resource Time Limit |
+| `audio.stream.started` | Other | Audio Stream Started |
+| `audio.stream.error` | Other | Audio Stream Error |
+| `audio.stream.transcription` | Other | Audio Stream Transcription |
 | `connection.established` | Connection | Connection Established |
 | `connection.ready` | Connection | Connection Ready |
 | `connection.error` | Connection | Connection Error |
@@ -473,10 +541,14 @@ Chat request model.
 
 | Field | Type | Default |
 |-------|------|---------|
-| `message` | `str` | Field(..., min_length=1, max_length=100000) |
+| `message` | `str` | Field(default='', max_length=100000) |
 | `session_key` | `str` | Field(default='default', pattern='^[a-zA-Z0-9_-]{1,64}$') |
 | `media` | `list[str]` | Field(default_factory=list, max_length=10) |
 | `options` | `ChatOptions | None` | None |
+| `audio_data` | `str | None` | Field(default=None, description='Base64-encoded audio data or data URL') |
+| `audio_format` | `str | None` | Field(default=None, description='Audio format: wav, mp3, ogg, webm, flac, m4a, aac') |
+| `audio_mime_type` | `str | None` | Field(default=None, description='MIME type (e.g. audio/wav). Used for format detection.') |
+| `audio_language` | `str | None` | Field(default=None, description='ISO 639-1 language hint for transcription (e.g. en, zh)') |
 
 #### `LoginRequest`
 
@@ -554,6 +626,8 @@ Response metadata.
 | `request_id` | `str` | *(required)* |
 | `timestamp` | `datetime` | Field(default_factory=datetime.utcnow) |
 | `duration_ms` | `int | None` | None |
+| `trace_id` | `str | None` | None |
+| `timing` | `dict[str, Any] | None` | None |
 
 #### `ErrorDetail`
 
@@ -618,6 +692,17 @@ Tool call information.
 | `arguments` | `dict[str, Any]` | *(required)* |
 | `result` | `str | None` | None |
 
+#### `TranscriptionInfo`
+
+Audio transcription information.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `text` | `str` | *(required)* |
+| `language` | `str | None` | None |
+| `duration_seconds` | `float | None` | None |
+| `provider` | `str` | 'whisper' |
+
 #### `ChatResponse`
 
 Chat response model.
@@ -628,6 +713,7 @@ Chat response model.
 | `tool_calls` | `list[ToolCallInfo]` | Field(default_factory=list) |
 | `usage` | `UsageInfo | None` | None |
 | `thinking_content` | `str | None` | None |
+| `transcription` | `TranscriptionInfo | None` | None |
 
 #### `StreamChunk`
 
@@ -756,6 +842,26 @@ Agent statistics.
 | `tools_available` | `int` | 0 |
 | `skills_loaded` | `int` | 0 |
 
+#### `ChannelStatusInfo`
+
+Status of a single channel.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `name` | `str` | *(required)* |
+| `status` | `str` | *(required)* |
+| `message` | `str | None` | None |
+
+#### `ChannelsInfo`
+
+Aggregate channels status.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `running` | `int` | 0 |
+| `total` | `int` | 0 |
+| `channels` | `list[ChannelStatusInfo]` | Field(default_factory=list) |
+
 #### `StatusResponse`
 
 Agent status response.
@@ -766,6 +872,7 @@ Agent status response.
 | `current_task` | `str | None` | None |
 | `uptime` | `int` | *(required)* |
 | `stats` | `AgentStats` | *(required)* |
+| `channels` | `ChannelsInfo | None` | None |
 
 #### `HealthCheck`
 
@@ -834,10 +941,6 @@ Health check response.
 
 | Variable | Default | Source |
 |----------|---------|--------|
-| `SPOON_BOT_DEFAULT_PROVIDER` | `anthropic` | server.py |
-| `SPOON_BOT_DEFAULT_MODEL` | *(none)* | server.py |
-| `SPOON_BOT_WORKSPACE_PATH` | `/data/workspace` | server.py |
-| `SPOON_BOT_ENABLE_SKILLS` | `true` | server.py |
 | `SESSION_STORE_BACKEND` | `file` | server.py |
 | `SESSION_STORE_DSN` | *(none)* | server.py |
 | `SESSION_STORE_DB_PATH` | *(none)* | server.py |
@@ -849,17 +952,20 @@ Health check response.
 | `GATEWAY_PORT` | `8080` | config.py |
 | `GATEWAY_DEBUG` | *(none)* | config.py |
 | `JWT_ACCESS_EXPIRE_MINUTES` | `15` | config.py |
+| `GATEWAY_TIMEOUT_REQUEST_MS` | `120000` | config.py |
+| `GATEWAY_TIMEOUT_TOOL_MS` | `60000` | config.py |
+| `GATEWAY_TIMEOUT_STREAM_MS` | `300000` | config.py |
+| `GATEWAY_AUDIO_ENABLED` | `true` | config.py |
+| `GATEWAY_AUDIO_STT_PROVIDER` | `whisper` | config.py |
+| `GATEWAY_AUDIO_STT_MODEL` | `whisper-1` | config.py |
+| `GATEWAY_AUDIO_DEFAULT_LANGUAGE` | *(none)* | config.py |
+| `GATEWAY_AUDIO_STREAMING` | `true` | config.py |
+| `GATEWAY_AUDIO_NATIVE_PROVIDERS` | `openai,gemini` | config.py |
 
 ### Default Models Per Provider
 
 | Provider | Default Model |
 |----------|---------------|
-| `anthropic` | `claude-sonnet-4-20250514` |
-| `openai` | `gpt-4o` |
-| `deepseek` | `deepseek-chat` |
-| `gemini` | `gemini-2.0-flash` |
-| `openrouter` | `anthropic/claude-sonnet-4` |
-| `ollama` | `llama3.2` |
 
 ---
 
@@ -908,7 +1014,9 @@ Set mode via `SPOON_BOT_MODE` environment variable.
 | `POST` | `/v1/agent/chat/async` | Yes | Send a message asynchronously. |
 | `GET` | `/v1/agent/tasks/{task_id}` | Yes | Get the status of an async task. |
 | `POST` | `/v1/agent/tasks/{task_id}/cancel` | Yes | Cancel an async task. |
-| `GET` | `/v1/agent/status` | Yes | Get agent status and statistics. |
+| `GET` | `/v1/agent/status` | Yes | Get agent status and statistics, including channel health. |
+| `POST` | `/v1/agent/voice/transcribe` | Yes | Transcribe an audio file to text (STT only, no agent process |
+| `POST` | `/v1/agent/voice/chat` | Yes | Send voice + optional text to the agent (multipart upload). |
 | `GET` | `/v1/sessions` | Yes | List all sessions. |
 | `POST` | `/v1/sessions` | Yes | Create a new session. |
 | `GET` | `/v1/sessions/{session_key}` | Yes | Get session details. |
