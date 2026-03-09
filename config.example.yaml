@@ -1,6 +1,13 @@
 # Spoon-Bot Configuration Example
 # Copy this file to ~/.spoon-bot/config.yaml or config.yaml
 # and fill in your credentials
+#
+# Background service quick start:
+#   spoon-bot service start          # Start in background now
+#   spoon-bot service install        # Register auto-start at login
+#   spoon-bot service status         # Check status
+#   spoon-bot service logs -f        # Follow logs
+#   spoon-bot service stop           # Stop
 
 # Agent Configuration
 agent:

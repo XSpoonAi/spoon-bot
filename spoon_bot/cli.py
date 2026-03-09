@@ -1022,5 +1022,148 @@ def version():
     console.print(f"spoon-bot version {__version__}")
 
 
+# ---------------------------------------------------------------------------
+# Service commands
+# ---------------------------------------------------------------------------
+
+service_app = typer.Typer(
+    name="service",
+    help="Manage spoon-bot as a background service (no Docker required).",
+    no_args_is_help=True,
+)
+app.add_typer(service_app)
+
+
+@service_app.command("start")
+def service_start(
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c",
+        help="Path to config.yaml (defaults to ~/.spoon-bot/config.yaml)",
+    ),
+) -> None:
+    """Start the gateway in the background."""
+    from spoon_bot.services.daemon import start
+
+    with console.status("[bold blue]Starting service...[/bold blue]"):
+        ok, msg = start(config)
+
+    if ok:
+        print_success(msg)
+    else:
+        print_error(Exception(msg))
+        raise typer.Exit(1)
+
+
+@service_app.command("stop")
+def service_stop() -> None:
+    """Stop the background service."""
+    from spoon_bot.services.daemon import stop
+
+    with console.status("[bold blue]Stopping service...[/bold blue]"):
+        ok, msg = stop()
+
+    if ok:
+        print_success(msg)
+    else:
+        print_error(Exception(msg))
+        raise typer.Exit(1)
+
+
+@service_app.command("restart")
+def service_restart(
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c",
+        help="Path to config.yaml",
+    ),
+) -> None:
+    """Restart the background service."""
+    from spoon_bot.services.daemon import restart
+
+    with console.status("[bold blue]Restarting service...[/bold blue]"):
+        ok, msg = restart(config)
+
+    if ok:
+        print_success(msg)
+    else:
+        print_error(Exception(msg))
+        raise typer.Exit(1)
+
+
+@service_app.command("status")
+def service_status() -> None:
+    """Show the service status."""
+    from spoon_bot.services.daemon import get_status
+
+    info = get_status()
+
+    status_icon = "[green]●[/green]" if info["running"] else "[red]●[/red]"
+    status_text = "[green]running[/green]" if info["running"] else "[red]stopped[/red]"
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="dim")
+    table.add_column()
+    table.add_row("Status:", f"{status_icon} {status_text}")
+    if info["pid"]:
+        table.add_row("PID:", str(info["pid"]))
+    table.add_row("Auto-start:", "[green]installed[/green]" if info["auto_start"] else "[dim]not installed[/dim]")
+    table.add_row("Log file:", info["log_file"])
+    table.add_row("PID file:", info["pid_file"])
+
+    console.print(Panel(table, title="[bold]spoon-bot Service[/bold]"))
+
+
+@service_app.command("logs")
+def service_logs(
+    lines: int = typer.Option(50, "-n", "--lines", help="Number of lines to show"),
+    follow: bool = typer.Option(False, "-f", "--follow", help="Stream new log output"),
+) -> None:
+    """View service logs."""
+    from spoon_bot.services.daemon import tail_logs
+
+    tail_logs(lines=lines, follow=follow)
+
+
+@service_app.command("install")
+def service_install(
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c",
+        help="Path to config.yaml to use at startup",
+    ),
+) -> None:
+    """Install spoon-bot to auto-start at user login.
+
+    \b
+    Windows → Windows Task Scheduler (no admin required)
+    Linux   → systemd user service (~/.config/systemd/user/)
+    macOS   → launchd agent (~/Library/LaunchAgents/)
+    """
+    from spoon_bot.services.daemon import install_auto_start
+
+    with console.status("[bold blue]Installing auto-start...[/bold blue]"):
+        ok, msg = install_auto_start(config)
+
+    if ok:
+        print_success(msg)
+        console.print("\n[dim]Run [bold]spoon-bot service start[/bold] to start immediately.[/dim]")
+    else:
+        print_error(Exception(msg))
+        raise typer.Exit(1)
+
+
+@service_app.command("uninstall")
+def service_uninstall() -> None:
+    """Remove auto-start registration."""
+    from spoon_bot.services.daemon import uninstall_auto_start
+
+    with console.status("[bold blue]Removing auto-start...[/bold blue]"):
+        ok, msg = uninstall_auto_start()
+
+    if ok:
+        print_success(msg)
+    else:
+        print_error(Exception(msg))
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

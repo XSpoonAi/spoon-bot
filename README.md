@@ -544,6 +544,9 @@ Default workspace: `~/.spoon-bot/workspace/`
 │   │   ├── MEMORY.md    # Long-term facts
 │   │   └── YYYY-MM-DD.md # Daily notes
 │   └── skills/          # Custom skills
+├── config.yaml          # Channel configuration (for service mode)
+├── service.pid          # PID of background service process
+├── gateway.log          # Background service log
 └── config.json          # Configuration
 ```
 
@@ -562,12 +565,80 @@ spoon-bot gateway --channels telegram  # Start Telegram channel only
 spoon-bot gateway --no-cli             # Disable CLI input in gateway mode
 spoon-bot gateway --config path/to/config.yaml  # Custom config file
 
+# Background service management
+spoon-bot service start                # Start gateway in the background
+spoon-bot service stop                 # Stop the background service
+spoon-bot service restart              # Restart the service
+spoon-bot service status               # Show PID, auto-start, and log path
+spoon-bot service logs                 # Show last 50 log lines
+spoon-bot service logs -f              # Follow log output (tail -f)
+spoon-bot service install              # Register auto-start at login
+spoon-bot service uninstall            # Remove auto-start registration
+
 # General
 spoon-bot onboard                      # Initialize workspace
-spoon-bot gateway                      # Start REST + WebSocket gateway
 spoon-bot status                       # Show status
 spoon-bot version                      # Show version
 ```
+
+## Background Service
+
+Run the gateway as a persistent background service — no Docker, no terminal window required. Once started, the bot keeps running and responds to your chat tools (Telegram, Discord, etc.) automatically.
+
+### Quick Start
+
+```bash
+# 1. Configure your channels (if not already done)
+cp config.example.yaml ~/.spoon-bot/config.yaml
+# edit ~/.spoon-bot/config.yaml with your tokens
+
+# 2. Start the service in the background
+spoon-bot service start
+
+# 3. Check it's running
+spoon-bot service status
+
+# 4. Follow logs
+spoon-bot service logs -f
+```
+
+### Auto-Start at Login
+
+Register the gateway to start automatically every time you log in:
+
+```bash
+spoon-bot service install    # register
+spoon-bot service uninstall  # remove
+```
+
+| Platform | Method | Requires Admin? |
+|----------|--------|----------------|
+| Windows 11 | Task Scheduler (`ONLOGON` trigger) | No |
+| Linux | systemd user service (`~/.config/systemd/user/`) | No |
+| macOS | launchd agent (`~/Library/LaunchAgents/`) | No |
+
+### Service Files
+
+All state is stored in `~/.spoon-bot/`:
+
+```
+~/.spoon-bot/
+├── config.yaml      # Channel configuration
+├── service.pid      # PID of the running process
+└── gateway.log      # Rolling log (append-only)
+```
+
+### Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `spoon-bot service start [-c config.yaml]` | Start gateway in background |
+| `spoon-bot service stop` | Gracefully stop (SIGTERM → SIGKILL after 10 s) |
+| `spoon-bot service restart` | Stop + start |
+| `spoon-bot service status` | Show running state, PID, auto-start flag, log path |
+| `spoon-bot service logs [-n N] [-f]` | Print last N lines; `-f` to stream |
+| `spoon-bot service install [-c config.yaml]` | Register OS-level auto-start |
+| `spoon-bot service uninstall` | Remove OS-level auto-start |
 
 ## Gateway API
 
