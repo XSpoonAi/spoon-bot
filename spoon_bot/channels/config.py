@@ -306,6 +306,7 @@ class ChannelsConfig:
                 allowed_chats=allowed_chats,
                 allowed_users=allowed_users,
                 require_mention=account.get("require_mention", True),
+                render_mode=account.get("render_mode", "auto"),
             )
             configs.append((config, name))
 
