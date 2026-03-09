@@ -142,7 +142,17 @@ def agent(
 
 
 class AgentProgressContext:
-    """Context manager for showing agent processing progress."""
+    """Context manager for showing agent processing progress.
+
+    Ensures Rich's Progress spinner is started and stopped on the SAME
+    thread so that terminal state (cursor visibility, alternate screen,
+    etc.) is properly restored — critical on Windows/MINTTY terminals.
+
+    While the spinner is active the global ``_active_progress_ctx`` is
+    set so that ``_tui_step_sink`` routes its output through
+    ``progress.update()`` instead of calling ``console.print()``
+    concurrently — which would corrupt terminal state.
+    """
 
     def __init__(self, console: Console):
         self.console = console
@@ -155,18 +165,39 @@ class AgentProgressContext:
         self.task_id = None
 
     async def __aenter__(self):
+        global _active_progress_ctx  # noqa: PLW0603
         self.progress.start()
         self.task_id = self.progress.add_task("Thinking...", total=None)
+        _active_progress_ctx = self
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.progress.stop()
+        global _active_progress_ctx  # noqa: PLW0603
+        _active_progress_ctx = None
+        # progress.stop() MUST run on the main thread — calling it from
+        # asyncio.to_thread breaks terminal state restoration on MINTTY.
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        # Always force-restore cursor and flush, regardless of Rich state.
+        try:
+            self.console.show_cursor(True)
+            if hasattr(self.console, "file") and self.console.file:
+                self.console.file.flush()
+        except Exception:
+            pass
         return False
 
     def update(self, description: str):
         """Update the progress description."""
         if self.task_id is not None:
             self.progress.update(self.task_id, description=description)
+
+
+# Tracks the currently-active progress context so _tui_step_sink can
+# route output through ``progress.update()`` instead of console.print().
+_active_progress_ctx: AgentProgressContext | None = None
 
 
 import re as _re
@@ -251,13 +282,23 @@ def _format_tool_args(tool_name: str, raw_args: str) -> str:
 
 
 def _tui_step_sink(message):
-    """Render agent step logs as compact TUI lines (opencode-style)."""
+    """Render agent step logs as compact TUI lines (opencode-style).
+
+    When ``AgentProgressContext`` is active, step information is routed
+    through ``progress.update()`` so that only one writer touches the
+    terminal at a time — prevents concurrent console.print() + Progress
+    rendering from corrupting cursor/terminal state on Windows / MINTTY.
+    """
     text = message.record["message"]
+    ctx = _active_progress_ctx  # read once for thread-safety
 
     m = _STEP_RE.search(text)
     if m:
         cur, total = m.group(1), m.group(2)
-        console.print(f"\n  [bold cyan]●[/bold cyan] [bold]Step {cur}/{total}[/bold]", highlight=False)
+        if ctx:
+            ctx.update(f"Step {cur}/{total}")
+        else:
+            console.print(f"\n  [bold cyan]●[/bold cyan] [bold]Step {cur}/{total}[/bold]", highlight=False)
         return
 
     m = _TOOL_CALL_RE.search(text)
@@ -265,10 +306,14 @@ def _tui_step_sink(message):
         name = m.group(1)
         args = (m.group(2) or "").strip()
         args_display = _format_tool_args(name, args)
-        if args_display:
-            console.print(f"    [dim]╭─[/dim] [yellow]{name}[/yellow] {args_display}", highlight=False)
+        if ctx:
+            brief = _strip_ansi(args_display)[:60] if args_display else ""
+            ctx.update(f"Step → {name} {brief}".rstrip())
         else:
-            console.print(f"    [dim]╭─[/dim] [yellow]{name}[/yellow]", highlight=False)
+            if args_display:
+                console.print(f"    [dim]╭─[/dim] [yellow]{name}[/yellow] {args_display}", highlight=False)
+            else:
+                console.print(f"    [dim]╭─[/dim] [yellow]{name}[/yellow]", highlight=False)
         return
 
     m = _TOOL_RESULT_RE.search(text)
@@ -277,14 +322,18 @@ def _tui_step_sink(message):
         result = _truncate(raw, 90)
         if not result:
             return
-        if raw.startswith("```diff") or raw.startswith("---"):
-            console.print("    [dim]╰→[/dim] [green]edit applied[/green]", highlight=False)
-        elif "Error" in result or "failed" in result.lower():
-            console.print(f"    [dim]╰→[/dim] [red]{result}[/red]", highlight=False)
-        elif "SUCCESS" in result or "Successfully" in result:
-            console.print(f"    [dim]╰→[/dim] [green]{result}[/green]", highlight=False)
+        if ctx:
+            brief = _strip_ansi(result)[:60]
+            ctx.update(f"Step ← {brief}")
         else:
-            console.print(f"    [dim]╰→[/dim] {result}", highlight=False)
+            if raw.startswith("```diff") or raw.startswith("---"):
+                console.print("    [dim]╰→[/dim] [green]edit applied[/green]", highlight=False)
+            elif "Error" in result or "failed" in result.lower():
+                console.print(f"    [dim]╰→[/dim] [red]{result}[/red]", highlight=False)
+            elif "SUCCESS" in result or "Successfully" in result:
+                console.print(f"    [dim]╰→[/dim] [green]{result}[/green]", highlight=False)
+            else:
+                console.print(f"    [dim]╰→[/dim] {result}", highlight=False)
         return
 
 

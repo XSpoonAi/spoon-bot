@@ -629,6 +629,13 @@ class ChannelManager:
                 )
 
             self._circuit_breaker.record_success()
+
+            if not response_text:
+                logger.warning(
+                    f"[{message.channel}] Agent returned empty response for {message.sender_id}"
+                )
+                response_text = "I processed your request but have no output to share. Please try again."
+
             logger.info(
                 f"[{message.channel}] Agent response ready "
                 f"({len(response_text)} chars) for {message.sender_id}"

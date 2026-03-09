@@ -122,11 +122,12 @@ class AgentLoop:
     # Must be concise (it's repeated every iteration) but directive enough
     # to prevent hallucination and ensure the model calls tools.
     DEFAULT_NEXT_STEP_PROMPT = (
-        "Pick the best tool for the next step and call it. "
-        "Do NOT skip tool calls — if a tool can help, you MUST call it. "
+        "The user's LATEST message is the top priority — always respond to what they just said. "
+        "For simple conversational messages (greetings, thanks, etc.) respond directly without calling tools or running skill initializations. "
+        "For explicit task requests, pick the best tool and call it. "
         "Do NOT fabricate output or pretend to run commands. "
-        "NEVER ask the user questions — make default choices autonomously. "
-        "Only stop when you can show a CONCRETE result (key, address, file path, etc.)."
+        "If a step fails or returns an error, STOP and report the failure — do not continue with follow-up steps. "
+        "NEVER ask the user questions — make autonomous default choices when needed."
     )
 
     def __init__(
@@ -928,9 +929,12 @@ class AgentLoop:
             if hasattr(result, 'tool_calls'):
                 logger.info(f"Agent tool_calls: {result.tool_calls}")
 
-            # Extract content
-            if hasattr(result, "content"):
+            # Extract content — guard against result.content being None
+            if hasattr(result, "content") and result.content is not None:
                 final_content = result.content
+            elif hasattr(result, "content"):
+                # result.content exists but is None; fall back to str(result)
+                final_content = str(result) if str(result) != "None" else ""
             else:
                 final_content = str(result)
 
@@ -980,6 +984,9 @@ class AgentLoop:
         """
         import re
 
+        if not content:
+            return content or ""
+
         lines = content.split('\n')
         filtered_lines = []
         skip_until_blank = False
@@ -1002,10 +1009,23 @@ class AgentLoop:
             # Keep all other lines
             filtered_lines.append(line)
 
+        # If everything was filtered (e.g. all lines were "Step N: ..."), fall back to
+        # extracting the inline content from the last Step line so we never return "".
+        if not filtered_lines and lines:
+            for raw_line in reversed(lines):
+                m = re.match(r'^Step \d+:\s*(.+)', raw_line)
+                if m and m.group(1).strip():
+                    filtered_lines = [m.group(1).strip()]
+                    break
+            if not filtered_lines:
+                # Last-resort: return original content unchanged
+                return content.strip()
+
         # Join and clean up excessive blank lines
         result = '\n'.join(filtered_lines)
         result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
         return result.strip()
+
 
     async def stream(
         self,
