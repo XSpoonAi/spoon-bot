@@ -613,7 +613,7 @@ spoon-bot service uninstall  # remove
 
 | Platform | Method | Requires Admin? |
 |----------|--------|----------------|
-| Windows 11 | Task Scheduler (`ONLOGON` trigger) | No |
+| Windows (7+) | Task Scheduler (`ONLOGON` trigger) | No |
 | Linux | systemd user service (`~/.config/systemd/user/`) | No |
 | macOS | launchd agent (`~/Library/LaunchAgents/`) | No |
 
