@@ -7,6 +7,7 @@ Provides user-friendly CLI with:
 """
 
 import asyncio
+import ctypes
 import os
 import sys
 from pathlib import Path
@@ -14,11 +15,8 @@ from typing import Any, Optional
 
 import typer
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -76,6 +74,71 @@ def print_warning(message: str) -> None:
     console.print(f"[yellow][bold]Warning:[/bold][/yellow] {message}")
 
 
+def _restore_console_input_mode() -> None:
+    """Restore the Windows console input handle to standard line-buffered mode.
+
+    Rich, subprocess, or ANSI escape processing can leave the console input
+    handle in an unexpected mode (e.g. raw or VT-input) which causes
+    ``sys.stdin.readline()`` to hang.  Calling this before each prompt
+    guarantees the handle is back to normal.  No-op on non-Windows.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        STD_INPUT_HANDLE = ctypes.c_ulong(-10 & 0xFFFFFFFF)
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        if handle == -1:
+            return
+        ENABLE_PROCESSED_INPUT = 0x0001
+        ENABLE_LINE_INPUT = 0x0002
+        ENABLE_ECHO_INPUT = 0x0004
+        default_mode = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT
+        kernel32.SetConsoleMode(handle, default_mode)
+    except Exception:
+        pass
+
+
+async def _read_stdin_line() -> str | None:
+    """Read one line from stdin with Ctrl+C support on Windows.
+
+    Plain ``asyncio.to_thread(sys.stdin.readline)`` spawns a thread that
+    cannot be interrupted by Ctrl+C on Windows (the thread blocks in a
+    Win32 ``ReadConsoleW`` call that ignores Python signals).
+
+    This helper uses a daemon thread + asyncio.Queue so the event loop
+    can service ``KeyboardInterrupt`` between short poll intervals.
+    Returns ``None`` on EOF.
+    """
+    if sys.platform != "win32":
+        line = await asyncio.to_thread(sys.stdin.readline)
+        return line if line else None
+
+    import threading
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            line = sys.stdin.readline()
+            loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception:
+            loop.call_soon_threadsafe(queue.put_nowait, "")
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    try:
+        while True:
+            try:
+                line = await asyncio.wait_for(queue.get(), timeout=0.3)
+                return line if line else None
+            except asyncio.TimeoutError:
+                continue
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        raise KeyboardInterrupt
+
+
 def get_workspace() -> Path:
     """Get the default workspace path."""
     return Path.home() / ".spoon-bot" / "workspace"
@@ -112,7 +175,7 @@ def agent(
         help="Workspace directory",
     ),
     max_iterations: int = typer.Option(
-        20, "--max-iterations",
+        50, "--max-iterations",
         help="Maximum tool call iterations",
     ),
     verbose: bool = typer.Option(
@@ -144,45 +207,50 @@ def agent(
 class AgentProgressContext:
     """Context manager for showing agent processing progress.
 
-    After Progress stops, explicitly restores cursor visibility and
-    flushes stdout — critical on Windows/MINTTY where Rich may not
-    fully restore terminal state on its own.
+    Uses a simple stdout-based spinner instead of Rich's Progress/Live
+    renderer.  Rich's Live rendering corrupts the Windows console input
+    mode, causing ``sys.stdin.readline()`` to hang on subsequent calls
+    and making Ctrl+C unresponsive.  Writing spinner frames directly via
+    ``sys.stdout`` avoids all Rich lock / terminal-state issues.
     """
+
+    _FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
     def __init__(self, console: Console):
         self.console = console
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold green]{task.description}[/bold green]"),
-            transient=True,
-            console=console,
-        )
-        self.task_id = None
+        self._description = "Thinking..."
+        self._task: asyncio.Task | None = None
 
     async def __aenter__(self):
-        self.progress.start()
-        self.task_id = self.progress.add_task("Thinking...", total=None)
+        self._task = asyncio.create_task(self._spin())
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        try:
-            self.progress.stop()
-        except Exception:
-            pass
-        # Force-restore cursor and flush — fixes "second input blocked"
-        # on Windows / MINTTY where Rich's cleanup can be incomplete.
-        try:
-            self.console.show_cursor(True)
-            if hasattr(self.console, "file") and self.console.file:
-                self.console.file.flush()
-        except Exception:
-            pass
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        # Clear the spinner line
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
         return False
 
+    async def _spin(self):
+        idx = 0
+        try:
+            while True:
+                frame = self._FRAMES[idx % len(self._FRAMES)]
+                sys.stdout.write(f"\r\033[K  {frame} {self._description}")
+                sys.stdout.flush()
+                idx += 1
+                await asyncio.sleep(0.08)
+        except asyncio.CancelledError:
+            pass
+
     def update(self, description: str):
-        """Update the progress description."""
-        if self.task_id is not None:
-            self.progress.update(self.task_id, description=description)
+        self._description = description
 
 
 import re as _re
@@ -190,15 +258,17 @@ import re as _re
 _STEP_RE = _re.compile(r"Agent \S+ is running step (\d+)/(\d+)")
 _TOOL_CALL_RE = _re.compile(r"Tool call: (\S+)\((.*)?\)", _re.DOTALL)
 _TOOL_RESULT_RE = _re.compile(r"Tool (\S+) executed with result: (.+)", _re.DOTALL)
+_THOUGHT_RE = _re.compile(r"💭 Agent reasoning: (.+)", _re.DOTALL)
 _ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
 _OBSERVED_PREFIX = _re.compile(r"^Observed output of cmd \S+ execution:\s*")
 
 
 def _tui_step_filter(record):
-    """Only pass through agent step/tool messages in TUI mode."""
+    """Only pass through agent step/tool/thought messages in TUI mode."""
     msg = record["message"]
     return bool(
         _STEP_RE.search(msg)
+        or _THOUGHT_RE.search(msg)
         or _TOOL_CALL_RE.search(msg)
         or _TOOL_RESULT_RE.search(msg)
     )
@@ -208,7 +278,7 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _truncate(text: str, max_len: int = 120) -> str:
+def _truncate(text: str, max_len: int = 200) -> str:
     text = _strip_ansi(text)
     text = _OBSERVED_PREFIX.sub("", text)
     first_line = text.split("\n", 1)[0].strip()
@@ -218,7 +288,7 @@ def _truncate(text: str, max_len: int = 120) -> str:
 
 
 def _format_tool_args(tool_name: str, raw_args: str) -> str:
-    """Extract a concise, human-readable summary from raw JSON tool args."""
+    """Extract a human-readable summary from raw JSON tool args."""
     import json as _json
 
     if not raw_args:
@@ -226,54 +296,60 @@ def _format_tool_args(tool_name: str, raw_args: str) -> str:
     try:
         obj = _json.loads(raw_args)
     except (ValueError, TypeError):
-        return f"[dim]{_truncate(raw_args, 60)}[/dim]"
+        return f"[dim]{_truncate(raw_args, 100)}[/dim]"
 
     if not isinstance(obj, dict):
-        return f"[dim]{_truncate(raw_args, 60)}[/dim]"
+        return f"[dim]{_truncate(raw_args, 100)}[/dim]"
 
-    # Show the most meaningful argument for common tools
     if tool_name == "shell":
         cmd = obj.get("command", "")
-        return f"[dim]$ {_truncate(cmd, 70)}[/dim]"
+        return f"\n      [dim]$ {cmd}[/dim]" if cmd else ""
     if tool_name == "skill_marketplace":
         action = obj.get("action", "")
-        url = obj.get("url", "")
+        url = obj.get("url", obj.get("skill_name", ""))
         if url:
-            return f"[dim]{action} → {_truncate(url, 60)}[/dim]"
+            return f"[dim]{action} → {url}[/dim]"
         return f"[dim]{action}[/dim]"
-    if tool_name == "read_text_file":
-        path = obj.get("path", "")
-        return f"[dim]{_truncate(path, 70)}[/dim]"
+    if tool_name in ("read_file", "read_text_file"):
+        return f"[dim]{obj.get('path', '')}[/dim]"
     if tool_name == "write_file":
-        path = obj.get("path", obj.get("file_path", ""))
-        return f"[dim]→ {_truncate(path, 70)}[/dim]"
+        return f"[dim]→ {obj.get('path', obj.get('file_path', ''))}[/dim]"
     if tool_name == "edit_file":
+        return f"[dim]{obj.get('path', '')}[/dim]"
+    if tool_name in ("list_dir", "list_directory"):
+        return f"[dim]{obj.get('path', '')}[/dim]"
+    if tool_name == "grep":
+        pat = obj.get("pattern", "")
         path = obj.get("path", "")
-        return f"[dim]{_truncate(path, 70)}[/dim]"
-    if tool_name == "list_directory":
-        path = obj.get("path", "")
-        return f"[dim]{_truncate(path, 70)}[/dim]"
+        return f"[dim]{pat} in {path}[/dim]"
     if tool_name == "self_upgrade":
         return f"[dim]{obj.get('action', '')}[/dim]"
 
-    # Generic: show keys and abbreviated values
     parts = []
-    for k, v in list(obj.items())[:3]:
+    for k, v in list(obj.items())[:4]:
         sv = str(v)
-        if len(sv) > 30:
-            sv = sv[:27] + "..."
+        if len(sv) > 60:
+            sv = sv[:57] + "..."
         parts.append(f"{k}={sv}")
     return "[dim]" + ", ".join(parts) + "[/dim]"
 
 
 def _tui_step_sink(message):
-    """Render agent step logs as compact TUI lines (opencode-style)."""
+    """Render agent step logs as detailed TUI lines."""
     text = message.record["message"]
 
     m = _STEP_RE.search(text)
     if m:
         cur, total = m.group(1), m.group(2)
         console.print(f"\n  [bold cyan]●[/bold cyan] [bold]Step {cur}/{total}[/bold]", highlight=False)
+        return
+
+    m = _THOUGHT_RE.search(text)
+    if m:
+        thought = m.group(1).strip()
+        if thought:
+            display = thought[:200] + "…" if len(thought) > 200 else thought
+            console.print(f"    [dim]💭[/dim] [italic]{display}[/italic]", highlight=False)
         return
 
     m = _TOOL_CALL_RE.search(text)
@@ -289,37 +365,100 @@ def _tui_step_sink(message):
 
     m = _TOOL_RESULT_RE.search(text)
     if m:
+        tool_name = m.group(1)
         raw = m.group(2).strip()
-        result = _truncate(raw, 90)
-        if not result:
+        raw = _strip_ansi(raw)
+        raw = _OBSERVED_PREFIX.sub("", raw)
+        if not raw.strip():
             return
         if raw.startswith("```diff") or raw.startswith("---"):
             console.print("    [dim]╰→[/dim] [green]edit applied[/green]", highlight=False)
-        elif "Error" in result or "failed" in result.lower():
-            console.print(f"    [dim]╰→[/dim] [red]{result}[/red]", highlight=False)
-        elif "SUCCESS" in result or "Successfully" in result:
-            console.print(f"    [dim]╰→[/dim] [green]{result}[/green]", highlight=False)
+            return
+
+        lines = raw.split("\n")
+        max_lines = 5 if tool_name == "shell" else 3
+        display_lines = lines[:max_lines]
+        display = "\n".join(ln.strip() for ln in display_lines)
+        if len(display) > 500:
+            display = display[:500] + "..."
+        if len(lines) > max_lines:
+            display += f"\n      ... ({len(lines) - max_lines} more lines)"
+
+        if "Error" in display or "failed" in display.lower() or "Security Error" in display:
+            style = "[red]"
+            end_style = "[/red]"
+        elif "SUCCESS" in display or "Successfully" in display:
+            style = "[green]"
+            end_style = "[/green]"
         else:
-            console.print(f"    [dim]╰→[/dim] {result}", highlight=False)
+            style = ""
+            end_style = ""
+
+        if "\n" in display:
+            console.print(f"    [dim]╰→[/dim] {style}{display}{end_style}", highlight=False)
+        else:
+            console.print(f"    [dim]╰→[/dim] {style}{display}{end_style}", highlight=False)
         return
 
 
 
-def _configure_logging(verbose: bool = False) -> None:
-    """Set loguru output level based on verbosity."""
-    import sys as _sys
+_log_file_id: int | None = None
+_logging_configured: bool = False
+
+
+def _configure_logging(verbose: bool = False, workspace: "Path | None" = None) -> None:
+    """Set loguru output level and optionally add a file sink for local logs.
+
+    Called twice: once early (console only) and once after workspace is resolved
+    (adds the file sink).  The second call only adds the file handler; it does
+    NOT re-remove + re-add console handlers.
+    """
+    global _log_file_id, _logging_configured
     from loguru import logger as _logger
 
-    _logger.remove()
-    if verbose:
-        _logger.add(_sys.stderr, level="DEBUG")
-    else:
-        _logger.add(
-            _tui_step_sink,
-            level="INFO",
-            filter=_tui_step_filter,
-            format="{message}",
+    if not _logging_configured:
+        import sys as _sys
+        _logger.remove()
+        if verbose:
+            _logger.add(_sys.stderr, level="DEBUG")
+        else:
+            _logger.add(
+                _tui_step_sink,
+                level="INFO",
+                filter=_tui_step_filter,
+                format="{message}",
+            )
+        _logging_configured = True
+
+    # Add workspace log file (only once)
+    if workspace and _log_file_id is None:
+        log_dir = Path(workspace) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"agent_{ts}.log"
+
+        def _log_file_format(record):
+            from spoon_bot.utils.privacy import mask_secrets
+            msg = record["message"]
+            msg = mask_secrets(msg)
+            if len(msg) > 8000:
+                msg = msg[:8000] + f"\n... [truncated {len(msg) - 8000} chars]"
+            msg = msg.replace("{", "{{").replace("}", "}}").replace("<", r"\<")
+            ts_str = record["time"].strftime("%H:%M:%S.%f")[:12]
+            lvl = record["level"].name
+            return f"{ts_str} | {lvl:<7} | {msg}\n"
+
+        _log_file_id = _logger.add(
+            str(log_path),
+            level="DEBUG",
+            format=_log_file_format,
+            rotation="10 MB",
+            retention="7 days",
+            encoding="utf-8",
+            colorize=False,
         )
+        console.print(f"  [dim]Logs → {log_path}[/dim]", highlight=False)
 
 
 async def _run_agent(
@@ -366,8 +505,14 @@ async def _run_agent(
         or get_workspace()
     )
     effective_tool_profile = tool_profile or agent_cfg.get("tool_profile")
-    effective_max_iterations = max_iterations or agent_cfg.get("max_iterations", 20)
+    effective_max_iterations = max_iterations or agent_cfg.get("max_iterations", 50)
     effective_enable_skills = agent_cfg.get("enable_skills", True)
+
+    # Ensure workspace directory exists
+    effective_workspace.mkdir(parents=True, exist_ok=True)
+
+    # Set up workspace-local log file
+    _configure_logging(verbose=False, workspace=effective_workspace)
 
     # ------------------------------------------------------------------
     # 3. Show startup header (opencode-style compact)
@@ -459,7 +604,9 @@ async def _run_agent(
 
     try:
         if message:
-            # One-shot mode
+            # One-shot mode — start with a clean session so stale history
+            # from previous runs does not confuse the agent.
+            agent.clear_history()
             console.print(f"\n  [bold cyan]>[/bold cyan] {message}\n")
 
             try:
@@ -488,11 +635,14 @@ async def _run_agent(
 
             while True:
                 try:
-                    # Use asyncio.to_thread so that blocking input does not
-                    # stall the event loop — channels keep processing.
-                    user_input = await asyncio.to_thread(
-                        Prompt.ask, "[bold cyan]You[/bold cyan]",
-                    )
+                    _restore_console_input_mode()
+                    sys.stdout.write("\033[1;36mYou\033[0m: ")
+                    sys.stdout.flush()
+                    line = await _read_stdin_line()
+                    if line is None:
+                        console.print("\n[dim]Goodbye![/dim]")
+                        break
+                    user_input = line.strip()
 
                     if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
                         console.print("\n[dim]Goodbye! Thanks for using spoon-bot.[/dim]")
@@ -535,7 +685,6 @@ async def _run_agent(
                     if not user_input.strip():
                         continue
 
-                    # Process with progress indicator
                     try:
                         async with AgentProgressContext(console) as progress:
                             progress.update("Thinking...")
@@ -814,6 +963,10 @@ async def _run_gateway(
     effective_tool_profile = tool_profile or agent_cfg.get("tool_profile")
     effective_max_iterations = agent_cfg.get("max_iterations")
     effective_enable_skills = agent_cfg.get("enable_skills", True)
+
+    # Set up workspace-local log file
+    effective_workspace.mkdir(parents=True, exist_ok=True)
+    _configure_logging(workspace=effective_workspace)
 
     # ------------------------------------------------------------------
     # 3. Show startup panel with effective values

@@ -147,8 +147,12 @@ async def _download_via_api(
                 await download_dir(ipath, sub_dest, client)
 
     target.mkdir(parents=True, exist_ok=True)
-    async with httpx.AsyncClient(timeout=30) as client:
-        await download_dir(subpath, target, client)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            await download_dir(subpath, target, client)
+    except Exception:
+        shutil.rmtree(str(target), ignore_errors=True)
+        raise
 
     return total_files
 
@@ -193,14 +197,15 @@ class SkillMarketplaceTool(BaseTool):
 
     name: str = "skill_marketplace"
     description: str = (
-        "Install, remove, or search skills. "
+        "Install, update, remove, or search skills. "
         "WHEN THE USER GIVES A GITHUB URL, call this tool with action='install_skill' and url=<the URL>. "
         "Actions: "
-        "install_skill (url required) — install a skill from GitHub URL like https://github.com/owner/repo/tree/branch/path; "
+        "install_skill (url required) — install a skill from GitHub URL; "
+        "update_skill (url required) — re-download and update an already-installed skill; "
         "search_skills (query required) — search skills.sh; "
         "remove_skill (skill_name required) — remove installed skill; "
         "skill_info (skill_name required) — show SKILL.md. "
-        "After install/remove, call self_upgrade(action='reload_skills') to activate."
+        "After install/update/remove, call self_upgrade(action='reload_skills') to activate."
     )
     parameters: dict = {
         "type": "object",
@@ -210,6 +215,7 @@ class SkillMarketplaceTool(BaseTool):
                 "enum": [
                     "search_skills",
                     "install_skill",
+                    "update_skill",
                     "remove_skill",
                     "skill_info",
                 ],
@@ -286,14 +292,11 @@ class SkillMarketplaceTool(BaseTool):
             if not url:
                 return "Error: 'url' is required for install_skill"
             try:
-                # Normalise: add https:// if the LLM passed a bare
-                # github.com/... URL (common with some models).
                 _url = url
                 if not _url.startswith(("http://", "https://")):
                     if "github.com" in _url:
                         _url = "https://" + _url.lstrip("/")
                     elif "/tree/" in _url:
-                        # Looks like a GitHub path fragment — prepend origin
                         _url = "https://github.com/" + _url.lstrip("/")
 
                 if _url.startswith(("http://", "https://")):
@@ -310,7 +313,6 @@ class SkillMarketplaceTool(BaseTool):
                         )
                     owner, repo = parts[0], parts[1]
                     branch = "main"
-                    # Skip /tree/<branch>/... if present in shorthand
                     rest = parts[2:]
                     if rest and rest[0] == "tree":
                         branch = rest[1] if len(rest) > 1 else "main"
@@ -320,39 +322,104 @@ class SkillMarketplaceTool(BaseTool):
                     skill_name_derived = skill_id or repo
 
                 target = workspace / "skills" / skill_name_derived
-                if target.exists():
+                _rel_path = f"skills/{skill_name_derived}"
+
+                if target.exists() and (target / "SKILL.md").exists():
                     return (
-                        f"Skill '{skill_name_derived}' is already installed. "
-                        "Use remove_skill first if you want to reinstall."
+                        f"Skill '{skill_name_derived}' is already installed.\n"
+                        "If the user asked to UPDATE, use action='update_skill' instead.\n"
+                        "Otherwise, proceed to USE the skill:\n"
+                        f"  read_file(path='{_rel_path}/SKILL.md')\n"
+                        "Then execute CLI commands from SKILL.md. Record in soul.md."
                     )
+                elif target.exists():
+                    shutil.rmtree(str(target), ignore_errors=True)
 
                 target.parent.mkdir(parents=True, exist_ok=True)
                 count = await _download_skill_files(
                     owner, repo, branch, subpath, target
                 )
 
-                # Read installed SKILL.md so the agent knows how to use it
-                skill_md_content = ""
-                skill_md_path = target / "SKILL.md"
-                if skill_md_path.exists():
-                    skill_md_content = skill_md_path.read_text(encoding="utf-8")
+                installed_files = []
+                for f in sorted(target.rglob("*")):
+                    if f.is_file():
+                        installed_files.append(str(f.relative_to(target)))
 
-                result_parts = [
-                    f"SUCCESS: Skill '{skill_name_derived}' installed ({count} files).",
-                    "",
-                    "NEXT STEP: Call `self_upgrade(action='reload_skills')` now "
-                    "to activate the new skill's tools.",
-                ]
-                if skill_md_content:
-                    result_parts.append("")
-                    result_parts.append("--- SKILL.md (follow these instructions after reload) ---")
-                    result_parts.append(skill_md_content)
-
-                return "\n".join(result_parts)
+                return (
+                    f"SUCCESS: Skill '{skill_name_derived}' installed ({count} files).\n"
+                    f"Files: {', '.join(installed_files[:15])}\n\n"
+                    "NEXT STEPS:\n"
+                    "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
+                    f"2) read_file(path='{_rel_path}/SKILL.md') for instructions.\n"
+                    "3) Execute CLI commands from SKILL.md (cast, curl — NOT scripts).\n"
+                    "4) Record the result in soul.md."
+                )
 
             except Exception as e:
                 logger.error(f"install_skill failed: {e}")
+                try:
+                    if target.exists():
+                        has_skill = (target / "SKILL.md").exists()
+                        if not has_skill:
+                            shutil.rmtree(str(target), ignore_errors=True)
+                except NameError:
+                    pass
                 return f"Error installing skill: {e}"
+
+        # ----------------------------------------------------------
+        # update_skill — re-download an already-installed skill
+        # ----------------------------------------------------------
+        elif action == "update_skill":
+            if not url:
+                return "Error: 'url' is required for update_skill"
+            try:
+                _url = url
+                if not _url.startswith(("http://", "https://")):
+                    if "github.com" in _url:
+                        _url = "https://" + _url.lstrip("/")
+                    elif "/tree/" in _url:
+                        _url = "https://github.com/" + _url.lstrip("/")
+
+                if _url.startswith(("http://", "https://")):
+                    owner, repo, branch, subpath = _parse_github_url(_url)
+                    skill_name_derived = (
+                        subpath.rsplit("/", 1)[-1] if subpath else repo
+                    )
+                else:
+                    parts = [p for p in url.split("/") if p]
+                    if len(parts) < 2:
+                        return "Error: provide a full GitHub URL or 'owner/repo/skillId' shorthand"
+                    owner, repo = parts[0], parts[1]
+                    branch = "main"
+                    rest = parts[2:]
+                    if rest and rest[0] == "tree":
+                        branch = rest[1] if len(rest) > 1 else "main"
+                        rest = rest[2:]
+                    skill_id = rest[-1] if rest else ""
+                    subpath = "/".join(rest) if rest else ""
+                    skill_name_derived = skill_id or repo
+
+                target = workspace / "skills" / skill_name_derived
+                _rel_path = f"skills/{skill_name_derived}"
+
+                if target.exists():
+                    shutil.rmtree(str(target), ignore_errors=True)
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                count = await _download_skill_files(
+                    owner, repo, branch, subpath, target
+                )
+
+                return (
+                    f"SUCCESS: Skill '{skill_name_derived}' updated ({count} files).\n\n"
+                    "NEXT STEPS:\n"
+                    "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
+                    f"2) read_file(path='{_rel_path}/SKILL.md') for updated instructions.\n"
+                    "3) Record the update in soul.md."
+                )
+            except Exception as e:
+                logger.error(f"update_skill failed: {e}")
+                return f"Error updating skill: {e}"
 
         # ----------------------------------------------------------
         # remove_skill
@@ -375,10 +442,18 @@ class SkillMarketplaceTool(BaseTool):
         elif action == "skill_info":
             if not skill_name:
                 return "Error: 'skill_name' is required for skill_info"
-            skill_md = workspace / "skills" / skill_name / "SKILL.md"
+            skill_dir = workspace / "skills" / skill_name
+            skill_md = skill_dir / "SKILL.md"
             if not skill_md.exists():
                 return f"Skill '{skill_name}' not found"
-            content = skill_md.read_text(encoding="utf-8")
-            return f"Skill: {skill_name}\n\n{content}"
+            files = [str(f.relative_to(skill_dir)) for f in sorted(skill_dir.rglob("*")) if f.is_file()]
+            _rel_path = f"skills/{skill_name}"
+
+            return (
+                f"Skill: {skill_name}\n"
+                f"SKILL.md: {_rel_path}/SKILL.md\n"
+                f"Files: {', '.join(files[:15])}\n\n"
+                f"To use: read_file(path='{_rel_path}/SKILL.md')"
+            )
 
         return f"Unknown action: {action!r}"

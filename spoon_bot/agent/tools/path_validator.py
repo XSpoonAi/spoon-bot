@@ -104,6 +104,7 @@ class PathValidator:
         workspace: Path | str | None = None,
         allow_outside_workspace: bool = False,
         strict_mode: bool = True,
+        additional_read_paths: list[Path | str] | None = None,
     ):
         """
         Initialize the path validator.
@@ -113,6 +114,9 @@ class PathValidator:
             allow_outside_workspace: If True, allows access outside workspace
                                      (NOT recommended for production).
             strict_mode: If True, also checks for sensitive filename patterns.
+            additional_read_paths: Extra directories allowed for **read** operations
+                                   (e.g. the spoon-bot home dir so skill files are
+                                   accessible even if they sit outside the workspace).
         """
         if workspace is None:
             self._workspace = Path.cwd().resolve()
@@ -122,6 +126,11 @@ class PathValidator:
         self._allow_outside = allow_outside_workspace
         self._strict_mode = strict_mode
         self._is_windows = platform.system() == "Windows"
+        self._additional_read_paths: list[Path] = []
+        if additional_read_paths:
+            self._additional_read_paths = [
+                Path(p).expanduser().resolve() for p in additional_read_paths
+            ]
 
         # Build the blocklist based on platform
         self._blocklist = self._build_blocklist()
@@ -179,7 +188,12 @@ class PathValidator:
                 return True, f"Access to sensitive path pattern '{pattern}' is blocked"
 
         # In strict mode, check filename patterns for files OUTSIDE workspace
-        if self._strict_mode and not is_within_workspace:
+        # (paths within additional_read_paths are treated as workspace-like)
+        if (
+            self._strict_mode
+            and not is_within_workspace
+            and not self._is_within_additional_read_paths(resolved_path)
+        ):
             filename = resolved_path.name.lower()
             for pattern in self.SENSITIVE_PATTERNS:
                 if pattern.lower() in filename:
@@ -198,11 +212,20 @@ class PathValidator:
             True if the path is within the workspace.
         """
         try:
-            # Use relative_to to check if path is under workspace
             resolved_path.relative_to(self._workspace)
             return True
         except ValueError:
             return False
+
+    def _is_within_additional_read_paths(self, resolved_path: Path) -> bool:
+        """Check if *resolved_path* falls under any additional read path."""
+        for allowed in self._additional_read_paths:
+            try:
+                resolved_path.relative_to(allowed)
+                return True
+            except ValueError:
+                continue
+        return False
 
     def _check_symlink_target(self, path: Path) -> tuple[bool, str | None]:
         """
@@ -235,6 +258,17 @@ class PathValidator:
             # Broken symlink or permission error
             return False, f"Cannot resolve symlink: {str(e)}"
 
+    @staticmethod
+    def _normalize_posix_on_windows(path_str: str) -> str:
+        """Convert Git Bash POSIX paths (/c/Users/...) to Windows (C:\\Users\\...) on Windows."""
+        if platform.system() != "Windows":
+            return path_str
+        import re
+        m = re.match(r'^/([a-zA-Z])(/.*)', path_str)
+        if m:
+            return f"{m.group(1).upper()}:{m.group(2)}"
+        return path_str
+
     def validate_read_path(self, path: str | Path) -> PathValidationResult:
         """
         Validate a path for read operations.
@@ -246,18 +280,25 @@ class PathValidator:
             PathValidationResult with validation status.
         """
         try:
-            # Expand user directory and resolve to absolute path
+            path = self._normalize_posix_on_windows(str(path))
             raw_path = Path(path).expanduser()
+
+            # Resolve relative paths against workspace first (not CWD)
+            if not raw_path.is_absolute() and self._workspace:
+                ws_candidate = (self._workspace / raw_path)
+                if ws_candidate.exists():
+                    raw_path = ws_candidate
 
             # For read operations, try to resolve strictly (file must exist)
             try:
                 resolved = raw_path.resolve(strict=True)
             except FileNotFoundError:
-                # File doesn't exist - still validate the path
                 resolved = raw_path.resolve(strict=False)
-                # Return early - no need to check further for non-existent files
-                # The actual tool will handle the "file not found" error
-                if not self._allow_outside and not self._is_within_workspace(resolved):
+                if (
+                    not self._allow_outside
+                    and not self._is_within_workspace(resolved)
+                    and not self._is_within_additional_read_paths(resolved)
+                ):
                     return PathValidationResult(
                         valid=False,
                         resolved_path=None,
@@ -268,8 +309,12 @@ class PathValidator:
                     return PathValidationResult(valid=False, resolved_path=None, error=reason)
                 return PathValidationResult(valid=True, resolved_path=resolved, error=None)
 
-            # Check workspace boundary
-            if not self._allow_outside and not self._is_within_workspace(resolved):
+            # Check workspace boundary (workspace + additional read paths)
+            if (
+                not self._allow_outside
+                and not self._is_within_workspace(resolved)
+                and not self._is_within_additional_read_paths(resolved)
+            ):
                 return PathValidationResult(
                     valid=False,
                     resolved_path=None,
@@ -315,9 +360,12 @@ class PathValidator:
             PathValidationResult with validation status.
         """
         try:
-            # Expand and resolve
+            path = self._normalize_posix_on_windows(str(path))
             raw_path = Path(path).expanduser()
-            resolved = raw_path.resolve(strict=False)  # File may not exist yet
+            # Resolve relative paths against workspace first
+            if not raw_path.is_absolute() and self._workspace:
+                raw_path = self._workspace / raw_path
+            resolved = raw_path.resolve(strict=False)
 
             # For write operations, ALWAYS enforce workspace boundary
             if not self._is_within_workspace(resolved):

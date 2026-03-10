@@ -21,7 +21,7 @@ channels:
   telegram:
     enabled: true
     accounts:
-      - name: "Irene_spoon_bot"
+      - name: "spoon_bot"
         token: "${TELEGRAM_BOT_TOKEN}"
         mode: "polling"
 
