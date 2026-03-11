@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-03-09 02:41 UTC.  
+> **Auto-generated** from source code on 2026-03-11 09:02 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -515,6 +515,7 @@ Handle audio.stream.end
 | `connection.established` | Connection | Connection Established |
 | `connection.ready` | Connection | Connection Ready |
 | `connection.error` | Connection | Connection Error |
+| `sandbox.file.changed` | Other | Sandbox File Changed |
 
 ---
 
