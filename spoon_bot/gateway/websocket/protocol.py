@@ -54,6 +54,15 @@ class ClientMethod(str, Enum):
 
     # Workspace methods
     WORKSPACE_TREE = "workspace.tree"
+    FS_LIST = "fs.list"
+    FS_STAT = "fs.stat"
+    FS_READ = "fs.read"
+    FS_WRITE = "fs.write"
+    FS_MKDIR = "fs.mkdir"
+    FS_RENAME = "fs.rename"
+    FS_REMOVE = "fs.remove"
+    FS_WATCH = "fs.watch"
+    FS_UNWATCH = "fs.unwatch"
 
     # Audio streaming methods
     AUDIO_STREAM_START = "audio.stream.start"
@@ -98,6 +107,9 @@ class ServerEvent(str, Enum):
     CONNECTION_ESTABLISHED = "connection.established"
     CONNECTION_READY = "connection.ready"
     CONNECTION_ERROR = "connection.error"
+
+    # Sandbox events
+    SANDBOX_FILE_CHANGED = "sandbox.file.changed"
 
 
 @dataclass

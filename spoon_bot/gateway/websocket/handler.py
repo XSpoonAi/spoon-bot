@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
+from pathlib import Path
 from uuid import uuid4
 from typing import Any, Callable, Coroutine
 
@@ -40,6 +41,8 @@ from spoon_bot.gateway.websocket.protocol import (
     WSStreamChunk,
     parse_message,
 )
+from spoon_bot.gateway.websocket.workspace_fs import WorkspaceFSService
+from spoon_bot.gateway.websocket.workspace_watch import WorkspaceWatchService
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +222,7 @@ async def websocket_endpoint(
         cancelled = await handler._cancel_current_task_for_cleanup()
         if cancelled:
             logger.info(f"Cancelled background WS chat task on disconnect: {conn_id}")
+        await handler._cleanup_resources()
         await manager.disconnect(conn_id)
 
 
@@ -238,6 +242,13 @@ class WebSocketHandler:
         self._current_task: asyncio.Task | None = None
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._chat_lock = asyncio.Lock()
+        agent = get_agent()
+        workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+        self._workspace_watch_service = WorkspaceWatchService(
+            workspace_root=workspace,
+            emit_change=self._emit_workspace_change,
+        )
+        self._workspace_fs_service = WorkspaceFSService(workspace_root=workspace)
 
         self._handlers: dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {
             # Chat methods
@@ -260,6 +271,15 @@ class WebSocketHandler:
             "unsubscribe": self._handle_unsubscribe,
             # Workspace
             "workspace.tree": self._handle_workspace_tree,
+            ClientMethod.FS_LIST.value: self._handle_fs_list,
+            ClientMethod.FS_STAT.value: self._handle_fs_stat,
+            ClientMethod.FS_READ.value: self._handle_fs_read,
+            ClientMethod.FS_WRITE.value: self._handle_fs_write,
+            ClientMethod.FS_MKDIR.value: self._handle_fs_mkdir,
+            ClientMethod.FS_RENAME.value: self._handle_fs_rename,
+            ClientMethod.FS_REMOVE.value: self._handle_fs_remove,
+            ClientMethod.FS_WATCH.value: self._handle_fs_watch,
+            ClientMethod.FS_UNWATCH.value: self._handle_fs_unwatch,
             # Audio streaming
             "audio.stream.start": self._handle_audio_stream_start,
             "audio.stream.end": self._handle_audio_stream_end,
@@ -547,6 +567,19 @@ class WebSocketHandler:
 
         return True
 
+    async def _cleanup_resources(self) -> None:
+        await self._workspace_watch_service.close()
+
+    async def _emit_workspace_change(self, payload: dict[str, Any]) -> None:
+        manager = get_connection_manager()
+        await manager.send_message(
+            self.connection_id,
+            WSEvent(
+                event=ServerEvent.SANDBOX_FILE_CHANGED.value,
+                data=payload,
+            ),
+        )
+
     # ========== Confirmation ==========
 
     async def _handle_confirm_respond(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -831,6 +864,92 @@ class WebSocketHandler:
 
         nodes = _build_tree(target, max_depth=depth, include_hidden=include_hidden)
         return {"tree": [n.model_dump() for n in nodes]}
+
+    async def _handle_fs_list(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = str(params.get("path", "")).strip() or "/workspace"
+        cursor = str(params["cursor"]).strip() if params.get("cursor") else None
+        limit = int(params.get("limit", 200))
+        return await self._workspace_fs_service.list(path, cursor=cursor, limit=limit)
+
+    async def _handle_fs_stat(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = str(params.get("path", "")).strip()
+        if not path:
+            raise ValueError("path is required")
+        return await self._workspace_fs_service.stat(path)
+
+    async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = str(params.get("path", "")).strip()
+        if not path:
+            raise ValueError("path is required")
+        encoding = str(params.get("encoding", "utf-8"))
+        offset = int(params.get("offset", 0))
+        limit = int(params.get("limit", 262144))
+        return await self._workspace_fs_service.read(
+            path,
+            encoding=encoding,
+            offset=offset,
+            limit=limit,
+        )
+
+    async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = str(params.get("path", "")).strip()
+        if not path:
+            raise ValueError("path is required")
+        if "content" not in params:
+            raise ValueError("content is required")
+        return await self._workspace_fs_service.write(
+            path,
+            content=str(params.get("content", "")),
+            encoding=str(params.get("encoding", "utf-8")),
+            create=bool(params.get("create", True)),
+            truncate=bool(params.get("truncate", True)),
+        )
+
+    async def _handle_fs_mkdir(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = str(params.get("path", "")).strip()
+        if not path:
+            raise ValueError("path is required")
+        return await self._workspace_fs_service.mkdir(
+            path,
+            recursive=bool(params.get("recursive", False)),
+        )
+
+    async def _handle_fs_rename(self, params: dict[str, Any]) -> dict[str, Any]:
+        from_path = str(params.get("from_path", "")).strip()
+        to_path = str(params.get("to_path", "")).strip()
+        if not from_path:
+            raise ValueError("from_path is required")
+        if not to_path:
+            raise ValueError("to_path is required")
+        return await self._workspace_fs_service.rename(
+            from_path,
+            to_path,
+            overwrite=bool(params.get("overwrite", False)),
+        )
+
+    async def _handle_fs_remove(self, params: dict[str, Any]) -> dict[str, Any]:
+        path = str(params.get("path", "")).strip()
+        if not path:
+            raise ValueError("path is required")
+        return await self._workspace_fs_service.remove(
+            path,
+            recursive=bool(params.get("recursive", False)),
+        )
+
+    async def _handle_fs_watch(self, params: dict[str, Any]) -> dict[str, Any]:
+        watch_path = str(params.get("path", "")).strip()
+        if not watch_path:
+            raise ValueError("path is required")
+        recursive = bool(params.get("recursive", False))
+        watch_id = await self._workspace_watch_service.add_watch(watch_path, recursive=recursive)
+        return {"watch_id": watch_id}
+
+    async def _handle_fs_unwatch(self, params: dict[str, Any]) -> dict[str, Any]:
+        watch_id = str(params.get("watch_id", "")).strip()
+        if not watch_id:
+            raise ValueError("watch_id is required")
+        removed = await self._workspace_watch_service.remove_watch(watch_id)
+        return {"watch_id": watch_id, "removed": removed}
 
     # ========== Audio Streaming ==========
 
