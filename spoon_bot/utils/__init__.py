@@ -14,6 +14,7 @@ from spoon_bot.utils.rate_limit import (
     SlidingWindowLimiter,
     RateLimitConfig,
 )
+from spoon_bot.utils.privacy import mask_secrets
 
 __all__ = [
     # Errors
@@ -28,4 +29,6 @@ __all__ = [
     "TokenBucketLimiter",
     "SlidingWindowLimiter",
     "RateLimitConfig",
+    # Privacy
+    "mask_secrets",
 ]

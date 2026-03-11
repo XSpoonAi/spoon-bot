@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging as stdlib_logging
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
@@ -49,7 +50,7 @@ try:
 except ImportError as e:
     logger.error(f"spoon-core SDK is required: {e}")
     raise ImportError(
-        "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai"
+        "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai-sdk"
     ) from e
 
 try:
@@ -77,6 +78,7 @@ from spoon_bot.agent.tools.filesystem import (
     EditFileTool,
     ListDirTool,
 )
+from spoon_bot.agent.tools.grep import GrepTool
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
     SelfConfigTool,
@@ -118,15 +120,13 @@ class AgentLoop:
     - spoon-bot's native OS tools (shell, filesystem, etc.)
     """
 
-    # Injected as a USER message at each agent step to steer tool usage.
-    # Must be concise (it's repeated every iteration) but directive enough
-    # to prevent hallucination and ensure the model calls tools.
+    # Minimal per-step prompt. Kept short since it's injected every iteration.
+    # The agent builds its own reasoning from the system prompt + memory.
     DEFAULT_NEXT_STEP_PROMPT = (
-        "Pick the best tool for the next step and call it. "
-        "Do NOT skip tool calls — if a tool can help, you MUST call it. "
-        "Do NOT fabricate output or pretend to run commands. "
-        "NEVER ask the user questions — make default choices autonomously. "
-        "Only stop when you can show a CONCRETE result (key, address, file path, etc.)."
+        "Continue working on the user's request. "
+        "Do NOT repeat previous actions. Do NOT fabricate output. "
+        "Make autonomous choices when input is needed. "
+        "When the task is complete, summarize concrete results."
     )
 
     def __init__(
@@ -136,8 +136,8 @@ class AgentLoop:
         provider: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_iterations: int = 20,
-        shell_timeout: int = 60,
+        max_iterations: int = 50,
+        shell_timeout: int = 90,
         max_output: int = 10000,
         session_key: str = "default",
         skill_paths: list[Path | str] | None = None,
@@ -352,6 +352,50 @@ class AgentLoop:
         # Context budget hint (compact)
         system_prompt += f"\n\n[Context: {self.context_window:,} tokens — be concise.]\n"
 
+        # Skills section (Openclaw pattern: XML metadata in system prompt)
+        skills_xml = self._build_skills_for_prompt()
+        if skills_xml:
+            system_prompt += f"\n## Installed Skills\n{skills_xml}\n"
+
+        if skills_xml:
+            system_prompt += (
+                "\n> **FIRST ACTION**: Match the user's request to a skill above "
+                "by name/description, then `read_file` its `<location>` path. "
+                "Do NOT call skill_marketplace, web_search, or filesystem search first.\n"
+            )
+
+        system_prompt += (
+            "\n## Workflow\n"
+            f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
+            "1. **Read SKILL.md**: If a skill above matches, `read_file` its path. "
+            "Extract config, addresses, commands.\n"
+            "2. **Execute**: Run commands from SKILL.md directly via shell "
+            "(`cast`, `curl`, etc.). Do NOT write script files.\n"
+            "3. **Done**: Summarize result. Save key state to `soul.md`.\n\n"
+            "Only use `web_search` if NO installed skill matches the task.\n\n"
+            "### Rules\n"
+            "- Do NOT re-read files already in context.\n"
+            "- `source .env.local` before commands that need env vars.\n"
+            "- If a command fails, analyze the error and retry with fixes.\n"
+            "- Follow user instructions exactly — respect specific IDs, names, actions.\n"
+            "\n## Agent Memory (soul.md)\n"
+            "After completing significant actions, append a timestamped entry to `soul.md`.\n"
+            "Format: `## YYYY-MM-DD HH:MM — <topic>` followed by bullet points.\n"
+        )
+
+        # Inject soul.md content if it exists
+        soul_path = self.workspace / "soul.md"
+        if soul_path.exists():
+            try:
+                soul_content = soul_path.read_text(encoding="utf-8").strip()
+                if soul_content:
+                    _max_soul = 2000
+                    if len(soul_content) > _max_soul:
+                        soul_content = soul_content[-_max_soul:]
+                    system_prompt += f"\n## Agent Memory (from soul.md)\n{soul_content}\n"
+            except Exception:
+                pass
+
         # NOTE: inactive-tools prompt is built later, after skill tools are
         # registered so that skill-provided tools are included in the list.
 
@@ -402,11 +446,13 @@ class AgentLoop:
             if "include_default_paths" in _sm_sig.parameters:
                 _sm_kwargs["include_default_paths"] = False
             self._skill_manager = SkillManager(**_sm_kwargs)
-            # Load skill tools into the ToolRegistry
+            # Load skill tools into the ToolRegistry (inactive by default)
             self._register_skill_tools()
-            # Auto-activate skill tools so the agent can use them immediately
-            for skill_tool_name in self._skill_tool_names:
-                self.tools.activate_tool(skill_tool_name)
+            # Only auto-activate skill tools when no skills are shown in prompt
+            # (prevents agent from calling skill_marketplace instead of reading SKILL.md)
+            if not self._build_skills_for_prompt():
+                for skill_tool_name in self._skill_tool_names:
+                    self.tools.activate_tool(skill_tool_name)
 
         # Build active tools list AFTER skill tools are registered and activated
         active_tools = list(self.tools.get_active_tools().values()) + self._mcp_tools
@@ -443,9 +489,8 @@ class AgentLoop:
         # Initialize agent
         await self._agent.initialize()
 
-        # Increase default step timeout for proxy/custom endpoints
-        if self.base_url:
-            self._agent._default_timeout = 300.0
+        # Increase default step timeout — on-chain txs (cast send) can take 60s+
+        self._agent._default_timeout = 300.0
 
         self._initialized = True
         active_count = len(self.tools.get_active_tools())
@@ -469,19 +514,26 @@ class AgentLoop:
 
     def _register_native_tools(self) -> None:
         """Register the default native OS tools."""
-        # Shell tool — allow_chaining lets the agent compose multi-step ops
+        # Shell tool — allow_chaining + allow_substitution lets the agent
+        # compose multi-step ops and use $(), ${}, and backtick expressions.
         self.tools.register(ShellTool(
             timeout=self.shell_timeout,
             max_output=self.max_output,
             working_dir=str(self.workspace),
             allow_chaining=True,
+            allow_substitution=True,
         ))
 
-        # Filesystem tools
-        self.tools.register(ReadFileTool(workspace=self.workspace))
+        # Filesystem tools — allow reads from the user home directory so that
+        # skill-managed data (e.g. ~/.agent-wallet, ~/.spoon-bot/skills) is
+        # accessible.  The PathValidator blocklist still blocks truly sensitive
+        # paths (.ssh, .aws, etc.).
+        _extra_read = [Path.home()]
+        self.tools.register(ReadFileTool(workspace=self.workspace, additional_read_paths=_extra_read, max_output=15000))
         self.tools.register(WriteFileTool(workspace=self.workspace))
         self.tools.register(EditFileTool(workspace=self.workspace))
-        self.tools.register(ListDirTool(workspace=self.workspace))
+        self.tools.register(ListDirTool(workspace=self.workspace, additional_read_paths=_extra_read))
+        self.tools.register(GrepTool(workspace=self.workspace))
 
         # Self-management tools
         self.tools.register(SelfConfigTool())
@@ -913,33 +965,75 @@ class AgentLoop:
             logger.info("Clearing previous shutdown signal before processing")
             self._agent._shutdown_event.clear()
 
-        # Run agent
+        # Pre-inject matched skill content into the message
+        message = self._pre_inject_matched_skill(message)
+
+        # Build a minimal per-step prompt with the user's request for context.
+        # The anti-loop tracker will dynamically append progress info.
+        _base_prompt = self._build_step_prompt(message)
+        self._agent.next_step_prompt = _base_prompt
+
+        # Install anti-loop tracker to prevent repeated tool calls
+        self._install_anti_loop_tracker(_base_prompt)
+
+        # Run agent — with recovery for LLM API errors (context overflow, etc.)
+        # Retry up to 2 times on ANY error, with increasingly aggressive compression.
+        _max_retries = 2
         try:
-            result = await self._agent.run(message)
+            for _attempt in range(_max_retries + 1):
+                try:
+                    result = await self._agent.run(message)
 
-            logger.debug(f"Agent result type: {type(result)}, attrs: {[a for a in dir(result) if not a.startswith('_')]}")
-            if hasattr(result, 'content'):
-                logger.info(f"Agent result.content (first 500): {str(result.content)[:500]}")
-            if hasattr(result, 'steps'):
-                logger.info(f"Agent steps count: {len(result.steps) if result.steps else 0}")
-                for i, step in enumerate(result.steps or []):
-                    step_str = str(step)[:200]
-                    logger.debug(f"  Step {i}: {step_str}")
-            if hasattr(result, 'tool_calls'):
-                logger.info(f"Agent tool_calls: {result.tool_calls}")
+                    logger.debug(f"Agent result type: {type(result)}")
+                    if hasattr(result, 'content'):
+                        logger.info(f"Agent result.content (first 300): {str(result.content)[:300]}")
 
-            # Extract content
-            if hasattr(result, "content"):
-                final_content = result.content
-            else:
-                final_content = str(result)
+                    # Extract content — guard against result.content being None
+                    if hasattr(result, "content") and result.content is not None:
+                        final_content = result.content
+                    elif hasattr(result, "content"):
+                        final_content = str(result) if str(result) != "None" else ""
+                    else:
+                        final_content = str(result)
 
-            # Filter out technical execution steps (Step 1:, Step 2:, etc.)
-            final_content = self._filter_execution_steps(final_content)
+                    # Fallback: when toolcall.run() returns "No results"
+                    if final_content.strip() in ("No results", ""):
+                        logger.warning(
+                            "Agent returned empty/no-results — attempting to extract "
+                            "content from agent memory"
+                        )
+                        _extracted = self._extract_last_assistant_content()
+                        if _extracted:
+                            final_content = _extracted
 
-        except Exception as e:
-            logger.error(f"Agent processing error: {e}")
-            raise
+                    # Filter out technical execution steps
+                    final_content = self._filter_execution_steps(final_content)
+                    break
+
+                except Exception as e:
+                    # Log the FULL error (before cli.py sanitizes it)
+                    import traceback
+                    logger.error(
+                        f"Agent run error (attempt {_attempt + 1}/{_max_retries + 1}): "
+                        f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                    )
+                    if _attempt < _max_retries:
+                        logger.warning("Compressing context and retrying...")
+                        # First retry: normal compression. Second: force-compress.
+                        if _attempt == 0:
+                            compressed = self._compress_runtime_context()
+                            if compressed == 0:
+                                self._force_compress_runtime_context()
+                        else:
+                            self._force_compress_runtime_context()
+                        # Reset agent state so it can re-enter run()
+                        if hasattr(self._agent, 'state'):
+                            self._agent.state = AgentState.IDLE
+                            self._agent.current_step = 0
+                        if hasattr(self._agent, '_shutdown_event'):
+                            self._agent._shutdown_event.clear()
+                        continue
+                    raise
         finally:
             # Always ensure agent is back in IDLE state after processing
             if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
@@ -967,6 +1061,433 @@ class AgentLoop:
 
         return final_content
 
+    def _extract_last_assistant_content(self) -> str:
+        """Extract the last assistant message content from the agent's memory.
+
+        Used as a fallback when toolcall.run() returns "No results" but the
+        LLM actually produced meaningful content stored in memory.
+        """
+        try:
+            if not hasattr(self._agent, "memory"):
+                return ""
+            messages = (
+                self._agent.memory.get_messages()
+                if hasattr(self._agent.memory, "get_messages")
+                else []
+            )
+            # Walk backwards to find the last assistant message with content
+            for msg in reversed(messages):
+                role = getattr(msg, "role", None)
+                # role may be an enum (Role.ASSISTANT) or a string
+                role_str = role.value if hasattr(role, "value") else str(role)
+                if role_str != "assistant":
+                    continue
+                # Prefer .text_content (handles multimodal), fall back to .content
+                text = getattr(msg, "text_content", None) or getattr(msg, "content", None)
+                if text and isinstance(text, str) and text.strip():
+                    # Skip internal sentinel messages
+                    if text.strip() in (
+                        "Task completed",
+                        "Task completed based on finish_reason signal",
+                        "Thinking completed. No action needed. Task finished.",
+                    ):
+                        continue
+                    logger.info(
+                        f"Extracted fallback content from memory (len={len(text)})"
+                    )
+                    return text.strip()
+        except Exception as exc:
+            logger.warning(f"Failed to extract content from agent memory: {exc}")
+        return ""
+
+    @staticmethod
+    def _msg_char_count(msg) -> int:
+        """Return total character count of a message's content."""
+        if isinstance(msg.content, str):
+            return len(msg.content)
+        if isinstance(msg.content, list):
+            return sum(len(getattr(b, 'text', '')) for b in msg.content)
+        return 0
+
+    def _estimate_runtime_tokens(self) -> int:
+        """Rough token estimate from the agent's runtime messages (~4 chars/token)."""
+        if not self._agent or not hasattr(self._agent, 'memory'):
+            return 0
+        return sum(self._msg_char_count(m) for m in self._agent.memory.messages) // 4
+
+    def _is_next_step_user_msg(self, msg) -> bool:
+        """True when *msg* looks like an injected next_step_prompt (not a real user message)."""
+        role = getattr(msg, 'role', None)
+        if hasattr(role, 'value'):
+            role = role.value
+        if role != 'user':
+            return False
+        text = msg.content if isinstance(msg.content, str) else ''
+        return text.startswith('[ORIGINAL USER REQUEST]') or text.startswith('Focus on the user')
+
+    @staticmethod
+    def _repair_tool_pairing(messages: list) -> int:
+        """Remove orphaned tool results and tool calls after message deletion.
+
+        Ensures every tool_call_id in a tool-result message has a matching
+        tool_calls entry in a preceding assistant message, and vice-versa.
+        Without this, the LLM API rejects the conversation.
+
+        Returns the number of messages removed.
+        """
+        removed = 0
+
+        # Collect all tool_call IDs from assistant messages
+        offered_ids: set[str] = set()
+        for msg in messages:
+            if getattr(msg, 'tool_calls', None):
+                for tc in msg.tool_calls:
+                    tc_id = getattr(tc, 'id', None)
+                    if tc_id:
+                        offered_ids.add(tc_id)
+
+        # Remove tool-result messages whose tool_call_id is not in offered_ids
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            tc_id = getattr(msg, 'tool_call_id', None)
+            if tc_id and tc_id not in offered_ids:
+                del messages[i]
+                removed += 1
+                continue
+            i += 1
+
+        # Collect all answered tool_call IDs
+        answered_ids: set[str] = set()
+        for msg in messages:
+            tc_id = getattr(msg, 'tool_call_id', None)
+            if tc_id:
+                answered_ids.add(tc_id)
+
+        # Remove tool_calls from assistant messages that have no matching result
+        for msg in messages:
+            tc_list = getattr(msg, 'tool_calls', None)
+            if not tc_list:
+                continue
+            original_len = len(tc_list)
+            tc_list[:] = [tc for tc in tc_list if getattr(tc, 'id', None) in answered_ids]
+            if len(tc_list) < original_len:
+                removed += original_len - len(tc_list)
+            # If all tool_calls were removed, clear the attribute
+            if not tc_list:
+                msg.tool_calls = None
+
+        if removed:
+            logger.info(f"Repaired tool pairing: removed {removed} orphaned messages/calls")
+        return removed
+
+    def _compress_runtime_context(self) -> int:
+        """Proactively compress the agent's runtime context.
+
+        Strategy (inspired by Openclaw's context engine):
+        1. Drop redundant next_step_prompt user messages (keep only the latest).
+        2. Truncate ALL older message content (tool results, assistant, user).
+        3. If still over budget, drop entire old message rounds.
+
+        Trigger: estimated tokens > 50 % of context_window.
+        """
+        if not self._agent or not hasattr(self._agent, 'memory'):
+            return 0
+
+        messages = self._agent.memory.messages
+        if len(messages) <= 6:
+            return 0
+
+        estimated = self._estimate_runtime_tokens()
+        budget = int(self.context_window * 0.50)
+
+        if estimated <= budget:
+            return 0
+
+        logger.warning(
+            f"Context compression triggered: ~{estimated:,} tokens "
+            f"(budget: {budget:,}, window: {self.context_window:,}). "
+            f"Messages: {len(messages)}"
+        )
+
+        compressed = 0
+
+        # Phase 1: Remove all but the LAST next_step_prompt user message.
+        last_nsp_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if self._is_next_step_user_msg(messages[i]):
+                last_nsp_idx = i
+                break
+        indices_to_remove = []
+        for i in range(len(messages)):
+            if i != last_nsp_idx and self._is_next_step_user_msg(messages[i]):
+                indices_to_remove.append(i)
+        for idx in reversed(indices_to_remove):
+            del messages[idx]
+            compressed += 1
+        if indices_to_remove:
+            logger.info(f"Phase 1: removed {len(indices_to_remove)} old next_step_prompt messages")
+
+        # Phase 2: Truncate content of ALL messages except the first and last 6.
+        keep_tail = min(6, len(messages))
+        max_content = 300
+        for i in range(1, max(1, len(messages) - keep_tail)):
+            msg = messages[i]
+            if isinstance(msg.content, str) and len(msg.content) > max_content:
+                orig = len(msg.content)
+                msg.content = msg.content[:max_content] + f"\n...[truncated {orig - max_content} chars]"
+                compressed += 1
+
+        # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
+        estimated = self._estimate_runtime_tokens()
+        if estimated > budget and len(messages) > 12:
+            keep_head = 1
+            keep_tail_drop = min(8, len(messages) - 1)
+            droppable = len(messages) - keep_head - keep_tail_drop
+            if droppable > 4:
+                drop_count = droppable // 2
+                del messages[keep_head:keep_head + drop_count]
+                compressed += drop_count
+                logger.info(f"Phase 3: dropped {drop_count} oldest messages")
+
+        # Phase 4: Repair tool_use/tool_result pairing broken by message deletion.
+        compressed += self._repair_tool_pairing(messages)
+
+        final_est = self._estimate_runtime_tokens()
+        logger.info(
+            f"Context compression done: {compressed} actions, "
+            f"tokens ~{estimated:,} -> ~{final_est:,}, "
+            f"messages {len(messages)}"
+        )
+        return compressed
+
+    def _force_compress_runtime_context(self) -> int:
+        """Emergency context compression when normal compression is insufficient.
+
+        Aggressively truncates ALL content and drops messages to get under 40 %
+        of context_window.
+        """
+        if not self._agent or not hasattr(self._agent, 'memory'):
+            return 0
+
+        messages = self._agent.memory.messages
+        if len(messages) <= 4:
+            return 0
+
+        compressed = 0
+
+        # Truncate ALL messages to 150 chars
+        for msg in messages:
+            if isinstance(msg.content, str) and len(msg.content) > 150:
+                msg.content = msg.content[:150] + "\n...[force-truncated]"
+                compressed += 1
+
+        # Drop all but first + last 6 messages
+        if len(messages) > 8:
+            keep_head = 1
+            keep_tail = min(6, len(messages) - 1)
+            drop_count = len(messages) - keep_head - keep_tail
+            if drop_count > 0:
+                del messages[keep_head:keep_head + drop_count]
+                compressed += drop_count
+
+        # Repair tool pairing broken by message deletion
+        compressed += self._repair_tool_pairing(messages)
+
+        logger.warning(f"Force-compressed {compressed} messages/results for recovery")
+        return compressed
+
+    def _install_anti_loop_tracker(self, base_prompt: str) -> None:
+        """Monkey-patch the agent's think() to inject dynamic progress tracking.
+
+        Tracks tool calls with their key arguments so the model sees a precise
+        history of what has been done and is warned about repeated actions with
+        the same parameters (e.g. reading the same file twice).
+        """
+        agent = self._agent
+        if agent is None:
+            return
+
+        agent_loop = self
+        original_think = agent.think
+        call_tracker: Counter = Counter()
+        detail_tracker: Counter = Counter()
+        read_files: set = set()
+
+        def _extract_key_arg(tc) -> str:
+            """Extract the most meaningful argument for dedup tracking."""
+            fn = getattr(tc, 'function', tc)
+            name = getattr(fn, 'name', '')
+            raw_args = getattr(fn, 'arguments', '')
+            if not raw_args:
+                return ''
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except (json.JSONDecodeError, TypeError):
+                return ''
+            if not isinstance(args, dict):
+                return ''
+            if name in ('read_file', 'read_text_file'):
+                return args.get('path', '')[:80]
+            if name == 'shell':
+                return args.get('command', '')[:60]
+            if name == 'skill_marketplace':
+                return f"{args.get('action', '')}:{args.get('url', args.get('skill_name', ''))}"[:80]
+            if name in ('write_file', 'edit_file', 'list_dir', 'list_directory'):
+                return args.get('path', '')[:80]
+            if name == 'self_upgrade':
+                return args.get('action', '')
+            return ''
+
+        ws_posix = str(self.workspace).replace("\\", "/")
+        import re as _re
+        ws_posix = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', ws_posix)
+
+        def _evict_duplicate_tool_results():
+            """When the same file/skill/dir is read again, replace OLD content with a stub.
+
+            This frees context budget without breaking tool message pairing.
+            Handles: read_file results, skill_marketplace results, list_dir results.
+            """
+            if not hasattr(agent, 'memory') or not agent.memory.messages:
+                return
+            messages = agent.memory.messages
+            # Map: dedup_key -> index of LATEST tool message with that content
+            latest_by_key: dict[str, int] = {}
+            evicted = 0
+            for i, msg in enumerate(messages):
+                if getattr(msg, 'role', '') != 'tool':
+                    continue
+                content = msg.content if isinstance(msg.content, str) else ''
+                if len(content) < 80:
+                    continue
+
+                dedup_key = None
+                # read_file results have [file: name | size] header
+                if content.startswith('[file:'):
+                    first_line = content.split('\n', 1)[0]
+                    if '|' in first_line:
+                        dedup_key = f"file:{first_line.split('|')[0].replace('[file:', '').strip()}"
+                # skill_marketplace results
+                elif content.startswith('Skill:') or content.startswith('SUCCESS: Skill'):
+                    for line in content.split('\n')[:3]:
+                        if line.startswith('Skill:') or "Skill '" in line:
+                            dedup_key = f"skill:{line.strip()[:60]}"
+                            break
+                # list_dir results
+                elif content.startswith('[DIR]') or content.startswith('[FILE]'):
+                    dedup_key = f"dir:{content[:40]}"
+                # Shell results containing file content (e.g. cat, read via shell)
+                elif len(content) > 200:
+                    _shell_prefix = 'Observed output of cmd shell execution: '
+                    if content.startswith(_shell_prefix):
+                        _body = content[len(_shell_prefix):]
+                        # Detect env file dumps
+                        if 'PRIVATE_KEY=' in _body or 'AGENT_ADDRESS=' in _body:
+                            dedup_key = "shell_env:env_local"
+                        # Detect file reads via shell
+                        elif _body.startswith('---\nname:') or _body.startswith('# '):
+                            header = _body.split('\n', 1)[0]
+                            dedup_key = f"shell_doc:{header.strip()[:60]}"
+
+                if not dedup_key:
+                    continue
+
+                if dedup_key in latest_by_key:
+                    old_idx = latest_by_key[dedup_key]
+                    old_msg = messages[old_idx]
+                    old_content = old_msg.content if isinstance(old_msg.content, str) else ''
+                    if len(old_content) > 100:
+                        old_msg.content = f"[{dedup_key} — superseded by newer result]"
+                        evicted += 1
+                latest_by_key[dedup_key] = i
+
+            if evicted:
+                logger.info(f"Evicted {evicted} duplicate tool results from context")
+
+        async def _tracked_think() -> bool:
+            _evict_duplicate_tool_results()
+            agent_loop._compress_runtime_context()
+
+            if call_tracker:
+                completed_parts = []
+                for key, count in detail_tracker.most_common(8):
+                    completed_parts.append(f"  - {key} (x{count})")
+                completed_summary = "\n".join(completed_parts)
+
+                anti_loop = f"\n[DONE]:\n{completed_summary}"
+
+                if read_files:
+                    recent = sorted(read_files)[-8:]
+                    anti_loop += "\n[FILES ALREADY READ — do NOT read again]:\n"
+                    anti_loop += "\n".join(f"  - {f}" for f in recent)
+
+                repeated_details = [k for k, c in detail_tracker.items() if c >= 2]
+                if repeated_details:
+                    anti_loop += (
+                        "\n⚠️ STOP REPEATING! You already did these actions. "
+                        "Move to the NEXT step toward the goal."
+                    )
+
+                if len(anti_loop) > 1000:
+                    anti_loop = anti_loop[:1000] + "..."
+
+                agent.next_step_prompt = base_prompt + anti_loop
+
+            result = await original_think()
+
+            _log_agent_reasoning()
+            _log_tool_calls()
+
+            if hasattr(agent, 'tool_calls') and agent.tool_calls:
+                for tc in agent.tool_calls:
+                    fn = getattr(tc, 'function', tc)
+                    name = getattr(fn, 'name', '')
+                    call_tracker[name] += 1
+                    key_arg = _extract_key_arg(tc)
+                    detail_key = f"{name}({key_arg})" if key_arg else name
+                    detail_tracker[detail_key] += 1
+                    if name in ('read_file', 'read_text_file') and key_arg:
+                        read_files.add(key_arg)
+                    elif name == 'shell' and key_arg:
+                        for _env_pat in ('.env.local', '.env', 'SKILL.md'):
+                            if _env_pat in key_arg:
+                                read_files.add(_env_pat)
+
+            return result
+
+        def _log_agent_reasoning():
+            """Extract and log the agent's reasoning text from its last response."""
+            from spoon_bot.utils.privacy import mask_secrets
+            if not hasattr(agent, 'memory') or not agent.memory.messages:
+                return
+            for msg in reversed(agent.memory.messages[-3:]):
+                role = getattr(msg, 'role', '')
+                if role != 'assistant':
+                    continue
+                content = msg.content if isinstance(msg.content, str) else ''
+                if not content or not content.strip():
+                    break
+                safe_text = mask_secrets(content.strip())
+                if len(safe_text) > 500:
+                    safe_text = safe_text[:500] + "…"
+                logger.info(f"💭 Agent reasoning: {safe_text}")
+                break
+
+        def _log_tool_calls():
+            """Log each tool call with arguments so TUI can display them."""
+            from spoon_bot.utils.privacy import mask_secrets
+            if not hasattr(agent, 'tool_calls') or not agent.tool_calls:
+                return
+            for tc in agent.tool_calls:
+                fn = getattr(tc, 'function', tc)
+                name = getattr(fn, 'name', '')
+                raw_args = getattr(fn, 'arguments', '')
+                safe_args = mask_secrets(raw_args) if raw_args else ''
+                logger.info(f"Tool call: {name}({safe_args})")
+
+        agent.think = _tracked_think
+
     def _filter_execution_steps(self, content: str) -> str:
         """
         Filter out technical execution steps from agent output.
@@ -979,6 +1500,9 @@ class AgentLoop:
             Cleaned content without execution steps
         """
         import re
+
+        if not content:
+            return content or ""
 
         lines = content.split('\n')
         filtered_lines = []
@@ -1002,10 +1526,23 @@ class AgentLoop:
             # Keep all other lines
             filtered_lines.append(line)
 
+        # If everything was filtered (e.g. all lines were "Step N: ..."), fall back to
+        # extracting the inline content from the last Step line so we never return "".
+        if not filtered_lines and lines:
+            for raw_line in reversed(lines):
+                m = re.match(r'^Step \d+:\s*(.+)', raw_line)
+                if m and m.group(1).strip():
+                    filtered_lines = [m.group(1).strip()]
+                    break
+            if not filtered_lines:
+                # Last-resort: return original content unchanged
+                return content.strip()
+
         # Join and clean up excessive blank lines
         result = '\n'.join(filtered_lines)
         result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
         return result.strip()
+
 
     async def stream(
         self,
@@ -1044,6 +1581,10 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
+
+        _base_prompt = self._build_step_prompt(message)
+        self._agent.next_step_prompt = _base_prompt
+        self._install_anti_loop_tracker(_base_prompt)
 
         # ------------------------------------------------------------------
         # Streaming uses the spoon-core run+stream pattern:
@@ -1265,6 +1806,10 @@ class AgentLoop:
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
 
+        _base_prompt = self._build_step_prompt(message)
+        self._agent.next_step_prompt = _base_prompt
+        self._install_anti_loop_tracker(_base_prompt)
+
         # Run agent with thinking enabled
         try:
             run_kwargs: dict[str, Any] = {"thinking": True}
@@ -1308,9 +1853,219 @@ class AgentLoop:
 
         return final_content, thinking_content
 
+    def _workspace_posix_path(self) -> str:
+        """Return the workspace path in POSIX form for shell commands."""
+        import re as _re
+        import sys
+        raw = str(self.workspace).replace("\\", "/")
+        if sys.platform == "win32":
+            raw = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', raw)
+        return raw
+
+    def _pre_inject_matched_skill(self, message: str) -> str:
+        """Match user message to an installed skill and prepend SKILL.md content.
+
+        Saves 2-5 agent steps by providing skill content upfront so the
+        agent can start executing immediately without calling read_file.
+        """
+        import re as _re
+
+        skills_dir = self.workspace / "skills"
+        if not skills_dir.is_dir():
+            return message
+
+        msg_lower = message.lower()
+        best_skill = None
+        best_score = 0
+
+        for child in sorted(skills_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            skill_md = child / "SKILL.md"
+            if not skill_md.exists():
+                continue
+
+            name = child.name
+            score = 0
+
+            # Match skill name tokens against user message
+            name_tokens = _re.split(r'[-_]', name)
+            for token in name_tokens:
+                if len(token) >= 3 and token.lower() in msg_lower:
+                    score += 2
+
+            # Match trigger words from frontmatter
+            try:
+                raw = skill_md.read_text(encoding="utf-8", errors="replace")
+                fm = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
+                if fm:
+                    for line in fm.group(1).split("\n"):
+                        if "triggers" in line.lower() or "trigger" in line.lower():
+                            triggers = _re.findall(r'"([^"]+)"', line)
+                            for t in triggers:
+                                if t.lower() in msg_lower:
+                                    score += 3
+            except Exception:
+                pass
+
+            if score > best_score:
+                best_score = score
+                best_skill = (name, skill_md)
+
+        if not best_skill or best_score < 2:
+            return message
+
+        skill_name, skill_path = best_skill
+        try:
+            content = skill_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            return message
+
+        logger.info(f"Pre-injected skill '{skill_name}' (score={best_score}) into message")
+        return (
+            f"{message}\n\n"
+            f"---\n"
+            f"[PRE-LOADED SKILL: {skill_name}] "
+            f"The following SKILL.md is already loaded — execute its steps directly. "
+            f"Do NOT call read_file on this skill again.\n\n"
+            f"{content}\n"
+            f"---"
+        )
+
+    def _build_step_prompt(self, message: str) -> str:
+        """Build a minimal per-step prompt from the user's request.
+
+        Keeps only the user's original request and workspace path.
+        Injects env vars so they survive short-term memory pruning.
+        The anti-loop tracker dynamically appends progress info.
+        """
+        _truncated = message[:300] + ("…" if len(message) > 300 else "")
+        _ws = self._workspace_posix_path()
+        prompt = (
+            f"[USER REQUEST]: {_truncated}\n"
+            f"[WORKSPACE]: {_ws}/\n\n"
+            + self.DEFAULT_NEXT_STEP_PROMPT
+        )
+        env_section = self._extract_env_for_prompt()
+        if env_section:
+            prompt += env_section
+        return prompt
+
+    def _extract_env_for_prompt(self) -> str:
+        """Extract env vars from .env.local for the step prompt.
+
+        Non-sensitive values shown directly. Private keys masked —
+        agent told to use ``source .env.local`` then ``$VAR``.
+        Persists across short-term memory pruning.
+        """
+        env_file = self.workspace / ".env.local"
+        if not env_file.exists():
+            return ""
+        try:
+            raw = env_file.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+        env_vars: dict[str, str] = {}
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if not key:
+                continue
+            _sensitive = any(s in key.upper() for s in (
+                "PRIVATE", "SECRET", "KEY", "PASSWORD", "TOKEN", "MNEMONIC",
+                "CREDENTIAL", "AUTH", "PASSPHRASE",
+            ))
+            env_vars[key] = "<set>" if _sensitive and val else val
+
+        if not env_vars:
+            return ""
+
+        parts = ["\n[ENV — from .env.local — do NOT re-read, use `source .env.local` for secrets]:"]
+        for k, v in env_vars.items():
+            parts.append(f"  {k}={v}")
+        return "\n".join(parts) + "\n"
+
     # ------------------------------------------------------------------
     # Dynamic prompt helpers
     # ------------------------------------------------------------------
+
+    def _build_skills_for_prompt(self) -> str:
+        """Build Openclaw-style XML metadata for installed skills.
+
+        Scans skill directories, extracts name + description from SKILL.md
+        frontmatter, and returns an <available_skills> XML block for the
+        system prompt. The agent reads SKILL.md lazily when needed.
+        """
+        import re as _re, os as _os, sys as _sys
+
+        skills_dir = self.workspace / "skills"
+        if not skills_dir.is_dir():
+            return ""
+
+        ws_str = str(self.workspace).replace("\\", "/")
+        if _sys.platform == "win32":
+            ws_str = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', ws_str)
+
+        entries = []
+        for child in sorted(skills_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            skill_md = child / "SKILL.md"
+            if not skill_md.exists():
+                continue
+
+            name = child.name
+            description = ""
+            try:
+                raw = skill_md.read_text(encoding="utf-8", errors="replace")
+                fm_match = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
+                if fm_match:
+                    for line in fm_match.group(1).split("\n"):
+                        stripped = line.strip()
+                        if stripped.startswith("description:"):
+                            val = stripped.split(":", 1)[1].strip().strip("'\"")
+                            if val and val != ">":
+                                description = val[:200]
+                                break
+                    if not description:
+                        in_desc = False
+                        desc_lines = []
+                        for line in fm_match.group(1).split("\n"):
+                            if line.strip().startswith("description:"):
+                                in_desc = True
+                                val = line.split(":", 1)[1].strip()
+                                if val and val not in (">", "|"):
+                                    desc_lines.append(val)
+                                continue
+                            if in_desc:
+                                if line.startswith("  ") or line.startswith("\t"):
+                                    desc_lines.append(line.strip())
+                                else:
+                                    break
+                        description = " ".join(desc_lines)[:200]
+                if not description:
+                    for line in raw.split("\n")[1:20]:
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith(("#", "---", "```")):
+                            description = stripped[:200]
+                            break
+            except Exception:
+                description = name
+
+            entries.append(
+                f'<skill name="{name}">\n'
+                f'  <description>{description}</description>\n'
+                f'  <location>skills/{name}/SKILL.md</location>\n'
+                f'</skill>'
+            )
+
+        if not entries:
+            return ""
+        return "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
 
     @staticmethod
     def _build_dynamic_tools_prompt(inactive_tools: dict[str, "Tool"]) -> str:

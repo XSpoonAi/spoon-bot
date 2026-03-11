@@ -91,8 +91,7 @@ class CommandValidator:
         re.compile(r"&&"),      # command1 && command2
         # Newline / carriage-return multi-command injection
         re.compile(r"[\r\n]+\s*\S"),
-        # Pipes (can be dangerous but often legitimate - more lenient)
-        # Command substitution
+        # Command substitution (skipped when allow_substitution is True)
         re.compile(r"\$\("),    # $(command)
         re.compile(r"`[^`]+`"), # `command`
         # Process substitution
@@ -106,6 +105,13 @@ class CommandValidator:
         re.compile(r">\s*~/.profile"),   # Modify profile
         re.compile(r">\s*/root/"),       # Write to root home
     ]
+
+    # Patterns that represent command substitution ($(...), `...`).
+    # Skipped when allow_substitution is True.
+    _SUBSTITUTION_PATTERNS: frozenset[str] = frozenset({
+        r"\$\(",
+        r"`[^`]+`",
+    })
 
     # Sensitive file paths that should not be modified
     SENSITIVE_PATHS = frozenset({
@@ -123,17 +129,43 @@ class CommandValidator:
 
     # Default allowed commands (whitelist mode)
     DEFAULT_WHITELIST = frozenset({
+        # Filesystem
         "ls", "dir", "pwd", "cd", "echo", "cat", "head", "tail", "grep",
         "find", "which", "where", "whoami", "date", "cal", "uname",
-        "git", "npm", "pnpm", "yarn", "node", "python", "python3", "pip",
-        "cargo", "rustc", "go", "java", "javac", "mvn", "gradle",
-        "docker", "kubectl", "terraform", "make", "cmake",
-        "curl", "wget", "ping", "traceroute", "dig", "nslookup",
-        "ps", "top", "htop", "df", "du", "free", "uptime",
-        "tar", "zip", "unzip", "gzip", "gunzip",
-        "cp", "mv", "mkdir", "touch", "ln",  # File operations (limited)
+        "cp", "mv", "mkdir", "touch", "ln", "rm", "wc", "sort", "uniq",
+        "chmod", "chown", "stat", "file", "basename", "dirname", "realpath",
+        "tee", "xargs", "sed", "awk", "tr", "cut", "paste", "diff",
+        # Version control
+        "git", "gh", "svn",
+        # JavaScript / Node.js
+        "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "tsx", "ts-node",
+        # Python
+        "python", "python3", "pip", "pip3", "uv", "pipx", "poetry", "pdm",
+        "pytest", "mypy", "ruff", "black", "isort", "flake8",
+        # Rust
+        "cargo", "rustc", "rustup",
+        # Go
+        "go",
+        # Java / JVM
+        "java", "javac", "mvn", "gradle",
+        # C / C++
+        "make", "cmake", "gcc", "g++", "clang",
+        # Blockchain / Web3
+        "cast", "forge", "anvil", "foundryup", "solc", "hardhat",
+        # Containers / Infra
+        "docker", "docker-compose", "podman", "kubectl", "helm", "terraform",
+        # Network / HTTP
+        "curl", "wget", "ping", "traceroute", "dig", "nslookup", "jq",
+        # System info
+        "ps", "top", "htop", "df", "du", "free", "uptime", "env", "printenv",
+        # Archive
+        "tar", "zip", "unzip", "gzip", "gunzip", "7z",
+        # Editors / pagers
         "code", "vim", "nano", "less", "more",
+        # Remote
         "ssh", "scp", "rsync",
+        # Misc scripting
+        "bash", "sh", "zsh", "source", "export", "set",
     })
 
     def __init__(
@@ -143,6 +175,7 @@ class CommandValidator:
         custom_blocklist: set[str] | None = None,
         allow_pipes: bool = True,
         allow_chaining: bool = False,
+        allow_substitution: bool = False,
         strict_mode: bool = False,
     ):
         """
@@ -156,6 +189,8 @@ class CommandValidator:
             allow_chaining: If True, allow command chaining (&&, ||, ;).
                 This lets the agent compose multi-step shell operations
                 while still blocking dangerous commands and substitution.
+            allow_substitution: If True, allow command substitution ($(...) and `...`).
+                Enables running commands with variable expansion and template literals.
             strict_mode: If True, block all potentially dangerous patterns.
         """
         self.whitelist_mode = whitelist_mode
@@ -166,6 +201,7 @@ class CommandValidator:
         self.custom_blocklist = custom_blocklist or set()
         self.allow_pipes = allow_pipes
         self.allow_chaining = allow_chaining
+        self.allow_substitution = allow_substitution
         self.strict_mode = strict_mode
 
     def _extract_base_command(self, command: str) -> str:
@@ -239,6 +275,9 @@ class CommandValidator:
         for pattern in self.INJECTION_PATTERNS:
             # Skip chaining patterns when allow_chaining is enabled
             if self.allow_chaining and pattern.pattern in self._CHAINING_PATTERNS:
+                continue
+            # Skip substitution patterns when allow_substitution is enabled
+            if self.allow_substitution and pattern.pattern in self._SUBSTITUTION_PATTERNS:
                 continue
             match = pattern.search(command)
             if match:
@@ -341,6 +380,7 @@ class ShellTool(Tool):
         custom_blocklist: set[str] | None = None,
         allow_pipes: bool = True,
         allow_chaining: bool = False,
+        allow_substitution: bool = False,
         strict_mode: bool = False,
         use_shell: bool = True,
         rate_limit_config: RateLimitConfig | None = None,
@@ -357,6 +397,7 @@ class ShellTool(Tool):
             custom_blocklist: Additional commands/patterns to block.
             allow_pipes: If True, allow pipe (|) in commands.
             allow_chaining: If True, allow && ; || for multi-step commands.
+            allow_substitution: If True, allow $() and backtick substitution.
             strict_mode: If True, block all potentially dangerous patterns.
             use_shell: If True, use shell execution; if False, use direct exec.
             rate_limit_config: Configuration for rate limiting shell commands.
@@ -373,6 +414,7 @@ class ShellTool(Tool):
             custom_blocklist=custom_blocklist,
             allow_pipes=allow_pipes,
             allow_chaining=allow_chaining,
+            allow_substitution=allow_substitution,
             strict_mode=strict_mode,
         )
 
@@ -516,6 +558,28 @@ class ShellTool(Tool):
                 return candidate
         return None
 
+    @staticmethod
+    def _convert_win_paths_to_posix(command: str) -> str:
+        """Convert Windows-style absolute paths in a bash command to POSIX format.
+
+        Converts ``C:\\path\\to\\file`` to ``/c/path/to/file`` so that Git Bash
+        receives a valid POSIX path instead of interpreting backslashes as escape
+        characters (which silently strips them, producing broken paths like
+        ``C:UsersRicky...``).
+
+        Only backslash-separated Windows paths are converted; forward-slash paths
+        (``C:/path``) and URLs (``https://...``) are left untouched.
+        """
+        def _replace(match: re.Match) -> str:
+            drive = match.group(1).lower()
+            rest = match.group(2).replace("\\", "/")
+            return f"/{drive}/{rest}" if rest else f"/{drive}"
+
+        # Match drive-letter paths with at least one backslash: C:\path\...
+        # The character class [^\s"'] stops at whitespace or quotes so we don't
+        # consume tokens that belong to the next shell argument.
+        return re.sub(r'([A-Za-z]):\\([^\s"\']*)', _replace, command)
+
     def _run_sync(
         self,
         command: str,
@@ -526,9 +590,13 @@ class ShellTool(Tool):
             bash = self._find_bash()
             if bash:
                 cwd = cwd.replace("\\", "/")
+                # Convert any Windows-style paths inside the command so that
+                # Git Bash receives valid POSIX paths (C:\foo -> /c/foo).
+                command = self._convert_win_paths_to_posix(command)
                 result = subprocess.run(
                     [bash, "--login", "-c", command],
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
                     cwd=cwd,
                     timeout=self.timeout,
                 )
@@ -536,6 +604,7 @@ class ShellTool(Tool):
                 result = subprocess.run(
                     command,
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
                     shell=True,
                     cwd=cwd,
                     timeout=self.timeout,
@@ -544,6 +613,7 @@ class ShellTool(Tool):
             result = subprocess.run(
                 command,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 shell=True,
                 executable="/bin/sh",
                 cwd=cwd,
@@ -556,6 +626,7 @@ class ShellTool(Tool):
             result = subprocess.run(
                 args,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 cwd=cwd,
                 timeout=self.timeout,
             )
@@ -617,6 +688,9 @@ class ShellTool(Tool):
 
             result = "\n".join(output_parts) if output_parts else "(no output)"
 
+            # Mask private keys / secrets so they don't leak into logs or context
+            result = self._mask_secrets(result)
+
             # Truncate very long output
             if len(result) > self.max_output:
                 truncated = len(result) - self.max_output
@@ -635,6 +709,13 @@ class ShellTool(Tool):
         except Exception as e:
             logger.error(f"Shell execute error ({type(e).__name__}): {e!r}")
             return f"Error executing command: {type(e).__name__}: {e}"
+
+
+    @staticmethod
+    def _mask_secrets(text: str) -> str:
+        """Mask sensitive values (keys, tokens, passwords, etc.) in output."""
+        from spoon_bot.utils.privacy import mask_secrets
+        return mask_secrets(text)
 
 
 class SafeShellTool(ShellTool):

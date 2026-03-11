@@ -15,7 +15,7 @@ from spoon_bot.agent.tools.base import Tool, ToolSchema
 # activated dynamically via AgentLoop.add_tool().
 # ---------------------------------------------------------------------------
 CORE_TOOLS: frozenset[str] = frozenset({
-    "shell", "read_file", "write_file", "edit_file", "list_dir",
+    "shell", "read_file", "write_file", "edit_file", "list_dir", "grep",
     "self_config", "memory", "activate_tool", "self_upgrade",
 })
 

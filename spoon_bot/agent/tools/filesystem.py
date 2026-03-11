@@ -23,22 +23,27 @@ from spoon_bot.agent.tools.path_validator import (
 class ReadFileTool(Tool):
     """Tool to read file contents with encoding fallback and path traversal protection."""
 
-    def __init__(self, workspace: Path | str | None = None):
-        """
-        Initialize the read file tool.
-
-        Args:
-            workspace: The allowed workspace directory. Paths outside this
-                       directory will be rejected for security.
-        """
+    def __init__(
+        self,
+        workspace: Path | str | None = None,
+        additional_read_paths: list[Path | str] | None = None,
+        max_output: int = 6000,
+    ):
         self._workspace = Path(workspace).resolve() if workspace else None
-        self._validator = PathValidator(workspace=workspace) if workspace else None
+        self._additional_read_paths = additional_read_paths
+        self._max_output = max_output
+        self._validator = (
+            PathValidator(workspace=workspace, additional_read_paths=additional_read_paths)
+            if workspace else None
+        )
 
     def set_workspace(self, workspace: Path | str) -> None:
         """Set the workspace boundary for path validation."""
         self._workspace = Path(workspace).resolve()
-        self._validator = PathValidator(workspace=self._workspace)
-        # Also update the global default
+        self._validator = PathValidator(
+            workspace=self._workspace,
+            additional_read_paths=self._additional_read_paths,
+        )
         set_default_validator(self._validator)
 
     @property
@@ -50,7 +55,11 @@ class ReadFileTool(Tool):
         workspace_note = ""
         if self._workspace:
             workspace_note = f" Files must be within the workspace: {self._workspace}"
-        return f"Read the contents of a file at the given path.{workspace_note}"
+        return (
+            f"Read file contents.{workspace_note} "
+            "Use offset+limit for large files (line-based). "
+            "For searching specific values, prefer `grep` tool instead."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -60,6 +69,14 @@ class ReadFileTool(Tool):
                 "path": {
                     "type": "string",
                     "description": "The file path to read (must be within workspace)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start from (1-indexed). Omit to read from start.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max lines to read. Omit for whole file (subject to truncation).",
                 },
                 "encoding": {
                     "type": "string",
@@ -72,25 +89,25 @@ class ReadFileTool(Tool):
     async def execute(
         self,
         path: str,
+        offset: int | None = None,
+        limit: int | None = None,
         encoding: str = "utf-8",
         **kwargs: Any,
     ) -> str:
         """Read file contents with path traversal protection."""
         try:
-            # Validate the path
             result = validate_read_path(path, workspace=self._workspace)
             if not result.valid:
                 return f"Security Error: {result.error}"
 
             file_path = result.resolved_path
-            assert file_path is not None  # Guaranteed by valid=True
+            assert file_path is not None
 
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
 
-            # Try primary encoding, fallback to latin-1
             try:
                 async with aiofiles.open(file_path, "r", encoding=encoding) as f:
                     content = await f.read()
@@ -98,12 +115,98 @@ class ReadFileTool(Tool):
                 async with aiofiles.open(file_path, "r", encoding="latin-1") as f:
                     content = await f.read()
 
-            return content
+            # Line-range selection (Pi-style offset+limit)
+            if offset is not None or limit is not None:
+                all_lines = content.split("\n")
+                total_lines = len(all_lines)
+                start = max(0, (offset or 1) - 1)
+                if start >= total_lines:
+                    return f"Error: Offset {offset} beyond end of file ({total_lines} lines)"
+                end = min(total_lines, start + limit) if limit else total_lines
+                content = "\n".join(all_lines[start:end])
+                range_note = f" | lines {start + 1}-{end}/{total_lines}"
+            else:
+                range_note = ""
+
+            total_size = len(content)
+            parts = file_path.parts
+            is_skill_file = "skills" in parts
+
+            if self._max_output and total_size > self._max_output:
+                content = content[:self._max_output] + f"\n... (truncated, {total_size - self._max_output} more chars)"
+
+            # Use relative path to workspace for dedup, fallback to name
+            try:
+                if self._workspace:
+                    rel = file_path.relative_to(self._workspace)
+                    display_path = str(rel).replace("\\", "/")
+                else:
+                    display_path = file_path.name
+            except ValueError:
+                display_path = file_path.name
+
+            actual_size = len(content)
+            header = f"[file: {display_path} | {actual_size} chars{range_note}"
+            if is_skill_file:
+                header += " | skill-ref"
+            header += "]\n"
+            return header + content
 
         except PermissionError:
             return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error reading file: {str(e)}"
+
+    @staticmethod
+    def _extract_skill_cli_content(content: str, budget: int = 2500) -> str:
+        """Extract CLI-relevant content from SKILL.md, stripping JS code blocks.
+
+        Keeps: frontmatter, headings, text, tables, `cast`/`curl`/`bash` code blocks.
+        Strips: `js`/`javascript`/`typescript` code blocks (replaced with one-line stub).
+        This steers the agent toward direct CLI usage.
+        """
+        import re
+        lines = content.split("\n")
+        out: list[str] = []
+        total = 0
+        in_code = False
+        code_lang = ""
+        skip_block = False
+        js_langs = {"js", "javascript", "typescript", "ts", "mjs"}
+
+        for line in lines:
+            if total > budget:
+                out.append(f"\n... [SKILL.md truncated at {budget} chars — use CLI examples above]")
+                break
+
+            if not in_code:
+                m = re.match(r'^```(\w*)', line)
+                if m:
+                    in_code = True
+                    code_lang = m.group(1).lower()
+                    skip_block = code_lang in js_langs
+                    if skip_block:
+                        stub = f"```{code_lang}\n// [JS code block omitted — use cast/curl CLI equivalent below]\n```"
+                        out.append(stub)
+                        total += len(stub)
+                    else:
+                        out.append(line)
+                        total += len(line) + 1
+                else:
+                    out.append(line)
+                    total += len(line) + 1
+            else:
+                if line.strip().startswith("```"):
+                    in_code = False
+                    if not skip_block:
+                        out.append(line)
+                        total += len(line) + 1
+                    skip_block = False
+                elif not skip_block:
+                    out.append(line)
+                    total += len(line) + 1
+
+        return "\n".join(out)
 
 
 class WriteFileTool(Tool):
@@ -289,21 +392,25 @@ class EditFileTool(Tool):
 class ListDirTool(Tool):
     """Tool to list directory contents with path traversal protection."""
 
-    def __init__(self, workspace: Path | str | None = None):
-        """
-        Initialize the list directory tool.
-
-        Args:
-            workspace: The allowed workspace directory. Listing outside this
-                       directory will be rejected for security.
-        """
+    def __init__(
+        self,
+        workspace: Path | str | None = None,
+        additional_read_paths: list[Path | str] | None = None,
+    ):
         self._workspace = Path(workspace).resolve() if workspace else None
-        self._validator = PathValidator(workspace=workspace) if workspace else None
+        self._additional_read_paths = additional_read_paths
+        self._validator = (
+            PathValidator(workspace=workspace, additional_read_paths=additional_read_paths)
+            if workspace else None
+        )
 
     def set_workspace(self, workspace: Path | str) -> None:
         """Set the workspace boundary for path validation."""
         self._workspace = Path(workspace).resolve()
-        self._validator = PathValidator(workspace=self._workspace)
+        self._validator = PathValidator(
+            workspace=self._workspace,
+            additional_read_paths=self._additional_read_paths,
+        )
         set_default_validator(self._validator)
 
     @property

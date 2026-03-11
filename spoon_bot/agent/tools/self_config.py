@@ -202,8 +202,8 @@ class SelfConfigTool(Tool):
     def _get_defaults(self) -> dict[str, Any]:
         """Get default configuration."""
         return {
-            "model": "claude-sonnet-4-20250514",
-            "max_iterations": 20,
+            "model": "claude-sonnet-4.6",
+            "max_iterations": 50,
             "shell_timeout": 60,
             "max_output": 10000,
             "provider": "anthropic",
