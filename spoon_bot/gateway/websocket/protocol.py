@@ -64,6 +64,12 @@ class ClientMethod(str, Enum):
     FS_WATCH = "fs.watch"
     FS_UNWATCH = "fs.unwatch"
 
+    # Terminal methods
+    TERM_OPEN = "term.open"
+    TERM_INPUT = "term.input"
+    TERM_RESIZE = "term.resize"
+    TERM_CLOSE = "term.close"
+
     # Audio streaming methods
     AUDIO_STREAM_START = "audio.stream.start"
     AUDIO_STREAM_END = "audio.stream.end"
@@ -109,7 +115,9 @@ class ServerEvent(str, Enum):
     CONNECTION_ERROR = "connection.error"
 
     # Sandbox events
+    SANDBOX_STDOUT = "sandbox.stdout"
     SANDBOX_FILE_CHANGED = "sandbox.file.changed"
+    TERM_CLOSED = "term.closed"
 
 
 @dataclass
