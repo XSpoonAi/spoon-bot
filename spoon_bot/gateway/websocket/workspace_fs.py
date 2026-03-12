@@ -4,12 +4,48 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 
 SANDBOX_WORKSPACE_ROOT = "/workspace"
+
+
+class _PathLockManager:
+    """Per-path asyncio locks with automatic cleanup."""
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._refcounts: dict[str, int] = {}
+        self._mu = asyncio.Lock()  # protects dict mutations
+
+    @asynccontextmanager
+    async def lock(self, *paths: str) -> AsyncIterator[None]:
+        """Acquire locks for one or more paths (sorted order to prevent deadlock)."""
+        sorted_paths = sorted(set(paths))
+        locks: list[tuple[str, asyncio.Lock]] = []
+        for p in sorted_paths:
+            async with self._mu:
+                if p not in self._locks:
+                    self._locks[p] = asyncio.Lock()
+                    self._refcounts[p] = 0
+                self._refcounts[p] += 1
+                locks.append((p, self._locks[p]))
+        try:
+            for _, lk in locks:
+                await lk.acquire()
+            yield
+        finally:
+            for _, lk in locks:
+                lk.release()
+            for p, _ in locks:
+                async with self._mu:
+                    self._refcounts[p] -= 1
+                    if self._refcounts[p] <= 0:
+                        self._locks.pop(p, None)
+                        self._refcounts.pop(p, None)
 
 
 class WorkspaceFSService:
@@ -17,6 +53,12 @@ class WorkspaceFSService:
 
     def __init__(self, workspace_root: Path) -> None:
         self._workspace_root = workspace_root.resolve()
+        self._path_locks = _PathLockManager()
+
+    def _canonical(self, path: str) -> str:
+        """Return canonical resolved path string for use as a lock key."""
+        target, _ = self._resolve_path(path)
+        return str(target)
 
     async def list(
         self,
@@ -55,17 +97,21 @@ class WorkspaceFSService:
         create: bool = True,
         truncate: bool = True,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._write_sync,
-            path,
-            content=content,
-            encoding=encoding,
-            create=create,
-            truncate=truncate,
-        )
+        canonical = self._canonical(path)
+        async with self._path_locks.lock(canonical):
+            return await asyncio.to_thread(
+                self._write_sync,
+                path,
+                content=content,
+                encoding=encoding,
+                create=create,
+                truncate=truncate,
+            )
 
     async def mkdir(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
-        return await asyncio.to_thread(self._mkdir_sync, path, recursive=recursive)
+        canonical = self._canonical(path)
+        async with self._path_locks.lock(canonical):
+            return await asyncio.to_thread(self._mkdir_sync, path, recursive=recursive)
 
     async def rename(
         self,
@@ -74,15 +120,20 @@ class WorkspaceFSService:
         *,
         overwrite: bool = False,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._rename_sync,
-            from_path,
-            to_path,
-            overwrite=overwrite,
-        )
+        c_from = self._canonical(from_path)
+        c_to = self._canonical(to_path)
+        async with self._path_locks.lock(c_from, c_to):
+            return await asyncio.to_thread(
+                self._rename_sync,
+                from_path,
+                to_path,
+                overwrite=overwrite,
+            )
 
     async def remove(self, path: str, *, recursive: bool = False) -> dict[str, Any]:
-        return await asyncio.to_thread(self._remove_sync, path, recursive=recursive)
+        canonical = self._canonical(path)
+        async with self._path_locks.lock(canonical):
+            return await asyncio.to_thread(self._remove_sync, path, recursive=recursive)
 
     def _list_sync(self, path: str, *, cursor: str | None, limit: int) -> dict[str, Any]:
         directory, _ = self._resolve_existing_path(path, expect_directory=True)

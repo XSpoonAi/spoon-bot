@@ -25,6 +25,7 @@ class Connection:
     connected_at: datetime = field(default_factory=datetime.utcnow)
     last_activity: datetime = field(default_factory=datetime.utcnow)
     subscriptions: set[str] = field(default_factory=set)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def update_activity(self) -> None:
         """Update last activity timestamp."""
@@ -160,7 +161,8 @@ class ConnectionManager:
 
         try:
             data = message.to_dict() if isinstance(message, WSMessage) else message
-            await conn.websocket.send_json(data)
+            async with conn.send_lock:
+                await conn.websocket.send_json(data)
             conn.update_activity()
             return True
         except Exception as e:
