@@ -9,6 +9,7 @@ Based on: docs/plans/2025-02-05-spoon-bot-api-design.md
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -42,6 +43,7 @@ from spoon_bot.gateway.websocket.protocol import (
     parse_message,
 )
 from spoon_bot.gateway.websocket.workspace_fs import WorkspaceFSService
+from spoon_bot.gateway.websocket.workspace_terminal import WorkspaceTerminalService
 from spoon_bot.gateway.websocket.workspace_watch import WorkspaceWatchService
 
 
@@ -77,6 +79,14 @@ class _AuthRateLimiter:
 
 
 _auth_limiter = _AuthRateLimiter()
+
+
+def _runtime_sandbox_id() -> str:
+    for key in ("CYPHER_SANDBOX_ID", "SANDBOX_ID", "MODAL_SANDBOX_ID"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return "runtime"
 
 
 # ---------------------------------------------------------------------------
@@ -244,11 +254,18 @@ class WebSocketHandler:
         self._chat_lock = asyncio.Lock()
         agent = get_agent()
         workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+        self._sandbox_id = _runtime_sandbox_id()
         self._workspace_watch_service = WorkspaceWatchService(
             workspace_root=workspace,
             emit_change=self._emit_workspace_change,
         )
         self._workspace_fs_service = WorkspaceFSService(workspace_root=workspace)
+        self._workspace_terminal_service = WorkspaceTerminalService(
+            workspace_root=workspace,
+            emit_stdout=self._emit_terminal_stdout,
+            emit_closed=self._emit_terminal_closed,
+            sandbox_id=self._sandbox_id,
+        )
 
         self._handlers: dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {
             # Chat methods
@@ -280,6 +297,10 @@ class WebSocketHandler:
             ClientMethod.FS_REMOVE.value: self._handle_fs_remove,
             ClientMethod.FS_WATCH.value: self._handle_fs_watch,
             ClientMethod.FS_UNWATCH.value: self._handle_fs_unwatch,
+            ClientMethod.TERM_OPEN.value: self._handle_term_open,
+            ClientMethod.TERM_INPUT.value: self._handle_term_input,
+            ClientMethod.TERM_RESIZE.value: self._handle_term_resize,
+            ClientMethod.TERM_CLOSE.value: self._handle_term_close,
             # Audio streaming
             "audio.stream.start": self._handle_audio_stream_start,
             "audio.stream.end": self._handle_audio_stream_end,
@@ -568,6 +589,7 @@ class WebSocketHandler:
         return True
 
     async def _cleanup_resources(self) -> None:
+        await self._workspace_terminal_service.shutdown()
         await self._workspace_watch_service.close()
 
     async def _emit_workspace_change(self, payload: dict[str, Any]) -> None:
@@ -576,6 +598,26 @@ class WebSocketHandler:
             self.connection_id,
             WSEvent(
                 event=ServerEvent.SANDBOX_FILE_CHANGED.value,
+                data=payload,
+            ),
+        )
+
+    async def _emit_terminal_stdout(self, payload: dict[str, Any]) -> None:
+        manager = get_connection_manager()
+        await manager.send_message(
+            self.connection_id,
+            WSEvent(
+                event=ServerEvent.SANDBOX_STDOUT.value,
+                data=payload,
+            ),
+        )
+
+    async def _emit_terminal_closed(self, payload: dict[str, Any]) -> None:
+        manager = get_connection_manager()
+        await manager.send_message(
+            self.connection_id,
+            WSEvent(
+                event=ServerEvent.TERM_CLOSED.value,
                 data=payload,
             ),
         )
@@ -950,6 +992,44 @@ class WebSocketHandler:
             raise ValueError("watch_id is required")
         removed = await self._workspace_watch_service.remove_watch(watch_id)
         return {"watch_id": watch_id, "removed": removed}
+
+    async def _handle_term_open(self, params: dict[str, Any]) -> dict[str, Any]:
+        env = params.get("env")
+        if env is not None and not isinstance(env, dict):
+            raise ValueError("env must be an object")
+        return await self._workspace_terminal_service.open(
+            cwd=str(params["cwd"]).strip() if params.get("cwd") else None,
+            shell=str(params["shell"]).strip() if params.get("shell") else None,
+            cols=int(params.get("cols", 120)),
+            rows=int(params.get("rows", 32)),
+            env=env if isinstance(env, dict) else None,
+        )
+
+    async def _handle_term_input(self, params: dict[str, Any]) -> dict[str, Any]:
+        term_id = str(params.get("term_id", "")).strip()
+        if not term_id:
+            raise ValueError("term_id is required")
+        if "input" not in params:
+            raise ValueError("input is required")
+        return await self._workspace_terminal_service.input(term_id, str(params.get("input", "")))
+
+    async def _handle_term_resize(self, params: dict[str, Any]) -> dict[str, Any]:
+        term_id = str(params.get("term_id", "")).strip()
+        if not term_id:
+            raise ValueError("term_id is required")
+        if "cols" not in params or "rows" not in params:
+            raise ValueError("cols and rows are required")
+        return await self._workspace_terminal_service.resize(
+            term_id,
+            cols=int(params.get("cols", 0)),
+            rows=int(params.get("rows", 0)),
+        )
+
+    async def _handle_term_close(self, params: dict[str, Any]) -> dict[str, Any]:
+        term_id = str(params.get("term_id", "")).strip()
+        if not term_id:
+            raise ValueError("term_id is required")
+        return await self._workspace_terminal_service.close(term_id)
 
     # ========== Audio Streaming ==========
 
