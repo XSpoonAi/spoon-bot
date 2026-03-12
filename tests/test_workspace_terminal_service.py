@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
+import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from spoon_bot.gateway.websocket import workspace_terminal
 from spoon_bot.gateway.websocket.workspace_terminal import WorkspaceTerminalService
 
 
@@ -116,3 +119,96 @@ async def test_workspace_terminal_service_rejects_cwd_outside_workspace() -> Non
         shell, _ = _test_shell()
         with pytest.raises(ValueError, match="outside workspace boundary"):
             await service.open(cwd="/etc", shell=shell)
+
+
+def test_workspace_terminal_service_terminates_process_group_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class DummyProcess:
+        pid = 1234
+
+        def __init__(self) -> None:
+            self.returncode = None
+            self.terminate_called = False
+            self.kill_called = False
+            self.wait_calls = 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_called = True
+
+        def kill(self) -> None:
+            self.kill_called = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            self.returncode = 0
+            return 0
+
+    process = DummyProcess()
+    monkeypatch.setattr(workspace_terminal.os, "name", "posix", raising=False)
+    monkeypatch.setattr(workspace_terminal.signal, "SIGTERM", 15, raising=False)
+    monkeypatch.setattr(workspace_terminal.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(
+        workspace_terminal.os,
+        "killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+        raising=False,
+    )
+
+    WorkspaceTerminalService._terminate_process(process)  # type: ignore[arg-type]
+
+    assert calls == [(process.pid, signal.SIGTERM)]
+    assert process.terminate_called is False
+    assert process.kill_called is False
+    assert process.wait_calls == 1
+
+
+def test_workspace_terminal_service_force_kills_process_group_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class DummyProcess:
+        pid = 5678
+
+        def __init__(self) -> None:
+            self.returncode = None
+            self.wait_calls = 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            raise AssertionError("terminate should not be used on posix")
+
+        def kill(self) -> None:
+            raise AssertionError("kill should not be used when killpg succeeds")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired(cmd="shell", timeout=timeout or 0)
+            self.returncode = -9
+            return -9
+
+    process = DummyProcess()
+    monkeypatch.setattr(workspace_terminal.os, "name", "posix", raising=False)
+    monkeypatch.setattr(workspace_terminal.signal, "SIGTERM", 15, raising=False)
+    monkeypatch.setattr(workspace_terminal.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(
+        workspace_terminal.os,
+        "killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+        raising=False,
+    )
+
+    WorkspaceTerminalService._terminate_process(process)  # type: ignore[arg-type]
+
+    assert calls == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, signal.SIGKILL),
+    ]
+    assert process.wait_calls == 2

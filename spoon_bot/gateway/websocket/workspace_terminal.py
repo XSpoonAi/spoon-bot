@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -346,11 +347,27 @@ class WorkspaceTerminalService:
     def _terminate_process(process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
-        process.terminate()
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except OSError:
+                process.terminate()
+        else:
+            process.terminate()
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            process.kill()
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    process.kill()
+            else:
+                process.kill()
             process.wait(timeout=2)
 
 
