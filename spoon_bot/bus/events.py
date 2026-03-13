@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 
@@ -50,3 +50,29 @@ class OutboundMessage:
     def has_media(self) -> bool:
         """Check if message has media attachments."""
         return len(self.media) > 0
+
+
+@dataclass
+class SubagentEvent:
+    """Lifecycle event emitted by the sub-agent system.
+
+    Consumed by channel integrations (Discord, Telegram) that want
+    to react to sub-agent spawning, progress, and completion.
+    """
+
+    # Event type — one of: "spawning", "started", "completed", "failed", "cancelled"
+    event_type: str
+    agent_id: str
+    label: str
+    parent_id: Optional[str] = None
+    depth: int = 0
+    model_name: Optional[str] = None
+    # For terminal events
+    result: Optional[str] = None
+    error: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+    # Routing context (which user/channel spawned this sub-agent)
+    spawner_session_key: Optional[str] = None
+    spawner_channel: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
+    metadata: Any = field(default_factory=dict)

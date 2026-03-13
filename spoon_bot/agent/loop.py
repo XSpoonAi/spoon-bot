@@ -88,7 +88,8 @@ from spoon_bot.agent.tools.self_config import (
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.hotreload import HotReloadService
-from spoon_bot.services.spawn import SpawnTool
+from spoon_bot.subagent.manager import SubagentManager
+from spoon_bot.subagent.tools import SubagentTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
@@ -272,6 +273,24 @@ class AgentLoop:
             self.memory = MemoryStore(self.workspace)
 
         self._git = GitManager(self.workspace) if auto_commit else None
+
+        # Sub-agent manager — shares this agent's SessionManager so sub-agents
+        # can reuse the same persistence backend with their own unique session keys.
+        self._subagent_manager = SubagentManager(
+            session_manager=self.sessions,
+            workspace=self.workspace,
+            max_depth=self._config.subagent.max_depth,
+            max_children_per_agent=self._config.subagent.max_children_per_agent,
+            max_total_subagents=self._config.subagent.max_total_subagents,
+            parent_model=model,
+            parent_provider=provider,
+            parent_api_key=api_key,
+            parent_base_url=base_url,
+            persist_runs=self._config.subagent.persist_runs,
+            persist_file=self._config.subagent.persist_file,
+            archive_after_minutes=self._config.subagent.archive_after_minutes,
+            sweeper_interval_seconds=self._config.subagent.sweeper_interval_seconds,
+        )
 
         # Skill paths: runtime workspace + bundled skills shipped with spoon-bot
         self._skill_paths = [self.workspace / "skills"]
@@ -501,6 +520,9 @@ class AgentLoop:
             f"skills_enabled={self._enable_skills}"
         )
 
+        # Start sub-agent archive sweeper (no-op if persistence is disabled)
+        await self._subagent_manager.start_sweeper()
+
         # Start background hot-reload service if enabled
         if self._auto_reload:
             self._hot_reload = HotReloadService(
@@ -555,8 +577,9 @@ class AgentLoop:
             ],
         ))
 
-        # Background task tool
-        self.tools.register(SpawnTool())
+        # Sub-agent tool — replaces the old placeholder SpawnTool
+        spawn_tool = SubagentTool(manager=getattr(self, "_subagent_manager", None))
+        self.tools.register(spawn_tool)
 
         # Web tools
         self.tools.register(WebSearchTool())
@@ -792,7 +815,14 @@ class AgentLoop:
         return {"skills": skills_result, "mcp": mcp_result}
 
     async def cleanup(self) -> None:
-        """Shut down all managed resources (MCP tools, skills, etc.)."""
+        """Shut down all managed resources (MCP tools, skills, sub-agents, etc.)."""
+        # Cleanup sub-agents first so they can still access tools during their own cleanup
+        if hasattr(self, "_subagent_manager"):
+            try:
+                await self._subagent_manager.cleanup()
+            except Exception as exc:
+                logger.debug(f"Sub-agent manager cleanup: {exc}")
+
         # Cleanup MCP tools
         for mcp_tool in self._mcp_tools:
             for method in ("close", "cleanup", "shutdown"):
@@ -917,6 +947,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        session_key: str | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -924,10 +955,17 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Optional session key to switch to before processing.
 
         Returns:
             The agent's response text.
         """
+        # Switch session if requested
+        if session_key and session_key != self.session_key:
+            self.session_key = session_key
+            self._session = self.sessions.get_or_create(session_key)
+            logger.info(f"Switched to session: {session_key}")
+
         # Honour stop request from previous /stop command
         if self._stop_requested:
             self._stop_requested = False
@@ -1779,6 +1817,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        session_key: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -1786,10 +1825,17 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Optional session key to switch to before processing.
 
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
         """
+        # Switch session if requested
+        if session_key and session_key != self.session_key:
+            self.session_key = session_key
+            self._session = self.sessions.get_or_create(session_key)
+            logger.info(f"Switched to session: {session_key}")
+
         if not self._initialized:
             await self.initialize()
 
@@ -2281,6 +2327,11 @@ class AgentLoop:
     def agent(self) -> SpoonReactMCP | SpoonReactSkill | None:
         """Access the underlying spoon-core agent."""
         return self._agent
+
+    @property
+    def subagent_manager(self) -> SubagentManager | None:
+        """Expose sub-agent manager for external access (e.g. slash commands)."""
+        return getattr(self, "_subagent_manager", None)
 
 
 async def create_agent(
