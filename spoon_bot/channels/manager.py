@@ -111,6 +111,12 @@ class ChannelManager:
         self._agent = agent
         self._bus.set_handler(self._handle_message)
 
+        # Give the sub-agent manager a reference to the bus so it can
+        # push wake-continuation messages when sub-agents complete.
+        _sm = getattr(agent, "subagent_manager", None)
+        if _sm is not None:
+            _sm.set_bus(self._bus)
+
         # Align bus concurrency with agent pool size so neither is wasted.
         pool_size = getattr(agent, "_pool_size", None)
         if pool_size is not None and pool_size != self._bus.max_concurrency:
@@ -608,6 +614,16 @@ class ChannelManager:
             think_level = message.metadata.get("think_level", "off")
             media = message.media if message.has_media else None
             session_key = message.session_key or None
+
+            # Update sub-agent spawner context so any sub-agents spawned
+            # during this request know which channel/session to deliver
+            # their results to (push-based wake continuation).
+            _sm = getattr(self._agent, "subagent_manager", None)
+            if _sm is not None:
+                _sm.set_spawner_context(
+                    session_key=session_key,
+                    channel=message.channel,
+                )
 
             if think_level != "off":
                 response_text, thinking_content = await self._agent.process_with_thinking(

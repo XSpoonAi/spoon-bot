@@ -115,6 +115,8 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("compact", "Compact conversation context"),
     ("clear", "Clear conversation history"),
     ("cancel", "Cancel current operation"),
+    ("subagents", "Manage sub-agents (list/spawn/cancel)"),
+    ("agents", "Alias for /subagents"),
 ]
 
 # ---------------------------------------------------------------------------

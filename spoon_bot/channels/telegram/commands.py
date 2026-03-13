@@ -71,6 +71,8 @@ class CommandHandlers:
             "compact": self.handle_compact,
             "clear": self.handle_clear,
             "cancel": self.handle_cancel,
+            "subagents": self.handle_subagents,
+            "agents": self.handle_subagents,
         }
         for name, handler in commands.items():
             app.add_handler(CommandHandler(name, handler))
@@ -432,6 +434,281 @@ class CommandHandlers:
             return
 
         await update.message.reply_text("Operation cancelled.")
+
+    # ------------------------------------------------------------------
+    # /subagents [list|spawn <task>|cancel [id|all]]
+    # /agents — alias for /subagents
+    # ------------------------------------------------------------------
+
+    async def handle_subagents(self, update: Update, context: Any) -> None:
+        if not self._check(update):
+            return
+
+        if not self._agent:
+            await self._reply(update, "Agent not available.")
+            return
+
+        manager = self._agent.subagent_manager
+        if manager is None:
+            await self._reply(update, "Sub-agent manager not available.")
+            return
+
+        args = context.args or []
+        subcommand = args[0].lower() if args else "list"
+
+        if subcommand in ("list", "ls"):
+            await self._subagents_list(update, manager)
+        elif subcommand == "spawn":
+            rest = args[1:]
+            await self._subagents_spawn(update, manager, rest)
+        elif subcommand in ("cancel", "kill"):
+            target = args[1] if len(args) > 1 else ""
+            await self._subagents_cancel(update, manager, target)
+        elif subcommand == "steer":
+            agent_id = args[1] if len(args) > 1 else ""
+            message = " ".join(args[2:]).strip()
+            await self._subagents_steer(update, manager, agent_id, message)
+        elif subcommand == "info":
+            agent_id = args[1] if len(args) > 1 else ""
+            await self._subagents_info(update, manager, agent_id)
+        elif subcommand == "help":
+            await self._reply(
+                update,
+                "*Sub-agent commands:*\n"
+                "`/subagents` — list all sub-agents\n"
+                "`/subagents spawn [--model M] [--thinking L] <task>` — spawn\n"
+                "`/subagents cancel <id|all>` — cascade-cancel sub-agent(s)\n"
+                "`/subagents kill <id|all>` — alias for cancel\n"
+                "`/subagents steer <id> <new instructions>` — redirect running agent\n"
+                "`/subagents info <id>` — detailed metadata\n"
+                "`/agents` — alias for /subagents",
+            )
+        else:
+            await self._reply(
+                update,
+                "*Usage:*\n"
+                "`/subagents` — list all sub-agents\n"
+                "`/subagents spawn <task>` — spawn a new sub-agent\n"
+                "`/subagents cancel <id|all>` — cascade-cancel sub-agent(s)\n"
+                "`/subagents steer <id> <message>` — redirect running agent\n"
+                "`/subagents info <id>` — show details\n"
+                "`/subagents help` — full command reference",
+            )
+
+    async def _subagents_list(self, update: Update, manager: Any) -> None:
+        summary = manager.get_status_summary()
+        total = summary.get("total", 0)
+        if total == 0:
+            await self._reply(update, "No sub-agents spawned.")
+            return
+
+        lines = [f"*Sub-agents ({total} total):*"]
+
+        active = summary.get("active", [])
+        if active:
+            lines.append("\n*Active:*")
+            for e in active:
+                agent_id = e["agent_id"]
+                label = e["label"]
+                state = e["state"]
+                elapsed = e.get("elapsed_seconds")
+                model = e.get("model") or ""
+                pending_desc = e.get("pending_descendants", 0)
+                elapsed_str = f" — {elapsed}s" if elapsed is not None else ""
+                model_str = f" \\[{model}]" if model else ""
+                desc_str = (
+                    f" *(+{pending_desc} descendants)*"
+                    if pending_desc > 0 else ""
+                )
+                lines.append(
+                    f"`[{agent_id}]` {label}: *{state}*{elapsed_str}{model_str}{desc_str}"
+                )
+
+        recent = summary.get("recent", [])
+        if recent:
+            lines.append("\n*Recent:*")
+            for e in recent:
+                agent_id = e["agent_id"]
+                label = e["label"]
+                state = e["state"]
+                elapsed = e.get("elapsed_seconds")
+                model = e.get("model") or ""
+                elapsed_str = f" — {elapsed}s" if elapsed is not None else ""
+                model_str = f" \\[{model}]" if model else ""
+                lines.append(f"`[{agent_id}]` {label}: *{state}*{elapsed_str}{model_str}")
+
+        await self._reply(update, "\n".join(lines))
+
+    async def _subagents_spawn(
+        self, update: Update, manager: Any, args: list
+    ) -> None:
+        """Parse optional --model and --thinking flags, then spawn."""
+        from spoon_bot.subagent.models import SubagentConfig
+
+        model: str | None = None
+        thinking: str | None = None
+        task_parts: list[str] = []
+
+        i = 0
+        while i < len(args):
+            token = args[i]
+            if token == "--model" and i + 1 < len(args):
+                model = args[i + 1]
+                i += 2
+            elif token == "--thinking" and i + 1 < len(args):
+                thinking = args[i + 1]
+                i += 2
+            elif token.startswith("--model="):
+                model = token.split("=", 1)[1]
+                i += 1
+            elif token.startswith("--thinking="):
+                thinking = token.split("=", 1)[1]
+                i += 1
+            else:
+                task_parts.append(token)
+                i += 1
+
+        task = " ".join(task_parts).strip()
+        if not task:
+            await self._reply(
+                update,
+                "Usage: `/subagents spawn [--model MODEL] [--thinking LEVEL] <task>`",
+            )
+            return
+
+        config = SubagentConfig()
+        if model:
+            config.model = model
+        if thinking:
+            config.thinking_level = thinking
+
+        try:
+            record = await manager.spawn(task=task, label=task[:60], config=config)
+            model_str = f"\nModel: {record.model_name}" if record.model_name else ""
+            thinking_str = f"\nThinking: {thinking}" if thinking else ""
+            await self._reply(
+                update,
+                f"*Sub-agent spawned!*\n"
+                f"ID: `{record.agent_id}`\n"
+                f"Label: {record.label}"
+                f"{model_str}{thinking_str}\n"
+                f"Use /subagents to monitor progress.",
+            )
+        except ValueError as exc:
+            await self._reply(update, f"Failed to spawn sub-agent: {exc}")
+        except Exception as exc:
+            logger.error(f"Unexpected error spawning sub-agent: {exc}")
+            await self._reply(update, f"Error spawning sub-agent: {exc}")
+
+    async def _subagents_cancel(self, update: Update, manager: Any, target: str) -> None:
+        if not target:
+            await self._reply(
+                update,
+                "Usage: `/subagents cancel <agent_id>` or `/subagents cancel all`",
+            )
+            return
+
+        if target.lower() == "all":
+            count = await manager.cancel_all()
+            await self._reply(
+                update,
+                f"Cascade cancellation requested for {count} sub-agent(s).",
+            )
+        else:
+            # Count descendants for informative message
+            record = manager.registry.get(target)
+            descendants = (
+                manager.registry.get_descendants(target) if record else []
+            )
+            found = await manager.cancel(target, cascade=True)
+            if found:
+                desc_count = len(descendants)
+                desc_str = f" and {desc_count} descendants" if desc_count else ""
+                await self._reply(
+                    update,
+                    f"Cancellation requested for sub-agent `{target}`{desc_str}.",
+                )
+            else:
+                await self._reply(
+                    update,
+                    f"Sub-agent `{target}` not found or already finished.",
+                )
+
+    async def _subagents_steer(
+        self, update: Update, manager: Any, agent_id: str, message: str
+    ) -> None:
+        if not agent_id:
+            await self._reply(
+                update,
+                "Usage: `/subagents steer <agent_id> <new instructions>`",
+            )
+            return
+        if not message:
+            await self._reply(
+                update,
+                "Usage: `/subagents steer <agent_id> <new instructions>`\n"
+                "You must provide new instructions for the sub-agent.",
+            )
+            return
+
+        result = await manager.steer(agent_id, message)
+        status = result.get("status")
+        msg = result.get("message", "")
+
+        if status == "accepted":
+            await self._reply(
+                update,
+                f"*Steer accepted!*\n"
+                f"Sub-agent `{agent_id}` will be redirected.\n"
+                f"{msg}",
+            )
+        elif status == "rate_limited":
+            await self._reply(update, f"*Rate limited:* {msg}")
+        elif status == "done":
+            await self._reply(update, f"*Cannot steer:* {msg}")
+        else:
+            await self._reply(update, f"Sub-agent not found: `{agent_id}`.")
+
+    async def _subagents_info(
+        self, update: Update, manager: Any, agent_id: str
+    ) -> None:
+        if not agent_id:
+            await self._reply(update, "Usage: `/subagents info <agent_id>`")
+            return
+
+        info = await manager.get_info(agent_id)
+        if info is None:
+            await self._reply(update, f"Sub-agent `{agent_id}` not found.")
+            return
+
+        lines = [f"*Sub-agent `{agent_id}` info:*"]
+        lines.append(f"Label: {info['label']}")
+        lines.append(f"State: *{info['state']}*")
+        lines.append(f"Task: {info['task'][:120]}")
+        lines.append(f"Depth: {info['depth']}")
+        if info.get("model"):
+            lines.append(f"Model: `{info['model']}`")
+        lines.append(f"Tool profile: {info['tool_profile']}")
+        if info.get("thinking_level"):
+            lines.append(f"Thinking: {info['thinking_level']}")
+        if info.get("elapsed_seconds") is not None:
+            lines.append(f"Elapsed: {info['elapsed_seconds']}s")
+        if info.get("pending_descendants", 0) > 0:
+            lines.append(f"Pending descendants: {info['pending_descendants']}")
+        if info.get("children"):
+            lines.append(f"Children: {', '.join(f'`{c}`' for c in info['children'])}")
+        if info.get("token_usage"):
+            tu = info["token_usage"]
+            lines.append(
+                f"Tokens: {tu.get('total_tokens', 0)} "
+                f"(in {tu.get('input_tokens', 0)} / out {tu.get('output_tokens', 0)})"
+            )
+        if info.get("result_preview"):
+            lines.append(f"Result preview:\n_{info['result_preview']}_")
+        if info.get("error"):
+            lines.append(f"Error: {info['error']}")
+
+        await self._reply(update, "\n".join(lines))
 
     # ------------------------------------------------------------------
     # /whoami  — user info (no agent needed)
