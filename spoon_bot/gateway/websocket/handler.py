@@ -48,6 +48,27 @@ from spoon_bot.gateway.websocket.workspace_watch import WorkspaceWatchService
 
 
 # ---------------------------------------------------------------------------
+# Methods that are safe for concurrent (task-based) dispatch.
+# Path-sensitive fs/workspace ops rely on WorkspaceFSService locking to
+# serialize conflicting requests while allowing unrelated paths to proceed.
+# ---------------------------------------------------------------------------
+
+_CONCURRENT_METHODS: frozenset[str] = frozenset({
+    ClientMethod.FS_LIST.value,
+    ClientMethod.FS_STAT.value,
+    ClientMethod.FS_READ.value,
+    ClientMethod.FS_WRITE.value,
+    ClientMethod.FS_MKDIR.value,
+    ClientMethod.FS_RENAME.value,
+    ClientMethod.FS_REMOVE.value,
+    ClientMethod.FS_WATCH.value,
+    ClientMethod.FS_UNWATCH.value,
+    "workspace.tree",
+})
+_CONCURRENT_REQUEST_LIMIT = 16
+
+
+# ---------------------------------------------------------------------------
 # Simple in-memory rate limiter for WS auth attempts (#19)
 # ---------------------------------------------------------------------------
 
@@ -211,6 +232,14 @@ async def websocket_endpoint(
                                 handler._current_task = None
 
                         handler._current_task = asyncio.create_task(_run_chat())
+
+                    elif message.method in _CONCURRENT_METHODS:
+                        task = asyncio.create_task(
+                            handler._dispatch_concurrent_request(manager, conn_id, message),
+                        )
+                        handler._concurrent_tasks.add(task)
+                        task.add_done_callback(handler._concurrent_tasks.discard)
+
                     else:
                         response = await handler.handle_request(message)
                         await manager.send_message(conn_id, response)
@@ -252,6 +281,8 @@ class WebSocketHandler:
         self._current_task: asyncio.Task | None = None
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._chat_lock = asyncio.Lock()
+        self._concurrent_request_slots = asyncio.Semaphore(_CONCURRENT_REQUEST_LIMIT)
+        self._concurrent_tasks: set[asyncio.Task] = set()
         agent = get_agent()
         workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
         self._sandbox_id = _runtime_sandbox_id()
@@ -337,6 +368,24 @@ class WebSocketHandler:
                 code="HANDLER_ERROR",
                 message="Internal handler error",  # Don't leak internals (#14)
             )
+
+    async def _dispatch_concurrent_request(
+        self,
+        manager,
+        connection_id: str,
+        request: WSRequest,
+    ) -> None:
+        """Run a concurrent-safe request with a bounded per-connection slot pool."""
+        async with self._concurrent_request_slots:
+            try:
+                response = await self.handle_request(request)
+                await manager.send_message(connection_id, response)
+            except Exception as exc:
+                logger.error(f"Concurrent RPC error ({request.method}): {exc}")
+                await manager.send_message(
+                    connection_id,
+                    WSError(id=request.id, code="HANDLER_ERROR", message=str(exc)),
+                )
 
     # ========== Chat ==========
 
@@ -589,6 +638,13 @@ class WebSocketHandler:
         return True
 
     async def _cleanup_resources(self) -> None:
+        # Cancel in-flight concurrent fs/workspace tasks
+        for task in list(self._concurrent_tasks):
+            if not task.done():
+                task.cancel()
+        if self._concurrent_tasks:
+            await asyncio.gather(*self._concurrent_tasks, return_exceptions=True)
+        self._concurrent_tasks.clear()
         await self._workspace_terminal_service.shutdown()
         await self._workspace_watch_service.close()
 
