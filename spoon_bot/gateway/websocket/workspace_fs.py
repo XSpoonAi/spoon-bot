@@ -14,38 +14,48 @@ SANDBOX_WORKSPACE_ROOT = "/workspace"
 
 
 class _PathLockManager:
-    """Per-path asyncio locks with automatic cleanup."""
+    """Path-tree lock manager with ancestor/descendant conflict detection."""
 
     def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._refcounts: dict[str, int] = {}
-        self._mu = asyncio.Lock()  # protects dict mutations
+        self._active: dict[str, int] = {}
+        self._condition = asyncio.Condition()
 
     @asynccontextmanager
     async def lock(self, *paths: str) -> AsyncIterator[None]:
-        """Acquire locks for one or more paths (sorted order to prevent deadlock)."""
-        sorted_paths = sorted(set(paths))
-        locks: list[tuple[str, asyncio.Lock]] = []
-        for p in sorted_paths:
-            async with self._mu:
-                if p not in self._locks:
-                    self._locks[p] = asyncio.Lock()
-                    self._refcounts[p] = 0
-                self._refcounts[p] += 1
-                locks.append((p, self._locks[p]))
+        """Acquire one or more non-overlapping path locks."""
+        sorted_paths = sorted(p for p in set(paths) if p)
+        if not sorted_paths:
+            yield
+            return
+
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._has_conflict(sorted_paths))
+            for path in sorted_paths:
+                self._active[path] = self._active.get(path, 0) + 1
         try:
-            for _, lk in locks:
-                await lk.acquire()
             yield
         finally:
-            for _, lk in locks:
-                lk.release()
-            for p, _ in locks:
-                async with self._mu:
-                    self._refcounts[p] -= 1
-                    if self._refcounts[p] <= 0:
-                        self._locks.pop(p, None)
-                        self._refcounts.pop(p, None)
+            async with self._condition:
+                for path in sorted_paths:
+                    remaining = self._active.get(path, 0) - 1
+                    if remaining > 0:
+                        self._active[path] = remaining
+                    else:
+                        self._active.pop(path, None)
+                self._condition.notify_all()
+
+    def _has_conflict(self, requested_paths: list[str]) -> bool:
+        for requested in requested_paths:
+            for active in self._active:
+                if self._paths_conflict(requested, active):
+                    return True
+        return False
+
+    @staticmethod
+    def _paths_conflict(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        return left.startswith(right + "/") or right.startswith(left + "/")
 
 
 class WorkspaceFSService:
@@ -80,13 +90,15 @@ class WorkspaceFSService:
         offset: int = 0,
         limit: int = 262144,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._read_sync,
-            path,
-            encoding=encoding,
-            offset=offset,
-            limit=limit,
-        )
+        canonical = self._canonical(path)
+        async with self._path_locks.lock(canonical):
+            return await asyncio.to_thread(
+                self._read_sync,
+                path,
+                encoding=encoding,
+                offset=offset,
+                limit=limit,
+            )
 
     async def write(
         self,

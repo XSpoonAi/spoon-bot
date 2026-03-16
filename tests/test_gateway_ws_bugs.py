@@ -46,7 +46,10 @@ from spoon_bot.gateway.websocket.protocol import (
     WSRequest,
     parse_message,
 )
-from spoon_bot.gateway.websocket.handler import _AuthRateLimiter
+from spoon_bot.gateway.websocket.handler import (
+    _AuthRateLimiter,
+    _CONCURRENT_REQUEST_LIMIT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +389,66 @@ class TestSubscribeValidation:
             })
             resp = ws.receive_json()
             assert resp["type"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_ws_concurrent_dispatch_respects_connection_limit() -> None:
+    """Concurrent fs/workspace dispatch should honor the per-connection slot limit."""
+
+    class _RecordingManager:
+        def __init__(self) -> None:
+            self.sent: list[object] = []
+
+        async def send_message(self, _connection_id, message):
+            self.sent.append(message)
+            return True
+
+    set_agent(_make_mock_agent())
+    manager = _RecordingManager()
+
+    from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+    handler = WebSocketHandler("conn_test")
+
+    active = 0
+    max_active = 0
+    lock = asyncio.Lock()
+    reached_limit = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_handle_request(request):
+        nonlocal active, max_active
+        async with lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == _CONCURRENT_REQUEST_LIMIT:
+                reached_limit.set()
+        await release.wait()
+        async with lock:
+            active -= 1
+        return {"ok": True, "id": request.id}
+
+    with patch.object(handler, "handle_request", side_effect=_slow_handle_request):
+        tasks = [
+            asyncio.create_task(
+                handler._dispatch_concurrent_request(
+                    manager,
+                    "conn_test",
+                    WSRequest(
+                        id=f"req-{i}",
+                        method="fs.read",
+                        params={"path": f"/workspace/{i}.txt"},
+                    ),
+                ),
+            )
+            for i in range(_CONCURRENT_REQUEST_LIMIT + 4)
+        ]
+        await asyncio.wait_for(reached_limit.wait(), timeout=1.0)
+        release.set()
+        await asyncio.gather(*tasks)
+
+    assert len(manager.sent) == _CONCURRENT_REQUEST_LIMIT + 4
+    assert max_active == _CONCURRENT_REQUEST_LIMIT
 
 
 # ===================================================================

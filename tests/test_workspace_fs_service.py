@@ -186,6 +186,141 @@ async def test_concurrent_writes_different_paths_parallel(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_read_and_write_same_path_serialized(tmp_path: Path) -> None:
+    """Reads and writes on the same path must not overlap."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "shared.txt").write_text("seed", encoding="utf-8")
+    service = WorkspaceFSService(workspace)
+
+    call_log: list[tuple[str, float, float]] = []
+    original_read_sync = service._read_sync
+    original_write_sync = service._write_sync
+
+    def _slow_read_sync(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        result = original_read_sync(*args, **kwargs)
+        end = time.monotonic()
+        call_log.append(("read", start, end))
+        return result
+
+    def _slow_write_sync(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        result = original_write_sync(*args, **kwargs)
+        end = time.monotonic()
+        call_log.append(("write", start, end))
+        return result
+
+    with (
+        patch.object(service, "_read_sync", side_effect=_slow_read_sync),
+        patch.object(service, "_write_sync", side_effect=_slow_write_sync),
+    ):
+        await asyncio.gather(
+            service.read("/workspace/shared.txt"),
+            service.write("/workspace/shared.txt", content="updated"),
+        )
+
+    assert len(call_log) == 2
+    sorted_log = sorted(call_log, key=lambda x: x[1])
+    assert sorted_log[1][1] >= sorted_log[0][2] - 0.001
+
+
+@pytest.mark.asyncio
+async def test_remove_directory_and_child_write_serialized(tmp_path: Path) -> None:
+    """Recursive directory removal must not overlap with child writes."""
+    workspace = tmp_path / "workspace"
+    nested = workspace / "dir"
+    nested.mkdir(parents=True)
+    (nested / "seed.txt").write_text("seed", encoding="utf-8")
+    service = WorkspaceFSService(workspace)
+
+    call_log: list[tuple[str, float, float]] = []
+    original_remove_sync = service._remove_sync
+    original_write_sync = service._write_sync
+
+    def _slow_remove_sync(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        result = original_remove_sync(*args, **kwargs)
+        end = time.monotonic()
+        call_log.append(("remove", start, end))
+        return result
+
+    def _slow_write_sync(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        result = original_write_sync(*args, **kwargs)
+        end = time.monotonic()
+        call_log.append(("write", start, end))
+        return result
+
+    with (
+        patch.object(service, "_remove_sync", side_effect=_slow_remove_sync),
+        patch.object(service, "_write_sync", side_effect=_slow_write_sync),
+    ):
+        results = await asyncio.gather(
+            service.remove("/workspace/dir", recursive=True),
+            service.write("/workspace/dir/child.txt", content="updated"),
+            return_exceptions=True,
+        )
+
+    assert len(call_log) == 2
+    sorted_log = sorted(call_log, key=lambda x: x[1])
+    assert sorted_log[1][1] >= sorted_log[0][2] - 0.001
+    assert any(isinstance(result, dict) for result in results)
+    assert any(isinstance(result, Exception) for result in results) or any(
+        isinstance(result, dict) and result.get("removed") is True for result in results
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_directory_and_child_write_serialized(tmp_path: Path) -> None:
+    """Directory rename must not overlap with writes to descendants."""
+    workspace = tmp_path / "workspace"
+    nested = workspace / "dir"
+    nested.mkdir(parents=True)
+    (nested / "seed.txt").write_text("seed", encoding="utf-8")
+    service = WorkspaceFSService(workspace)
+
+    call_log: list[tuple[str, float, float]] = []
+    original_rename_sync = service._rename_sync
+    original_write_sync = service._write_sync
+
+    def _slow_rename_sync(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        result = original_rename_sync(*args, **kwargs)
+        end = time.monotonic()
+        call_log.append(("rename", start, end))
+        return result
+
+    def _slow_write_sync(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        result = original_write_sync(*args, **kwargs)
+        end = time.monotonic()
+        call_log.append(("write", start, end))
+        return result
+
+    with (
+        patch.object(service, "_rename_sync", side_effect=_slow_rename_sync),
+        patch.object(service, "_write_sync", side_effect=_slow_write_sync),
+    ):
+        results = await asyncio.gather(
+            service.rename("/workspace/dir", "/workspace/renamed", overwrite=True),
+            service.write("/workspace/dir/child.txt", content="updated"),
+            return_exceptions=True,
+        )
+
+    assert len(call_log) == 2
+    sorted_log = sorted(call_log, key=lambda x: x[1])
+    assert sorted_log[1][1] >= sorted_log[0][2] - 0.001
+    assert any(isinstance(result, dict) and result.get("moved") is True for result in results)
+
+
+@pytest.mark.asyncio
 async def test_rename_no_deadlock(tmp_path: Path) -> None:
     """Concurrent rename(a,b) and rename(b,a) must not deadlock."""
     workspace = tmp_path / "workspace"
@@ -213,11 +348,9 @@ async def test_path_lock_cleanup() -> None:
     plm = _PathLockManager()
 
     async with plm.lock("/a", "/b"):
-        assert "/a" in plm._locks
-        assert "/b" in plm._locks
+        assert "/a" in plm._active
+        assert "/b" in plm._active
 
     # After context exit, locks should be cleaned up
-    assert "/a" not in plm._locks
-    assert "/b" not in plm._locks
-    assert "/a" not in plm._refcounts
-    assert "/b" not in plm._refcounts
+    assert "/a" not in plm._active
+    assert "/b" not in plm._active
