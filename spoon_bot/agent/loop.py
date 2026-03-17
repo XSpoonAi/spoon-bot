@@ -477,6 +477,7 @@ class AgentLoop:
         # and can cause the model to summarize instead of continue).
         self._agent.next_step_prompt = self.DEFAULT_NEXT_STEP_PROMPT
         self._agent._custom_next_step_prompt = True
+        self._agent._spoon_bot_base_think = self._agent.think
 
         # Build dynamic-tools prompt now that all tools (native + skill) are registered
         inactive_tools = self.tools.get_inactive_tools()
@@ -1036,6 +1037,7 @@ class AgentLoop:
                     raise
         finally:
             # Always ensure agent is back in IDLE state after processing
+            self._restore_agent_think()
             if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
                 logger.warning(
                     f"Post-run cleanup: resetting agent from {self._agent.state} to IDLE"
@@ -1309,7 +1311,12 @@ class AgentLoop:
             return
 
         agent_loop = self
-        original_think = agent.think
+        original_think = getattr(agent, "_spoon_bot_base_think", None)
+        if original_think is None:
+            original_think = agent.think
+            setattr(agent, "_spoon_bot_base_think", original_think)
+        else:
+            agent.think = original_think
         call_tracker: Counter = Counter()
         detail_tracker: Counter = Counter()
         read_files: set = set()
@@ -1488,6 +1495,15 @@ class AgentLoop:
 
         agent.think = _tracked_think
 
+    def _restore_agent_think(self) -> None:
+        """Restore the agent's base think() implementation after a request."""
+        agent = self._agent
+        if agent is None:
+            return
+        original_think = getattr(agent, "_spoon_bot_base_think", None)
+        if original_think is not None:
+            agent.think = original_think
+
     def _filter_execution_steps(self, content: str) -> str:
         """
         Filter out technical execution steps from agent output.
@@ -1578,6 +1594,9 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+        stream_completed = False
+        stream_cancelled = False
+        bg_task: asyncio.Task[None] | None = None
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
@@ -1658,8 +1677,9 @@ class AgentLoop:
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
-                    logger.warning("Streaming cancelled")
-                    break
+                    stream_cancelled = True
+                    logger.warning("Streaming cancelled while waiting for output")
+                    raise
                 except Exception as e:
                     logger.warning(f"Queue get error: {type(e).__name__}: {e}")
                     continue
@@ -1759,15 +1779,29 @@ class AgentLoop:
                 }
 
             # Emit done
+            stream_completed = True
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
+        except asyncio.CancelledError:
+            stream_cancelled = True
+            logger.warning("Streaming cancelled")
+            raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
+            stream_completed = True
             yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
+        finally:
+            self._restore_agent_think()
+            if bg_task is not None and not bg_task.done():
+                bg_task.cancel()
+                try:
+                    await asyncio.wait_for(bg_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
 
         # Save to session only if we got actual content
-        if full_content:
+        if full_content and stream_completed and not stream_cancelled:
             try:
                 self._session.add_message("user", message)
                 self._session.add_message("assistant", full_content)
@@ -1834,6 +1868,8 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             raise
+        finally:
+            self._restore_agent_think()
 
         # Save to session
         try:
