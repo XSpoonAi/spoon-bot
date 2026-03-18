@@ -43,6 +43,13 @@ from spoon_bot.gateway.observability.tracing import (
     build_timing_payload,
     new_trace_id,
 )
+from spoon_bot.gateway.websocket.handler import (
+    _derive_media_from_attachments,
+    _merge_attachment_context,
+    _normalize_attachment_refs,
+    _validate_attachment_paths,
+    _validate_media_paths,
+)
 
 logger = getLogger(__name__)
 
@@ -147,6 +154,7 @@ async def _stream_sse(
     agent,
     message: str,
     media: list[str] | None,
+    attachments: list[dict[str, Any]] | None,
     thinking: bool,
     *,
     session_key: str | None = None,
@@ -178,6 +186,8 @@ async def _stream_sse(
             kwargs = {"message": message, "thinking": thinking}
             if media:
                 kwargs["media"] = media
+            if attachments:
+                kwargs["attachments"] = attachments
 
             try:
                 async for chunk_data in agent.stream(**kwargs):
@@ -282,13 +292,18 @@ async def chat(
                 language=request.audio_language,
             )
 
+        attachments = _validate_attachment_paths(_normalize_attachment_refs(request.attachments))
+        media = _validate_media_paths(list(dict.fromkeys((request.media or []) + _derive_media_from_attachments(attachments))))
+        message = _merge_attachment_context(message, attachments)
+
         # Streaming mode: return SSE
         if stream:
             return StreamingResponse(
                 _stream_sse(
                     agent,
                     message,
-                    request.media or None,
+                    media or None,
+                    attachments or None,
                     thinking,
                     session_key=session_key,
                     trace_id=trace_id,
@@ -311,8 +326,10 @@ async def chat(
                 _switch_session(agent, session_key)
 
                 kwargs = {"message": message}
-                if request.media:
-                    kwargs["media"] = request.media
+                if media:
+                    kwargs["media"] = media
+                if attachments:
+                    kwargs["attachments"] = attachments
 
                 thinking_content = None
                 if thinking:

@@ -28,6 +28,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -72,7 +73,9 @@ def _make_mock_agent():
     session = MagicMock()
     session.session_key = "default"
     session.messages = []
-    session.add_message = MagicMock()
+    def _session_add_message(role, content, **kwargs):
+        session.messages.append({"role": role, "content": content, **kwargs})
+    session.add_message = MagicMock(side_effect=_session_add_message)
     session.clear = MagicMock()
 
     sessions = MagicMock()
@@ -594,6 +597,11 @@ class TestWSSessionImport:
             result = resp["result"]
             assert result["success"] is True
             assert result["restored"]["session_key"] == "imported-session"
+            saved_session = app_module._agent.sessions.get_or_create.return_value
+            saved_session.add_message.assert_any_call(
+                "user",
+                "hi",
+            )
 
     def test_import_missing_state_error(self, client):
         """session.import without state should raise error."""
@@ -620,6 +628,101 @@ class TestWSSessionImport:
             })
             resp = ws.receive_json()
             assert resp["type"] == "error"
+
+    def test_import_preserves_attachment_metadata(self, client, tmp_path: Path):
+        """session.import/export should round-trip media and attachments."""
+        workspace = tmp_path / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        attachment_path = uploads / "demo.png"
+        attachment_path.write_bytes(b"png")
+        app_module._agent.workspace = workspace
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "imp4",
+                "method": "session.import",
+                "params": {
+                    "state": {
+                        "version": "1.0",
+                        "session_key": "imported-session",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "see file",
+                                "media": [str(attachment_path)],
+                                "attachments": [
+                                    {
+                                        "uri": str(attachment_path),
+                                        "name": "demo.png",
+                                        "mime_type": "image/png",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                },
+            })
+            resp = ws.receive_json()
+            assert resp["type"] == "response"
+            saved_session = app_module._agent.sessions.get_or_create.return_value
+            saved_session.add_message.assert_any_call(
+                "user",
+                "see file",
+                media=[str(attachment_path)],
+                attachments=[{
+                    "uri": str(attachment_path),
+                    "name": "demo.png",
+                    "mime_type": "image/png",
+                    "workspace_path": str(attachment_path),
+                }],
+            )
+
+            ws.send_json({
+                "type": "request",
+                "id": "exp2",
+                "method": "session.export",
+                "params": {"session_key": "default"},
+            })
+            export_resp = ws.receive_json()
+            assert export_resp["type"] == "response"
+            assert export_resp["result"]["success"] is True
+            messages = export_resp["result"]["state"]["messages"]
+            assert isinstance(messages, list)
+
+    def test_import_rejects_attachment_outside_workspace(self, client, tmp_path: Path):
+        """session.import should reject attachment refs that escape the workspace."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"png")
+        app_module._agent.workspace = workspace
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "imp5",
+                "method": "session.import",
+                "params": {
+                    "state": {
+                        "version": "1.0",
+                        "session_key": "imported-session",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "see file",
+                                "attachments": [{"uri": str(outside), "name": "outside.png"}],
+                            },
+                        ],
+                    },
+                },
+            })
+            resp = ws.receive_json()
+            assert resp["type"] == "error"
+            assert "Invalid attachment path" in resp["error"]["message"]
 
 
 # ===================================================================
@@ -969,6 +1072,97 @@ class TestWSStreamingContent:
             assert response is not None
             assert response["result"]["content"] == "Hello from test agent"
             assert response["result"]["success"] is True
+
+    def test_chat_send_rejects_invalid_media_paths(self, client):
+        """Invalid media paths should fail fast instead of being silently skipped."""
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "badmedia1",
+                "method": "chat.send",
+                "params": {
+                    "message": "look at this",
+                    "media": ["/definitely/missing/file.png"],
+                    "stream": False,
+                },
+            })
+            resp = ws.receive_json()
+            assert resp["type"] == "error"
+            assert "Invalid media path" in resp["error"]["message"]
+
+    def test_chat_send_with_attachment_only_builds_context_and_passes_metadata(self, client, tmp_path: Path):
+        """Attachment-only requests should reach agent with structured attachments."""
+        workspace = tmp_path / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        attachment_path = uploads / "demo.pdf"
+        attachment_path.write_text("demo", encoding="utf-8")
+        app_module._agent.workspace = workspace
+        app_module._agent.process = AsyncMock(return_value="ok")
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "attach1",
+                "method": "chat.send",
+                "params": {
+                    "message": "",
+                    "stream": False,
+                    "attachments": [
+                        {
+                            "uri": str(attachment_path),
+                            "name": "demo.pdf",
+                            "mime_type": "application/pdf",
+                            "size": 4,
+                        }
+                    ],
+                },
+            })
+            events = []
+            for _ in range(10):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+        app_module._agent.process.assert_awaited_once()
+        kwargs = app_module._agent.process.await_args.kwargs
+        assert kwargs["attachments"] == [
+            {
+                "uri": str(attachment_path),
+                "name": "demo.pdf",
+                "mime_type": "application/pdf",
+                "size": 4,
+                "workspace_path": str(attachment_path),
+            }
+        ]
+        assert str(attachment_path) in kwargs["message"]
+
+    def test_chat_send_rejects_existing_media_outside_workspace(self, client, tmp_path: Path):
+        """Existing files outside workspace should not be accepted as media inputs."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"png")
+        app_module._agent.workspace = workspace
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "badmedia2",
+                "method": "chat.send",
+                "params": {
+                    "message": "look at this",
+                    "media": [str(outside)],
+                    "stream": False,
+                },
+            })
+            resp = ws.receive_json()
+            assert resp["type"] == "error"
+            assert "Invalid media path" in resp["error"]["message"]
 
     def test_stream_done_metadata_falls_back_to_content(self, client):
         """If no chunk delta is emitted, done.metadata.content should still reach clients."""

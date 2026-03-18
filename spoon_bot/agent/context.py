@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 
 class ContextBuilder:
     """
@@ -199,10 +201,15 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
             return text
 
         images = []
+        skipped: list[str] = []
         for path in media:
             p = Path(path)
             mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
+            if not p.is_file():
+                skipped.append(f"{path}: missing file")
+                continue
+            if not mime or not mime.startswith("image/"):
+                skipped.append(f"{path}: unsupported mime {mime or 'unknown'}")
                 continue
             try:
                 b64 = base64.b64encode(p.read_bytes()).decode()
@@ -210,8 +217,14 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"}
                 })
-            except Exception:
-                pass
+            except Exception as exc:
+                skipped.append(f"{path}: {exc}")
+
+        if skipped:
+            logger.warning(
+                "Skipped media inputs while building multimodal content: {}",
+                "; ".join(skipped),
+            )
 
         if not images:
             return text

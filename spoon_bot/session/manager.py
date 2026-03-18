@@ -53,6 +53,10 @@ class Session:
             for m in self.messages
         ]
 
+    def get_messages(self) -> list[dict[str, Any]]:
+        """Get full persisted messages including optional metadata."""
+        return [dict(message) for message in self.messages if isinstance(message, dict)]
+
     def clear(self) -> None:
         """Clear all messages."""
         self.messages.clear()

@@ -23,6 +23,7 @@ class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=100000)
     session_key: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     media: list[str] = Field(default_factory=list, max_length=10)
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     options: ChatOptions | None = None
 
     # Audio fields (alternative to text message)

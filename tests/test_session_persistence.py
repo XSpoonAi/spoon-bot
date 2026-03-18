@@ -85,6 +85,18 @@ class TestSessionDataClass:
         assert h[0] == {"role": "user", "content": "Hello!"}
         assert "timestamp" not in h[0]
 
+    def test_get_messages_preserves_metadata(self):
+        s = Session(session_key="s1")
+        s.add_message(
+            "user",
+            "see attachment",
+            media=["/workspace/uploads/demo.png"],
+            attachments=[{"uri": "/workspace/uploads/demo.png", "name": "demo.png"}],
+        )
+        messages = s.get_messages()
+        assert messages[0]["media"] == ["/workspace/uploads/demo.png"]
+        assert messages[0]["attachments"] == [{"uri": "/workspace/uploads/demo.png", "name": "demo.png"}]
+
     def test_clear(self):
         s = _sample_session()
         s.clear()
@@ -350,21 +362,33 @@ class _FakeRuntimeMemory:
 class _FakeRuntimeAgent:
     def __init__(self) -> None:
         self.memory = _FakeRuntimeMemory()
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, dict]] = []
 
     async def add_message(self, role: str, content: str, **kwargs) -> None:
-        self.calls.append((role, content))
+        self.calls.append((role, content, kwargs))
 
 
 class TestAgentLoopSessionHydration:
     @pytest.mark.asyncio
-    async def test_runtime_history_injected_from_persisted_session(self):
+    async def test_runtime_history_injected_from_persisted_session(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        attachment_path = uploads / "alice.png"
+        attachment_path.write_bytes(b"png")
 
         loop = AgentLoop.__new__(AgentLoop)
         loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
         loop._session = Session(session_key="persisted")
-        loop._session.add_message("user", "我叫Alice，请记住")
+        loop._session.add_message(
+            "user",
+            "我叫Alice，请记住",
+            media=[str(attachment_path)],
+            attachments=[{"uri": str(attachment_path), "name": "alice.png"}],
+        )
         loop._session.add_message("assistant", "好的，我会记住你叫Alice。")
 
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
@@ -372,8 +396,8 @@ class TestAgentLoopSessionHydration:
         assert loop._agent.memory.cleared is True
         assert injected == 2
         assert loop._agent.calls == [
-            ("user", "我叫Alice，请记住"),
-            ("assistant", "好的，我会记住你叫Alice。"),
+            ("user", f"我叫Alice，请记住\n\nAttached workspace files (source of truth for this request):\n- {attachment_path} (name: alice.png)\nUse these attached workspace files as the primary source of truth for this request.", {"media": [str(attachment_path)]}),
+            ("assistant", "好的，我会记住你叫Alice。", {}),
         ]
 
 

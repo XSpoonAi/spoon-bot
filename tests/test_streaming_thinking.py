@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1141,7 +1142,7 @@ class TestBackwardCompatibility:
 
         assert response.status_code == 200
 
-    def test_media_field_still_works(self):
+    def test_media_field_still_works(self, tmp_path: Path):
         """Media field should still work in non-streaming mode."""
         mock_agent = MagicMock()
         mock_agent.process = AsyncMock(return_value="processed with media")
@@ -1149,15 +1150,19 @@ class TestBackwardCompatibility:
         mock_agent.tools = MagicMock()
         mock_agent.tools.list_tools = MagicMock(return_value=[])
         mock_agent.skills = []
+        mock_agent.workspace = tmp_path
 
         app = _create_test_app(mock_agent)
         client = TestClient(app)
+
+        image_path = tmp_path / "image.png"
+        image_path.write_bytes(b"png")
 
         response = client.post(
             "/v1/agent/chat",
             json={
                 "message": "analyze this",
-                "media": ["/path/to/image.png"],
+                "media": [str(image_path)],
             },
         )
 

@@ -66,6 +66,140 @@ _CONCURRENT_METHODS: frozenset[str] = frozenset({
     "workspace.tree",
 })
 _CONCURRENT_REQUEST_LIMIT = 16
+_ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this request):"
+
+
+def _workspace_root() -> Path:
+    """Return the resolved workspace root used for attachment/media validation."""
+    agent = get_agent()
+    workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+    return workspace.expanduser().resolve()
+
+
+def _resolve_workspace_file(path_str: str) -> Path | None:
+    """Resolve a file path and ensure it stays within the configured workspace."""
+    candidate = str(path_str or "").strip()
+    if not candidate:
+        return None
+    try:
+        resolved = Path(candidate).expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+    workspace = _workspace_root()
+    if resolved != workspace and workspace not in resolved.parents:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _string_list_from_any(raw: Any) -> list[str]:
+    """Best-effort normalize media payloads to a list of non-empty strings."""
+    if not isinstance(raw, list):
+        return []
+
+    items: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            value = item.strip()
+        else:
+            value = str(item).strip() if item is not None else ""
+        if value:
+            items.append(value)
+    return items
+
+
+def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
+    """Normalize attachment metadata from websocket params."""
+    if not isinstance(raw, list):
+        return []
+
+    attachments: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if not uri:
+            continue
+        attachment = dict(item)
+        attachment["uri"] = uri
+        attachment.setdefault("workspace_path", uri)
+        attachments.append(attachment)
+    return attachments
+
+
+def _validate_media_paths(media: list[str]) -> list[str]:
+    """Reject media paths that are missing or outside the sandbox workspace."""
+    invalid = [path for path in media if _resolve_workspace_file(path) is None]
+    if invalid:
+        raise ValueError(f"Invalid media path(s): {', '.join(invalid)}")
+    return media
+
+
+def _validate_attachment_paths(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reject attachment paths that are missing or outside the sandbox workspace."""
+    missing = [
+        str(item.get("workspace_path") or item.get("uri") or "").strip()
+        for item in attachments
+        if _resolve_workspace_file(str(item.get("workspace_path") or item.get("uri") or "").strip()) is None
+    ]
+    if missing:
+        raise ValueError(f"Invalid attachment path(s): {', '.join(missing)}")
+    return attachments
+
+
+def _derive_media_from_attachments(attachments: list[dict[str, Any]]) -> list[str]:
+    """Best-effort derive image media paths from attachment metadata."""
+    items: list[str] = []
+    for attachment in attachments:
+        path = str(attachment.get("workspace_path") or attachment.get("uri") or "").strip()
+        mime_type = str(attachment.get("mime_type") or attachment.get("file_type") or "").strip().lower()
+        if not path:
+            continue
+        if mime_type.startswith("image/") or Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+            items.append(path)
+    return items
+
+
+def _merge_attachment_context(message: str, attachments: list[dict[str, Any]]) -> str:
+    """Ensure request text contains workspace attachment references."""
+    if not attachments:
+        return message
+
+    normalized: list[tuple[dict[str, Any], str]] = []
+    for item in attachments:
+        path = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if path:
+            normalized.append((item, path))
+    if not normalized:
+        return message
+
+    text = message.strip()
+    if _ATTACHMENT_CONTEXT_HEADER in text and all(path in text for _, path in normalized):
+        return text
+
+    lines = [text] if text else [
+        "The user attached files without extra text. Inspect the files and answer based on their contents."
+    ]
+    lines.extend(["", _ATTACHMENT_CONTEXT_HEADER])
+    for item, path in normalized:
+        parts: list[str] = []
+        name = str(item.get("name") or item.get("file_name") or "").strip()
+        mime_type = str(item.get("mime_type") or item.get("file_type") or "").strip()
+        size = item.get("size") if "size" in item else item.get("file_size")
+        if name:
+            parts.append(f"name: {name}")
+        if mime_type:
+            parts.append(f"mime: {mime_type}")
+        if isinstance(size, int) and size > 0:
+            parts.append(f"size: {size} bytes")
+        line = f"- {path}"
+        if parts:
+            line += f" ({', '.join(parts)})"
+        lines.append(line)
+    lines.append("Use these attached workspace files as the primary source of truth for this request.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +538,12 @@ class WebSocketHandler:
         if not conn:
             raise ValueError("Connection not found")
 
-        message = params.get("message", "")
+        attachments = _validate_attachment_paths(_normalize_attachment_refs(params.get("attachments")))
+        media = _string_list_from_any(params.get("media"))
+        media = _validate_media_paths(list(dict.fromkeys(media + _derive_media_from_attachments(attachments))))
+        message = _merge_attachment_context(str(params.get("message", "")), attachments)
         if not message:
-            raise ValueError("Message is required")
+            raise ValueError("Message or attachments are required")
 
         session_key = params.get("session_key", conn.session_key)
         # Validate session_key type
@@ -445,7 +582,7 @@ class WebSocketHandler:
                     if stream:
                         # Streaming mode: emit chunks via WSEvent
                         full_content = ""
-                        async for chunk_data in agent.stream(message=message, thinking=thinking):
+                        async for chunk_data in agent.stream(message=message, media=media, attachments=attachments, thinking=thinking):
                             check_budget("stream", config.budget.stream_timeout_ms, span.elapsed_ms)
                             if self._cancel_requested:
                                 break
@@ -522,9 +659,9 @@ class WebSocketHandler:
                     else:
                         # Non-streaming mode
                         if thinking:
-                            response, thinking_content = await agent.process_with_thinking(message=message)
+                            response, thinking_content = await agent.process_with_thinking(message=message, media=media, attachments=attachments)
                         else:
-                            response = await agent.process(message=message)
+                            response = await agent.process(message=message, media=media, attachments=attachments)
                             thinking_content = None
                         check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
@@ -857,8 +994,9 @@ class WebSocketHandler:
                     "version": "1.0",
                     "session_key": session_key,
                     "messages": [
-                        {"role": m.get("role", ""), "content": m.get("content", "")}
+                        dict(m)
                         for m in (session.messages if isinstance(session.messages, list) else [])
+                        if isinstance(m, dict)
                     ],
                 },
             }
@@ -889,8 +1027,19 @@ class WebSocketHandler:
                 if isinstance(msg, dict):
                     role = msg.get("role", "")
                     content = msg.get("content", "")
-                    if role and content:
-                        session.add_message(role, content)
+                    extras = {
+                        key: value
+                        for key, value in msg.items()
+                        if key not in {"role", "content", "timestamp"}
+                    }
+                    if "media" in extras:
+                        extras["media"] = _validate_media_paths(_string_list_from_any(extras.get("media")))
+                    if "attachments" in extras:
+                        extras["attachments"] = _validate_attachment_paths(
+                            _normalize_attachment_refs(extras.get("attachments"))
+                        )
+                    if role and (content or extras.get("attachments") or extras.get("media")):
+                        session.add_message(role, content, **extras)
             agent.sessions.save(session)
 
             return {
