@@ -642,6 +642,7 @@ class TestAgentLoopStream:
         agent.workspace = Path("/workspace")
         agent._agent = MagicMock()
         agent._agent.think = base_think
+        agent._agent._spoon_bot_base_think = base_think
         agent._agent.next_step_prompt = ""
         agent._agent.tool_calls = [tool_call]
         agent._agent.memory = MagicMock()
