@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-03-16 09:15 UTC.  
+> **Auto-generated** from source code on 2026-03-19 07:15 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:248`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:293`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:670`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:722`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:545`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:597`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:443`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:497`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:481`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:533`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:514`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:566`*
 
 ---
 
@@ -547,11 +547,21 @@ Chat request model.
 | `message` | `str` | Field(default='', max_length=100000) |
 | `session_key` | `str` | Field(default='default', pattern='^[a-zA-Z0-9_-]{1,64}$') |
 | `media` | `list[str]` | Field(default_factory=list, max_length=10) |
+| `attachments` | `list[dict[str, Any]]` | Field(default_factory=list, max_length=20) |
 | `options` | `ChatOptions | None` | None |
 | `audio_data` | `str | None` | Field(default=None, description='Base64-encoded audio data or data URL') |
 | `audio_format` | `str | None` | Field(default=None, description='Audio format: wav, mp3, ogg, webm, flac, m4a, aac') |
 | `audio_mime_type` | `str | None` | Field(default=None, description='MIME type (e.g. audio/wav). Used for format detection.') |
 | `audio_language` | `str | None` | Field(default=None, description='ISO 639-1 language hint for transcription (e.g. en, zh)') |
+
+#### `AsyncChatRequest`
+
+Async chat request model.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `message` | `str` | Field(..., min_length=1, max_length=100000) |
+| `session_key` | `str` | Field(default='default', pattern='^[a-zA-Z0-9_-]{1,64}$') |
 
 #### `LoginRequest`
 
