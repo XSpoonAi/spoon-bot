@@ -443,6 +443,15 @@ class TestAgentLoopSessionHydration:
         attachment_only = _ensure_attachment_context("", attachments)
         assert _strip_attachment_context(attachment_only, attachments) == ""
 
+    def test_strip_direct_media_context_recovers_original_user_text(self):
+        from spoon_bot.agent.loop import _ensure_direct_media_context, _strip_direct_media_context
+
+        injected = _ensure_direct_media_context("描述图片", ["/workspace/uploads/demo.png"])
+        assert _strip_direct_media_context(injected, ["/workspace/uploads/demo.png"]) == "描述图片"
+
+        media_only = _ensure_direct_media_context("", ["/workspace/uploads/demo.png"])
+        assert _strip_direct_media_context(media_only, ["/workspace/uploads/demo.png"]) == ""
+
 
 class _NoChunkRuntimeAgent:
     """Runtime agent that finishes run() but never emits queue chunks."""
@@ -473,7 +482,100 @@ class _ChunkedRuntimeAgent:
         return type("RunResult", (), {"content": "".join(self._chunks)})()
 
 
+class _AddMessageMediaRuntimeAgent:
+    """Runtime agent whose run() cannot accept media kwargs but add_message() can."""
+
+    def __init__(self, final_content: str, stream_chunks: list[str] | None = None) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.name = "media-fallback-agent"
+        self.current_step = 0
+        self._shutdown_event = asyncio.Event()
+        self._final_content = final_content
+        self._stream_chunks = stream_chunks or []
+        self.add_calls: list[dict[str, object]] = []
+
+    async def add_message(self, role: str, content: str, **kwargs) -> None:
+        self.add_calls.append({"role": role, "content": content, **kwargs})
+
+    async def run(self, request: str):
+        await self.add_message("user", request)
+        for chunk in self._stream_chunks:
+            await self.output_queue.put({"content": chunk})
+            await asyncio.sleep(0)
+        return type("RunResult", (), {"content": self._final_content})()
+
+
 class TestAgentLoopStreamFallback:
+    @pytest.mark.asyncio
+    async def test_process_injects_media_via_add_message_when_run_lacks_media_kwarg(self):
+        from spoon_bot.agent.loop import AgentLoop, AgentState
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._stop_requested = False
+        loop._agent = _AddMessageMediaRuntimeAgent("saw image")
+        loop._agent.state = AgentState.IDLE
+        loop._session = Session(session_key="process_media_fallback")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._pre_inject_matched_skill = MagicMock(side_effect=lambda text: text)
+        loop._build_step_prompt = MagicMock(side_effect=lambda text: text)
+        loop._install_anti_loop_tracker = MagicMock()
+        loop._restore_agent_think = MagicMock()
+        loop._filter_execution_steps = MagicMock(side_effect=lambda text: text)
+        loop._auto_commit = False
+        loop._git = None
+
+        response = await AgentLoop.process(
+            loop,
+            message="描述这张图片",
+            media=["/workspace/uploads/demo.png"],
+        )
+
+        assert response == "saw image"
+        assert loop._agent.add_calls[0]["content"].startswith("描述这张图片\n\nDirect media guidance for this request:")
+        assert loop._agent.add_calls[0]["media"] == ["/workspace/uploads/demo.png"]
+        assert loop._session.messages[0]["content"] == "描述这张图片"
+
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_ignores_unsupported_run_kwargs(self):
+        from spoon_bot.agent.loop import AgentLoop, AgentState
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _AddMessageMediaRuntimeAgent("thoughtful answer")
+        loop._agent.state = AgentState.IDLE
+        loop._session = Session(session_key="thinking_media_fallback")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = MagicMock(side_effect=lambda text: text)
+        loop._install_anti_loop_tracker = MagicMock()
+        loop._restore_agent_think = MagicMock()
+        loop._auto_commit = False
+        loop._git = None
+
+        response, thinking = await AgentLoop.process_with_thinking(
+            loop,
+            message="结合图片回答",
+            media=["/workspace/uploads/demo.png"],
+        )
+
+        assert response == "thoughtful answer"
+        assert thinking is None
+        assert loop._agent.add_calls[0]["media"] == ["/workspace/uploads/demo.png"]
+        assert "Direct media guidance for this request:" in loop._agent.add_calls[0]["content"]
+        assert loop._session.messages[0]["content"] == "结合图片回答"
+
     @pytest.mark.asyncio
     async def test_stream_falls_back_to_run_result_when_no_chunks(self):
         from spoon_bot.agent.loop import AgentLoop
@@ -559,6 +661,39 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[0]["role"] == "user"
         assert loop._session.messages[0]["content"] == "请总结附件"
         assert loop._session.messages[0]["attachments"] == attachments
+
+    @pytest.mark.asyncio
+    async def test_stream_injects_media_via_add_message_when_run_lacks_media_kwarg(self):
+        from spoon_bot.agent.loop import AgentLoop, AgentState
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _AddMessageMediaRuntimeAgent("视觉回答", stream_chunks=["视觉", "回答"])
+        loop._agent.state = AgentState.IDLE
+        loop._session = Session(session_key="stream_media_fallback")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = MagicMock(side_effect=lambda text: text)
+        loop._install_anti_loop_tracker = MagicMock()
+        loop._restore_agent_think = MagicMock()
+
+        chunks = []
+        async for chunk in AgentLoop.stream(
+            loop,
+            message="看图回答",
+            media=["/workspace/uploads/demo.png"],
+        ):
+            chunks.append(chunk)
+
+        assert "Direct media guidance for this request:" in loop._agent.add_calls[0]["content"]
+        assert loop._agent.add_calls[0]["media"] == ["/workspace/uploads/demo.png"]
+        assert [chunk["delta"] for chunk in chunks if chunk["type"] == "content"] == ["视觉", "回答"]
+        assert any(chunk["type"] == "done" for chunk in chunks)
+        assert loop._session.messages[0]["content"] == "看图回答"
 
 
 class TestContextBuilderMediaPaths:

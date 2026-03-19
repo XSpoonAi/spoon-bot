@@ -8,9 +8,11 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging as stdlib_logging
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
 
@@ -112,6 +114,10 @@ _ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this
 _ATTACHMENT_ONLY_PLACEHOLDER = (
     "The user attached files without extra text. Inspect the files and answer based on their contents."
 )
+_DIRECT_MEDIA_CONTEXT_HEADER = "Direct media guidance for this request:"
+_DIRECT_MEDIA_ONLY_PLACEHOLDER = (
+    "The user attached media without extra text. Inspect the media directly and answer based on what you see."
+)
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
 
 
@@ -207,6 +213,21 @@ def _sanitize_attachment_refs(raw: Any, workspace: Path | str | None) -> list[di
     return sanitized
 
 
+def _callable_accepts_kwarg(func: Any, name: str) -> bool:
+    """Return True when *func* explicitly accepts *name* or arbitrary kwargs."""
+    if not callable(func):
+        return False
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return name in signature.parameters
+
+
 def _attachment_context_entries(attachments: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
     """Return normalized attachment entries with resolved display paths."""
     normalized_items: list[tuple[dict[str, Any], str]] = []
@@ -263,6 +284,34 @@ def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) 
     return "\n".join(lines)
 
 
+def _build_direct_media_context_lines(media: list[str] | None) -> list[str]:
+    """Build a short instruction block that prefers direct multimodal inspection."""
+    if not media:
+        return []
+
+    return [
+        _DIRECT_MEDIA_CONTEXT_HEADER,
+        f"- Attached media items are already available in the model input ({len(media)} item(s)).",
+        "- Inspect the attached media directly before using shell commands or other tools.",
+        "- Use tools only if the user explicitly asks for file-level processing or direct inspection is insufficient.",
+        "- If the user asks what an image shows, answer from the image itself instead of saying you cannot view it.",
+    ]
+
+
+def _ensure_direct_media_context(content: str, media: list[str] | None) -> str:
+    """Append direct-vision guidance for the current media-bearing request."""
+    if not media:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    if _DIRECT_MEDIA_CONTEXT_HEADER in text:
+        return text
+
+    lines = [text.strip()] if text.strip() else [_DIRECT_MEDIA_ONLY_PLACEHOLDER]
+    lines.extend(["", *_build_direct_media_context_lines(media)])
+    return "\n".join(lines)
+
+
 def _strip_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
     """Remove the exact synthetic attachment block so sessions keep user-authored text only."""
     if not attachments:
@@ -285,6 +334,32 @@ def _strip_attachment_context(content: str, attachments: list[dict[str, Any]]) -
     if suffix != expected_suffix:
         return text
     if prefix == _ATTACHMENT_ONLY_PLACEHOLDER:
+        return ""
+    return prefix
+
+
+def _strip_direct_media_context(content: str, media: list[str] | None) -> str:
+    """Remove the exact direct-media instruction block from persisted user text."""
+    if not media:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    if _DIRECT_MEDIA_CONTEXT_HEADER not in text:
+        return text
+
+    context_lines = _build_direct_media_context_lines(media)
+    if not context_lines:
+        return text
+
+    delimiter = f"\n\n{context_lines[0]}\n"
+    if delimiter not in text:
+        return text
+
+    prefix, suffix = text.split(delimiter, 1)
+    expected_suffix = "\n".join(context_lines[1:])
+    if suffix != expected_suffix:
+        return text
+    if prefix == _DIRECT_MEDIA_ONLY_PLACEHOLDER:
         return ""
     return prefix
 
@@ -1118,6 +1193,116 @@ class AgentLoop:
             f"trimmed_messages={trimmed_count}"
         )
 
+    def _agent_run_accepts_kwarg(self, name: str) -> bool:
+        """Check whether the runtime agent run() accepts a keyword argument."""
+        return _callable_accepts_kwarg(getattr(self._agent, "run", None), name)
+
+    @staticmethod
+    def _content_matches_current_request(content: Any, message: str) -> bool:
+        """Best-effort matcher for the primary user message added during run()."""
+        if isinstance(content, str):
+            text = content
+        else:
+            text = getattr(content, "text_content", None) or getattr(content, "content", None)
+            if not isinstance(text, str):
+                text = str(content)
+
+        normalized = text.strip()
+        expected = str(message or "").strip()
+        if not normalized or not expected:
+            return False
+        if normalized.startswith("[ORIGINAL USER REQUEST]") or normalized.startswith("Focus on the user"):
+            return False
+        return normalized == expected
+
+    @contextmanager
+    def _inject_current_message_media(
+        self,
+        message: str,
+        media: list[str] | None,
+    ):
+        """Patch add_message() so agents without run(media=...) still receive images."""
+        if not media or not self._agent or self._agent_run_accepts_kwarg("media"):
+            yield
+            return
+
+        original_add_message = getattr(self._agent, "add_message", None)
+        if not callable(original_add_message):
+            logger.warning(
+                "Runtime agent run() does not accept media and add_message() is unavailable; "
+                "continuing without multimodal input"
+            )
+            yield
+            return
+
+        if not _callable_accepts_kwarg(original_add_message, "media"):
+            logger.warning(
+                "Runtime agent run() does not accept media and add_message() cannot receive media; "
+                "continuing without multimodal input"
+            )
+            yield
+            return
+
+        injected = False
+        media_payload = list(media)
+
+        if inspect.iscoroutinefunction(original_add_message):
+            async def patched_add_message(role, content, *args, **kwargs):
+                nonlocal injected
+                if (
+                    not injected
+                    and str(role).strip().lower() == "user"
+                    and "media" not in kwargs
+                    and self._content_matches_current_request(content, message)
+                ):
+                    kwargs = dict(kwargs)
+                    kwargs["media"] = list(media_payload)
+                    injected = True
+                return await original_add_message(role, content, *args, **kwargs)
+        else:
+            def patched_add_message(role, content, *args, **kwargs):
+                nonlocal injected
+                if (
+                    not injected
+                    and str(role).strip().lower() == "user"
+                    and "media" not in kwargs
+                    and self._content_matches_current_request(content, message)
+                ):
+                    kwargs = dict(kwargs)
+                    kwargs["media"] = list(media_payload)
+                    injected = True
+                return original_add_message(role, content, *args, **kwargs)
+
+        self._agent.add_message = patched_add_message
+        try:
+            yield
+        finally:
+            self._agent.add_message = original_add_message
+
+    async def _invoke_agent_run(
+        self,
+        message: str,
+        *,
+        media: list[str] | None = None,
+        thinking: bool = False,
+        request_kw: bool = False,
+    ) -> Any:
+        """Invoke the runtime agent while adapting to spoon-core signature differences."""
+        run_kwargs: dict[str, Any] = {}
+        if thinking:
+            if self._agent_run_accepts_kwarg("thinking"):
+                run_kwargs["thinking"] = True
+            else:
+                logger.debug("Runtime agent run() does not accept thinking; continuing without it")
+        if media and self._agent_run_accepts_kwarg("media"):
+            run_kwargs["media"] = list(media)
+
+        with self._inject_current_message_media(message, media):
+            if request_kw and self._agent_run_accepts_kwarg("request"):
+                run_kwargs["request"] = message
+                return await self._agent.run(**run_kwargs)
+            return await self._agent.run(message, **run_kwargs)
+
     async def process(
         self,
         message: str,
@@ -1173,6 +1358,7 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
+        message = _ensure_direct_media_context(message, media)
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1188,10 +1374,7 @@ class AgentLoop:
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    run_kwargs: dict[str, Any] = {}
-                    if media:
-                        run_kwargs["media"] = media
-                    result = await self._agent.run(message, **run_kwargs)
+                    result = await self._invoke_agent_run(message, media=media)
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1262,7 +1445,10 @@ class AgentLoop:
                 save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
             self._session.add_message(
                 "user",
-                _strip_attachment_context(message, attachments or []),
+                _strip_attachment_context(
+                    _strip_direct_media_context(message, media),
+                    attachments or [],
+                ),
                 **save_kwargs,
             )
             self._session.add_message("assistant", final_content)
@@ -1819,6 +2005,7 @@ class AgentLoop:
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
 
+        message = _ensure_direct_media_context(message, media)
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
@@ -1831,6 +2018,7 @@ class AgentLoop:
         # ------------------------------------------------------------------
 
         try:
+            message = _ensure_direct_media_context(message, media)
             # 1. Reset streaming state
             self._agent.task_done.clear()
             while not self._agent.output_queue.empty():
@@ -1845,10 +2033,11 @@ class AgentLoop:
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    run_kwargs: dict[str, Any] = {"request": message}
-                    if media:
-                        run_kwargs["media"] = media
-                    result = await self._agent.run(**run_kwargs)
+                    result = await self._invoke_agent_run(
+                        message,
+                        media=media,
+                        request_kw=True,
+                    )
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2031,7 +2220,10 @@ class AgentLoop:
                     save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
                 self._session.add_message(
                     "user",
-                    _strip_attachment_context(message, attachments or []),
+                    _strip_attachment_context(
+                        _strip_direct_media_context(message, media),
+                        attachments or [],
+                    ),
                     **save_kwargs,
                 )
                 self._session.add_message("assistant", full_content)
@@ -2071,16 +2263,18 @@ class AgentLoop:
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
 
+        message = _ensure_direct_media_context(message, media)
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
 
         # Run agent with thinking enabled
         try:
-            run_kwargs: dict[str, Any] = {"thinking": True}
-            if media:
-                run_kwargs["media"] = media
-            result = await self._agent.run(message, **run_kwargs)
+            result = await self._invoke_agent_run(
+                message,
+                media=media,
+                thinking=True,
+            )
 
             # Extract content and thinking
             if hasattr(result, "content"):
@@ -2111,7 +2305,10 @@ class AgentLoop:
                 save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
             self._session.add_message(
                 "user",
-                _strip_attachment_context(message, attachments or []),
+                _strip_attachment_context(
+                    _strip_direct_media_context(message, media),
+                    attachments or [],
+                ),
                 **save_kwargs,
             )
             self._session.add_message("assistant", final_content)
