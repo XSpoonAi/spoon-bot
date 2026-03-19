@@ -725,6 +725,43 @@ class TestWSSessionImport:
             assert resp["type"] == "error"
             assert "Invalid attachment path" in resp["error"]["message"]
 
+    def test_import_validation_failure_preserves_existing_messages(self, client, tmp_path: Path):
+        """A failed import should not clear the existing in-memory session."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"png")
+        app_module._agent.workspace = workspace
+
+        saved_session = app_module._agent.sessions.get_or_create.return_value
+        saved_session.messages = [{"role": "user", "content": "keep me"}]
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "imp6",
+                "method": "session.import",
+                "params": {
+                    "state": {
+                        "version": "1.0",
+                        "session_key": "imported-session",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "see file",
+                                "media": [str(outside)],
+                            },
+                        ],
+                    },
+                },
+            })
+            resp = ws.receive_json()
+            assert resp["type"] == "error"
+            assert "Invalid media path" in resp["error"]["message"]
+
+        assert saved_session.messages == [{"role": "user", "content": "keep me"}]
+
 
 # ===================================================================
 # #13 — WS chat.cancel non-stream
@@ -1152,6 +1189,39 @@ class TestWSStreamingContent:
             }
         ]
         assert attachment_uri in kwargs["message"]
+
+    def test_chat_send_resolves_workspace_alias_media_to_real_path(self, client, tmp_path: Path):
+        """Sandbox media aliases should reach the agent as real filesystem paths."""
+        workspace = tmp_path / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "demo.png"
+        image_path.write_bytes(b"png")
+        app_module._agent.workspace = workspace
+        app_module._agent.process = AsyncMock(return_value="ok")
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()
+            ws.send_json({
+                "type": "request",
+                "id": "media_alias1",
+                "method": "chat.send",
+                "params": {
+                    "message": "look at this image",
+                    "media": ["/workspace/uploads/demo.png"],
+                    "stream": False,
+                },
+            })
+            events = []
+            for _ in range(10):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+        app_module._agent.process.assert_awaited_once()
+        kwargs = app_module._agent.process.await_args.kwargs
+        assert kwargs["media"] == [str(image_path.resolve())]
 
     def test_resolve_workspace_file_accepts_sandbox_alias(self, tmp_path: Path):
         """Sandbox aliases should resolve against the configured runtime workspace."""

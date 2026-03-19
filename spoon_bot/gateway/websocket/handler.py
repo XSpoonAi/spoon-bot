@@ -145,10 +145,17 @@ def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
 
 def _validate_media_paths(media: list[str]) -> list[str]:
     """Reject media paths that are missing or outside the sandbox workspace."""
-    invalid = [path for path in media if _resolve_workspace_file(path) is None]
+    invalid: list[str] = []
+    resolved_media: list[str] = []
+    for path in media:
+        resolved = _resolve_workspace_file(path)
+        if resolved is None:
+            invalid.append(path)
+            continue
+        resolved_media.append(str(resolved))
     if invalid:
         raise ValueError(f"Invalid media path(s): {', '.join(invalid)}")
-    return media
+    return resolved_media
 
 
 def _validate_attachment_paths(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1035,8 +1042,7 @@ class WebSocketHandler:
 
         try:
             session = agent.sessions.get_or_create(session_key)
-            # Replace messages with imported ones
-            session.messages.clear()
+            imported_messages: list[tuple[str, str, dict[str, Any]]] = []
             for msg in messages:
                 if isinstance(msg, dict):
                     role = msg.get("role", "")
@@ -1053,7 +1059,12 @@ class WebSocketHandler:
                             _normalize_attachment_refs(extras.get("attachments"))
                         )
                     if role and (content or extras.get("attachments") or extras.get("media")):
-                        session.add_message(role, content, **extras)
+                        imported_messages.append((role, content, extras))
+
+            # Replace messages only after the full import payload validates.
+            session.messages.clear()
+            for role, content, extras in imported_messages:
+                session.add_message(role, content, **extras)
             agent.sessions.save(session)
 
             return {
