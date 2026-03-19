@@ -513,6 +513,27 @@ class _ChunkedRuntimeAgent:
         return type("RunResult", (), {"content": "".join(self._chunks)})()
 
 
+class _RetryRuntimeAgent:
+    """Runtime agent that fails once, then succeeds on retry."""
+
+    def __init__(self, final_content: str, failures: int = 1) -> None:
+        self.state = "IDLE"
+        self._final_content = final_content
+        self._failures_remaining = failures
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        if self._failures_remaining > 0:
+            self._failures_remaining -= 1
+            raise RuntimeError("transient runtime failure")
+        return type("RunResult", (), {"content": self._final_content})()
+
+
 class TestAgentLoopCurrentRequestMultimodal:
     @pytest.mark.asyncio
     async def test_process_injects_multimodal_request_before_run(self, tmp_dir: Path):
@@ -558,6 +579,58 @@ class TestAgentLoopCurrentRequestMultimodal:
         )
         assert loop._agent.run_calls == [((), {})]
         assert loop._session.messages[0]["media"] == [str(image_path)]
+
+    @pytest.mark.asyncio
+    async def test_process_requeues_multimodal_request_after_retry_compression(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "retry.png"
+        image_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._stop_requested = False
+        loop._initialized = True
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop._agent = _RetryRuntimeAgent("recovered reply")
+        loop._session = Session(session_key="retry_multimodal")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._auto_commit = False
+        loop._git = None
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._pre_inject_matched_skill = lambda message: message
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._filter_execution_steps = lambda content: content
+        loop._compress_runtime_context = MagicMock(return_value=1)
+        loop._force_compress_runtime_context = MagicMock(return_value=0)
+
+        response = await AgentLoop.process(
+            loop,
+            message="What text appears in the image?",
+            media=[str(image_path)],
+        )
+
+        assert response == "recovered reply"
+        assert len(loop._agent.add_message_calls) == 2
+        _assert_multimodal_user_call(
+            loop._agent.add_message_calls[0],
+            expected_text="What text appears in the image?",
+        )
+        _assert_multimodal_user_call(
+            loop._agent.add_message_calls[1],
+            expected_text="What text appears in the image?",
+        )
+        assert loop._agent.run_calls == [((), {}), ((), {})]
+        loop._compress_runtime_context.assert_called_once()
 
 
 class TestAgentLoopStreamFallback:

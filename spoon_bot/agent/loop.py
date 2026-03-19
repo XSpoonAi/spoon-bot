@@ -1201,16 +1201,16 @@ class AgentLoop:
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
 
-        # spoon-core agents consume multimodal input from runtime memory, not
-        # from extra kwargs passed to run().
-        await self._agent.add_message("user", runtime_message)
-
         # Run agent — with recovery for LLM API errors (context overflow, etc.)
         # Retry up to 2 times on ANY error, with increasingly aggressive compression.
         _max_retries = 2
         try:
             for _attempt in range(_max_retries + 1):
                 try:
+                    # Requeue the active request for every attempt. Recovery
+                    # compression can drop earlier user messages, so retries
+                    # must restore the current prompt before run().
+                    await self._agent.add_message("user", runtime_message)
                     result = await self._agent.run()
 
                     logger.debug(f"Agent result type: {type(result)}")
