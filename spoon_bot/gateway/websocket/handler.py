@@ -145,17 +145,10 @@ def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
 
 def _validate_media_paths(media: list[str]) -> list[str]:
     """Reject media paths that are missing or outside the sandbox workspace."""
-    invalid: list[str] = []
-    resolved_media: list[str] = []
-    for path in media:
-        resolved = _resolve_workspace_file(path)
-        if resolved is None:
-            invalid.append(path)
-            continue
-        resolved_media.append(str(resolved))
+    invalid = [path for path in media if _resolve_workspace_file(path) is None]
     if invalid:
         raise ValueError(f"Invalid media path(s): {', '.join(invalid)}")
-    return resolved_media
+    return media
 
 
 def _validate_attachment_paths(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1074,6 +1067,8 @@ class WebSocketHandler:
                     "messages_imported": len(session.messages),
                 },
             }
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Session import failed: {e}")
             return {

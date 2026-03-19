@@ -20,6 +20,7 @@ class ContextBuilder:
     """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    SANDBOX_WORKSPACE_ROOT = "/workspace"
 
     def __init__(self, workspace: Path):
         """
@@ -203,9 +204,9 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
         images = []
         skipped: list[str] = []
         for path in media:
-            p = Path(path)
+            p = self._resolve_media_path(path)
             mime, _ = mimetypes.guess_type(path)
-            if not p.is_file():
+            if p is None or not p.is_file():
                 skipped.append(f"{path}: missing file")
                 continue
             if not mime or not mime.startswith("image/"):
@@ -229,6 +230,32 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    def _resolve_media_path(self, path: str) -> Path | None:
+        """Resolve runtime media refs, including /workspace aliases and workspace-relative paths."""
+        candidate = str(path or "").strip()
+        if not candidate:
+            return None
+
+        sandbox_root = self.SANDBOX_WORKSPACE_ROOT.rstrip("/")
+        workspace_root_str = self.workspace.as_posix().rstrip("/")
+        try:
+            if candidate.startswith("/"):
+                normalized = Path(candidate).as_posix()
+                if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                    relative = normalized[len(sandbox_root):].lstrip("/")
+                    resolved = (self.workspace / relative).resolve(strict=True)
+                elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                    relative = normalized[len(workspace_root_str):].lstrip("/")
+                    resolved = (self.workspace / relative).resolve(strict=True)
+                else:
+                    resolved = Path(candidate).expanduser().resolve(strict=True)
+            else:
+                resolved = (self.workspace / candidate).resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            return None
+
+        return resolved if resolved.is_file() else None
 
     def add_tool_result(
         self,

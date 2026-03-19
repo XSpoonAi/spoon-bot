@@ -561,6 +561,29 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[0]["attachments"] == attachments
 
 
+class TestContextBuilderMediaPaths:
+    def test_build_user_content_resolves_workspace_alias_and_relative_media(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "demo.png"
+        image_path.write_bytes(b"png")
+
+        builder = ContextBuilder(workspace)
+
+        alias_content = builder._build_user_content("look", ["/workspace/uploads/demo.png"])
+        relative_content = builder._build_user_content("look", ["uploads/demo.png"])
+
+        assert isinstance(alias_content, list)
+        assert isinstance(relative_content, list)
+        assert alias_content[0]["type"] == "image_url"
+        assert relative_content[0]["type"] == "image_url"
+        assert alias_content[-1] == {"type": "text", "text": "look"}
+        assert relative_content[-1] == {"type": "text", "text": "look"}
+
+
 # ============================================================================
 # §5  create_session_store factory
 # ============================================================================

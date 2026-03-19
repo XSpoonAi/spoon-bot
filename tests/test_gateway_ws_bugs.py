@@ -1190,8 +1190,8 @@ class TestWSStreamingContent:
         ]
         assert attachment_uri in kwargs["message"]
 
-    def test_chat_send_resolves_workspace_alias_media_to_real_path(self, client, tmp_path: Path):
-        """Sandbox media aliases should reach the agent as real filesystem paths."""
+    def test_chat_send_preserves_workspace_alias_media_uri(self, client, tmp_path: Path):
+        """Sandbox media aliases should remain portable URIs when passed to the agent."""
         workspace = tmp_path / "workspace"
         uploads = workspace / "uploads"
         uploads.mkdir(parents=True)
@@ -1221,7 +1221,7 @@ class TestWSStreamingContent:
 
         app_module._agent.process.assert_awaited_once()
         kwargs = app_module._agent.process.await_args.kwargs
-        assert kwargs["media"] == [str(image_path.resolve())]
+        assert kwargs["media"] == ["/workspace/uploads/demo.png"]
 
     def test_resolve_workspace_file_accepts_sandbox_alias(self, tmp_path: Path):
         """Sandbox aliases should resolve against the configured runtime workspace."""
