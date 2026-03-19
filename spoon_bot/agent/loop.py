@@ -109,6 +109,10 @@ if TYPE_CHECKING:
 
 
 _ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this request):"
+_ATTACHMENT_ONLY_PLACEHOLDER = (
+    "The user attached files without extra text. Inspect the files and answer based on their contents."
+)
+_SANDBOX_WORKSPACE_ROOT = "/workspace"
 
 
 def _workspace_root_path(workspace: Path | str | None) -> Path:
@@ -121,12 +125,26 @@ def _resolve_workspace_file(path_str: str, workspace: Path | str | None) -> Path
     candidate = str(path_str or "").strip()
     if not candidate:
         return None
+
+    workspace_root = _workspace_root_path(workspace)
+    sandbox_root = _SANDBOX_WORKSPACE_ROOT.rstrip("/")
     try:
-        resolved = Path(candidate).expanduser().resolve(strict=True)
+        if candidate.startswith("/"):
+            normalized = Path(candidate).as_posix()
+            workspace_root_str = workspace_root.as_posix().rstrip("/")
+            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                relative = normalized[len(sandbox_root):].lstrip("/")
+                resolved = (workspace_root / relative).resolve(strict=True)
+            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                relative = normalized[len(workspace_root_str):].lstrip("/")
+                resolved = (workspace_root / relative).resolve(strict=True)
+            else:
+                resolved = Path(candidate).expanduser().resolve(strict=True)
+        else:
+            resolved = (workspace_root / candidate).resolve(strict=True)
     except (FileNotFoundError, OSError):
         return None
 
-    workspace_root = _workspace_root_path(workspace)
     if resolved != workspace_root and workspace_root not in resolved.parents:
         return None
     if not resolved.is_file():
@@ -189,12 +207,8 @@ def _sanitize_attachment_refs(raw: Any, workspace: Path | str | None) -> list[di
     return sanitized
 
 
-def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
-    """Append attachment path context unless it is already present in content."""
-    if not attachments:
-        return content
-
-    text = content if isinstance(content, str) else str(content)
+def _attachment_context_entries(attachments: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """Return normalized attachment entries with resolved display paths."""
     normalized_items: list[tuple[dict[str, Any], str]] = []
     for item in attachments:
         if not isinstance(item, dict):
@@ -202,16 +216,16 @@ def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) 
         uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
         if uri:
             normalized_items.append((item, uri))
-    uris = [uri for _, uri in normalized_items]
-    if not uris:
-        return text
-    if _ATTACHMENT_CONTEXT_HEADER in text and all(uri in text for uri in uris):
-        return text
+    return normalized_items
 
-    lines = [text.strip()] if text.strip() else [
-        "The user attached files without extra text. Inspect the files and answer based on their contents."
-    ]
-    lines.extend(["", _ATTACHMENT_CONTEXT_HEADER])
+
+def _build_attachment_context_lines(attachments: list[dict[str, Any]]) -> list[str]:
+    """Build the synthetic attachment context block appended to prompts."""
+    normalized_items = _attachment_context_entries(attachments)
+    if not normalized_items:
+        return []
+
+    lines = [_ATTACHMENT_CONTEXT_HEADER]
     for item, uri in normalized_items:
         name = str(item.get("name") or item.get("file_name") or "").strip()
         mime_type = str(item.get("mime_type") or item.get("file_type") or "").strip()
@@ -228,7 +242,51 @@ def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) 
             line += f" ({', '.join(suffix)})"
         lines.append(line)
     lines.append("Use these attached workspace files as the primary source of truth for this request.")
+    return lines
+
+
+def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Append attachment path context unless it is already present in content."""
+    if not attachments:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    normalized_items = _attachment_context_entries(attachments)
+    uris = [uri for _, uri in normalized_items]
+    if not uris:
+        return text
+    if _ATTACHMENT_CONTEXT_HEADER in text and all(uri in text for uri in uris):
+        return text
+
+    lines = [text.strip()] if text.strip() else [_ATTACHMENT_ONLY_PLACEHOLDER]
+    lines.extend(["", *_build_attachment_context_lines(attachments)])
     return "\n".join(lines)
+
+
+def _strip_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Remove the exact synthetic attachment block so sessions keep user-authored text only."""
+    if not attachments:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    if _ATTACHMENT_CONTEXT_HEADER not in text:
+        return text
+
+    context_lines = _build_attachment_context_lines(attachments)
+    if not context_lines:
+        return text
+
+    delimiter = f"\n\n{context_lines[0]}\n"
+    if delimiter not in text:
+        return text
+
+    prefix, suffix = text.split(delimiter, 1)
+    expected_suffix = "\n".join(context_lines[1:])
+    if suffix != expected_suffix:
+        return text
+    if prefix == _ATTACHMENT_ONLY_PLACEHOLDER:
+        return ""
+    return prefix
 
 
 class AgentLoop:
@@ -1202,7 +1260,11 @@ class AgentLoop:
                 save_kwargs["media"] = list(media)
             if attachments:
                 save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-            self._session.add_message("user", message, **save_kwargs)
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(message, attachments or []),
+                **save_kwargs,
+            )
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
@@ -1967,7 +2029,11 @@ class AgentLoop:
                     save_kwargs["media"] = list(media)
                 if attachments:
                     save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-                self._session.add_message("user", message, **save_kwargs)
+                self._session.add_message(
+                    "user",
+                    _strip_attachment_context(message, attachments or []),
+                    **save_kwargs,
+                )
                 self._session.add_message("assistant", full_content)
                 self.sessions.save(self._session)
             except Exception as e:
@@ -2043,7 +2109,11 @@ class AgentLoop:
                 save_kwargs["media"] = list(media)
             if attachments:
                 save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-            self._session.add_message("user", message, **save_kwargs)
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(message, attachments or []),
+                **save_kwargs,
+            )
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:

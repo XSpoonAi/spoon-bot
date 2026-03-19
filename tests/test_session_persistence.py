@@ -400,6 +400,49 @@ class TestAgentLoopSessionHydration:
             ("assistant", "好的，我会记住你叫Alice。", {}),
         ]
 
+    @pytest.mark.asyncio
+    async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        attachment_path = uploads / "alice.png"
+        attachment_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message(
+            "user",
+            "看这个附件",
+            media=["uploads/alice.png"],
+            attachments=[{"uri": "/workspace/uploads/alice.png", "name": "alice.png"}],
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert injected == 1
+        assert loop._agent.calls == [
+            (
+                "user",
+                "看这个附件\n\nAttached workspace files (source of truth for this request):\n- /workspace/uploads/alice.png (name: alice.png)\nUse these attached workspace files as the primary source of truth for this request.",
+                {"media": ["uploads/alice.png"]},
+            ),
+        ]
+
+    def test_strip_attachment_context_recovers_original_user_text(self):
+        from spoon_bot.agent.loop import _ensure_attachment_context, _strip_attachment_context
+
+        attachments = [{"uri": "/workspace/uploads/alice.png", "name": "alice.png"}]
+
+        injected = _ensure_attachment_context("原始问题", attachments)
+        assert _strip_attachment_context(injected, attachments) == "原始问题"
+
+        attachment_only = _ensure_attachment_context("", attachments)
+        assert _strip_attachment_context(attachment_only, attachments) == ""
+
 
 class _NoChunkRuntimeAgent:
     """Runtime agent that finishes run() but never emits queue chunks."""
@@ -489,6 +532,33 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Hello"
         assert loop._session.messages[-1]["content"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_stream_persists_original_user_text_instead_of_attachment_prose(self):
+        from spoon_bot.agent.loop import AgentLoop, _ensure_attachment_context
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _NoChunkRuntimeAgent("attachment reply")
+        loop._session = Session(session_key="stream_attachment_text")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+
+        attachments = [{"uri": "/workspace/uploads/demo.pdf", "name": "demo.pdf"}]
+        injected_message = _ensure_attachment_context("请总结附件", attachments)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message=injected_message, attachments=attachments):
+            chunks.append(chunk)
+
+        assert any(chunk["type"] == "done" for chunk in chunks)
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "请总结附件"
+        assert loop._session.messages[0]["attachments"] == attachments
 
 
 # ============================================================================
