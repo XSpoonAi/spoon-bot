@@ -267,10 +267,10 @@ class TestSQLiteSessionStore:
 
     def test_unicode_content(self, sqlite_store: SQLiteSessionStore):
         s = Session(session_key="unicode")
-        s.add_message("user", "你好世界 🌍 مرحبا")
+        s.add_message("user", "Hello world 🌍 مرحبا")
         sqlite_store.save_session(s)
         loaded = sqlite_store.load_session("unicode")
-        assert loaded.messages[0]["content"] == "你好世界 🌍 مرحبا"
+        assert loaded.messages[0]["content"] == "Hello world 🌍 مرحبا"
 
 
 # ============================================================================
@@ -403,11 +403,11 @@ class TestAgentLoopSessionHydration:
         loop._session = Session(session_key="persisted")
         loop._session.add_message(
             "user",
-            "我叫Alice，请记住",
+            "My name is Alice. Please remember it.",
             media=[str(attachment_path)],
             attachments=[{"uri": str(attachment_path), "name": "alice.png"}],
         )
-        loop._session.add_message("assistant", "好的，我会记住你叫Alice。")
+        loop._session.add_message("assistant", "Okay, I will remember your name is Alice.")
 
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
@@ -416,13 +416,13 @@ class TestAgentLoopSessionHydration:
         _assert_multimodal_user_call(
             loop._agent.calls[0],
             expected_text=(
-                f"我叫Alice，请记住\n\n"
+                f"My name is Alice. Please remember it.\n\n"
                 f"Attached workspace files (source of truth for this request):\n"
                 f"- {attachment_path} (name: alice.png)\n"
                 f"Use these attached workspace files as the primary source of truth for this request."
             ),
         )
-        assert loop._agent.calls[1] == ("assistant", "好的，我会记住你叫Alice。", {})
+        assert loop._agent.calls[1] == ("assistant", "Okay, I will remember your name is Alice.", {})
 
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
@@ -442,7 +442,7 @@ class TestAgentLoopSessionHydration:
         loop._session = Session(session_key="persisted")
         loop._session.add_message(
             "user",
-            "看这个附件",
+            "Please look at this attachment.",
             media=["uploads/alice.png"],
             attachments=[{"uri": "/workspace/uploads/alice.png", "name": "alice.png"}],
         )
@@ -453,7 +453,7 @@ class TestAgentLoopSessionHydration:
         _assert_multimodal_user_call(
             loop._agent.calls[0],
             expected_text=(
-                "看这个附件\n\n"
+                "Please look at this attachment.\n\n"
                 "Attached workspace files (source of truth for this request):\n"
                 "- /workspace/uploads/alice.png (name: alice.png)\n"
                 "Use these attached workspace files as the primary source of truth for this request."
@@ -465,8 +465,8 @@ class TestAgentLoopSessionHydration:
 
         attachments = [{"uri": "/workspace/uploads/alice.png", "name": "alice.png"}]
 
-        injected = _ensure_attachment_context("原始问题", attachments)
-        assert _strip_attachment_context(injected, attachments) == "原始问题"
+        injected = _ensure_attachment_context("Original question", attachments)
+        assert _strip_attachment_context(injected, attachments) == "Original question"
 
         attachment_only = _ensure_attachment_context("", attachments)
         assert _strip_attachment_context(attachment_only, attachments) == ""
@@ -547,14 +547,14 @@ class TestAgentLoopCurrentRequestMultimodal:
 
         response = await AgentLoop.process(
             loop,
-            message="看图里写了什么",
+            message="What text appears in the image?",
             media=[str(image_path)],
         )
 
         assert response == "image reply"
         _assert_multimodal_user_call(
             loop._agent.add_message_calls[0],
-            expected_text="看图里写了什么",
+            expected_text="What text appears in the image?",
         )
         assert loop._agent.run_calls == [((), {})]
         assert loop._session.messages[0]["media"] == [str(image_path)]
@@ -645,7 +645,7 @@ class TestAgentLoopStreamFallback:
         loop._install_anti_loop_tracker = lambda prompt: None
 
         attachments = [{"uri": "/workspace/uploads/demo.pdf", "name": "demo.pdf"}]
-        injected_message = _ensure_attachment_context("请总结附件", attachments)
+        injected_message = _ensure_attachment_context("Please summarize the attachment.", attachments)
 
         chunks = []
         async for chunk in AgentLoop.stream(loop, message=injected_message, attachments=attachments):
@@ -653,7 +653,7 @@ class TestAgentLoopStreamFallback:
 
         assert any(chunk["type"] == "done" for chunk in chunks)
         assert loop._session.messages[0]["role"] == "user"
-        assert loop._session.messages[0]["content"] == "请总结附件"
+        assert loop._session.messages[0]["content"] == "Please summarize the attachment."
         assert loop._session.messages[0]["attachments"] == attachments
 
 
