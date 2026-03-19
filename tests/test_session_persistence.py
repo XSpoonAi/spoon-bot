@@ -19,6 +19,7 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Generator
 from unittest.mock import AsyncMock, MagicMock
 
@@ -520,11 +521,20 @@ class _RetryRuntimeAgent:
         self.state = "IDLE"
         self._final_content = final_content
         self._failures_remaining = failures
+        self.memory = SimpleNamespace(messages=[])
         self.add_message_calls: list[tuple[str, Any, dict]] = []
         self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
     async def add_message(self, role: str, content: Any, **kwargs) -> None:
         self.add_message_calls.append((role, content, kwargs))
+        self.memory.messages.append(
+            SimpleNamespace(
+                role=role,
+                content=content,
+                tool_calls=kwargs.get("tool_calls"),
+                tool_call_id=kwargs.get("tool_call_id"),
+            )
+        )
 
     async def run(self, *args, **kwargs):
         self.run_calls.append((args, kwargs))
@@ -532,6 +542,37 @@ class _RetryRuntimeAgent:
             self._failures_remaining -= 1
             raise RuntimeError("transient runtime failure")
         return type("RunResult", (), {"content": self._final_content})()
+
+
+class _ThinkingRuntimeAgent:
+    """Runtime agent that supports a thinking kwarg."""
+
+    def __init__(self, final_content: str, thinking_content: str) -> None:
+        self.state = "IDLE"
+        self.memory = SimpleNamespace(messages=[])
+        self._final_content = final_content
+        self._thinking_content = thinking_content
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+        self.memory.messages.append(
+            SimpleNamespace(
+                role=role,
+                content=content,
+                tool_calls=kwargs.get("tool_calls"),
+                tool_call_id=kwargs.get("tool_call_id"),
+            )
+        )
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        return type(
+            "RunResult",
+            (),
+            {"content": self._final_content, "thinking_content": self._thinking_content},
+        )()
 
 
 class TestAgentLoopCurrentRequestMultimodal:
@@ -610,7 +651,11 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
         loop._filter_execution_steps = lambda content: content
-        loop._compress_runtime_context = MagicMock(return_value=1)
+        def _compress_runtime_context() -> int:
+            loop._agent.memory.messages[-1].content = "[compressed away]"
+            return 1
+
+        loop._compress_runtime_context = MagicMock(side_effect=_compress_runtime_context)
         loop._force_compress_runtime_context = MagicMock(return_value=0)
 
         response = await AgentLoop.process(
@@ -631,6 +676,55 @@ class TestAgentLoopCurrentRequestMultimodal:
         )
         assert loop._agent.run_calls == [((), {}), ((), {})]
         loop._compress_runtime_context.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_process_does_not_duplicate_request_after_noop_retry_compression(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "retry-noop.png"
+        image_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._stop_requested = False
+        loop._initialized = True
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop._agent = _RetryRuntimeAgent("recovered reply")
+        loop._session = Session(session_key="retry_multimodal_noop")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._auto_commit = False
+        loop._git = None
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._pre_inject_matched_skill = lambda message: message
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._filter_execution_steps = lambda content: content
+        loop._compress_runtime_context = MagicMock(return_value=0)
+        loop._force_compress_runtime_context = MagicMock(return_value=0)
+
+        response = await AgentLoop.process(
+            loop,
+            message="What text appears in the image?",
+            media=[str(image_path)],
+        )
+
+        assert response == "recovered reply"
+        assert len(loop._agent.add_message_calls) == 1
+        _assert_multimodal_user_call(
+            loop._agent.add_message_calls[0],
+            expected_text="What text appears in the image?",
+        )
+        assert loop._agent.run_calls == [((), {}), ((), {})]
+        loop._compress_runtime_context.assert_called_once()
+        loop._force_compress_runtime_context.assert_called_once()
 
 
 class TestAgentLoopStreamFallback:
@@ -751,6 +845,68 @@ class TestContextBuilderMediaPaths:
         assert relative_content[0]["type"] == "image_url"
         assert alias_content[-1] == {"type": "text", "text": "look"}
         assert relative_content[-1] == {"type": "text", "text": "look"}
+
+
+class TestAgentLoopRuntimeCompression:
+    def test_compress_runtime_context_counts_and_summarizes_inline_image_payloads(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        data_url = "data:image/png;base64," + ("A" * 800)
+        multimodal_message = [
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": "Please inspect this image carefully."},
+        ]
+        messages = [
+            SimpleNamespace(role="system", content="system prompt", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content=multimodal_message, tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="assistant 1", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content="user 2", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="assistant 2", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content="user 3", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="assistant 3", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content="latest request", tool_calls=None, tool_call_id=None),
+        ]
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.context_window = 200
+        loop._agent = SimpleNamespace(memory=SimpleNamespace(messages=messages))
+
+        compressed = AgentLoop._compress_runtime_context(loop)
+
+        assert compressed >= 1
+        assert isinstance(messages[1].content, str)
+        assert "image attachment(s) omitted during context compression" in messages[1].content
+        assert "Please inspect this image carefully." in messages[1].content
+        assert "data:image/png;base64," not in messages[1].content
+
+
+class TestAgentLoopThinkingMode:
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_passes_flag_when_runtime_accepts_it(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop.workspace = tmp_dir
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._agent = _ThinkingRuntimeAgent("answer", "reasoning trace")
+        loop._session = Session(session_key="thinking_mode")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._auto_commit = False
+        loop._git = None
+
+        response, thinking = await AgentLoop.process_with_thinking(loop, message="Explain the answer.")
+
+        assert response == "answer"
+        assert thinking == "reasoning trace"
+        assert loop._agent.run_calls == [((), {"thinking": True})]
 
 
 # ============================================================================
