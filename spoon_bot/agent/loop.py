@@ -108,6 +108,187 @@ if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
 
 
+_ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this request):"
+_ATTACHMENT_ONLY_PLACEHOLDER = (
+    "The user attached files without extra text. Inspect the files and answer based on their contents."
+)
+_SANDBOX_WORKSPACE_ROOT = "/workspace"
+
+
+def _workspace_root_path(workspace: Path | str | None) -> Path:
+    """Resolve the workspace root used to validate persisted file references."""
+    return Path(workspace or Path.home() / ".spoon-bot" / "workspace").expanduser().resolve()
+
+
+def _resolve_workspace_file(path_str: str, workspace: Path | str | None) -> Path | None:
+    """Resolve a file path and ensure it stays within the configured workspace."""
+    candidate = str(path_str or "").strip()
+    if not candidate:
+        return None
+
+    workspace_root = _workspace_root_path(workspace)
+    sandbox_root = _SANDBOX_WORKSPACE_ROOT.rstrip("/")
+    try:
+        if candidate.startswith("/"):
+            normalized = Path(candidate).as_posix()
+            workspace_root_str = workspace_root.as_posix().rstrip("/")
+            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                relative = normalized[len(sandbox_root):].lstrip("/")
+                resolved = (workspace_root / relative).resolve(strict=True)
+            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                relative = normalized[len(workspace_root_str):].lstrip("/")
+                resolved = (workspace_root / relative).resolve(strict=True)
+            else:
+                resolved = Path(candidate).expanduser().resolve(strict=True)
+        else:
+            resolved = (workspace_root / candidate).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+    if resolved != workspace_root and workspace_root not in resolved.parents:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _normalize_media_list(raw: Any) -> list[str]:
+    """Normalize stored media payloads to a list of non-empty file paths."""
+    if not isinstance(raw, list):
+        return []
+
+    items: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            value = item.strip()
+        else:
+            value = str(item).strip() if item is not None else ""
+        if value:
+            items.append(value)
+    return items
+
+
+def _sanitize_media_list(raw: Any, workspace: Path | str | None) -> list[str]:
+    """Keep only workspace-backed media paths from persisted session metadata."""
+    return [
+        path
+        for path in _normalize_media_list(raw)
+        if _resolve_workspace_file(path, workspace) is not None
+    ]
+
+
+def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
+    """Normalize stored attachment references from session metadata."""
+    if not isinstance(raw, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if not uri:
+            continue
+        attachment = dict(item)
+        attachment["uri"] = uri
+        attachment.setdefault("workspace_path", uri)
+        normalized.append(attachment)
+    return normalized
+
+
+def _sanitize_attachment_refs(raw: Any, workspace: Path | str | None) -> list[dict[str, Any]]:
+    """Keep only workspace-backed attachment references from persisted metadata."""
+    sanitized: list[dict[str, Any]] = []
+    for item in _normalize_attachment_refs(raw):
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if _resolve_workspace_file(uri, workspace) is None:
+            continue
+        sanitized.append(item)
+    return sanitized
+
+
+def _attachment_context_entries(attachments: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """Return normalized attachment entries with resolved display paths."""
+    normalized_items: list[tuple[dict[str, Any], str]] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if uri:
+            normalized_items.append((item, uri))
+    return normalized_items
+
+
+def _build_attachment_context_lines(attachments: list[dict[str, Any]]) -> list[str]:
+    """Build the synthetic attachment context block appended to prompts."""
+    normalized_items = _attachment_context_entries(attachments)
+    if not normalized_items:
+        return []
+
+    lines = [_ATTACHMENT_CONTEXT_HEADER]
+    for item, uri in normalized_items:
+        name = str(item.get("name") or item.get("file_name") or "").strip()
+        mime_type = str(item.get("mime_type") or item.get("file_type") or "").strip()
+        size = item.get("size") if "size" in item else item.get("file_size")
+        suffix = []
+        if name:
+            suffix.append(f"name: {name}")
+        if mime_type:
+            suffix.append(f"mime: {mime_type}")
+        if isinstance(size, int) and size > 0:
+            suffix.append(f"size: {size} bytes")
+        line = f"- {uri}"
+        if suffix:
+            line += f" ({', '.join(suffix)})"
+        lines.append(line)
+    lines.append("Use these attached workspace files as the primary source of truth for this request.")
+    return lines
+
+
+def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Append attachment path context unless it is already present in content."""
+    if not attachments:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    normalized_items = _attachment_context_entries(attachments)
+    uris = [uri for _, uri in normalized_items]
+    if not uris:
+        return text
+    if _ATTACHMENT_CONTEXT_HEADER in text and all(uri in text for uri in uris):
+        return text
+
+    lines = [text.strip()] if text.strip() else [_ATTACHMENT_ONLY_PLACEHOLDER]
+    lines.extend(["", *_build_attachment_context_lines(attachments)])
+    return "\n".join(lines)
+
+
+def _strip_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Remove the exact synthetic attachment block so sessions keep user-authored text only."""
+    if not attachments:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    if _ATTACHMENT_CONTEXT_HEADER not in text:
+        return text
+
+    context_lines = _build_attachment_context_lines(attachments)
+    if not context_lines:
+        return text
+
+    delimiter = f"\n\n{context_lines[0]}\n"
+    if delimiter not in text:
+        return text
+
+    prefix, suffix = text.split(delimiter, 1)
+    expected_suffix = "\n".join(context_lines[1:])
+    if suffix != expected_suffix:
+        return text
+    if prefix == _ATTACHMENT_ONLY_PLACEHOLDER:
+        return ""
+    return prefix
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine using spoon-core SDK.
@@ -878,7 +1059,12 @@ class AgentLoop:
             return 0
 
         injected_count = 0
-        for msg in self._session.get_history():
+        history_messages = (
+            self._session.get_messages()
+            if hasattr(self._session, "get_messages")
+            else self._session.get_history()
+        )
+        for msg in history_messages:
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
                 continue
@@ -890,8 +1076,26 @@ class AgentLoop:
                 except Exception:
                     content = str(content)
 
+            raw_media = _normalize_media_list(msg.get("media"))
+            media = _sanitize_media_list(raw_media, self.workspace)
+            if raw_media and len(media) != len(raw_media):
+                logger.warning("Dropped invalid persisted media refs outside workspace during history sync")
+
+            raw_attachments = _normalize_attachment_refs(msg.get("attachments"))
+            attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
+            if raw_attachments and len(attachments) != len(raw_attachments):
+                logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
+            content = _ensure_attachment_context(content, attachments)
+
+            add_kwargs: dict[str, Any] = {}
+            if media:
+                add_kwargs["media"] = media
+
             try:
-                await self._agent.add_message(role, content)
+                try:
+                    await self._agent.add_message(role, content, **add_kwargs)
+                except TypeError:
+                    await self._agent.add_message(role, content)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -918,6 +1122,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -983,7 +1188,10 @@ class AgentLoop:
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    result = await self._agent.run(message)
+                    run_kwargs: dict[str, Any] = {}
+                    if media:
+                        run_kwargs["media"] = media
+                    result = await self._agent.run(message, **run_kwargs)
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1047,7 +1255,16 @@ class AgentLoop:
 
         # Save to session
         try:
-            self._session.add_message("user", message)
+            save_kwargs: dict[str, Any] = {}
+            if media:
+                save_kwargs["media"] = list(media)
+            if attachments:
+                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(message, attachments or []),
+                **save_kwargs,
+            )
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
@@ -1564,6 +1781,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         thinking: bool = False,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
@@ -1627,7 +1845,10 @@ class AgentLoop:
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    result = await self._agent.run(request=message)
+                    run_kwargs: dict[str, Any] = {"request": message}
+                    if media:
+                        run_kwargs["media"] = media
+                    result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -1803,7 +2024,16 @@ class AgentLoop:
         # Save to session only if we got actual content
         if full_content and stream_completed and not stream_cancelled:
             try:
-                self._session.add_message("user", message)
+                save_kwargs: dict[str, Any] = {}
+                if media:
+                    save_kwargs["media"] = list(media)
+                if attachments:
+                    save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
+                self._session.add_message(
+                    "user",
+                    _strip_attachment_context(message, attachments or []),
+                    **save_kwargs,
+                )
                 self._session.add_message("assistant", full_content)
                 self.sessions.save(self._session)
             except Exception as e:
@@ -1813,6 +2043,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -1873,7 +2104,16 @@ class AgentLoop:
 
         # Save to session
         try:
-            self._session.add_message("user", message)
+            save_kwargs: dict[str, Any] = {}
+            if media:
+                save_kwargs["media"] = list(media)
+            if attachments:
+                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(message, attachments or []),
+                **save_kwargs,
+            )
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
