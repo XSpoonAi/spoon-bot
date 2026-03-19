@@ -50,6 +50,7 @@ from spoon_bot.gateway.websocket.protocol import (
 from spoon_bot.gateway.websocket.handler import (
     _AuthRateLimiter,
     _CONCURRENT_REQUEST_LIMIT,
+    _resolve_workspace_file,
 )
 
 
@@ -891,6 +892,17 @@ class TestAsyncTaskAPI:
         # Should either be cancelled or already in terminal state
         assert "cancelled" in data
 
+    def test_async_chat_rejects_attachment_payloads(self, client):
+        """POST /v1/agent/chat/async should reject sync-only attachment inputs."""
+        resp = client.post(
+            "/v1/agent/chat/async",
+            json={
+                "message": "hello async",
+                "attachments": [{"uri": "/workspace/uploads/demo.txt"}],
+            },
+        )
+        assert resp.status_code == 422
+
     def test_task_owner_enforced_for_get_and_cancel(self, client_auth):
         """Task read/cancel should be forbidden for non-owner users."""
         owner_headers = _auth_headers("owner-user")
@@ -1098,6 +1110,7 @@ class TestWSStreamingContent:
         uploads.mkdir(parents=True)
         attachment_path = uploads / "demo.pdf"
         attachment_path.write_text("demo", encoding="utf-8")
+        attachment_uri = "/workspace/uploads/demo.pdf"
         app_module._agent.workspace = workspace
         app_module._agent.process = AsyncMock(return_value="ok")
 
@@ -1112,7 +1125,7 @@ class TestWSStreamingContent:
                     "stream": False,
                     "attachments": [
                         {
-                            "uri": str(attachment_path),
+                            "uri": attachment_uri,
                             "name": "demo.pdf",
                             "mime_type": "application/pdf",
                             "size": 4,
@@ -1131,14 +1144,25 @@ class TestWSStreamingContent:
         kwargs = app_module._agent.process.await_args.kwargs
         assert kwargs["attachments"] == [
             {
-                "uri": str(attachment_path),
+                "uri": attachment_uri,
                 "name": "demo.pdf",
                 "mime_type": "application/pdf",
                 "size": 4,
-                "workspace_path": str(attachment_path),
+                "workspace_path": attachment_uri,
             }
         ]
-        assert str(attachment_path) in kwargs["message"]
+        assert attachment_uri in kwargs["message"]
+
+    def test_resolve_workspace_file_accepts_sandbox_alias(self, tmp_path: Path):
+        """Sandbox aliases should resolve against the configured runtime workspace."""
+        workspace = tmp_path / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        attachment_path = uploads / "alias.txt"
+        attachment_path.write_text("alias", encoding="utf-8")
+        app_module._agent.workspace = workspace
+
+        assert _resolve_workspace_file("/workspace/uploads/alias.txt") == attachment_path.resolve()
 
     def test_chat_send_rejects_existing_media_outside_workspace(self, client, tmp_path: Path):
         """Existing files outside workspace should not be accepted as media inputs."""
@@ -1335,6 +1359,48 @@ class TestHTTPChat:
         )
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
+
+    def test_chat_invalid_attachment_path_returns_422(self, client):
+        """Bad attachment paths should produce a client-actionable 4xx response."""
+        resp = client.post(
+            "/v1/agent/chat",
+            json={
+                "message": "hello",
+                "attachments": [{"uri": "/workspace/uploads/missing.txt"}],
+            },
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "INVALID_REQUEST"
+        assert "Invalid attachment path" in detail["message"]
+
+    def test_voice_chat_stream_passes_new_stream_arguments(self, client):
+        """POST /v1/agent/voice/chat stream should produce SSE instead of TypeError."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _voice_stream(**kwargs):
+            assert kwargs["message"] == "voice prompt"
+            assert kwargs["thinking"] is False
+            yield {"type": "content", "delta": "voice ok", "metadata": {}}
+            yield {"type": "done", "delta": "", "metadata": {}}
+
+        agent.stream = _voice_stream
+
+        with patch(
+            "spoon_bot.gateway.api.v1.agent._process_audio_input",
+            AsyncMock(return_value=("voice prompt", None)),
+        ):
+            resp = client.post(
+                "/v1/agent/voice/chat",
+                data={"stream": "true"},
+                files={"audio": ("voice.wav", b"fake-audio", "audio/wav")},
+            )
+
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        assert "voice ok" in resp.text
+        assert "TypeError" not in resp.text
 
     def test_agent_status(self, client):
         """GET /v1/agent/status returns agent info."""

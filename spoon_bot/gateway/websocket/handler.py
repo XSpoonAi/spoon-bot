@@ -42,7 +42,7 @@ from spoon_bot.gateway.websocket.protocol import (
     WSStreamChunk,
     parse_message,
 )
-from spoon_bot.gateway.websocket.workspace_fs import WorkspaceFSService
+from spoon_bot.gateway.websocket.workspace_fs import SANDBOX_WORKSPACE_ROOT, WorkspaceFSService
 from spoon_bot.gateway.websocket.workspace_terminal import WorkspaceTerminalService
 from spoon_bot.gateway.websocket.workspace_watch import WorkspaceWatchService
 
@@ -81,12 +81,26 @@ def _resolve_workspace_file(path_str: str) -> Path | None:
     candidate = str(path_str or "").strip()
     if not candidate:
         return None
+
+    workspace = _workspace_root()
+    sandbox_root = SANDBOX_WORKSPACE_ROOT.rstrip("/")
     try:
-        resolved = Path(candidate).expanduser().resolve(strict=True)
+        if candidate.startswith("/"):
+            normalized = Path(candidate).as_posix()
+            workspace_root_str = workspace.as_posix().rstrip("/")
+            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                relative = normalized[len(sandbox_root):].lstrip("/")
+                resolved = (workspace / relative).resolve(strict=True)
+            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                relative = normalized[len(workspace_root_str):].lstrip("/")
+                resolved = (workspace / relative).resolve(strict=True)
+            else:
+                resolved = Path(candidate).expanduser().resolve(strict=True)
+        else:
+            resolved = (workspace / candidate).resolve(strict=True)
     except (FileNotFoundError, OSError):
         return None
 
-    workspace = _workspace_root()
     if resolved != workspace and workspace not in resolved.parents:
         return None
     if not resolved.is_file():
