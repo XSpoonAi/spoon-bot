@@ -1085,17 +1085,15 @@ class AgentLoop:
             attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
             if raw_attachments and len(attachments) != len(raw_attachments):
                 logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
-            content = _ensure_attachment_context(content, attachments)
-
-            add_kwargs: dict[str, Any] = {}
-            if media:
-                add_kwargs["media"] = media
+            content = self._build_runtime_message_content(
+                role,
+                content,
+                media=media,
+                attachments=attachments,
+            )
 
             try:
-                try:
-                    await self._agent.add_message(role, content, **add_kwargs)
-                except TypeError:
-                    await self._agent.add_message(role, content)
+                await self._agent.add_message(role, content)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -1117,6 +1115,19 @@ class AgentLoop:
             f"estimated_tokens~{estimated_tokens}, "
             f"trimmed_messages={trimmed_count}"
         )
+
+    def _build_runtime_message_content(
+        self,
+        role: str,
+        content: str,
+        media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Build message content in the format expected by spoon-core runtime memory."""
+        text_content = _ensure_attachment_context(content, attachments or [])
+        if role == "user" and media:
+            return self.context._build_user_content(text_content, media)
+        return text_content
 
     async def process(
         self,
@@ -1173,6 +1184,14 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
+        runtime_message = self._build_runtime_message_content(
+            "user",
+            message,
+            media=media,
+            attachments=attachments,
+        )
+        if isinstance(runtime_message, str):
+            message = runtime_message
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1182,16 +1201,17 @@ class AgentLoop:
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
 
+        # spoon-core agents consume multimodal input from runtime memory, not
+        # from extra kwargs passed to run().
+        await self._agent.add_message("user", runtime_message)
+
         # Run agent — with recovery for LLM API errors (context overflow, etc.)
         # Retry up to 2 times on ANY error, with increasingly aggressive compression.
         _max_retries = 2
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    run_kwargs: dict[str, Any] = {}
-                    if media:
-                        run_kwargs["media"] = media
-                    result = await self._agent.run(message, **run_kwargs)
+                    result = await self._agent.run()
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1818,6 +1838,14 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
+        runtime_message = self._build_runtime_message_content(
+            "user",
+            message,
+            media=media,
+            attachments=attachments,
+        )
+        if isinstance(runtime_message, str):
+            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
@@ -1839,16 +1867,15 @@ class AgentLoop:
                 except (asyncio.TimeoutError, Exception):
                     break
 
+            await self._agent.add_message("user", runtime_message)
+
             # 2. Start run() in background
             run_result_text = ""
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    run_kwargs: dict[str, Any] = {"request": message}
-                    if media:
-                        run_kwargs["media"] = media
-                    result = await self._agent.run(**run_kwargs)
+                    result = await self._agent.run()
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2070,17 +2097,23 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
+        runtime_message = self._build_runtime_message_content(
+            "user",
+            message,
+            media=media,
+            attachments=attachments,
+        )
+        if isinstance(runtime_message, str):
+            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
+        await self._agent.add_message("user", runtime_message)
 
         # Run agent with thinking enabled
         try:
-            run_kwargs: dict[str, Any] = {"thinking": True}
-            if media:
-                run_kwargs["media"] = media
-            result = await self._agent.run(message, **run_kwargs)
+            result = await self._agent.run()
 
             # Extract content and thinking
             if hasattr(result, "content"):

@@ -19,7 +19,7 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -362,16 +362,33 @@ class _FakeRuntimeMemory:
 class _FakeRuntimeAgent:
     def __init__(self) -> None:
         self.memory = _FakeRuntimeMemory()
-        self.calls: list[tuple[str, str, dict]] = []
+        self.calls: list[tuple[str, Any, dict]] = []
 
-    async def add_message(self, role: str, content: str, **kwargs) -> None:
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
         self.calls.append((role, content, kwargs))
+
+
+def _assert_multimodal_user_call(
+    call: tuple[str, Any, dict],
+    *,
+    expected_text: str,
+    expected_data_url_suffix: str = "cG5n",
+) -> None:
+    role, content, kwargs = call
+    assert role == "user"
+    assert kwargs == {}
+    assert isinstance(content, list)
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"].endswith(expected_data_url_suffix)
+    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[-1] == {"type": "text", "text": expected_text}
 
 
 class TestAgentLoopSessionHydration:
     @pytest.mark.asyncio
     async def test_runtime_history_injected_from_persisted_session(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
 
         workspace = tmp_dir / "workspace"
         uploads = workspace / "uploads"
@@ -382,6 +399,7 @@ class TestAgentLoopSessionHydration:
         loop = AgentLoop.__new__(AgentLoop)
         loop._agent = _FakeRuntimeAgent()
         loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
         loop._session = Session(session_key="persisted")
         loop._session.add_message(
             "user",
@@ -395,14 +413,21 @@ class TestAgentLoopSessionHydration:
 
         assert loop._agent.memory.cleared is True
         assert injected == 2
-        assert loop._agent.calls == [
-            ("user", f"我叫Alice，请记住\n\nAttached workspace files (source of truth for this request):\n- {attachment_path} (name: alice.png)\nUse these attached workspace files as the primary source of truth for this request.", {"media": [str(attachment_path)]}),
-            ("assistant", "好的，我会记住你叫Alice。", {}),
-        ]
+        _assert_multimodal_user_call(
+            loop._agent.calls[0],
+            expected_text=(
+                f"我叫Alice，请记住\n\n"
+                f"Attached workspace files (source of truth for this request):\n"
+                f"- {attachment_path} (name: alice.png)\n"
+                f"Use these attached workspace files as the primary source of truth for this request."
+            ),
+        )
+        assert loop._agent.calls[1] == ("assistant", "好的，我会记住你叫Alice。", {})
 
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
 
         workspace = tmp_dir / "workspace"
         uploads = workspace / "uploads"
@@ -413,6 +438,7 @@ class TestAgentLoopSessionHydration:
         loop = AgentLoop.__new__(AgentLoop)
         loop._agent = _FakeRuntimeAgent()
         loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
         loop._session = Session(session_key="persisted")
         loop._session.add_message(
             "user",
@@ -424,13 +450,15 @@ class TestAgentLoopSessionHydration:
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
         assert injected == 1
-        assert loop._agent.calls == [
-            (
-                "user",
-                "看这个附件\n\nAttached workspace files (source of truth for this request):\n- /workspace/uploads/alice.png (name: alice.png)\nUse these attached workspace files as the primary source of truth for this request.",
-                {"media": ["uploads/alice.png"]},
+        _assert_multimodal_user_call(
+            loop._agent.calls[0],
+            expected_text=(
+                "看这个附件\n\n"
+                "Attached workspace files (source of truth for this request):\n"
+                "- /workspace/uploads/alice.png (name: alice.png)\n"
+                "Use these attached workspace files as the primary source of truth for this request."
             ),
-        ]
+        )
 
     def test_strip_attachment_context_recovers_original_user_text(self):
         from spoon_bot.agent.loop import _ensure_attachment_context, _strip_attachment_context
@@ -452,8 +480,14 @@ class _NoChunkRuntimeAgent:
         self.output_queue: asyncio.Queue = asyncio.Queue()
         self.state = "IDLE"
         self._final_content = final_content
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    async def run(self, **kwargs):
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
         return type("RunResult", (), {"content": self._final_content})()
 
 
@@ -465,22 +499,76 @@ class _ChunkedRuntimeAgent:
         self.output_queue: asyncio.Queue = asyncio.Queue()
         self.state = "IDLE"
         self._chunks = chunks
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    async def run(self, **kwargs):
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
         for chunk in self._chunks:
             await self.output_queue.put({"content": chunk})
             await asyncio.sleep(0)
         return type("RunResult", (), {"content": "".join(self._chunks)})()
 
 
+class TestAgentLoopCurrentRequestMultimodal:
+    @pytest.mark.asyncio
+    async def test_process_injects_multimodal_request_before_run(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "current.png"
+        image_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._stop_requested = False
+        loop._initialized = True
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop._agent = _NoChunkRuntimeAgent("image reply")
+        loop._session = Session(session_key="current_multimodal")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._auto_commit = False
+        loop._git = None
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._pre_inject_matched_skill = lambda message: message
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._filter_execution_steps = lambda content: content
+
+        response = await AgentLoop.process(
+            loop,
+            message="看图里写了什么",
+            media=[str(image_path)],
+        )
+
+        assert response == "image reply"
+        _assert_multimodal_user_call(
+            loop._agent.add_message_calls[0],
+            expected_text="看图里写了什么",
+        )
+        assert loop._agent.run_calls == [((), {})]
+        assert loop._session.messages[0]["media"] == [str(image_path)]
+
+
 class TestAgentLoopStreamFallback:
     @pytest.mark.asyncio
-    async def test_stream_falls_back_to_run_result_when_no_chunks(self):
+    async def test_stream_falls_back_to_run_result_when_no_chunks(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
         loop._initialized = True
         loop._agent = _NoChunkRuntimeAgent("fallback from run result")
+        loop.workspace = tmp_dir
         loop._session = Session(session_key="stream_fallback")
         loop.sessions = MagicMock()
         loop.sessions.save = MagicMock()
@@ -488,6 +576,8 @@ class TestAgentLoopStreamFallback:
         loop.memory.get_memory_context = MagicMock(return_value=None)
         loop.context = MagicMock()
         loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
 
         chunks = []
         async for chunk in AgentLoop.stream(loop, message="hello"):
@@ -506,12 +596,13 @@ class TestAgentLoopStreamFallback:
         loop.sessions.save.assert_called_once_with(loop._session)
 
     @pytest.mark.asyncio
-    async def test_stream_preserves_incremental_queue_chunks(self):
+    async def test_stream_preserves_incremental_queue_chunks(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
         loop._initialized = True
         loop._agent = _ChunkedRuntimeAgent(["Hel", "lo"])
+        loop.workspace = tmp_dir
         loop._session = Session(session_key="stream_incremental")
         loop.sessions = MagicMock()
         loop.sessions.save = MagicMock()
@@ -519,6 +610,8 @@ class TestAgentLoopStreamFallback:
         loop.memory.get_memory_context = MagicMock(return_value=None)
         loop.context = MagicMock()
         loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
 
         chunks = []
         async for chunk in AgentLoop.stream(loop, message="hello"):
@@ -534,12 +627,13 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[-1]["content"] == "Hello"
 
     @pytest.mark.asyncio
-    async def test_stream_persists_original_user_text_instead_of_attachment_prose(self):
+    async def test_stream_persists_original_user_text_instead_of_attachment_prose(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop, _ensure_attachment_context
 
         loop = AgentLoop.__new__(AgentLoop)
         loop._initialized = True
         loop._agent = _NoChunkRuntimeAgent("attachment reply")
+        loop.workspace = tmp_dir
         loop._session = Session(session_key="stream_attachment_text")
         loop.sessions = MagicMock()
         loop.sessions.save = MagicMock()
@@ -547,6 +641,8 @@ class TestAgentLoopStreamFallback:
         loop.memory.get_memory_context = MagicMock(return_value=None)
         loop.context = MagicMock()
         loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
 
         attachments = [{"uri": "/workspace/uploads/demo.pdf", "name": "demo.pdf"}]
         injected_message = _ensure_attachment_context("请总结附件", attachments)
