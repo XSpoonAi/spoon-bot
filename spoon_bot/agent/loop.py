@@ -8,7 +8,6 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging as stdlib_logging
 from collections import Counter
@@ -89,7 +88,10 @@ from spoon_bot.agent.tools.self_config import (
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.hotreload import HotReloadService
-from spoon_bot.services.spawn import SpawnTool
+from spoon_bot.subagent.manager import SubagentManager
+from spoon_bot.subagent.tools import SubagentTool
+from spoon_bot.subagent.catalog import format_roles_for_prompt
+from spoon_bot.subagent.models import SubagentState
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
@@ -107,187 +109,6 @@ from spoon_bot.services.git import GitManager
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
-
-
-_ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this request):"
-_ATTACHMENT_ONLY_PLACEHOLDER = (
-    "The user attached files without extra text. Inspect the files and answer based on their contents."
-)
-_SANDBOX_WORKSPACE_ROOT = "/workspace"
-
-
-def _workspace_root_path(workspace: Path | str | None) -> Path:
-    """Resolve the workspace root used to validate persisted file references."""
-    return Path(workspace or Path.home() / ".spoon-bot" / "workspace").expanduser().resolve()
-
-
-def _resolve_workspace_file(path_str: str, workspace: Path | str | None) -> Path | None:
-    """Resolve a file path and ensure it stays within the configured workspace."""
-    candidate = str(path_str or "").strip()
-    if not candidate:
-        return None
-
-    workspace_root = _workspace_root_path(workspace)
-    sandbox_root = _SANDBOX_WORKSPACE_ROOT.rstrip("/")
-    try:
-        if candidate.startswith("/"):
-            normalized = Path(candidate).as_posix()
-            workspace_root_str = workspace_root.as_posix().rstrip("/")
-            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
-                relative = normalized[len(sandbox_root):].lstrip("/")
-                resolved = (workspace_root / relative).resolve(strict=True)
-            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
-                relative = normalized[len(workspace_root_str):].lstrip("/")
-                resolved = (workspace_root / relative).resolve(strict=True)
-            else:
-                resolved = Path(candidate).expanduser().resolve(strict=True)
-        else:
-            resolved = (workspace_root / candidate).resolve(strict=True)
-    except (FileNotFoundError, OSError):
-        return None
-
-    if resolved != workspace_root and workspace_root not in resolved.parents:
-        return None
-    if not resolved.is_file():
-        return None
-    return resolved
-
-
-def _normalize_media_list(raw: Any) -> list[str]:
-    """Normalize stored media payloads to a list of non-empty file paths."""
-    if not isinstance(raw, list):
-        return []
-
-    items: list[str] = []
-    for item in raw:
-        if isinstance(item, str):
-            value = item.strip()
-        else:
-            value = str(item).strip() if item is not None else ""
-        if value:
-            items.append(value)
-    return items
-
-
-def _sanitize_media_list(raw: Any, workspace: Path | str | None) -> list[str]:
-    """Keep only workspace-backed media paths from persisted session metadata."""
-    return [
-        path
-        for path in _normalize_media_list(raw)
-        if _resolve_workspace_file(path, workspace) is not None
-    ]
-
-
-def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
-    """Normalize stored attachment references from session metadata."""
-    if not isinstance(raw, list):
-        return []
-
-    normalized: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
-        if not uri:
-            continue
-        attachment = dict(item)
-        attachment["uri"] = uri
-        attachment.setdefault("workspace_path", uri)
-        normalized.append(attachment)
-    return normalized
-
-
-def _sanitize_attachment_refs(raw: Any, workspace: Path | str | None) -> list[dict[str, Any]]:
-    """Keep only workspace-backed attachment references from persisted metadata."""
-    sanitized: list[dict[str, Any]] = []
-    for item in _normalize_attachment_refs(raw):
-        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
-        if _resolve_workspace_file(uri, workspace) is None:
-            continue
-        sanitized.append(item)
-    return sanitized
-
-
-def _attachment_context_entries(attachments: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
-    """Return normalized attachment entries with resolved display paths."""
-    normalized_items: list[tuple[dict[str, Any], str]] = []
-    for item in attachments:
-        if not isinstance(item, dict):
-            continue
-        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
-        if uri:
-            normalized_items.append((item, uri))
-    return normalized_items
-
-
-def _build_attachment_context_lines(attachments: list[dict[str, Any]]) -> list[str]:
-    """Build the synthetic attachment context block appended to prompts."""
-    normalized_items = _attachment_context_entries(attachments)
-    if not normalized_items:
-        return []
-
-    lines = [_ATTACHMENT_CONTEXT_HEADER]
-    for item, uri in normalized_items:
-        name = str(item.get("name") or item.get("file_name") or "").strip()
-        mime_type = str(item.get("mime_type") or item.get("file_type") or "").strip()
-        size = item.get("size") if "size" in item else item.get("file_size")
-        suffix = []
-        if name:
-            suffix.append(f"name: {name}")
-        if mime_type:
-            suffix.append(f"mime: {mime_type}")
-        if isinstance(size, int) and size > 0:
-            suffix.append(f"size: {size} bytes")
-        line = f"- {uri}"
-        if suffix:
-            line += f" ({', '.join(suffix)})"
-        lines.append(line)
-    lines.append("Use these attached workspace files as the primary source of truth for this request.")
-    return lines
-
-
-def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
-    """Append attachment path context unless it is already present in content."""
-    if not attachments:
-        return content
-
-    text = content if isinstance(content, str) else str(content)
-    normalized_items = _attachment_context_entries(attachments)
-    uris = [uri for _, uri in normalized_items]
-    if not uris:
-        return text
-    if _ATTACHMENT_CONTEXT_HEADER in text and all(uri in text for uri in uris):
-        return text
-
-    lines = [text.strip()] if text.strip() else [_ATTACHMENT_ONLY_PLACEHOLDER]
-    lines.extend(["", *_build_attachment_context_lines(attachments)])
-    return "\n".join(lines)
-
-
-def _strip_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
-    """Remove the exact synthetic attachment block so sessions keep user-authored text only."""
-    if not attachments:
-        return content
-
-    text = content if isinstance(content, str) else str(content)
-    if _ATTACHMENT_CONTEXT_HEADER not in text:
-        return text
-
-    context_lines = _build_attachment_context_lines(attachments)
-    if not context_lines:
-        return text
-
-    delimiter = f"\n\n{context_lines[0]}\n"
-    if delimiter not in text:
-        return text
-
-    prefix, suffix = text.split(delimiter, 1)
-    expected_suffix = "\n".join(context_lines[1:])
-    if suffix != expected_suffix:
-        return text
-    if prefix == _ATTACHMENT_ONLY_PLACEHOLDER:
-        return ""
-    return prefix
 
 
 class AgentLoop:
@@ -329,6 +150,8 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        session_manager: SessionManager | None = None,
+        subagent_manager: SubagentManager | None = None,
         session_store_backend: str = "file",
         session_store_dsn: str | None = None,
         session_store_db_path: str | None = None,
@@ -358,6 +181,8 @@ class AgentLoop:
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
             tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            session_manager: Existing SessionManager to reuse for persistence.
+            subagent_manager: Existing SubagentManager to reuse for child agents.
             session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
             session_store_dsn: PostgreSQL DSN for 'postgres' backend.
             session_store_db_path: SQLite DB path for 'sqlite' backend.
@@ -409,22 +234,26 @@ class AgentLoop:
         self.tools = ToolRegistry()
 
         # Session persistence — configurable backend
-        _store_backend = session_store_backend or "file"
-        _store_db_path = session_store_db_path
-        if _store_backend == "sqlite" and not _store_db_path:
-            _store_db_path = str(self.workspace / "sessions.db")
-        try:
-            _session_store = create_session_store(
-                backend=_store_backend,
-                workspace=self.workspace,
-                db_path=_store_db_path,
-                dsn=session_store_dsn,
-            )
-            self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
-            logger.info(f"Session store: {_store_backend}")
-        except Exception as exc:
-            logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
-            self.sessions = SessionManager(self.workspace)
+        if session_manager is not None:
+            self.sessions = session_manager
+            logger.info("Session store: inherited from parent SessionManager")
+        else:
+            _store_backend = session_store_backend or "file"
+            _store_db_path = session_store_db_path
+            if _store_backend == "sqlite" and not _store_db_path:
+                _store_db_path = str(self.workspace / "sessions.db")
+            try:
+                _session_store = create_session_store(
+                    backend=_store_backend,
+                    workspace=self.workspace,
+                    db_path=_store_db_path,
+                    dsn=session_store_dsn,
+                )
+                self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
+                logger.info(f"Session store: {_store_backend}")
+            except Exception as exc:
+                logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
+                self.sessions = SessionManager(self.workspace)
 
         # Memory store — semantic (memsearch) or file-based
         self._memsearch_config: MemSearchConfig | None = None
@@ -454,6 +283,30 @@ class AgentLoop:
             self.memory = MemoryStore(self.workspace)
 
         self._git = GitManager(self.workspace) if auto_commit else None
+
+        # Sub-agent manager — shares this agent's SessionManager so sub-agents
+        # can reuse the same persistence backend with their own unique session keys.
+        if subagent_manager is not None:
+            self._subagent_manager = subagent_manager
+            self._owns_subagent_manager = False
+        else:
+            self._subagent_manager = SubagentManager(
+                session_manager=self.sessions,
+                workspace=self.workspace,
+                max_depth=self._config.subagent.max_depth,
+                max_children_per_agent=self._config.subagent.max_children_per_agent,
+                max_total_subagents=self._config.subagent.max_total_subagents,
+                parent_model=model,
+                parent_provider=provider,
+                parent_api_key=api_key,
+                parent_base_url=base_url,
+                persist_runs=self._config.subagent.persist_runs,
+                persist_file=self._config.subagent.persist_file,
+                archive_after_minutes=self._config.subagent.archive_after_minutes,
+                sweeper_interval_seconds=self._config.subagent.sweeper_interval_seconds,
+                max_persistent_agents=self._config.subagent.max_persistent_agents,
+            )
+            self._owns_subagent_manager = True
 
         # Skill paths: runtime workspace + bundled skills shipped with spoon-bot
         self._skill_paths = [self.workspace / "skills"]
@@ -578,6 +431,51 @@ class AgentLoop:
             except Exception:
                 pass
 
+        # ----------------------------------------------------------------
+        # Multi-Agent Orchestration section
+        # Injected when the SubagentTool (spawn) is available.
+        # Mirrors opencode task.txt's usage notes and openclaw's
+        # sessions-spawn-tool description pattern.
+        # ----------------------------------------------------------------
+        if "spawn" in self.tools.get_active_tools():
+            roles_block = format_roles_for_prompt()
+            system_prompt += (
+                "\n\n## Multi-Agent Orchestration\n\n"
+                "You are an **Orchestrator**. For complex tasks (e.g. 'build a user "
+                "management system', 'implement a REST API with frontend'), decompose "
+                "the work and delegate to specialised sub-agents using the `spawn` tool.\n\n"
+                "**You decide which agents to use and in what order** — there is no fixed "
+                "pipeline. Use your judgement based on the task requirements.\n\n"
+                "### Available specialised agent roles\n"
+                f"{roles_block}\n\n"
+                "### When to use sub-agents\n"
+                "- Complex tasks requiring multiple specialised skills\n"
+                "- Tasks that benefit from sequential specialisation "
+                "(e.g. plan → implement → review)\n"
+                "- Research + implementation tasks that can be parallelised\n\n"
+                "### When NOT to use sub-agents\n"
+                "- Simple, single-step tasks (file reads, quick questions, small edits)\n"
+                "- Tasks you can complete directly in a few tool calls\n\n"
+                "### Orchestration workflow (decide autonomously)\n"
+                "1. For complex tasks, start with `spawn(action='spawn', role='planner', "
+                "task='Analyse requirements for: <user request>')` to get a technical plan\n"
+                "2. Wait for the planner: `spawn(action='wait', timeout=120)`\n"
+                "3. Based on the plan, spawn implementation agents as needed:\n"
+                "   - `spawn(action='spawn', role='backend', task='...<plan context>...')`\n"
+                "   - `spawn(action='spawn', role='frontend', task='...<plan context>...')`\n"
+                "   - Launch independent agents in parallel (multiple tool calls at once)\n"
+                "4. Wait for results: `spawn(action='wait', timeout=180)`\n"
+                "5. Optionally spawn a `reviewer` to check the implementation\n"
+                "6. Summarise all results to the user\n\n"
+                "### Key rules (from opencode task.txt)\n"
+                "- Each sub-agent starts with a **fresh context** — provide all necessary "
+                "context in the `task` parameter\n"
+                "- The sub-agent's output is NOT visible to the user until you summarise it\n"
+                "- Use `task_id` from a result to resume the same sub-agent session later\n"
+                "- Use `spawn(action='list_roles')` to see all available roles at runtime\n"
+            )
+            logger.info("Injected Multi-Agent Orchestration section into system prompt")
+
         # NOTE: inactive-tools prompt is built later, after skill tools are
         # registered so that skill-provided tools are included in the list.
 
@@ -659,7 +557,6 @@ class AgentLoop:
         # and can cause the model to summarize instead of continue).
         self._agent.next_step_prompt = self.DEFAULT_NEXT_STEP_PROMPT
         self._agent._custom_next_step_prompt = True
-        self._agent._spoon_bot_base_think = self._agent.think
 
         # Build dynamic-tools prompt now that all tools (native + skill) are registered
         inactive_tools = self.tools.get_inactive_tools()
@@ -683,6 +580,9 @@ class AgentLoop:
             f"mcp_servers={len(self._mcp_tools)}, "
             f"skills_enabled={self._enable_skills}"
         )
+
+        # Start sub-agent archive sweeper (no-op if persistence is disabled)
+        await self._subagent_manager.start_sweeper()
 
         # Start background hot-reload service if enabled
         if self._auto_reload:
@@ -738,8 +638,9 @@ class AgentLoop:
             ],
         ))
 
-        # Background task tool
-        self.tools.register(SpawnTool())
+        # Sub-agent tool — replaces the old placeholder SpawnTool
+        spawn_tool = SubagentTool(manager=getattr(self, "_subagent_manager", None))
+        self.tools.register(spawn_tool)
 
         # Web tools
         self.tools.register(WebSearchTool())
@@ -975,7 +876,14 @@ class AgentLoop:
         return {"skills": skills_result, "mcp": mcp_result}
 
     async def cleanup(self) -> None:
-        """Shut down all managed resources (MCP tools, skills, etc.)."""
+        """Shut down all managed resources (MCP tools, skills, sub-agents, etc.)."""
+        # Cleanup sub-agents first so they can still access tools during their own cleanup
+        if hasattr(self, "_subagent_manager") and getattr(self, "_owns_subagent_manager", True):
+            try:
+                await self._subagent_manager.cleanup()
+            except Exception as exc:
+                logger.debug(f"Sub-agent manager cleanup: {exc}")
+
         # Cleanup MCP tools
         for mcp_tool in self._mcp_tools:
             for method in ("close", "cleanup", "shutdown"):
@@ -1060,12 +968,7 @@ class AgentLoop:
             return 0
 
         injected_count = 0
-        history_messages = (
-            self._session.get_messages()
-            if hasattr(self._session, "get_messages")
-            else self._session.get_history()
-        )
-        for msg in history_messages:
+        for msg in self._session.get_history():
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
                 continue
@@ -1076,22 +979,6 @@ class AgentLoop:
                     content = json.dumps(content, ensure_ascii=False)
                 except Exception:
                     content = str(content)
-
-            raw_media = _normalize_media_list(msg.get("media"))
-            media = _sanitize_media_list(raw_media, self.workspace)
-            if raw_media and len(media) != len(raw_media):
-                logger.warning("Dropped invalid persisted media refs outside workspace during history sync")
-
-            raw_attachments = _normalize_attachment_refs(msg.get("attachments"))
-            attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
-            if raw_attachments and len(attachments) != len(raw_attachments):
-                logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
-            content = self._build_runtime_message_content(
-                role,
-                content,
-                media=media,
-                attachments=attachments,
-            )
 
             try:
                 await self._agent.add_message(role, content)
@@ -1117,24 +1004,135 @@ class AgentLoop:
             f"trimmed_messages={trimmed_count}"
         )
 
-    def _build_runtime_message_content(
+    def set_subagent_context(
         self,
-        role: str,
-        content: str,
-        media: list[str] | None = None,
-        attachments: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        """Build message content in the format expected by spoon-core runtime memory."""
-        text_content = _ensure_attachment_context(content, attachments or [])
-        if role == "user" and media:
-            return self.context._build_user_content(text_content, media)
-        return text_content
+        *,
+        session_key: str | None = None,
+        channel: str | None = None,
+    ) -> None:
+        """Bind the spawn tool to the current requester session/channel."""
+        spawn_tool = self.tools.get("spawn")
+        if spawn_tool and isinstance(spawn_tool, SubagentTool):
+            spawn_tool.set_spawner_context(
+                session_key=session_key or self.session_key,
+                channel=channel,
+            )
+
+    def _persist_turn(self, user_message: str, assistant_message: str) -> None:
+        """Save a completed user/assistant turn to session storage."""
+        try:
+            self._session.add_message("user", user_message)
+            self._session.add_message("assistant", assistant_message)
+            self.sessions.save(self._session)
+        except Exception as e:
+            logger.warning(f"Failed to save session: {e}")
+
+    def _should_skip_specialist_auto_route(self, message: str) -> bool:
+        """Return True when the current message should not be auto-routed."""
+        stripped = message.lstrip()
+        return (
+            self.session_key.startswith("subagent-")
+            or stripped.startswith("[Sub-agent Completed]")
+        )
+
+    def _maybe_create_persistent_subagent_from_request(
+        self,
+        message: str,
+    ) -> str | None:
+        """Create a persistent subagent from a natural-language user request."""
+        if self._should_skip_specialist_auto_route(message):
+            return None
+        parsed = self._subagent_manager.parse_persistent_subagent_request(message)
+        if parsed is None:
+            return None
+
+        profile = self._subagent_manager.create_persistent_subagent(
+            description=parsed["specialization"],
+        )
+        keywords = ", ".join(profile.match_keywords[:8]) or "(none)"
+        response = (
+            f"Persistent subagent `{profile.name}` created.\n"
+            f"Specialization: {profile.specialization}\n"
+            f"Auto-route: {'ON' if profile.auto_route else 'OFF'}\n"
+            f"Tool profile: {profile.tool_profile}\n"
+            f"Keywords: {keywords}\n\n"
+            "Future matching requests will be routed to this subagent automatically."
+        )
+        return response
+
+    async def _maybe_route_to_persistent_specialist(
+        self,
+        message: str,
+    ) -> tuple[str, str | None] | None:
+        """Attempt to route a matching top-level request to a persistent subagent."""
+        if self._should_skip_specialist_auto_route(message):
+            return None
+
+        matched = self._subagent_manager.find_best_auto_route_specialist(message)
+        if matched is None:
+            return None
+
+        agent_name = matched["agent_name"]
+        reason_text = ", ".join(matched["reasons"]) or "high-confidence subagent match"
+        logger.info(
+            f"Auto-routing request to persistent subagent {agent_name!r} "
+            f"(score={matched['score']}; {reason_text})"
+        )
+
+        current_channel = getattr(self._subagent_manager, "_current_spawner_channel", None)
+        current_metadata = getattr(self._subagent_manager, "_current_spawner_metadata", {})
+        current_reply_to = getattr(self._subagent_manager, "_current_spawner_reply_to", None)
+        record = await self._subagent_manager.dispatch_persistent_subagent(
+            agent_name=agent_name,
+            task=message,
+            spawner_session_key=self.session_key,
+            spawner_channel=current_channel,
+            spawner_metadata=current_metadata,
+            spawner_reply_to=current_reply_to,
+        )
+        wait_timeout = float(record.config.timeout_seconds or 300)
+        results = await self._subagent_manager.collect_results(
+            timeout=wait_timeout,
+            spawner_session_key=self.session_key,
+            agent_id=record.agent_id,
+        )
+        if not results:
+            response = (
+                f"Auto-routed to subagent `{agent_name}`, but it did not finish "
+                f"within {int(wait_timeout)}s."
+            )
+            note = (
+                f"Auto-routed to persistent subagent {agent_name} "
+                f"(score={matched['score']}; {reason_text})."
+            )
+            return response, note
+
+        result = results[-1]
+        if result.state == SubagentState.COMPLETED:
+            result_text = self._filter_execution_steps(result.result or "(no output)")
+            response = f"Subagent `{agent_name}` handled this request.\n\n{result_text}"
+        elif result.state == SubagentState.FAILED:
+            response = (
+                f"Subagent `{agent_name}` failed while handling this request.\n\n"
+                f"{result.error or '(no error message)'}"
+            )
+        elif result.state == SubagentState.CANCELLED:
+            response = f"Subagent `{agent_name}` was cancelled before finishing."
+        else:
+            response = result.result or result.error or f"Subagent `{agent_name}` returned no output."
+
+        note = (
+            f"Auto-routed to persistent subagent {agent_name} "
+            f"(score={matched['score']}; {reason_text})."
+        )
+        return response, note
 
     async def process(
         self,
         message: str,
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_key: str | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -1142,10 +1140,18 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Optional session key for multi-user/multi-channel isolation.
+                         When provided, switches to this session before processing.
 
         Returns:
             The agent's response text.
         """
+        # Switch session if requested
+        if session_key and session_key != self.session_key:
+            self.session_key = session_key
+            self._session = self.sessions.get_or_create(session_key)
+            logger.info(f"Switched to session: {session_key}")
+
         # Honour stop request from previous /stop command
         if self._stop_requested:
             self._stop_requested = False
@@ -1156,7 +1162,32 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
+        # Switch session if a different key is requested
+        if session_key and session_key != self.session_key:
+            self._session = self.sessions.get_or_create(session_key)
+            self.session_key = session_key
+            logger.debug(f"Switched to session: {session_key}")
+
+        self.set_subagent_context(session_key=self.session_key)
+
         logger.info(f"Processing message: {message[:100]}...")
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if created is not None:
+            self._persist_turn(message, created)
+            return created
+
+        routed = await self._maybe_route_to_persistent_specialist(message)
+        if routed is not None:
+            routed_content, _route_note = routed
+            self._persist_turn(message, routed_content)
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
+            return routed_content
 
         # Refresh memory context
         try:
@@ -1185,14 +1216,6 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
-        runtime_message = self._build_runtime_message_content(
-            "user",
-            message,
-            media=media,
-            attachments=attachments,
-        )
-        if isinstance(runtime_message, str):
-            message = runtime_message
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1201,22 +1224,17 @@ class AgentLoop:
 
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
-        await self._agent.add_message("user", runtime_message)
 
         # Run agent — with recovery for LLM API errors (context overflow, etc.)
         # Retry up to 2 times on ANY error, with increasingly aggressive compression.
         _max_retries = 2
-        retry_requires_runtime_message_check = False
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    if (
-                        retry_requires_runtime_message_check
-                        and not self._recent_runtime_has_user_message_content(runtime_message)
-                    ):
-                        await self._agent.add_message("user", runtime_message)
-                    retry_requires_runtime_message_check = False
-                    result = await self._agent.run()
+                    run_kwargs: dict[str, Any] = {}
+                    if media:
+                        run_kwargs["media"] = media
+                    result = await self._agent.run(message, **run_kwargs)
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1254,14 +1272,12 @@ class AgentLoop:
                     if _attempt < _max_retries:
                         logger.warning("Compressing context and retrying...")
                         # First retry: normal compression. Second: force-compress.
-                        compression_actions = 0
                         if _attempt == 0:
-                            compression_actions = self._compress_runtime_context()
-                            if compression_actions == 0:
-                                compression_actions += self._force_compress_runtime_context()
+                            compressed = self._compress_runtime_context()
+                            if compressed == 0:
+                                self._force_compress_runtime_context()
                         else:
-                            compression_actions = self._force_compress_runtime_context()
-                        retry_requires_runtime_message_check = True
+                            self._force_compress_runtime_context()
                         # Reset agent state so it can re-enter run()
                         if hasattr(self._agent, 'state'):
                             self._agent.state = AgentState.IDLE
@@ -1272,7 +1288,6 @@ class AgentLoop:
                     raise
         finally:
             # Always ensure agent is back in IDLE state after processing
-            self._restore_agent_think()
             if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
                 logger.warning(
                     f"Post-run cleanup: resetting agent from {self._agent.state} to IDLE"
@@ -1281,21 +1296,7 @@ class AgentLoop:
                 self._agent.current_step = 0
 
         # Save to session
-        try:
-            save_kwargs: dict[str, Any] = {}
-            if media:
-                save_kwargs["media"] = list(media)
-            if attachments:
-                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-            self._session.add_message(
-                "user",
-                _strip_attachment_context(message, attachments or []),
-                **save_kwargs,
-            )
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
-        except Exception as e:
-            logger.warning(f"Failed to save session: {e}")
+        self._persist_turn(message, final_content)
 
         # Auto-commit workspace changes
         if self._auto_commit and self._git:
@@ -1346,161 +1347,14 @@ class AgentLoop:
             logger.warning(f"Failed to extract content from agent memory: {exc}")
         return ""
 
-    @classmethod
-    def _serialize_message_content(cls, content: Any) -> Any:
-        """Convert message content into JSON-serializable Python objects."""
-        if content is None or isinstance(content, (str, int, float, bool)):
-            return content
-        if isinstance(content, list):
-            return [cls._serialize_message_content(item) for item in content]
-        if isinstance(content, dict):
-            return {
-                str(key): cls._serialize_message_content(value)
-                for key, value in content.items()
-            }
-        if hasattr(content, "model_dump"):
-            try:
-                dumped = content.model_dump(exclude_none=True)
-            except TypeError:
-                dumped = content.model_dump()
-            return cls._serialize_message_content(dumped)
-
-        extracted: dict[str, Any] = {}
-        for attr in (
-            "type",
-            "text",
-            "image_url",
-            "source",
-            "file_path",
-            "media_type",
-            "filename",
-            "name",
-            "url",
-            "detail",
-            "data",
-        ):
-            if hasattr(content, attr):
-                extracted[attr] = cls._serialize_message_content(getattr(content, attr))
-        if extracted:
-            return extracted
-        return str(content)
-
-    @classmethod
-    def _message_content_fingerprint(cls, content: Any) -> str:
-        """Create a stable string fingerprint for runtime content comparisons."""
-        serialized = cls._serialize_message_content(content)
-        if isinstance(serialized, str):
-            return f"str:{serialized}"
-        return json.dumps(serialized, sort_keys=True, ensure_ascii=True, default=str)
-
-    @classmethod
-    def _multimodal_content_summary(cls, content: list[Any], max_text_chars: int) -> str:
-        """Summarize multimodal content while dropping heavy binary payloads."""
-        serialized = cls._serialize_message_content(content)
-        if not isinstance(serialized, list):
-            text = str(serialized or "")
-            return text[:max_text_chars] if max_text_chars and len(text) > max_text_chars else text
-
-        text_parts: list[str] = []
-        image_count = 0
-        document_count = 0
-        file_refs: list[str] = []
-
-        for block in serialized:
-            if isinstance(block, dict):
-                block_type = str(block.get("type") or "")
-                if block_type == "text":
-                    text = str(block.get("text") or "")
-                    if text:
-                        text_parts.append(text)
-                    continue
-                if block_type in {"image", "image_url"}:
-                    image_count += 1
-                    continue
-                if block_type == "document":
-                    document_count += 1
-                    continue
-                if block_type == "file":
-                    file_path = str(block.get("file_path") or "")
-                    if file_path:
-                        file_refs.append(Path(file_path).name or file_path)
-                    continue
-            elif block:
-                text_parts.append(str(block))
-
-        text = "\n".join(part for part in text_parts if part).strip()
-        if max_text_chars and len(text) > max_text_chars:
-            text = text[:max_text_chars] + f"\n...[truncated {len(text) - max_text_chars} chars]"
-
-        summary_parts = [text] if text else []
-        if image_count:
-            summary_parts.append(f"[{image_count} image attachment(s) omitted during context compression]")
-        if document_count:
-            summary_parts.append(f"[{document_count} document attachment(s) omitted during context compression]")
-        if file_refs:
-            shown = ", ".join(file_refs[:3])
-            more = "" if len(file_refs) <= 3 else f" (+{len(file_refs) - 3} more)"
-            summary_parts.append(f"[File attachment reference(s): {shown}{more}]")
-        if not summary_parts:
-            summary_parts.append("[Multimodal content omitted during context compression]")
-        return "\n".join(summary_parts)
-
-    @classmethod
-    def _compress_message_content(cls, content: Any, max_chars: int) -> Any:
-        """Truncate text content and summarize multimodal content for recovery."""
-        if isinstance(content, str):
-            if len(content) <= max_chars:
-                return content
-            return content[:max_chars] + f"\n...[truncated {len(content) - max_chars} chars]"
-        if isinstance(content, list):
-            return cls._multimodal_content_summary(content, max_chars)
-        return content
-
-    @classmethod
-    def _message_content_char_count(cls, content: Any) -> int:
-        """Return an approximate character count for text and multimodal payloads."""
-        if content is None:
-            return 0
-        if isinstance(content, str):
-            return len(content)
-        if not isinstance(content, list):
-            return len(str(content))
-
-        total = 0
-        serialized = cls._serialize_message_content(content)
-        for block in serialized if isinstance(serialized, list) else [serialized]:
-            if isinstance(block, dict):
-                block_type = str(block.get("type") or "")
-                if block_type == "text":
-                    total += len(str(block.get("text") or ""))
-                    continue
-                if block_type == "image_url":
-                    total += len(str((block.get("image_url") or {}).get("url") or ""))
-                    continue
-                if block_type == "image":
-                    source = block.get("source") or {}
-                    total += len(str(source.get("media_type") or ""))
-                    total += len(str(source.get("data") or ""))
-                    continue
-                if block_type == "document":
-                    source = block.get("source") or {}
-                    total += len(str(source.get("media_type") or ""))
-                    total += len(str(source.get("data") or ""))
-                    total += len(str(block.get("filename") or ""))
-                    continue
-                if block_type == "file":
-                    total += len(str(block.get("file_path") or ""))
-                    total += len(str(block.get("media_type") or ""))
-                    continue
-                total += len(json.dumps(block, sort_keys=True, ensure_ascii=True, default=str))
-                continue
-            total += len(str(block))
-        return total
-
-    @classmethod
-    def _msg_char_count(cls, msg) -> int:
+    @staticmethod
+    def _msg_char_count(msg) -> int:
         """Return total character count of a message's content."""
-        return cls._message_content_char_count(getattr(msg, "content", None))
+        if isinstance(msg.content, str):
+            return len(msg.content)
+        if isinstance(msg.content, list):
+            return sum(len(getattr(b, 'text', '')) for b in msg.content)
+        return 0
 
     def _estimate_runtime_tokens(self) -> int:
         """Rough token estimate from the agent's runtime messages (~4 chars/token)."""
@@ -1517,52 +1371,6 @@ class AgentLoop:
             return False
         text = msg.content if isinstance(msg.content, str) else ''
         return text.startswith('[ORIGINAL USER REQUEST]') or text.startswith('Focus on the user')
-
-    def _recent_runtime_has_user_message_content(
-        self,
-        content: Any,
-        recent_messages: int = 10,
-    ) -> bool:
-        """Check whether recent runtime memory still contains the active user request."""
-        if not self._agent or not hasattr(self._agent, "memory"):
-            return False
-        messages = getattr(self._agent.memory, "messages", None)
-        if not isinstance(messages, list) or not messages:
-            return False
-
-        target = self._message_content_fingerprint(content)
-        for msg in reversed(messages[-recent_messages:]):
-            role = getattr(msg, "role", None)
-            role = role.value if hasattr(role, "value") else role
-            if role != "user":
-                continue
-            if self._is_next_step_user_msg(msg):
-                continue
-            if self._message_content_fingerprint(getattr(msg, "content", None)) == target:
-                return True
-        return False
-
-    @staticmethod
-    def _callable_accepts_kwarg(func: Any, kwarg: str) -> bool:
-        """Return True when *func* can accept *kwarg* as a keyword argument."""
-        try:
-            signature = inspect.signature(func)
-        except (TypeError, ValueError):
-            return False
-
-        if any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        ):
-            return True
-        param = signature.parameters.get(kwarg)
-        return bool(
-            param
-            and param.kind in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-        )
 
     @staticmethod
     def _repair_tool_pairing(messages: list) -> int:
@@ -1672,10 +1480,9 @@ class AgentLoop:
         max_content = 300
         for i in range(1, max(1, len(messages) - keep_tail)):
             msg = messages[i]
-            original_content = getattr(msg, "content", None)
-            compressed_content = self._compress_message_content(original_content, max_content)
-            if compressed_content != original_content:
-                msg.content = compressed_content
+            if isinstance(msg.content, str) and len(msg.content) > max_content:
+                orig = len(msg.content)
+                msg.content = msg.content[:max_content] + f"\n...[truncated {orig - max_content} chars]"
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
@@ -1718,10 +1525,8 @@ class AgentLoop:
 
         # Truncate ALL messages to 150 chars
         for msg in messages:
-            original_content = getattr(msg, "content", None)
-            compressed_content = self._compress_message_content(original_content, 150)
-            if compressed_content != original_content:
-                msg.content = compressed_content
+            if isinstance(msg.content, str) and len(msg.content) > 150:
+                msg.content = msg.content[:150] + "\n...[force-truncated]"
                 compressed += 1
 
         # Drop all but first + last 6 messages
@@ -1751,12 +1556,7 @@ class AgentLoop:
             return
 
         agent_loop = self
-        original_think = getattr(agent, "_spoon_bot_base_think", None)
-        if original_think is None:
-            original_think = agent.think
-            setattr(agent, "_spoon_bot_base_think", original_think)
-        else:
-            agent.think = original_think
+        original_think = agent.think
         call_tracker: Counter = Counter()
         detail_tracker: Counter = Counter()
         read_files: set = set()
@@ -1935,15 +1735,6 @@ class AgentLoop:
 
         agent.think = _tracked_think
 
-    def _restore_agent_think(self) -> None:
-        """Restore the agent's base think() implementation after a request."""
-        agent = self._agent
-        if agent is None:
-            return
-        original_think = getattr(agent, "_spoon_bot_base_think", None)
-        if original_think is not None:
-            agent.think = original_think
-
     def _filter_execution_steps(self, content: str) -> str:
         """
         Filter out technical execution steps from agent output.
@@ -2035,20 +1826,9 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
-        stream_completed = False
-        stream_cancelled = False
-        bg_task: asyncio.Task[None] | None = None
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
-        runtime_message = self._build_runtime_message_content(
-            "user",
-            message,
-            media=media,
-            attachments=attachments,
-        )
-        if isinstance(runtime_message, str):
-            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
@@ -2070,15 +1850,13 @@ class AgentLoop:
                 except (asyncio.TimeoutError, Exception):
                     break
 
-            await self._agent.add_message("user", runtime_message)
-
             # 2. Start run() in background
             run_result_text = ""
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    result = await self._agent.run()
+                    result = await self._agent.run(request=message)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2128,9 +1906,8 @@ class AgentLoop:
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
-                    stream_cancelled = True
-                    logger.warning("Streaming cancelled while waiting for output")
-                    raise
+                    logger.warning("Streaming cancelled")
+                    break
                 except Exception as e:
                     logger.warning(f"Queue get error: {type(e).__name__}: {e}")
                     continue
@@ -2230,40 +2007,17 @@ class AgentLoop:
                 }
 
             # Emit done
-            stream_completed = True
             yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
 
-        except asyncio.CancelledError:
-            stream_cancelled = True
-            logger.warning("Streaming cancelled")
-            raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            stream_completed = True
             yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
-        finally:
-            self._restore_agent_think()
-            if bg_task is not None and not bg_task.done():
-                bg_task.cancel()
-                try:
-                    await asyncio.wait_for(bg_task, timeout=5.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                    pass
 
         # Save to session only if we got actual content
-        if full_content and stream_completed and not stream_cancelled:
+        if full_content:
             try:
-                save_kwargs: dict[str, Any] = {}
-                if media:
-                    save_kwargs["media"] = list(media)
-                if attachments:
-                    save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-                self._session.add_message(
-                    "user",
-                    _strip_attachment_context(message, attachments or []),
-                    **save_kwargs,
-                )
+                self._session.add_message("user", message)
                 self._session.add_message("assistant", full_content)
                 self.sessions.save(self._session)
             except Exception as e:
@@ -2274,6 +2028,7 @@ class AgentLoop:
         message: str,
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_key: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -2281,14 +2036,46 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Optional session key for multi-user/multi-channel isolation.
 
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
         """
+        # Switch session if requested
+        if session_key and session_key != self.session_key:
+            self.session_key = session_key
+            self._session = self.sessions.get_or_create(session_key)
+            logger.info(f"Switched to session: {session_key}")
+
         if not self._initialized:
             await self.initialize()
 
+        # Switch session if a different key is requested
+        if session_key and session_key != self.session_key:
+            self._session = self.sessions.get_or_create(session_key)
+            self.session_key = session_key
+            logger.debug(f"Switched to session: {session_key}")
+
+        self.set_subagent_context(session_key=self.session_key)
+
         logger.info(f"Processing message (with thinking): {message[:100]}...")
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if created is not None:
+            self._persist_turn(message, created)
+            return created, "Created persistent subagent from natural-language request."
+
+        routed = await self._maybe_route_to_persistent_specialist(message)
+        if routed is not None:
+            routed_content, route_note = routed
+            self._persist_turn(message, routed_content)
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
+            return routed_content, route_note
 
         # Refresh memory context
         try:
@@ -2300,26 +2087,17 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
-        runtime_message = self._build_runtime_message_content(
-            "user",
-            message,
-            media=media,
-            attachments=attachments,
-        )
-        if isinstance(runtime_message, str):
-            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
-        await self._agent.add_message("user", runtime_message)
 
         # Run agent with thinking enabled
         try:
-            run_kwargs: dict[str, Any] = {}
-            if self._callable_accepts_kwarg(self._agent.run, "thinking"):
-                run_kwargs["thinking"] = True
-            result = await self._agent.run(**run_kwargs)
+            run_kwargs: dict[str, Any] = {"thinking": True}
+            if media:
+                run_kwargs["media"] = media
+            result = await self._agent.run(message, **run_kwargs)
 
             # Extract content and thinking
             if hasattr(result, "content"):
@@ -2338,25 +2116,9 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             raise
-        finally:
-            self._restore_agent_think()
 
         # Save to session
-        try:
-            save_kwargs: dict[str, Any] = {}
-            if media:
-                save_kwargs["media"] = list(media)
-            if attachments:
-                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-            self._session.add_message(
-                "user",
-                _strip_attachment_context(message, attachments or []),
-                **save_kwargs,
-            )
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
-        except Exception as e:
-            logger.warning(f"Failed to save session: {e}")
+        self._persist_turn(message, final_content)
 
         # Auto-commit workspace changes
         if self._auto_commit and self._git:
@@ -2796,6 +2558,11 @@ class AgentLoop:
     def agent(self) -> SpoonReactMCP | SpoonReactSkill | None:
         """Access the underlying spoon-core agent."""
         return self._agent
+
+    @property
+    def subagent_manager(self) -> SubagentManager | None:
+        """Expose sub-agent manager for external access (e.g. slash commands)."""
+        return getattr(self, "_subagent_manager", None)
 
 
 async def create_agent(
