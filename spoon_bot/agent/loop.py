@@ -8,6 +8,7 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging as stdlib_logging
 from collections import Counter
@@ -1085,17 +1086,15 @@ class AgentLoop:
             attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
             if raw_attachments and len(attachments) != len(raw_attachments):
                 logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
-            content = _ensure_attachment_context(content, attachments)
-
-            add_kwargs: dict[str, Any] = {}
-            if media:
-                add_kwargs["media"] = media
+            content = self._build_runtime_message_content(
+                role,
+                content,
+                media=media,
+                attachments=attachments,
+            )
 
             try:
-                try:
-                    await self._agent.add_message(role, content, **add_kwargs)
-                except TypeError:
-                    await self._agent.add_message(role, content)
+                await self._agent.add_message(role, content)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -1117,6 +1116,19 @@ class AgentLoop:
             f"estimated_tokens~{estimated_tokens}, "
             f"trimmed_messages={trimmed_count}"
         )
+
+    def _build_runtime_message_content(
+        self,
+        role: str,
+        content: str,
+        media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Build message content in the format expected by spoon-core runtime memory."""
+        text_content = _ensure_attachment_context(content, attachments or [])
+        if role == "user" and media:
+            return self.context._build_user_content(text_content, media)
+        return text_content
 
     async def process(
         self,
@@ -1173,6 +1185,14 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
+        runtime_message = self._build_runtime_message_content(
+            "user",
+            message,
+            media=media,
+            attachments=attachments,
+        )
+        if isinstance(runtime_message, str):
+            message = runtime_message
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1181,17 +1201,22 @@ class AgentLoop:
 
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
+        await self._agent.add_message("user", runtime_message)
 
         # Run agent — with recovery for LLM API errors (context overflow, etc.)
         # Retry up to 2 times on ANY error, with increasingly aggressive compression.
         _max_retries = 2
+        retry_requires_runtime_message_check = False
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    run_kwargs: dict[str, Any] = {}
-                    if media:
-                        run_kwargs["media"] = media
-                    result = await self._agent.run(message, **run_kwargs)
+                    if (
+                        retry_requires_runtime_message_check
+                        and not self._recent_runtime_has_user_message_content(runtime_message)
+                    ):
+                        await self._agent.add_message("user", runtime_message)
+                    retry_requires_runtime_message_check = False
+                    result = await self._agent.run()
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1229,12 +1254,14 @@ class AgentLoop:
                     if _attempt < _max_retries:
                         logger.warning("Compressing context and retrying...")
                         # First retry: normal compression. Second: force-compress.
+                        compression_actions = 0
                         if _attempt == 0:
-                            compressed = self._compress_runtime_context()
-                            if compressed == 0:
-                                self._force_compress_runtime_context()
+                            compression_actions = self._compress_runtime_context()
+                            if compression_actions == 0:
+                                compression_actions += self._force_compress_runtime_context()
                         else:
-                            self._force_compress_runtime_context()
+                            compression_actions = self._force_compress_runtime_context()
+                        retry_requires_runtime_message_check = True
                         # Reset agent state so it can re-enter run()
                         if hasattr(self._agent, 'state'):
                             self._agent.state = AgentState.IDLE
@@ -1319,14 +1346,161 @@ class AgentLoop:
             logger.warning(f"Failed to extract content from agent memory: {exc}")
         return ""
 
-    @staticmethod
-    def _msg_char_count(msg) -> int:
+    @classmethod
+    def _serialize_message_content(cls, content: Any) -> Any:
+        """Convert message content into JSON-serializable Python objects."""
+        if content is None or isinstance(content, (str, int, float, bool)):
+            return content
+        if isinstance(content, list):
+            return [cls._serialize_message_content(item) for item in content]
+        if isinstance(content, dict):
+            return {
+                str(key): cls._serialize_message_content(value)
+                for key, value in content.items()
+            }
+        if hasattr(content, "model_dump"):
+            try:
+                dumped = content.model_dump(exclude_none=True)
+            except TypeError:
+                dumped = content.model_dump()
+            return cls._serialize_message_content(dumped)
+
+        extracted: dict[str, Any] = {}
+        for attr in (
+            "type",
+            "text",
+            "image_url",
+            "source",
+            "file_path",
+            "media_type",
+            "filename",
+            "name",
+            "url",
+            "detail",
+            "data",
+        ):
+            if hasattr(content, attr):
+                extracted[attr] = cls._serialize_message_content(getattr(content, attr))
+        if extracted:
+            return extracted
+        return str(content)
+
+    @classmethod
+    def _message_content_fingerprint(cls, content: Any) -> str:
+        """Create a stable string fingerprint for runtime content comparisons."""
+        serialized = cls._serialize_message_content(content)
+        if isinstance(serialized, str):
+            return f"str:{serialized}"
+        return json.dumps(serialized, sort_keys=True, ensure_ascii=True, default=str)
+
+    @classmethod
+    def _multimodal_content_summary(cls, content: list[Any], max_text_chars: int) -> str:
+        """Summarize multimodal content while dropping heavy binary payloads."""
+        serialized = cls._serialize_message_content(content)
+        if not isinstance(serialized, list):
+            text = str(serialized or "")
+            return text[:max_text_chars] if max_text_chars and len(text) > max_text_chars else text
+
+        text_parts: list[str] = []
+        image_count = 0
+        document_count = 0
+        file_refs: list[str] = []
+
+        for block in serialized:
+            if isinstance(block, dict):
+                block_type = str(block.get("type") or "")
+                if block_type == "text":
+                    text = str(block.get("text") or "")
+                    if text:
+                        text_parts.append(text)
+                    continue
+                if block_type in {"image", "image_url"}:
+                    image_count += 1
+                    continue
+                if block_type == "document":
+                    document_count += 1
+                    continue
+                if block_type == "file":
+                    file_path = str(block.get("file_path") or "")
+                    if file_path:
+                        file_refs.append(Path(file_path).name or file_path)
+                    continue
+            elif block:
+                text_parts.append(str(block))
+
+        text = "\n".join(part for part in text_parts if part).strip()
+        if max_text_chars and len(text) > max_text_chars:
+            text = text[:max_text_chars] + f"\n...[truncated {len(text) - max_text_chars} chars]"
+
+        summary_parts = [text] if text else []
+        if image_count:
+            summary_parts.append(f"[{image_count} image attachment(s) omitted during context compression]")
+        if document_count:
+            summary_parts.append(f"[{document_count} document attachment(s) omitted during context compression]")
+        if file_refs:
+            shown = ", ".join(file_refs[:3])
+            more = "" if len(file_refs) <= 3 else f" (+{len(file_refs) - 3} more)"
+            summary_parts.append(f"[File attachment reference(s): {shown}{more}]")
+        if not summary_parts:
+            summary_parts.append("[Multimodal content omitted during context compression]")
+        return "\n".join(summary_parts)
+
+    @classmethod
+    def _compress_message_content(cls, content: Any, max_chars: int) -> Any:
+        """Truncate text content and summarize multimodal content for recovery."""
+        if isinstance(content, str):
+            if len(content) <= max_chars:
+                return content
+            return content[:max_chars] + f"\n...[truncated {len(content) - max_chars} chars]"
+        if isinstance(content, list):
+            return cls._multimodal_content_summary(content, max_chars)
+        return content
+
+    @classmethod
+    def _message_content_char_count(cls, content: Any) -> int:
+        """Return an approximate character count for text and multimodal payloads."""
+        if content is None:
+            return 0
+        if isinstance(content, str):
+            return len(content)
+        if not isinstance(content, list):
+            return len(str(content))
+
+        total = 0
+        serialized = cls._serialize_message_content(content)
+        for block in serialized if isinstance(serialized, list) else [serialized]:
+            if isinstance(block, dict):
+                block_type = str(block.get("type") or "")
+                if block_type == "text":
+                    total += len(str(block.get("text") or ""))
+                    continue
+                if block_type == "image_url":
+                    total += len(str((block.get("image_url") or {}).get("url") or ""))
+                    continue
+                if block_type == "image":
+                    source = block.get("source") or {}
+                    total += len(str(source.get("media_type") or ""))
+                    total += len(str(source.get("data") or ""))
+                    continue
+                if block_type == "document":
+                    source = block.get("source") or {}
+                    total += len(str(source.get("media_type") or ""))
+                    total += len(str(source.get("data") or ""))
+                    total += len(str(block.get("filename") or ""))
+                    continue
+                if block_type == "file":
+                    total += len(str(block.get("file_path") or ""))
+                    total += len(str(block.get("media_type") or ""))
+                    continue
+                total += len(json.dumps(block, sort_keys=True, ensure_ascii=True, default=str))
+                continue
+            total += len(str(block))
+        return total
+
+    @classmethod
+    def _msg_char_count(cls, msg) -> int:
         """Return total character count of a message's content."""
-        if isinstance(msg.content, str):
-            return len(msg.content)
-        if isinstance(msg.content, list):
-            return sum(len(getattr(b, 'text', '')) for b in msg.content)
-        return 0
+        return cls._message_content_char_count(getattr(msg, "content", None))
 
     def _estimate_runtime_tokens(self) -> int:
         """Rough token estimate from the agent's runtime messages (~4 chars/token)."""
@@ -1343,6 +1517,52 @@ class AgentLoop:
             return False
         text = msg.content if isinstance(msg.content, str) else ''
         return text.startswith('[ORIGINAL USER REQUEST]') or text.startswith('Focus on the user')
+
+    def _recent_runtime_has_user_message_content(
+        self,
+        content: Any,
+        recent_messages: int = 10,
+    ) -> bool:
+        """Check whether recent runtime memory still contains the active user request."""
+        if not self._agent or not hasattr(self._agent, "memory"):
+            return False
+        messages = getattr(self._agent.memory, "messages", None)
+        if not isinstance(messages, list) or not messages:
+            return False
+
+        target = self._message_content_fingerprint(content)
+        for msg in reversed(messages[-recent_messages:]):
+            role = getattr(msg, "role", None)
+            role = role.value if hasattr(role, "value") else role
+            if role != "user":
+                continue
+            if self._is_next_step_user_msg(msg):
+                continue
+            if self._message_content_fingerprint(getattr(msg, "content", None)) == target:
+                return True
+        return False
+
+    @staticmethod
+    def _callable_accepts_kwarg(func: Any, kwarg: str) -> bool:
+        """Return True when *func* can accept *kwarg* as a keyword argument."""
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return False
+
+        if any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        ):
+            return True
+        param = signature.parameters.get(kwarg)
+        return bool(
+            param
+            and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        )
 
     @staticmethod
     def _repair_tool_pairing(messages: list) -> int:
@@ -1452,9 +1672,10 @@ class AgentLoop:
         max_content = 300
         for i in range(1, max(1, len(messages) - keep_tail)):
             msg = messages[i]
-            if isinstance(msg.content, str) and len(msg.content) > max_content:
-                orig = len(msg.content)
-                msg.content = msg.content[:max_content] + f"\n...[truncated {orig - max_content} chars]"
+            original_content = getattr(msg, "content", None)
+            compressed_content = self._compress_message_content(original_content, max_content)
+            if compressed_content != original_content:
+                msg.content = compressed_content
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
@@ -1497,8 +1718,10 @@ class AgentLoop:
 
         # Truncate ALL messages to 150 chars
         for msg in messages:
-            if isinstance(msg.content, str) and len(msg.content) > 150:
-                msg.content = msg.content[:150] + "\n...[force-truncated]"
+            original_content = getattr(msg, "content", None)
+            compressed_content = self._compress_message_content(original_content, 150)
+            if compressed_content != original_content:
+                msg.content = compressed_content
                 compressed += 1
 
         # Drop all but first + last 6 messages
@@ -1818,6 +2041,14 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
+        runtime_message = self._build_runtime_message_content(
+            "user",
+            message,
+            media=media,
+            attachments=attachments,
+        )
+        if isinstance(runtime_message, str):
+            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
@@ -1839,16 +2070,15 @@ class AgentLoop:
                 except (asyncio.TimeoutError, Exception):
                     break
 
+            await self._agent.add_message("user", runtime_message)
+
             # 2. Start run() in background
             run_result_text = ""
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    run_kwargs: dict[str, Any] = {"request": message}
-                    if media:
-                        run_kwargs["media"] = media
-                    result = await self._agent.run(**run_kwargs)
+                    result = await self._agent.run()
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2070,17 +2300,26 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
+        runtime_message = self._build_runtime_message_content(
+            "user",
+            message,
+            media=media,
+            attachments=attachments,
+        )
+        if isinstance(runtime_message, str):
+            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
+        await self._agent.add_message("user", runtime_message)
 
         # Run agent with thinking enabled
         try:
-            run_kwargs: dict[str, Any] = {"thinking": True}
-            if media:
-                run_kwargs["media"] = media
-            result = await self._agent.run(message, **run_kwargs)
+            run_kwargs: dict[str, Any] = {}
+            if self._callable_accepts_kwarg(self._agent.run, "thinking"):
+                run_kwargs["thinking"] = True
+            result = await self._agent.run(**run_kwargs)
 
             # Extract content and thinking
             if hasattr(result, "content"):
