@@ -763,7 +763,7 @@ class SubagentManager:
                     f"Persistent agent {agent_name!r} already exists. "
                     "Use resume_agent / spawn(action='resume') to reuse it."
                 )
-            if len(existing_names) >= self.max_persistent_agents:
+            if agent_name not in existing_names and len(existing_names) >= self.max_persistent_agents:
                 raise ValueError(
                     f"Max persistent agents ({self.max_persistent_agents}) reached."
                 )

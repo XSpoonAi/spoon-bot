@@ -1131,6 +1131,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         session_key: str | None = None,
     ) -> str:
         """
@@ -1230,7 +1231,10 @@ class AgentLoop:
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    result = await self._agent.run(message)
+                    run_kwargs: dict[str, Any] = {}
+                    if media:
+                        run_kwargs["media"] = media
+                    result = await self._agent.run(message, **run_kwargs)
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1791,6 +1795,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         thinking: bool = False,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
@@ -2022,6 +2027,7 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         session_key: str | None = None,
     ) -> tuple[str, str | None]:
         """
