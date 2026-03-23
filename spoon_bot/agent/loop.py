@@ -353,6 +353,7 @@ class AgentLoop:
 
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
+        self._last_response_source = self._build_response_source()
 
         active_count = len(self.tools)
         total_count = len(self.tools._tools)
@@ -360,6 +361,34 @@ class AgentLoop:
             f"AgentLoop created: model={model}, provider={provider}, "
             f"tools={active_count}/{total_count}, session={session_key}"
         )
+
+    @staticmethod
+    def _build_response_source(
+        *,
+        source_type: str = "agent",
+        subagent_id: str | None = None,
+        subagent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Build machine-readable metadata describing who produced a result."""
+        return {
+            "type": source_type,
+            "is_subagent": source_type == "subagent",
+            "subagent_id": subagent_id,
+            "subagent_name": subagent_name,
+        }
+
+    def _set_last_response_source(
+        self,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Store and return the latest result source metadata."""
+        resolved = dict(source or self._build_response_source())
+        self._last_response_source = resolved
+        return dict(resolved)
+
+    def get_last_response_source(self) -> dict[str, Any]:
+        """Return the latest result source metadata."""
+        return dict(getattr(self, "_last_response_source", self._build_response_source()))
 
     async def initialize(self) -> None:
         """Initialize spoon-core components."""
@@ -1060,10 +1089,10 @@ class AgentLoop:
         )
         return response
 
-    async def _maybe_route_to_persistent_specialist(
+    async def _maybe_route_to_persistent_specialist_result(
         self,
         message: str,
-    ) -> tuple[str, str | None] | None:
+    ) -> tuple[str, str | None, dict[str, Any]] | None:
         """Attempt to route a matching top-level request to a persistent subagent."""
         if self._should_skip_specialist_auto_route(message):
             return None
@@ -1105,9 +1134,22 @@ class AgentLoop:
                 f"Auto-routed to persistent subagent {agent_name} "
                 f"(score={matched['score']}; {reason_text})."
             )
-            return response, note
+            return (
+                response,
+                note,
+                self._build_response_source(
+                    source_type="subagent",
+                    subagent_id=record.agent_id,
+                    subagent_name=agent_name,
+                ),
+            )
 
         result = results[-1]
+        source = self._build_response_source(
+            source_type="subagent",
+            subagent_id=result.agent_id or record.agent_id,
+            subagent_name=agent_name,
+        )
         if result.state == SubagentState.COMPLETED:
             result_text = self._filter_execution_steps(result.result or "(no output)")
             response = f"Subagent `{agent_name}` handled this request.\n\n{result_text}"
@@ -1125,6 +1167,17 @@ class AgentLoop:
             f"Auto-routed to persistent subagent {agent_name} "
             f"(score={matched['score']}; {reason_text})."
         )
+        return response, note, source
+
+    async def _maybe_route_to_persistent_specialist(
+        self,
+        message: str,
+    ) -> tuple[str, str | None] | None:
+        """Backward-compatible wrapper without source metadata."""
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if routed is None:
+            return None
+        response, note, _source = routed
         return response, note
 
     async def process(
@@ -1146,6 +1199,8 @@ class AgentLoop:
         Returns:
             The agent's response text.
         """
+        AgentLoop._set_last_response_source(self)
+
         # Switch session if requested
         if session_key and session_key != self.session_key:
             self.session_key = session_key
@@ -1168,18 +1223,20 @@ class AgentLoop:
             self.session_key = session_key
             logger.debug(f"Switched to session: {session_key}")
 
-        self.set_subagent_context(session_key=self.session_key)
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(session_key=current_session_key)
 
         logger.info(f"Processing message: {message[:100]}...")
 
         created = self._maybe_create_persistent_subagent_from_request(message)
-        if created is not None:
+        if isinstance(created, str):
             self._persist_turn(message, created)
             return created
 
-        routed = await self._maybe_route_to_persistent_specialist(message)
-        if routed is not None:
-            routed_content, _route_note = routed
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, _route_note, route_source = routed
+            AgentLoop._set_last_response_source(self, route_source)
             self._persist_turn(message, routed_content)
             if self._auto_commit and self._git:
                 try:
@@ -1297,6 +1354,7 @@ class AgentLoop:
 
         # Save to session
         self._persist_turn(message, final_content)
+        AgentLoop._set_last_response_source(self)
 
         # Auto-commit workspace changes
         if self._auto_commit and self._git:
@@ -1811,11 +1869,57 @@ class AgentLoop:
               type:     "content" | "thinking" | "tool_call" | "tool_result" | "done"
               delta:    Incremental text (may be empty for non-text events)
               metadata: Extra context (tool name, args, step number, etc.)
+              source:   Machine-readable producer metadata for this output
         """
         if not self._initialized:
             await self.initialize()
 
+        current_source = AgentLoop._set_last_response_source(self)
         logger.info(f"Streaming message: {message[:100]}...")
+
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(session_key=current_session_key)
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            if created:
+                full_content = created
+                yield {
+                    "type": "content",
+                    "delta": created,
+                    "metadata": {"persistent_subagent_created": True},
+                    "source": current_source,
+                }
+                yield {
+                    "type": "done",
+                    "delta": "",
+                    "metadata": {"content": full_content},
+                    "source": current_source,
+                }
+                self._persist_turn(message, full_content)
+            return
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, _route_note, current_source = routed
+            AgentLoop._set_last_response_source(self, current_source)
+            full_content = routed_content or ""
+            if full_content:
+                yield {
+                    "type": "content",
+                    "delta": full_content,
+                    "metadata": {"auto_routed_to_subagent": True},
+                    "source": current_source,
+                }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": full_content},
+                "source": current_source,
+            }
+            if full_content:
+                self._persist_turn(message, full_content)
+            return
 
         # Refresh memory context
         try:
@@ -1939,6 +2043,7 @@ class AgentLoop:
                             "type": "error",
                             "delta": chunk.get("delta", ""),
                             "metadata": chunk.get("metadata", {}),
+                            "source": current_source,
                         }
                         continue
 
@@ -1963,6 +2068,7 @@ class AgentLoop:
                                     "name": fn_name,
                                     "arguments": fn_args,
                                 },
+                                "source": current_source,
                             }
                         continue
                     # Support both "content" and "delta" keys (#10)
@@ -1982,7 +2088,12 @@ class AgentLoop:
                     full_content += delta
 
                 if delta:
-                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+                    yield {
+                        "type": chunk_type,
+                        "delta": delta,
+                        "metadata": metadata,
+                        "source": current_source,
+                    }
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
 
@@ -2004,15 +2115,32 @@ class AgentLoop:
                     "type": "content",
                     "delta": run_result_text,
                     "metadata": {"fallback": "run_result_no_chunks"},
+                    "source": current_source,
                 }
 
             # Emit done
-            yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": full_content},
+                "source": current_source,
+            }
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
-            yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
+            current_source = AgentLoop.get_last_response_source(self)
+            yield {
+                "type": "error",
+                "delta": str(e),
+                "metadata": {"error": str(e)},
+                "source": current_source,
+            }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"error": str(e)},
+                "source": current_source,
+            }
 
         # Save to session only if we got actual content
         if full_content:
@@ -2041,6 +2169,8 @@ class AgentLoop:
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
         """
+        AgentLoop._set_last_response_source(self)
+
         # Switch session if requested
         if session_key and session_key != self.session_key:
             self.session_key = session_key
@@ -2056,18 +2186,20 @@ class AgentLoop:
             self.session_key = session_key
             logger.debug(f"Switched to session: {session_key}")
 
-        self.set_subagent_context(session_key=self.session_key)
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(session_key=current_session_key)
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
 
         created = self._maybe_create_persistent_subagent_from_request(message)
-        if created is not None:
+        if isinstance(created, str):
             self._persist_turn(message, created)
             return created, "Created persistent subagent from natural-language request."
 
-        routed = await self._maybe_route_to_persistent_specialist(message)
-        if routed is not None:
-            routed_content, route_note = routed
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, route_note, route_source = routed
+            AgentLoop._set_last_response_source(self, route_source)
             self._persist_turn(message, routed_content)
             if self._auto_commit and self._git:
                 try:
@@ -2119,6 +2251,7 @@ class AgentLoop:
 
         # Save to session
         self._persist_turn(message, final_content)
+        AgentLoop._set_last_response_source(self)
 
         # Auto-commit workspace changes
         if self._auto_commit and self._git:

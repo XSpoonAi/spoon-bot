@@ -80,6 +80,15 @@ class TranscriptionInfo(BaseModel):
     provider: str = "whisper"
 
 
+class ResponseSource(BaseModel):
+    """Machine-readable metadata describing who produced a response."""
+
+    type: str = "agent"
+    is_subagent: bool = False
+    subagent_id: str | None = None
+    subagent_name: str | None = None
+
+
 class ChatResponse(BaseModel):
     """Chat response model."""
 
@@ -88,6 +97,7 @@ class ChatResponse(BaseModel):
     usage: UsageInfo | None = None
     thinking_content: str | None = None
     transcription: TranscriptionInfo | None = None
+    source: ResponseSource | None = None
 
 
 class StreamChunk(BaseModel):
@@ -96,6 +106,7 @@ class StreamChunk(BaseModel):
     type: str  # "content", "thinking", "tool_call", "done"
     delta: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+    source: ResponseSource | None = None
 
 
 class SessionInfo(BaseModel):

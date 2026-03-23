@@ -9,6 +9,7 @@ Based on: docs/plans/2025-02-05-spoon-bot-api-design.md
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from collections import defaultdict
@@ -272,6 +273,31 @@ def _switch_agent_session(agent, session_key: str | None) -> None:
             agent.session_key = session_key
         except Exception:
             pass  # Gracefully degrade
+
+
+def _get_agent_response_source(agent) -> dict[str, Any]:
+    """Read machine-readable response source metadata from the agent."""
+    getter = getattr(agent, "get_last_response_source", None)
+    if callable(getter) and not inspect.iscoroutinefunction(getter):
+        try:
+            raw = getter()
+            if inspect.isawaitable(raw):
+                return {
+                    "type": "agent",
+                    "is_subagent": False,
+                    "subagent_id": None,
+                    "subagent_name": None,
+                }
+            if isinstance(raw, dict):
+                return dict(raw)
+        except Exception:
+            pass
+    return {
+        "type": "agent",
+        "is_subagent": False,
+        "subagent_id": None,
+        "subagent_name": None,
+    }
 
 
 async def websocket_endpoint(
@@ -605,6 +631,7 @@ class WebSocketHandler:
                             # Support both "delta" and "content" keys (#10)
                             delta = chunk_data.get("delta", "") or chunk_data.get("content", "")
                             metadata = chunk_data.get("metadata", {})
+                            source = chunk_data.get("source") or _get_agent_response_source(agent)
 
                             # Detect error chunks and propagate as agent.error event
                             if chunk_type == "error":
@@ -619,6 +646,7 @@ class WebSocketHandler:
                                             "code": metadata.get("error_code", "AGENT_RUNTIME_ERROR"),
                                             "message": delta,
                                         },
+                                        "source": source,
                                     }),
                                 )
                                 continue
@@ -639,6 +667,7 @@ class WebSocketHandler:
                                             "delta": done_content,
                                             "metadata": {"fallback": "done_metadata_content"},
                                             "trace_id": trace_id,
+                                            "source": source,
                                         }),
                                     )
 
@@ -650,6 +679,7 @@ class WebSocketHandler:
                                         "content": full_content,
                                         "trace_id": trace_id,
                                         "timing": build_timing_payload(span),
+                                        "source": source,
                                     }),
                                 )
                             else:
@@ -666,6 +696,7 @@ class WebSocketHandler:
                                             "delta": delta,
                                             "metadata": metadata,
                                             "trace_id": trace_id,
+                                            "source": source,
                                         }),
                                     )
 
@@ -679,6 +710,7 @@ class WebSocketHandler:
                             thinking_content = None
                         check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
+            response_source = _get_agent_response_source(agent)
             # Emit complete event
             span.stop()
             timing = build_timing_payload(span)
@@ -688,6 +720,7 @@ class WebSocketHandler:
                 "response": response[:200] if isinstance(response, str) else str(response)[:200],
                 "trace_id": trace_id,
                 "timing": timing,
+                "source": response_source,
             }
             if not stream and thinking and thinking_content:
                 complete_data["thinking_content"] = thinking_content
@@ -704,6 +737,7 @@ class WebSocketHandler:
                 "session_key": session_key,
                 "trace_id": trace_id,
                 "timing": timing,
+                "source": response_source,
             }
             if not stream and thinking and thinking_content:
                 result["thinking_content"] = thinking_content
@@ -726,6 +760,7 @@ class WebSocketHandler:
                             "elapsed_ms": exc.elapsed_ms,
                             "limit_ms": exc.limit_ms,
                         },
+                        "source": _get_agent_response_source(agent),
                     },
                 ),
             )
@@ -746,6 +781,7 @@ class WebSocketHandler:
                         "trace_id": trace_id,
                         "timing": build_timing_payload(span),
                         "error": timeout_detail.model_dump(),
+                        "source": _get_agent_response_source(agent),
                     },
                 ),
             )
