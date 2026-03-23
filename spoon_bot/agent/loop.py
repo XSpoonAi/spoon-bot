@@ -2091,7 +2091,10 @@ class AgentLoop:
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    result = await self._agent.run()
+                    run_kwargs: dict[str, Any] = {}
+                    if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
+                        run_kwargs["thinking"] = True
+                    result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2121,14 +2124,27 @@ class AgentLoop:
             oq = self._agent.output_queue
             td = self._agent.task_done
             logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
-            stream_timeout = 120.0
+            stream_timeout = 600.0 if thinking else 300.0
             deadline = asyncio.get_event_loop().time() + stream_timeout
             chunk_count = 0
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
             while not (td.is_set() and oq.empty()):
                 if asyncio.get_event_loop().time() > deadline:
-                    logger.warning("Streaming deadline reached, stopping")
+                    logger.warning(
+                        f"Streaming deadline reached ({stream_timeout}s), "
+                        f"stopping after {chunk_count} chunks"
+                    )
+                    yield {
+                        "type": "error",
+                        "delta": f"Stream timeout after {int(stream_timeout)}s",
+                        "metadata": {
+                            "error": "STREAM_TIMEOUT",
+                            "error_code": "STREAM_TIMEOUT",
+                            "timeout_seconds": stream_timeout,
+                            "chunks_received": chunk_count,
+                        },
+                    }
                     break
 
                 try:
