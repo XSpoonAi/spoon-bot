@@ -22,6 +22,9 @@ class MessageBus:
     - Handler registration
     - Channel routing
     - Error handling
+    - **Latest-wins per session**: when a new message arrives for a session
+      that already has an in-flight or queued message, the older message is
+      cancelled/skipped and only the newest message is processed.
     """
 
     def __init__(self, max_queue_size: int = 100, max_concurrency: int = 4):
@@ -40,6 +43,21 @@ class MessageBus:
         self._max_concurrency = max_concurrency
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._active_tasks: set[asyncio.Task] = set()
+
+        # Message coalescing: when multiple messages arrive for the same
+        # session before processing begins, they are merged into a single
+        # message so the agent sees the full context (e.g. a follow-up
+        # clarification is kept together with the original request).
+        # If a task is already in-flight, it is cancelled and the new
+        # (merged) message is processed instead.
+        self._seq_counter: int = 0
+        self._latest_seq: dict[str, int] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_tasks: dict[str, asyncio.Task] = {}
+        # Per-session accumulator: messages are buffered here on publish()
+        # and drained at processing time so that all pending messages for a
+        # session are coalesced into one.
+        self._session_buffer: dict[str, list[InboundMessage]] = {}
 
     def set_handler(self, handler: MessageHandler) -> None:
         """
@@ -74,12 +92,39 @@ class MessageBus:
         would freeze the channel's event handler (e.g. Discord gateway
         heartbeats), potentially causing a disconnect.
 
+        **Message coalescing**: the message is added to a per-session
+        buffer *and* enqueued.  When processing starts, all buffered
+        messages for the session are merged into one so the agent sees
+        the full context (follow-ups, corrections, etc.).  If a task is
+        already running for this session, it is cancelled and the new
+        (coalesced) message takes over.
+
         Args:
             message: Inbound message from a channel.
 
         Returns:
             True if the message was enqueued, False if the queue is full.
         """
+        # Assign a sequence number for ordering
+        self._seq_counter += 1
+        message._bus_seq = self._seq_counter
+        session_key = message.session_key or message.channel
+        self._latest_seq[session_key] = self._seq_counter
+
+        # Accumulate in per-session buffer for coalescing at processing time
+        self._session_buffer.setdefault(session_key, []).append(message)
+
+        # Cancel the currently running task for this session (if any).
+        # The cancelled task will release its session lock, allowing the
+        # new (coalesced) message to proceed once it is dequeued.
+        existing_task = self._session_tasks.get(session_key)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+            logger.info(
+                f"Cancelling in-flight task for session {session_key} — "
+                f"newer message arrived: {message.content[:50]}..."
+            )
+
         try:
             self._queue.put_nowait(message)
             logger.debug(f"Published message from {message.channel}: {message.content[:50]}...")
@@ -110,6 +155,9 @@ class MessageBus:
                 else:
                     logger.warning(f"No outbound handler for channel: {target_channel}")
 
+        except asyncio.CancelledError:
+            # Let CancelledError propagate — the caller handles it.
+            raise
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             # Send error response to ensure channel cleanup (typing, reactions).
@@ -129,11 +177,132 @@ class MessageBus:
                 except Exception as send_err:
                     logger.error(f"Failed to send error response: {send_err}")
 
+    def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        """Return (or create) a per-session lock for serialised processing."""
+        lock = self._session_locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_key] = lock
+        return lock
+
+    @staticmethod
+    def _coalesce_messages(messages: list[InboundMessage]) -> InboundMessage:
+        """Merge a list of messages into one, preserving the latest metadata.
+
+        The content of all messages is joined with newlines so the agent
+        sees the full context.  Media attachments are concatenated.  All
+        other fields (channel, session_key, metadata, …) are taken from
+        the **last** message since it is the most recent user intent.
+        """
+        if len(messages) == 1:
+            return messages[0]
+
+        base = messages[-1]  # newest message is the base
+        merged_content = "\n".join(m.content for m in messages)
+
+        # Merge media from all messages (deduplicated, order preserved)
+        seen: set[str] = set()
+        merged_media: list[str] = []
+        for m in messages:
+            for path in m.media:
+                if path not in seen:
+                    seen.add(path)
+                    merged_media.append(path)
+
+        # Build the coalesced message from the newest, replacing content/media
+        coalesced = InboundMessage(
+            content=merged_content,
+            channel=base.channel,
+            session_key=base.session_key,
+            sender_id=base.sender_id,
+            sender_name=base.sender_name,
+            message_id=base.message_id,
+            timestamp=base.timestamp,
+            media=merged_media,
+            metadata=base.metadata.copy() if base.metadata else {},
+        )
+        coalesced._bus_seq = base._bus_seq
+        return coalesced
+
     async def _process_with_semaphore(self, message: InboundMessage) -> None:
-        """Process a single message under the concurrency semaphore."""
+        """Process a single message under the concurrency semaphore.
+
+        **Per-session serialisation**: messages belonging to the same
+        ``session_key`` are processed one at a time via a per-session lock
+        so that a fast second message cannot run concurrently with the
+        first.
+
+        **Message coalescing**: before starting actual work, all pending
+        messages for this session are drained from ``_session_buffer``
+        and merged into one.  This means follow-up messages ("also use
+        TypeScript") are kept together with the original request.
+
+        If this trigger message is not the latest for its session (i.e.
+        a newer trigger was already enqueued), it yields to the newer
+        trigger which will perform the coalescing instead.
+
+        **Cancellation-safe**: if this task is cancelled (because a newer
+        message triggered cancellation via ``publish()``), the session
+        lock and semaphore are properly released and the queue bookkeeping
+        is maintained.
+        """
+        session_key = message.session_key or message.channel
+        session_lock = self._get_session_lock(session_key)
+
         try:
-            async with self._semaphore:
-                await self._process_message(message)
+            # Acquire per-session lock first (no semaphore slot consumed
+            # while waiting, so other sessions are not starved).
+            async with session_lock:
+                # Only the trigger with the highest seq should coalesce
+                # and process.  Earlier triggers for the same session
+                # exit here — the latest trigger will pick up all
+                # buffered messages.
+                msg_seq = message._bus_seq
+                latest = self._latest_seq.get(session_key, 0)
+                if msg_seq < latest:
+                    logger.info(
+                        f"Skipping earlier trigger (seq={msg_seq}, "
+                        f"latest={latest}) for session {session_key}"
+                    )
+                    return
+
+                # Drain the per-session buffer and coalesce
+                buffered = self._session_buffer.pop(session_key, [])
+                if buffered:
+                    message = self._coalesce_messages(buffered)
+                    if len(buffered) > 1:
+                        logger.info(
+                            f"Coalesced {len(buffered)} messages for "
+                            f"session {session_key}"
+                        )
+
+                # Register as the active task for this session
+                current_task = asyncio.current_task()
+                self._session_tasks[session_key] = current_task  # type: ignore[assignment]
+
+                try:
+                    async with self._semaphore:
+                        await self._process_message(message)
+                except asyncio.CancelledError:
+                    logger.info(
+                        f"Task cancelled for session {session_key}: "
+                        f"{message.content[:50]}..."
+                    )
+                    # Do NOT re-raise inside the session_lock context —
+                    # we want to release the lock cleanly so the next
+                    # message can proceed.
+                    return
+                finally:
+                    # Only clear if we are still the registered task
+                    if self._session_tasks.get(session_key) is current_task:
+                        self._session_tasks.pop(session_key, None)
+        except asyncio.CancelledError:
+            # Cancelled while waiting for the session lock — nothing to
+            # clean up, just exit silently.
+            logger.debug(
+                f"Task cancelled while waiting for lock, "
+                f"session {session_key}: {message.content[:50]}..."
+            )
         finally:
             self._queue.task_done()
 
