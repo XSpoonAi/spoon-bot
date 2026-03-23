@@ -319,7 +319,7 @@ class AgentLoop:
         api_key: str | None = None,
         base_url: str | None = None,
         max_iterations: int = 50,
-        shell_timeout: int = 90,
+        shell_timeout: int = 3600,
         max_output: int = 10000,
         session_key: str = "default",
         skill_paths: list[Path | str] | None = None,
@@ -672,8 +672,9 @@ class AgentLoop:
         # Initialize agent
         await self._agent.initialize()
 
-        # Increase default step timeout — on-chain txs (cast send) can take 60s+
-        self._agent._default_timeout = 300.0
+        # Keep the agent's per-step timeout aligned with the configured shell timeout
+        # so long-running commands are not cancelled prematurely by the outer loop.
+        self._agent._default_timeout = max(300.0, float(self.shell_timeout))
 
         self._initialized = True
         active_count = len(self.tools.get_active_tools())

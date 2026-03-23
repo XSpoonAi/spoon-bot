@@ -373,7 +373,7 @@ class AgentLoopConfig(BaseModel):
         description="Maximum tool call iterations (1-100)"
     )
     shell_timeout: int = Field(
-        default=60,
+        default=3600,
         ge=1,
         le=3600,
         description="Shell command timeout in seconds (1-3600)"
@@ -578,7 +578,7 @@ class SpoonBotSettings(BaseSettings):
         description="Default max iterations"
     )
     shell_timeout: int = Field(
-        default=60,
+        default=3600,
         ge=1,
         le=3600,
         description="Default shell timeout"
@@ -666,7 +666,7 @@ def validate_agent_loop_params(
     workspace: Path | str | None = None,
     model: str | None = None,
     max_iterations: int = 20,
-    shell_timeout: int = 60,
+    shell_timeout: int = 3600,
     max_output: int = 10000,
     session_key: str = "default",
     skill_paths: list[Path | str] | None = None,

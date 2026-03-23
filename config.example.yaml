@@ -24,7 +24,7 @@ agent:
   #   filesystem:
   #     command: "npx"
   #     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
-  # shell_timeout: 60
+  # shell_timeout: 3600
   # max_output: 10000
   # context_window: 200000
   # auto_reload: false          # Watch skill paths & config for changes, auto-reload
