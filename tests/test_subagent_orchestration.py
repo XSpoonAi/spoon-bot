@@ -895,9 +895,30 @@ async def test_resume_agent_uses_persistent_profile_when_runtime_record_missing(
     record = await manager.resume_agent(
         agent_name="news-subagent",
         task="Please summarize today's news",
+        parent_id="sub_parent_restored",
     )
 
     assert record.agent_name == "news-subagent"
     assert spawned
     assert spawned[0][1] is not None
     assert spawned[0][1].spawn_mode == SpawnMode.SESSION
+    assert record.parent_id == "sub_parent_restored"
+
+
+def test_create_persistent_subagent_enforces_cap(workspace_dir):
+    manager = SubagentManager(
+        session_manager=SessionManager(workspace=workspace_dir),
+        workspace=workspace_dir,
+        max_persistent_agents=1,
+    )
+
+    manager.create_persistent_subagent(
+        description="summarize today's news",
+        agent_name="news-subagent",
+    )
+
+    with pytest.raises(ValueError, match="Max persistent agents"):
+        manager.create_persistent_subagent(
+            description="handle literature search and paper summaries",
+            agent_name="research-subagent",
+        )

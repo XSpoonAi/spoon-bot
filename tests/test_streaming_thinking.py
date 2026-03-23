@@ -497,6 +497,57 @@ class TestAgentLoopStream:
         assert content_chunks[0]["delta"] == "Result"
 
     @pytest.mark.asyncio
+    async def test_stream_forwards_media_and_attachments_to_run(self):
+        """stream() should pass media and attachments through to the underlying run call."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        seen_kwargs: dict[str, Any] = {}
+
+        queue: asyncio.Queue = asyncio.Queue()
+        task_done = asyncio.Event()
+
+        async def run(**kwargs):
+            seen_kwargs.update(kwargs)
+            await queue.put("hello")
+            return MagicMock(content="hello")
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.run = AsyncMock(side_effect=run)
+        agent._agent.output_queue = queue
+        agent._agent.task_done = task_done
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent.set_subagent_context = MagicMock()
+
+        media = ["/workspace/uploads/demo.png"]
+        attachments = [{"uri": "/workspace/uploads/demo.txt", "name": "demo.txt"}]
+
+        chunks = []
+        async for chunk in AgentLoop.stream(
+            agent,
+            message="test",
+            media=media,
+            attachments=attachments,
+        ):
+            chunks.append(chunk)
+
+        assert any(chunk["type"] == "content" for chunk in chunks)
+        assert seen_kwargs["request"] == "test"
+        assert seen_kwargs["media"] == media
+        assert seen_kwargs["attachments"] == attachments
+
+    @pytest.mark.asyncio
     async def test_stream_error_handling(self):
         """stream() should catch errors and emit done with error metadata."""
         from spoon_bot.agent.loop import AgentLoop

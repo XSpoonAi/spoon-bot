@@ -1963,7 +1963,12 @@ class AgentLoop:
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    result = await self._agent.run(request=message)
+                    run_kwargs: dict[str, Any] = {"request": message}
+                    if media:
+                        run_kwargs["media"] = media
+                    if attachments:
+                        run_kwargs["attachments"] = attachments
+                    result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):

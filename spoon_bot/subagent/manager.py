@@ -1088,6 +1088,7 @@ class SubagentManager:
                     task=task,
                     label=task[:60],
                     config=profile.to_subagent_config(),
+                    parent_id=parent_id,
                     spawner_session_key=spawner_session_key,
                     spawner_channel=spawner_channel,
                     spawner_metadata=spawner_metadata,
@@ -1250,6 +1251,18 @@ class SubagentManager:
             cfg.match_keywords = list(profile["match_keywords"])
         if not cfg.match_examples:
             cfg.match_examples = list(profile["match_examples"])
+
+        existing_names = self._persistent_agent_names()
+        if agent_name:
+            normalized_name = agent_name.strip()
+            if normalized_name and normalized_name not in existing_names and len(existing_names) >= self.max_persistent_agents:
+                raise ValueError(
+                    f"Max persistent agents ({self.max_persistent_agents}) reached."
+                )
+        elif len(existing_names) >= self.max_persistent_agents:
+            raise ValueError(
+                f"Max persistent agents ({self.max_persistent_agents}) reached."
+            )
 
         chosen_name = self._allocate_persistent_agent_name(
             agent_name or profile["suggested_name"]
