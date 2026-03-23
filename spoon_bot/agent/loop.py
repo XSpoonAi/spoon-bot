@@ -337,6 +337,7 @@ class AgentLoop:
         auto_reload: bool = False,
         auto_reload_interval: float = 5.0,
         config_path: Path | str | None = None,
+        yolo_mode: bool = False,
     ) -> None:
         """
         Initialize the agent loop.
@@ -362,6 +363,7 @@ class AgentLoop:
             session_store_dsn: PostgreSQL DSN for 'postgres' backend.
             session_store_db_path: SQLite DB path for 'sqlite' backend.
             context_window: Override context window in tokens (auto-resolved from model if None).
+            yolo_mode: Operate directly in user's path without sandbox isolation.
         """
         # Validate parameters
         try:
@@ -374,6 +376,7 @@ class AgentLoop:
                 session_key=session_key,
                 skill_paths=skill_paths,
                 mcp_config=mcp_config,
+                yolo_mode=yolo_mode,
             )
         except Exception as e:
             logger.error(f"Configuration validation failed: {e}")
@@ -381,6 +384,7 @@ class AgentLoop:
 
         # Store config — callers must provide model/provider explicitly
         self.workspace = self._config.workspace
+        self.yolo_mode = self._config.yolo_mode
         self.model = model
         self.provider = provider
         self.api_key = api_key
@@ -405,8 +409,11 @@ class AgentLoop:
         self._mcp_tools: list[MCPTool] = []
 
         # spoon-bot components
-        self.context = ContextBuilder(self.workspace)
+        self.context = ContextBuilder(self.workspace, yolo_mode=self.yolo_mode)
         self.tools = ToolRegistry()
+
+        if self.yolo_mode:
+            logger.info(f"YOLO mode enabled — operating directly in: {self.workspace}")
 
         # Session persistence — configurable backend
         _store_backend = session_store_backend or "file"
@@ -712,7 +719,12 @@ class AgentLoop:
         # skill-managed data (e.g. ~/.agent-wallet, ~/.spoon-bot/skills) is
         # accessible.  The PathValidator blocklist still blocks truly sensitive
         # paths (.ssh, .aws, etc.).
-        _extra_read = [Path.home()]
+        #
+        # In YOLO mode the workspace IS the user's directory, so we add its
+        # parents as extra read paths to let the agent navigate freely.
+        _extra_read: list[Path] = [Path.home()]
+        if self.yolo_mode:
+            _extra_read.extend(p for p in self.workspace.parents if p != Path.home())
         self.tools.register(ReadFileTool(workspace=self.workspace, additional_read_paths=_extra_read, max_output=15000))
         self.tools.register(WriteFileTool(workspace=self.workspace))
         self.tools.register(EditFileTool(workspace=self.workspace))
@@ -2815,6 +2827,7 @@ async def create_agent(
     auto_reload: bool = False,
     auto_reload_interval: float = 5.0,
     config_path: Path | str | None = None,
+    yolo_mode: bool = False,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -2839,6 +2852,7 @@ async def create_agent(
         auto_commit: Whether to auto-commit workspace changes after each message.
         enabled_tools: Explicit set of tool names to enable. None = core only.
         tool_profile: Named profile ('core', 'coding', 'web3', 'research', 'full').
+        yolo_mode: Operate directly in user's path without sandbox isolation.
         **kwargs: Additional arguments for AgentLoop.
 
     Returns:
@@ -2851,9 +2865,8 @@ async def create_agent(
         >>> # Load all tools
         >>> agent = await create_agent(tool_profile="full")
 
-        >>> # Dynamically add a tool after creation
-        >>> agent = await create_agent()
-        >>> agent.add_tool("web_search")
+        >>> # YOLO mode — work in /home/user/project directly
+        >>> agent = await create_agent(yolo_mode=True, workspace="/home/user/project")
     """
     agent = AgentLoop(
         model=model,
@@ -2871,6 +2884,7 @@ async def create_agent(
         auto_reload=auto_reload,
         auto_reload_interval=auto_reload_interval,
         config_path=config_path,
+        yolo_mode=yolo_mode,
         **kwargs,
     )
 

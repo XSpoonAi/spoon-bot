@@ -59,10 +59,16 @@ class _PathLockManager:
 
 
 class WorkspaceFSService:
-    """Implement sandbox filesystem RPCs against the runtime workspace."""
+    """Implement sandbox filesystem RPCs against the runtime workspace.
 
-    def __init__(self, workspace_root: Path) -> None:
+    When *yolo_mode* is ``True`` the service operates directly on the user's
+    filesystem without the ``/workspace`` sandbox prefix rewriting.  All paths
+    are resolved relative to the configured workspace root.
+    """
+
+    def __init__(self, workspace_root: Path, *, yolo_mode: bool = False) -> None:
         self._workspace_root = workspace_root.resolve()
+        self._yolo_mode = yolo_mode
         self._path_locks = _PathLockManager()
 
     def _canonical(self, path: str) -> str:
@@ -341,6 +347,10 @@ class WorkspaceFSService:
 
     def _resolve_path(self, requested_path: str) -> tuple[Path, str]:
         raw_path = str(requested_path or "").strip()
+
+        if self._yolo_mode:
+            return self._resolve_path_yolo(raw_path)
+
         if raw_path == "" or raw_path == SANDBOX_WORKSPACE_ROOT:
             target = self._workspace_root
         elif raw_path.startswith("/"):
@@ -354,6 +364,29 @@ class WorkspaceFSService:
             else:
                 relative = normalized[len(sandbox_root):].lstrip("/")
             target = (self._workspace_root / relative).resolve(strict=False)
+        else:
+            target = (self._workspace_root / raw_path).resolve(strict=False)
+
+        if not self._is_within_workspace(target):
+            raise ValueError("Path is outside workspace boundary")
+        return target, self._sandbox_path(target)
+
+    def _resolve_path_yolo(self, raw_path: str) -> tuple[Path, str]:
+        """Resolve a path in YOLO mode — no sandbox prefix rewriting."""
+        if raw_path == "" or raw_path == SANDBOX_WORKSPACE_ROOT:
+            target = self._workspace_root
+        elif raw_path.startswith("/"):
+            candidate = Path(raw_path).resolve(strict=False)
+            if self._is_within_workspace(candidate):
+                target = candidate
+            else:
+                normalized = Path(raw_path).as_posix()
+                sandbox_root = SANDBOX_WORKSPACE_ROOT.rstrip("/")
+                if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                    relative = normalized[len(sandbox_root):].lstrip("/")
+                    target = (self._workspace_root / relative).resolve(strict=False)
+                else:
+                    raise ValueError("Path is outside workspace boundary")
         else:
             target = (self._workspace_root / raw_path).resolve(strict=False)
 

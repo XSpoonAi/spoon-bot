@@ -16,6 +16,10 @@ agent:
   workspace: "~/.spoon-bot/workspace"
   max_iterations: 20
   tool_profile: "core"  # Options: core, coding, web3, research, full
+  # yolo_mode: false     # YOLO mode: work directly in `workspace` path
+                          # instead of a sandboxed directory.  The agent
+                          # reads/writes/executes against your real filesystem.
+                          # Enable via config or env: SPOON_BOT_YOLO_MODE=true
   # enabled_tools:        # Optional fine-grained override
   #   - shell
   #   - read_file
