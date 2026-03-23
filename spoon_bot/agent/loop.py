@@ -1614,7 +1614,8 @@ class AgentLoop:
             return
 
         agent_loop = self
-        original_think = agent.think
+        original_think = getattr(agent, '_spoon_bot_base_think', agent.think)
+        agent._spoon_bot_base_think = original_think
         call_tracker: Counter = Counter()
         detail_tracker: Counter = Counter()
         read_files: set = set()
@@ -1922,6 +1923,8 @@ class AgentLoop:
             return
 
         # Refresh memory context
+        bg_task: asyncio.Task | None = None
+
         try:
             memory_context = self.memory.get_memory_context()
             if memory_context:
@@ -2141,6 +2144,15 @@ class AgentLoop:
                 "metadata": {"error": str(e)},
                 "source": current_source,
             }
+        finally:
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
+                try:
+                    await bg_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
 
         # Save to session only if we got actual content
         if full_content:
