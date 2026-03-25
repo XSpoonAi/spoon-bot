@@ -300,6 +300,9 @@ class AgentLoop:
                 parent_provider=provider,
                 parent_api_key=api_key,
                 parent_base_url=base_url,
+                parent_enable_skills=enable_skills,
+                default_model=self._config.subagent.default_model,
+                default_tool_profile=self._config.subagent.default_tool_profile,
                 persist_runs=self._config.subagent.persist_runs,
                 persist_file=self._config.subagent.persist_file,
                 archive_after_minutes=self._config.subagent.archive_after_minutes,
@@ -1038,13 +1041,29 @@ class AgentLoop:
         *,
         session_key: str | None = None,
         channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> None:
         """Bind the spawn tool to the current requester session/channel."""
-        spawn_tool = self.tools.get("spawn")
+        registry = getattr(self, "tools", None)
+        if registry is None:
+            return
+        spawn_tool = registry.get("spawn")
         if spawn_tool and isinstance(spawn_tool, SubagentTool):
+            bound_channel = channel
+            if bound_channel is None:
+                bound_channel = getattr(spawn_tool, "_spawner_channel", None)
+            bound_metadata = metadata
+            if bound_metadata is None:
+                bound_metadata = getattr(spawn_tool, "_spawner_metadata", {})
+            bound_reply_to = reply_to
+            if bound_reply_to is None:
+                bound_reply_to = getattr(spawn_tool, "_spawner_reply_to", None)
             spawn_tool.set_spawner_context(
                 session_key=session_key or self.session_key,
-                channel=channel,
+                channel=bound_channel,
+                metadata=bound_metadata,
+                reply_to=bound_reply_to,
             )
 
     def _persist_turn(self, user_message: str, assistant_message: str) -> None:
@@ -1124,6 +1143,7 @@ class AgentLoop:
             timeout=wait_timeout,
             spawner_session_key=self.session_key,
             agent_id=record.agent_id,
+            run_id=record.run_id,
         )
         if not results:
             response = (
@@ -2174,6 +2194,7 @@ class AgentLoop:
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         session_key: str | None = None,
+        thinking_level: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -2243,10 +2264,40 @@ class AgentLoop:
 
         # Run agent with thinking enabled
         try:
-            run_kwargs: dict[str, Any] = {"thinking": True}
+            run_kwargs: dict[str, Any] = {}
             if media:
                 run_kwargs["media"] = media
-            result = await self._agent.run(message, **run_kwargs)
+            requested_thinking = thinking_level or True
+            try:
+                result = await self._agent.run(
+                    message,
+                    thinking=requested_thinking,
+                    **run_kwargs,
+                )
+            except TypeError as exc:
+                if "thinking" not in str(exc):
+                    raise
+                if requested_thinking is not True:
+                    try:
+                        result = await self._agent.run(
+                            message,
+                            thinking=True,
+                            **run_kwargs,
+                        )
+                    except TypeError as nested_exc:
+                        if "thinking" not in str(nested_exc):
+                            raise
+                        logger.warning(
+                            "Agent runtime does not support explicit thinking mode; "
+                            "falling back to a standard run."
+                        )
+                        result = await self._agent.run(message, **run_kwargs)
+                else:
+                    logger.warning(
+                        "Agent runtime does not support explicit thinking mode; "
+                        "falling back to a standard run."
+                    )
+                    result = await self._agent.run(message, **run_kwargs)
 
             # Extract content and thinking
             if hasattr(result, "content"):
