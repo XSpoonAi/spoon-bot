@@ -113,6 +113,15 @@ ENV SPOON_BOT_LOG_LEVEL=INFO
 # --- Workspace ---
 ENV SPOON_BOT_WORKSPACE_PATH=/data/workspace
 
+# --- YOLO Mode ---
+# When true, the agent operates directly in the user-mounted path
+# instead of the sandboxed /data/workspace.  Mount your host directory
+# to SPOON_BOT_WORKSPACE_PATH and set YOLO_MODE to activate.
+#   docker run -v /home/user/project:/project \
+#     -e SPOON_BOT_YOLO_MODE=true \
+#     -e SPOON_BOT_WORKSPACE_PATH=/project ...
+ENV SPOON_BOT_YOLO_MODE=false
+
 # Create workspace directory with correct ownership
 RUN mkdir -p /data/workspace/memory /data/workspace/skills \
     && chown -R spoonbot:spoonbot /data /app

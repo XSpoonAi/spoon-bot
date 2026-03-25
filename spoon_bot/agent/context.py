@@ -22,14 +22,17 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     SANDBOX_WORKSPACE_ROOT = "/workspace"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, yolo_mode: bool = False):
         """
         Initialize context builder.
 
         Args:
             workspace: Path to the workspace directory.
+            yolo_mode: When True, the agent operates directly in the user's
+                       filesystem path without sandbox isolation.
         """
         self.workspace = Path(workspace).expanduser().resolve()
+        self.yolo_mode = yolo_mode
         self._memory_context: str = ""
         self._skills_summary: str = ""
         self._skill_context: str = ""
@@ -98,12 +101,20 @@ class ContextBuilder:
         else:
             shell_path = display_path
 
+        yolo_banner = ""
+        if self.yolo_mode:
+            yolo_banner = (
+                "\n**YOLO MODE ACTIVE** — You are operating directly on the "
+                "user's filesystem. All file reads, writes, and shell commands "
+                "execute against this real directory tree. Proceed with care.\n"
+            )
+
         return f"""# spoon-bot
 
 You are spoon-bot, an AI agent that completes tasks by calling tools.
 Current time: {now}
 Workspace: {display_path}
-
+{yolo_banner}
 ## Core Behavior — ALWAYS USE TOOLS
 
 You MUST use your tools to accomplish tasks. NEVER fabricate results, NEVER pretend to execute commands, NEVER invent output. If a tool exists for the job, call it.

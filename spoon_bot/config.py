@@ -362,6 +362,16 @@ class AgentLoopConfig(BaseModel):
         default_factory=lambda: Path.home() / ".spoon-bot" / "workspace",
         description="Workspace directory path"
     )
+
+    yolo_mode: bool = Field(
+        default=False,
+        description=(
+            "YOLO mode: operate directly in the user's filesystem path "
+            "instead of the sandboxed workspace. When enabled, the agent "
+            "reads/writes files and runs commands in 'workspace' as a plain "
+            "directory without sandbox isolation."
+        ),
+    )
     model: str | None = Field(
         default=None,
         description="LLM model name (uses provider default if not specified)"
@@ -468,12 +478,21 @@ class AgentLoopConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_workspace_accessible(self) -> "AgentLoopConfig":
-        """Validate that workspace path can be created and is writable."""
+        """Validate that workspace path can be created and is writable.
+
+        In YOLO mode the directory must already exist; we skip the
+        mkdir + write-test since the user is responsible for the path.
+        """
+        if self.yolo_mode:
+            if not self.workspace.is_dir():
+                raise ValueError(
+                    f"YOLO mode workspace path does not exist: {self.workspace}"
+                )
+            return self
+
         try:
-            # Try to create the workspace directory
             self.workspace.mkdir(parents=True, exist_ok=True)
 
-            # Check if it's writable by creating a test file
             test_file = self.workspace / ".write_test"
             try:
                 test_file.touch()
@@ -558,6 +577,10 @@ class SpoonBotSettings(BaseSettings):
     workspace_path: Path = Field(
         default_factory=lambda: Path.home() / ".spoon-bot" / "workspace",
         description="Default workspace directory"
+    )
+    yolo_mode: bool = Field(
+        default=False,
+        description="YOLO mode: operate in user's path instead of sandbox"
     )
 
     # LLM settings
@@ -671,6 +694,7 @@ def validate_agent_loop_params(
     session_key: str = "default",
     skill_paths: list[Path | str] | None = None,
     mcp_config: dict[str, dict[str, Any]] | None = None,
+    yolo_mode: bool = False,
 ) -> AgentLoopConfig:
     """
     Validate AgentLoop initialization parameters.
@@ -684,6 +708,7 @@ def validate_agent_loop_params(
         session_key: Session identifier.
         skill_paths: Additional skill search paths.
         mcp_config: MCP server configurations.
+        yolo_mode: If True, operate directly in the user path without sandbox.
 
     Returns:
         Validated AgentLoopConfig.
@@ -696,6 +721,10 @@ def validate_agent_loop_params(
     if mcp_config:
         mcp_servers = validate_mcp_configs(mcp_config)
 
+    # In YOLO mode, default workspace to CWD instead of ~/.spoon-bot/workspace
+    if yolo_mode and workspace is None:
+        workspace = Path.cwd()
+
     return AgentLoopConfig(
         workspace=workspace,  # type: ignore
         model=model,
@@ -705,4 +734,5 @@ def validate_agent_loop_params(
         session_key=session_key,
         skill_paths=skill_paths,  # type: ignore
         mcp_servers=mcp_servers,
+        yolo_mode=yolo_mode,
     )
