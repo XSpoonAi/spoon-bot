@@ -24,6 +24,9 @@ class InboundMessage:
     timestamp: datetime = field(default_factory=datetime.now)
     media: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Sequence number assigned by MessageBus for latest-wins ordering.
+    # 0 means not yet assigned.
+    _bus_seq: int = field(default=0, repr=False)
 
     @property
     def has_media(self) -> bool:

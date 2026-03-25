@@ -459,12 +459,13 @@ class WebSocketHandler:
         self._concurrent_tasks: set[asyncio.Task] = set()
         agent = get_agent()
         workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+        yolo_mode = bool(getattr(agent, "yolo_mode", False))
         self._sandbox_id = _runtime_sandbox_id()
         self._workspace_watch_service = WorkspaceWatchService(
             workspace_root=workspace,
             emit_change=self._emit_workspace_change,
         )
-        self._workspace_fs_service = WorkspaceFSService(workspace_root=workspace)
+        self._workspace_fs_service = WorkspaceFSService(workspace_root=workspace, yolo_mode=yolo_mode)
         self._workspace_terminal_service = WorkspaceTerminalService(
             workspace_root=workspace,
             emit_stdout=self._emit_terminal_stdout,

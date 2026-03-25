@@ -535,7 +535,7 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
     Supported fields::
 
-        model, provider, api_key, base_url, workspace,
+        model, provider, api_key, base_url, workspace, yolo_mode,
         max_iterations, tool_profile, enabled_tools, enable_skills,
         shell_timeout, max_output, context_window,
         session_store_backend, session_store_dsn, session_store_db_path,
@@ -683,19 +683,22 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         "workspace":      ["SPOON_BOT_WORKSPACE_PATH"],
         "max_iterations": ["SPOON_BOT_MAX_ITERATIONS", "SPOON_MAX_STEPS"],
         "enable_skills":  ["SPOON_BOT_ENABLE_SKILLS"],
+        "yolo_mode":      ["SPOON_BOT_YOLO_MODE"],
         "shell_timeout":  ["SPOON_BOT_SHELL_TIMEOUT"],
         "max_output":     ["SPOON_BOT_MAX_OUTPUT"],
         "context_window": ["CONTEXT_WINDOW"],
     }
+    _bool_fields = {"enable_skills", "yolo_mode"}
+    _int_fields = {"max_iterations", "shell_timeout", "max_output", "context_window"}
     for field, env_vars in agent_env_map.items():
         if not resolved.get(field):
             for var in env_vars:
                 val = os.environ.get(var)
                 if val:
-                    if field in {"max_iterations", "shell_timeout", "max_output", "context_window"}:
+                    if field in _int_fields:
                         resolved[field] = int(val)
-                    elif field == "enable_skills":
-                        resolved[field] = val.lower() == "true"
+                    elif field in _bool_fields:
+                        resolved[field] = val.lower() in ("true", "1", "yes")
                     else:
                         resolved[field] = val
                     logger.debug(f"Agent config: {field} from env var {var}")
