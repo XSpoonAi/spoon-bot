@@ -519,7 +519,10 @@ class CommandHandlers:
             )
 
     async def _subagents_list(self, update: Update, manager: Any) -> None:
-        summary = manager.get_status_summary()
+        spawner_session_key, _, _, _ = self._subagent_request_context(update)
+        summary = manager.get_status_summary(
+            spawner_session_key=spawner_session_key
+        )
         total = summary.get("total", 0)
         if total == 0:
             await self._reply(update, "No sub-agents spawned.")
@@ -579,10 +582,12 @@ class CommandHandlers:
             RoutingMode,
             SpawnMode,
             SubagentConfig,
+            normalize_thinking_level,
         )
 
         model: str | None = None
         thinking: str | None = None
+        enable_skills: bool | None = None
         mode: str | None = None
         agent_name: str | None = None
         cleanup: str | None = None
@@ -592,6 +597,14 @@ class CommandHandlers:
         routing_mode: str | None = None
         task_parts: list[str] = []
 
+        def _parse_bool_flag(value: str) -> bool:
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "on", "yes", "enabled"}:
+                return True
+            if normalized in {"0", "false", "off", "no", "disabled"}:
+                return False
+            raise ValueError("Use on/off, true/false, yes/no, or 1/0.")
+
         i = 0
         while i < len(args):
             token = args[i]
@@ -599,6 +612,18 @@ class CommandHandlers:
                 model = args[i + 1]; i += 2
             elif token == "--thinking" and i + 1 < len(args):
                 thinking = args[i + 1]; i += 2
+            elif token == "--skills":
+                if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                    try:
+                        enable_skills = _parse_bool_flag(args[i + 1])
+                    except ValueError as exc:
+                        await self._reply(update, f"Invalid --skills value {args[i + 1]!r}: {exc}")
+                        return
+                    i += 2
+                else:
+                    enable_skills = True; i += 1
+            elif token == "--no-skills":
+                enable_skills = False; i += 1
             elif token == "--mode" and i + 1 < len(args):
                 mode = args[i + 1]; i += 2
             elif token == "--name" and i + 1 < len(args):
@@ -629,6 +654,13 @@ class CommandHandlers:
                 model = token.split("=", 1)[1]; i += 1
             elif token.startswith("--thinking="):
                 thinking = token.split("=", 1)[1]; i += 1
+            elif token.startswith("--skills="):
+                try:
+                    enable_skills = _parse_bool_flag(token.split("=", 1)[1])
+                except ValueError as exc:
+                    await self._reply(update, f"Invalid --skills value {token.split('=', 1)[1]!r}: {exc}")
+                    return
+                i += 1
             elif token.startswith("--mode="):
                 mode = token.split("=", 1)[1]; i += 1
             elif token.startswith("--name="):
@@ -648,7 +680,7 @@ class CommandHandlers:
         if not task:
             await self._reply(
                 update,
-                "Usage: `/subagents spawn [--model M] [--thinking L] [--mode run|session] [--name N] "
+                "Usage: `/subagents spawn [--model M] [--thinking off|basic|extended] [--skills|--no-skills] [--mode run|session] [--name N] "
                 "[--specialization TEXT] [--keywords a,b] [--auto-route] [--routing direct|orchestrated] <task>`",
             )
             return
@@ -657,7 +689,13 @@ class CommandHandlers:
         if model:
             config.model = model
         if thinking:
-            config.thinking_level = thinking
+            try:
+                config.thinking_level = normalize_thinking_level(thinking)
+            except ValueError as exc:
+                await self._reply(update, f"Invalid --thinking value {thinking!r}: {exc}")
+                return
+        if enable_skills is not None:
+            config.enable_skills = enable_skills
         if mode:
             try:
                 config.spawn_mode = SpawnMode(mode)
@@ -698,7 +736,17 @@ class CommandHandlers:
                 spawner_reply_to=spawner_reply_to,
             )
             model_str = f"\nModel: `{record.model_name}`" if record.model_name else ""
-            thinking_str = f"\nThinking: {thinking}" if thinking else ""
+            thinking_str = (
+                f"\nThinking: {record.config.thinking_level}"
+                if record.config.thinking_level
+                else ""
+            )
+            if record.config.enable_skills is None:
+                skills_str = "\nSkills: inherit"
+            else:
+                skills_str = (
+                    f"\nSkills: {'ON' if record.config.enable_skills else 'OFF'}"
+                )
             mode_str = f"\nMode: {record.spawn_mode.value}"
             name_str = f" `[{record.agent_name}]`" if record.agent_name else ""
             route_str = "\nAuto-route: ON" if record.config.auto_route else ""
@@ -710,13 +758,21 @@ class CommandHandlers:
                 f"\nKeywords: {', '.join(record.config.match_keywords)}"
                 if record.config.match_keywords else ""
             )
+            nested_str = (
+                "\nNested spawn: ON"
+                if (
+                    record.config.allow_subagents
+                    or record.config.routing_mode == RoutingMode.ORCHESTRATED
+                )
+                else ""
+            )
             await self._reply(
                 update,
                 f"*Sub-agent spawned!*\n"
                 f"ID: `{record.agent_id}`\n"
                 f"Label: {record.label}"
-                f"{model_str}{thinking_str}{mode_str}{name_str}"
-                f"{route_str}{specialization_str}{keywords_str}\n"
+                f"{model_str}{thinking_str}{skills_str}{mode_str}{name_str}"
+                f"{route_str}{specialization_str}{keywords_str}{nested_str}\n"
                 f"Use /subagents to monitor progress.",
             )
         except ValueError as exc:
@@ -777,18 +833,30 @@ class CommandHandlers:
             return
 
         if target.lower() == "all":
-            count = await manager.cancel_all()
+            spawner_session_key, _, _, _ = self._subagent_request_context(update)
+            count = await manager.cancel_all(
+                spawner_session_key=spawner_session_key
+            )
             await self._reply(
                 update,
                 f"Cascade cancellation requested for {count} sub-agent(s).",
             )
         else:
             # Count descendants for informative message
-            record = manager.registry.get(target)
+            spawner_session_key, _, _, _ = self._subagent_request_context(update)
+            info = await manager.get_info(
+                target,
+                spawner_session_key=spawner_session_key,
+            )
+            record = manager.registry.get(target) if info is not None else None
             descendants = (
                 manager.registry.get_descendants(target) if record else []
             )
-            found = await manager.cancel(target, cascade=True)
+            found = await manager.cancel(
+                target,
+                cascade=True,
+                spawner_session_key=spawner_session_key,
+            )
             if found:
                 desc_count = len(descendants)
                 desc_str = f" and {desc_count} descendants" if desc_count else ""
@@ -819,7 +887,12 @@ class CommandHandlers:
             )
             return
 
-        result = await manager.steer(agent_id, message)
+        spawner_session_key, _, _, _ = self._subagent_request_context(update)
+        result = await manager.steer(
+            agent_id,
+            message,
+            spawner_session_key=spawner_session_key,
+        )
         status = result.get("status")
         msg = result.get("message", "")
 
@@ -844,7 +917,11 @@ class CommandHandlers:
             await self._reply(update, "Usage: `/subagents info <agent_id>`")
             return
 
-        info = await manager.get_info(agent_id)
+        spawner_session_key, _, _, _ = self._subagent_request_context(update)
+        info = await manager.get_info(
+            agent_id,
+            spawner_session_key=spawner_session_key,
+        )
         if info is None:
             await self._reply(update, f"Sub-agent `{agent_id}` not found.")
             return
@@ -865,6 +942,11 @@ class CommandHandlers:
             lines.append(f"Routing mode: {info['routing_mode']}")
         if info.get("match_keywords"):
             lines.append(f"Keywords: {', '.join(info['match_keywords'])}")
+        if "effective_enable_skills" in info:
+            inherited = " (inherited)" if info.get("enable_skills") is None else ""
+            lines.append(
+                f"Skills: {'ON' if info['effective_enable_skills'] else 'OFF'}{inherited}"
+            )
         if info.get("thinking_level"):
             lines.append(f"Thinking: {info['thinking_level']}")
         if info.get("elapsed_seconds") is not None:

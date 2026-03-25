@@ -46,6 +46,38 @@ class RoutingMode(str, Enum):
     ORCHESTRATED = "orchestrated"
 
 
+_VALID_THINKING_LEVELS = {"off", "basic", "extended"}
+_THINKING_LEVEL_ALIASES = {
+    "false": "off",
+    "none": "off",
+    "disabled": "off",
+    "on": "basic",
+    "true": "basic",
+    "default": "basic",
+    "standard": "basic",
+    "deep": "extended",
+}
+
+
+def normalize_thinking_level(value: Any) -> Optional[str]:
+    """Normalize a thinking-level value to ``off``, ``basic``, or ``extended``."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "basic" if value else "off"
+
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    normalized = _THINKING_LEVEL_ALIASES.get(normalized, normalized)
+    if normalized not in _VALID_THINKING_LEVELS:
+        raise ValueError(
+            f"Invalid thinking level {value!r}. "
+            "Use 'off', 'basic', or 'extended'."
+        )
+    return normalized
+
+
 class TokenUsage(BaseModel):
     """Token usage statistics for a sub-agent run."""
 
@@ -110,9 +142,12 @@ class SubagentConfig(BaseModel):
         default=None,
         description="Explicit set of tool names to enable (None = profile default)",
     )
-    enable_skills: bool = Field(
-        default=False,
-        description="Whether to enable the skill system (off by default for speed)",
+    enable_skills: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether to enable the skill system. "
+            "None = inherit the parent agent setting."
+        ),
     )
     context_window: Optional[int] = Field(
         default=None,
@@ -122,7 +157,7 @@ class SubagentConfig(BaseModel):
         default=None,
         description=(
             "Extended thinking level for LLM models: "
-            "'basic' or 'extended'. None = disabled."
+            "'off', 'basic', or 'extended'. None = inherit/default."
         ),
     )
     timeout_seconds: Optional[int] = Field(
@@ -190,6 +225,14 @@ class SubagentConfig(BaseModel):
             "'direct' means route the whole request to this specialist."
         ),
     )
+    allow_subagents: bool = Field(
+        default=False,
+        description=(
+            "Whether this sub-agent may spawn nested sub-agents of its own. "
+            "Keep disabled for normal worker roles; enable only for explicit "
+            "orchestrator-style agents."
+        ),
+    )
 
 
 class PersistentSubagentProfile(BaseModel):
@@ -209,7 +252,7 @@ class PersistentSubagentProfile(BaseModel):
     system_prompt: Optional[str] = Field(default=None)
     tool_profile: str = Field(default="core")
     enabled_tools: Optional[Set[str]] = Field(default=None)
-    enable_skills: bool = Field(default=False)
+    enable_skills: Optional[bool] = Field(default=None)
     context_window: Optional[int] = Field(default=None)
     thinking_level: Optional[str] = Field(default=None)
     timeout_seconds: Optional[int] = Field(default=None, ge=10, le=3600)
@@ -219,10 +262,12 @@ class PersistentSubagentProfile(BaseModel):
     match_keywords: List[str] = Field(default_factory=list)
     match_examples: List[str] = Field(default_factory=list)
     routing_mode: RoutingMode = Field(default=RoutingMode.DIRECT)
+    allow_subagents: bool = Field(default=False)
     created_at: float = Field(default_factory=time.time)
     last_active_at: Optional[float] = Field(default=None)
     last_run_agent_id: Optional[str] = Field(default=None)
     last_run_state: Optional[str] = Field(default=None)
+    session_key: Optional[str] = Field(default=None)
 
     def to_subagent_config(self) -> "SubagentConfig":
         """Convert this profile into a session-mode SubagentConfig."""
@@ -248,6 +293,7 @@ class PersistentSubagentProfile(BaseModel):
             match_keywords=list(self.match_keywords),
             match_examples=list(self.match_examples),
             routing_mode=self.routing_mode,
+            allow_subagents=self.allow_subagents,
         )
 
     @classmethod
@@ -260,6 +306,7 @@ class PersistentSubagentProfile(BaseModel):
         last_active_at: float | None = None,
         last_run_agent_id: str | None = None,
         last_run_state: str | None = None,
+        session_key: str | None = None,
     ) -> "PersistentSubagentProfile":
         """Create a persistent profile from a session-mode config."""
         return cls(
@@ -275,7 +322,7 @@ class PersistentSubagentProfile(BaseModel):
             enabled_tools=config.enabled_tools,
             enable_skills=config.enable_skills,
             context_window=config.context_window,
-            thinking_level=config.thinking_level,
+            thinking_level=normalize_thinking_level(config.thinking_level),
             timeout_seconds=config.timeout_seconds,
             cleanup=config.cleanup,
             specialization=config.specialization,
@@ -283,10 +330,12 @@ class PersistentSubagentProfile(BaseModel):
             match_keywords=list(config.match_keywords),
             match_examples=list(config.match_examples),
             routing_mode=config.routing_mode,
+            allow_subagents=config.allow_subagents,
             created_at=created_at or time.time(),
             last_active_at=last_active_at,
             last_run_agent_id=last_run_agent_id,
             last_run_state=last_run_state,
+            session_key=session_key,
         )
 
 
@@ -296,6 +345,10 @@ class SubagentRecord(BaseModel):
     agent_id: str = Field(
         default_factory=lambda: f"sub_{uuid4().hex[:10]}",
         description="Unique identifier for this sub-agent",
+    )
+    run_id: str = Field(
+        default_factory=lambda: f"run_{uuid4().hex[:12]}",
+        description="Unique identifier for the current execution run",
     )
     parent_id: Optional[str] = Field(
         default=None,
@@ -418,6 +471,10 @@ class SubagentResult(BaseModel):
     """Result delivered back to the parent agent via the results queue."""
 
     agent_id: str = Field(description="Sub-agent identifier")
+    run_id: str = Field(
+        default_factory=lambda: f"run_{uuid4().hex[:12]}",
+        description="Execution run identifier",
+    )
     label: str = Field(description="Sub-agent label")
     state: SubagentState = Field(description="Final state")
     result: Optional[str] = Field(default=None, description="Output text if completed")

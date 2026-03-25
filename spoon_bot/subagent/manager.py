@@ -7,18 +7,22 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Optional, TYPE_CHECKING
+from uuid import uuid4
 
 from loguru import logger
 
+from spoon_bot.agent.tools.registry import TOOL_PROFILES
 from spoon_bot.subagent.models import (
     CleanupMode,
     PersistentSubagentProfile,
+    RoutingMode,
     SpawnMode,
     SubagentConfig,
     SubagentRecord,
     SubagentResult,
     SubagentState,
     TokenUsage,
+    normalize_thinking_level,
 )
 from spoon_bot.subagent.registry import SubagentRegistry
 from spoon_bot.subagent.persistence import AgentDirectory, SubagentRunsFile, SubagentSweeper
@@ -62,6 +66,9 @@ class SubagentManager:
         parent_provider: str | None = None,
         parent_api_key: str | None = None,
         parent_base_url: str | None = None,
+        parent_enable_skills: bool = True,
+        default_model: str | None = None,
+        default_tool_profile: str = "core",
         # Persistence settings
         persist_runs: bool = True,
         persist_file: str = "subagents/runs.json",
@@ -106,6 +113,9 @@ class SubagentManager:
         self._parent_provider = parent_provider
         self._parent_api_key = parent_api_key
         self._parent_base_url = parent_base_url
+        self._parent_enable_skills = parent_enable_skills
+        self._default_model = default_model
+        self._default_tool_profile = default_tool_profile
 
         # Pull-based result delivery
         self._results: asyncio.Queue[SubagentResult] = asyncio.Queue()
@@ -125,11 +135,12 @@ class SubagentManager:
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
         # Steer support — pending steer messages and timestamps
-        self._steer_requests: dict[str, str] = {}
+        self._steer_requests: dict[str, dict[str, Any]] = {}
         self._steer_timestamps: dict[str, float] = {}
 
         # Lifecycle event listeners
         self._event_listeners: list[Callable[[SubagentEvent], Awaitable[None] | None]] = []
+        self._persistent_session_managers: dict[str, SessionManager] = {}
 
     # ------------------------------------------------------------------
     # Configuration
@@ -189,14 +200,121 @@ class SubagentManager:
         )
 
     @staticmethod
+    def _config_field_explicit(
+        cfg: SubagentConfig,
+        field_name: str,
+    ) -> bool:
+        """Return True when the caller explicitly set *field_name*."""
+        return field_name in getattr(cfg, "model_fields_set", set())
+
+    def _apply_default_config(
+        self,
+        cfg: SubagentConfig | None,
+    ) -> SubagentConfig:
+        """Apply manager-level subagent defaults without overriding explicit fields."""
+        effective = cfg.model_copy(deep=True) if cfg is not None else SubagentConfig()
+        default_tool_profile = str(self._default_tool_profile or "").strip()
+        base_tool_profile = SubagentConfig.model_fields["tool_profile"].default
+
+        if (
+            self._default_model
+            and not self._config_field_explicit(effective, "model")
+            and not effective.model
+        ):
+            effective.model = self._default_model
+
+        if (
+            default_tool_profile
+            and not self._config_field_explicit(effective, "tool_profile")
+            and effective.tool_profile == base_tool_profile
+        ):
+            effective.tool_profile = default_tool_profile
+
+        effective.thinking_level = normalize_thinking_level(effective.thinking_level)
+
+        return effective
+
+    @staticmethod
+    def _config_allows_nested_subagents(cfg: SubagentConfig) -> bool:
+        """Return True when the config allows nested child spawning."""
+        return bool(
+            cfg.allow_subagents or cfg.routing_mode == RoutingMode.ORCHESTRATED
+        )
+
+    def _resolve_effective_enable_skills(self, cfg: SubagentConfig) -> bool:
+        """Resolve the effective skills toggle for a child agent."""
+        if cfg.enable_skills is None:
+            return self._parent_enable_skills
+        return bool(cfg.enable_skills)
+
+    def _record_visible_to_requester(
+        self,
+        record: SubagentRecord,
+        *,
+        spawner_session_key: str | None = None,
+    ) -> bool:
+        """Return True when *record* belongs to the requester's subagent lineage."""
+        if spawner_session_key is None:
+            return True
+
+        current: SubagentRecord | None = record
+        visited: set[str] = set()
+        while current is not None and current.agent_id not in visited:
+            if current.spawner_session_key == spawner_session_key:
+                return True
+            visited.add(current.agent_id)
+            if not current.parent_id:
+                break
+            current = self.registry.get(current.parent_id)
+        return False
+
+    def _filter_records_for_requester(
+        self,
+        records: list[SubagentRecord],
+        *,
+        spawner_session_key: str | None = None,
+    ) -> list[SubagentRecord]:
+        """Filter records down to the requester-visible lineage."""
+        if spawner_session_key is None:
+            return list(records)
+        return [
+            record
+            for record in records
+            if self._record_visible_to_requester(
+                record,
+                spawner_session_key=spawner_session_key,
+            )
+        ]
+
+    def _get_scoped_record(
+        self,
+        agent_id: str,
+        *,
+        spawner_session_key: str | None = None,
+    ) -> SubagentRecord | None:
+        """Return *agent_id* only when it is visible to the requester."""
+        record = self.registry.get(agent_id)
+        if record is None:
+            return None
+        if not self._record_visible_to_requester(
+            record,
+            spawner_session_key=spawner_session_key,
+        ):
+            return None
+        return record
+
+    @staticmethod
     def _result_matches_scope(
         result: SubagentResult,
         *,
         spawner_session_key: str | None = None,
         agent_id: str | None = None,
+        run_id: str | None = None,
     ) -> bool:
         """Return True when *result* belongs to the requested requester scope."""
         if agent_id is not None and result.agent_id != agent_id:
+            return False
+        if run_id is not None and result.run_id != run_id:
             return False
         if (
             spawner_session_key is not None
@@ -204,6 +322,29 @@ class SubagentManager:
         ):
             return False
         return True
+
+    @staticmethod
+    def _new_run_id() -> str:
+        """Return a fresh run identifier for one execution attempt."""
+        return f"run_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _resolve_child_enabled_tools(cfg: SubagentConfig) -> set[str] | None:
+        """Resolve effective child tools, enabling ``spawn`` only for orchestrators."""
+        if cfg.enabled_tools is not None:
+            enabled = set(cfg.enabled_tools)
+            if SubagentManager._config_allows_nested_subagents(cfg):
+                enabled.add("spawn")
+            else:
+                enabled.discard("spawn")
+            return enabled
+
+        if not SubagentManager._config_allows_nested_subagents(cfg):
+            return None
+
+        enabled = set(TOOL_PROFILES.get(cfg.tool_profile, frozenset()))
+        enabled.add("spawn")
+        return enabled
 
     def _start_background_run(
         self,
@@ -237,12 +378,130 @@ class SubagentManager:
         """Return a persistent subagent profile by name."""
         return self._persistent_profiles.get(name)
 
+    def _resolve_agent_directory(
+        self,
+        record: SubagentRecord,
+    ) -> AgentDirectory | None:
+        """Return the persistent agent directory for a session-mode record."""
+        if self._record_spawn_mode(record) != SpawnMode.SESSION:
+            return None
+
+        agent_name = self._record_agent_name(record)
+        if not agent_name:
+            return None
+
+        agent_dir = AgentDirectory(self.workspace, agent_name)
+        agent_dir.ensure()
+        expected_root = str(agent_dir.root)
+        if record.agent_dir != expected_root:
+            self.registry.update_fields(record.agent_id, agent_dir=expected_root)
+            record.agent_dir = expected_root
+            self._persist_session_agent_state(record.agent_id)
+        return agent_dir
+
+    def _session_manager_for_record(self, record: SubagentRecord) -> SessionManager:
+        """Return the session manager that should back *record* transcripts."""
+        agent_dir = self._resolve_agent_directory(record)
+        if agent_dir is None:
+            return self.session_manager
+
+        agent_name = self._record_agent_name(record)
+        if not agent_name:
+            return self.session_manager
+
+        session_manager = self._persistent_session_managers.get(agent_name)
+        if session_manager is None:
+            session_manager = agent_dir.build_session_manager()
+            self._persistent_session_managers[agent_name] = session_manager
+
+        self._migrate_persistent_session_if_needed(record, session_manager)
+        return session_manager
+
+    def _migrate_persistent_session_if_needed(
+        self,
+        record: SubagentRecord,
+        target_manager: SessionManager,
+    ) -> None:
+        """Move a legacy shared session transcript into the agent-scoped store."""
+        if target_manager is self.session_manager:
+            return
+        if self._record_spawn_mode(record) != SpawnMode.SESSION:
+            return
+        if not record.session_key:
+            return
+
+        existing = target_manager.get(record.session_key)
+        if existing is not None:
+            return
+
+        legacy_session = self.session_manager.get(record.session_key)
+        if legacy_session is None:
+            return
+
+        target_manager.save(legacy_session)
+        logger.info(
+            f"Migrated persistent agent session {record.session_key!r} "
+            f"to {target_manager.sessions_dir}"
+        )
+
+        try:
+            self.session_manager.archive(record.session_key)
+        except Exception as exc:
+            logger.warning(
+                f"Failed to archive legacy session {record.session_key!r} "
+                f"after migration: {exc}"
+            )
+
     def _save_persistent_profile(self, profile: PersistentSubagentProfile) -> None:
         """Persist and cache a persistent subagent profile."""
         agent_dir = AgentDirectory(self.workspace, profile.name)
         agent_dir.ensure()
         agent_dir.save_profile_json(profile)
         self._persistent_profiles[profile.name] = profile
+
+    def _discover_profile_session_key(
+        self,
+        profile: PersistentSubagentProfile,
+    ) -> str | None:
+        """Recover a persistent session key from agent-scoped transcripts."""
+        if profile.session_key:
+            return profile.session_key
+
+        agent_dir = AgentDirectory(self.workspace, profile.name)
+        if not agent_dir.exists():
+            if profile.last_run_agent_id:
+                legacy_session_key = f"subagent-{profile.last_run_agent_id}"
+                if self.session_manager.get(legacy_session_key) is not None:
+                    profile.session_key = legacy_session_key
+                    self._save_persistent_profile(profile)
+                    return legacy_session_key
+            return None
+
+        session_manager = self._persistent_session_managers.get(profile.name)
+        owns_manager = session_manager is None
+        if session_manager is None:
+            session_manager = agent_dir.build_session_manager()
+        try:
+            if profile.last_run_agent_id:
+                legacy_session_key = f"subagent-{profile.last_run_agent_id}"
+                if (
+                    session_manager.get(legacy_session_key) is not None
+                    or self.session_manager.get(legacy_session_key) is not None
+                ):
+                    profile.session_key = legacy_session_key
+                    self._save_persistent_profile(profile)
+                    return legacy_session_key
+
+            session_keys = session_manager.list_sessions()
+            if len(session_keys) == 1:
+                profile.session_key = session_keys[0]
+                self._save_persistent_profile(profile)
+                return session_keys[0]
+        finally:
+            if owns_manager:
+                session_manager.close()
+
+        return None
 
     @staticmethod
     def _record_agent_name(record: SubagentRecord) -> str | None:
@@ -633,6 +892,7 @@ class SubagentManager:
                     name=agent_name,
                     config=record.config,
                     created_at=record.created_at,
+                    session_key=record.session_key,
                 )
             else:
                 profile = base_profile.model_copy(deep=True)
@@ -656,6 +916,8 @@ class SubagentManager:
                 profile.match_keywords = list(updated_cfg.match_keywords)
                 profile.match_examples = list(updated_cfg.match_examples)
                 profile.routing_mode = updated_cfg.routing_mode
+                profile.allow_subagents = updated_cfg.allow_subagents
+                profile.session_key = record.session_key
             profile.last_active_at = record.completed_at or record.started_at or record.created_at
             profile.last_run_agent_id = record.agent_id
             profile.last_run_state = record.state.value
@@ -692,6 +954,7 @@ class SubagentManager:
         spawner_metadata: dict[str, Any] | None = None,
         spawner_reply_to: str | None = None,
         allow_existing_profile_name: bool = False,
+        session_key_override: str | None = None,
     ) -> SubagentRecord:
         """Spawn a new sub-agent to work on *task*.
 
@@ -710,14 +973,20 @@ class SubagentManager:
         Raises:
             ValueError: If any limit is exceeded or config is invalid.
         """
-        cfg = config or SubagentConfig()
+        cfg = self._apply_default_config(config)
 
         # --- Depth check ---
         parent_depth = 0
+        parent_record: SubagentRecord | None = None
         if parent_id:
             parent_record = self.registry.get(parent_id)
             if parent_record:
                 parent_depth = parent_record.depth
+                if not self._config_allows_nested_subagents(parent_record.config):
+                    raise ValueError(
+                        "Nested sub-agent spawning is disabled for this parent. "
+                        "Enable allow_subagents=true only for explicit orchestrator agents."
+                    )
         child_depth = parent_depth + 1
 
         if child_depth > self.max_depth:
@@ -793,6 +1062,7 @@ class SubagentManager:
             label=label or task[:60],
             task=task,
             config=cfg,
+            session_key=session_key_override or "",
             model_name=effective_model,
             spawner_session_key=resolved_spawner_session,
             spawner_channel=resolved_spawner_channel,
@@ -808,7 +1078,8 @@ class SubagentManager:
         self._persist_session_agent_state(record.agent_id)
         logger.info(
             f"Sub-agent {record.agent_id!r} registered: "
-            f"depth={record.depth}, label={record.label!r}, model={effective_model!r}"
+            f"run_id={record.run_id}, depth={record.depth}, "
+            f"label={record.label!r}, model={effective_model!r}"
         )
 
         # Emit lifecycle event
@@ -821,6 +1092,7 @@ class SubagentManager:
             model_name=effective_model,
             spawner_session_key=record.spawner_session_key,
             spawner_channel=record.spawner_channel,
+            metadata={"run_id": record.run_id},
         ))
 
         # --- Start background execution ---
@@ -834,6 +1106,7 @@ class SubagentManager:
         *,
         spawner_session_key: str | None = None,
         agent_id: str | None = None,
+        run_id: str | None = None,
     ) -> list[SubagentResult]:
         """Collect scoped results without draining unrelated sub-agent outputs.
 
@@ -855,6 +1128,7 @@ class SubagentManager:
                         buffered,
                         spawner_session_key=spawner_session_key,
                         agent_id=agent_id,
+                        run_id=run_id,
                     ):
                         results.append(buffered)
                     else:
@@ -880,13 +1154,20 @@ class SubagentManager:
                 result,
                 spawner_session_key=spawner_session_key,
                 agent_id=agent_id,
+                run_id=run_id,
             ):
                 results.append(result)
             else:
                 async with self._results_lock:
                     self._buffered_results.append(result)
 
-    async def cancel(self, agent_id: str, *, cascade: bool = True) -> bool:
+    async def cancel(
+        self,
+        agent_id: str,
+        *,
+        cascade: bool = True,
+        spawner_session_key: str | None = None,
+    ) -> bool:
         """Cancel a running or pending sub-agent.
 
         Args:
@@ -896,6 +1177,13 @@ class SubagentManager:
         Returns:
             True if the task was found and cancellation was requested.
         """
+        record = self._get_scoped_record(
+            agent_id,
+            spawner_session_key=spawner_session_key,
+        )
+        if record is None:
+            return False
+
         found = False
         if cascade:
             # Cancel descendants first (deepest first)
@@ -914,7 +1202,12 @@ class SubagentManager:
             found = True
         return found
 
-    async def cancel_all(self, parent_id: str | None = None) -> int:
+    async def cancel_all(
+        self,
+        parent_id: str | None = None,
+        *,
+        spawner_session_key: str | None = None,
+    ) -> int:
         """Cancel all active sub-agents, optionally filtered by parent.
 
         Always uses cascade kill.
@@ -922,12 +1215,32 @@ class SubagentManager:
         Returns:
             Number of top-level sub-agents whose cancellation was requested.
         """
+        if parent_id:
+            records = self.registry.list_by_parent(parent_id)
+            records = self._filter_records_for_requester(
+                records,
+                spawner_session_key=spawner_session_key,
+            )
+        else:
+            visible_records = self._filter_records_for_requester(
+                self.registry.list_all(),
+                spawner_session_key=spawner_session_key,
+            )
+            visible_ids = {record.agent_id for record in visible_records}
+            records = [
+                record
+                for record in visible_records
+                if record.parent_id not in visible_ids
+            ]
+
         count = 0
-        for record in self.registry.list_all():
-            if parent_id and record.parent_id != parent_id:
-                continue
+        for record in records:
             if record.state in (SubagentState.PENDING, SubagentState.RUNNING):
-                if await self.cancel(record.agent_id, cascade=True):
+                if await self.cancel(
+                    record.agent_id,
+                    cascade=True,
+                    spawner_session_key=spawner_session_key,
+                ):
                     count += 1
         return count
 
@@ -935,6 +1248,8 @@ class SubagentManager:
         self,
         agent_id: str,
         new_message: str,
+        *,
+        spawner_session_key: str | None = None,
     ) -> dict[str, Any]:
         """Redirect a running sub-agent with a new message.
 
@@ -946,7 +1261,10 @@ class SubagentManager:
         Returns:
             Dict with keys: status, agent_id, label, message.
         """
-        record = self.registry.get(agent_id)
+        record = self._get_scoped_record(
+            agent_id,
+            spawner_session_key=spawner_session_key,
+        )
         if record is None:
             return {"status": "not_found", "agent_id": agent_id, "message": "Agent not found."}
 
@@ -971,7 +1289,11 @@ class SubagentManager:
             }
 
         # Queue the steer request (processed in _run_subagent's CancelledError handler)
-        self._steer_requests[agent_id] = new_message
+        next_run_id = self._new_run_id()
+        self._steer_requests[agent_id] = {
+            "message": new_message,
+            "run_id": next_run_id,
+        }
         self._steer_timestamps[agent_id] = time.time()
 
         # Cancel current task (triggers the steer restart)
@@ -986,7 +1308,11 @@ class SubagentManager:
                 "status": "accepted",
                 "agent_id": agent_id,
                 "label": record.label,
-                "message": f"Steer accepted. Sub-agent {agent_id} will be redirected.",
+                "run_id": next_run_id,
+                "message": (
+                    f"Steer accepted. Sub-agent {agent_id} will be redirected "
+                    f"to run {next_run_id}."
+                ),
             }
         else:
             # Task is done — start a fresh run
@@ -998,12 +1324,20 @@ class SubagentManager:
                 "message": "Agent already finished. Use spawn to create a new one.",
             }
 
-    async def get_info(self, agent_id: str) -> dict[str, Any] | None:
+    async def get_info(
+        self,
+        agent_id: str,
+        *,
+        spawner_session_key: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return detailed metadata for a sub-agent.
 
         Returns None if the agent is not found.
         """
-        record = self.registry.get(agent_id)
+        record = self._get_scoped_record(
+            agent_id,
+            spawner_session_key=spawner_session_key,
+        )
         if record is None:
             return None
 
@@ -1017,6 +1351,7 @@ class SubagentManager:
 
         return {
             "agent_id": record.agent_id,
+            "run_id": record.run_id,
             "label": record.label,
             "state": record.state.value,
             "task": record.task,
@@ -1030,8 +1365,11 @@ class SubagentManager:
             "match_keywords": list(record.config.match_keywords),
             "match_examples": list(record.config.match_examples),
             "routing_mode": record.config.routing_mode.value,
+            "allow_subagents": self._config_allows_nested_subagents(record.config),
+            "enable_skills": record.config.enable_skills,
+            "effective_enable_skills": self._resolve_effective_enable_skills(record.config),
             "max_iterations": record.config.max_iterations,
-            "thinking_level": record.config.thinking_level,
+            "thinking_level": normalize_thinking_level(record.config.thinking_level),
             "timeout_seconds": record.config.timeout_seconds,
             "children": record.children,
             "pending_descendants": pending_desc,
@@ -1051,6 +1389,7 @@ class SubagentManager:
         agent_name: str,
         task: str,
         *,
+        label: str | None = None,
         config: SubagentConfig | None = None,
         parent_id: str | None = None,
         spawner_session_key: str | None = None,
@@ -1084,16 +1423,22 @@ class SubagentManager:
         if not matching:
             profile = self._get_persistent_profile(agent_name)
             if profile is not None:
+                effective_config = self._apply_default_config(
+                    self._merge_resume_config(profile.to_subagent_config(), config)
+                )
+                effective_config.spawn_mode = SpawnMode.SESSION
+                effective_config.agent_name = agent_name
                 return await self.spawn(
                     task=task,
-                    label=task[:60],
-                    config=profile.to_subagent_config(),
+                    label=label or task[:60],
+                    config=effective_config,
                     parent_id=parent_id,
                     spawner_session_key=spawner_session_key,
                     spawner_channel=spawner_channel,
                     spawner_metadata=spawner_metadata,
                     spawner_reply_to=spawner_reply_to,
                     allow_existing_profile_name=True,
+                    session_key_override=self._discover_profile_session_key(profile),
                 )
             raise ValueError(
                 f"No session-mode agent named {agent_name!r} found. "
@@ -1108,10 +1453,13 @@ class SubagentManager:
                 f"{record.state.value}. Wait for it to complete first."
             )
 
-        effective_config = self._merge_resume_config(record.config, config)
+        effective_config = self._apply_default_config(
+            self._merge_resume_config(record.config, config)
+        )
         effective_config.spawn_mode = SpawnMode.SESSION
         effective_config.agent_name = agent_name
         effective_model = effective_config.model or self._parent_model
+        next_run_id = self._new_run_id()
         (
             resolved_spawner_session,
             resolved_spawner_channel,
@@ -1123,11 +1471,12 @@ class SubagentManager:
             spawner_metadata=spawner_metadata,
             spawner_reply_to=spawner_reply_to,
         )
-        label = task[:60]
+        label = label or task[:60]
         self.registry.prepare_for_resume(
             record.agent_id,
             task=task,
             label=label,
+            run_id=next_run_id,
             parent_id=parent_id,
             spawner_session_key=resolved_spawner_session,
             spawner_channel=resolved_spawner_channel,
@@ -1140,7 +1489,7 @@ class SubagentManager:
 
         logger.info(
             f"Resuming session agent {agent_name!r} ({record.agent_id}): "
-            f"{task[:60]!r}"
+            f"run_id={record.run_id}, task={task[:60]!r}"
         )
 
         # Launch background task (reuses existing session_key = preserved context)
@@ -1154,6 +1503,7 @@ class SubagentManager:
             model_name=record.model_name,
             spawner_session_key=record.spawner_session_key,
             spawner_channel=record.spawner_channel,
+            metadata={"run_id": record.run_id},
         ))
         self._start_background_run(record)
 
@@ -1178,14 +1528,12 @@ class SubagentManager:
                     last_active_at=record.completed_at or record.started_at or record.created_at,
                     last_run_agent_id=record.agent_id,
                     last_run_state=record.state.value,
+                    session_key=record.session_key,
                 )
 
         for profile in profiles.values():
             if not profile.auto_route:
                 continue
-            if profile.routing_mode.value != "direct":
-                continue
-
             score, strong_signal, reasons = self._score_specialist_match(
                 message=task,
                 profile=profile,
@@ -1241,6 +1589,7 @@ class SubagentManager:
         """Create a persistent subagent profile without immediately running it."""
         profile = self._infer_persistent_subagent_profile(description)
         cfg = (config.model_copy(deep=True) if config else SubagentConfig())
+        cfg.thinking_level = normalize_thinking_level(cfg.thinking_level)
         cfg.spawn_mode = SpawnMode.SESSION
         cfg.auto_route = True if config is None else cfg.auto_route
         cfg.specialization = cfg.specialization or profile["specialization"]
@@ -1295,6 +1644,15 @@ class SubagentManager:
         if profile is None:
             raise ValueError(f"No persistent subagent profile named {agent_name!r} found.")
 
+        dispatch_task = task
+        if profile.routing_mode == RoutingMode.ORCHESTRATED:
+            dispatch_task = (
+                "Handle this request as the owning orchestrator for your specialist area. "
+                "You may decompose the work into nested sub-agents when useful, then "
+                "return one final synthesized answer.\n\n"
+                f"User request:\n{task}"
+            )
+
         matching = [
             r for r in self.registry.list_all()
             if self._record_agent_name(r) == agent_name and self._record_spawn_mode(r) == SpawnMode.SESSION
@@ -1306,24 +1664,14 @@ class SubagentManager:
                     f"Persistent subagent {agent_name!r} is already running. "
                     "Wait for it to finish before dispatching another task."
                 )
-            return await self.resume_agent(
-                agent_name=agent_name,
-                task=task,
-                spawner_session_key=spawner_session_key,
-                spawner_channel=spawner_channel,
-                spawner_metadata=spawner_metadata,
-                spawner_reply_to=spawner_reply_to,
-            )
-
-        return await self.spawn(
-            task=task,
+        return await self.resume_agent(
+            agent_name=agent_name,
+            task=dispatch_task,
             label=task[:60],
-            config=profile.to_subagent_config(),
             spawner_session_key=spawner_session_key,
             spawner_channel=spawner_channel,
             spawner_metadata=spawner_metadata,
             spawner_reply_to=spawner_reply_to,
-            allow_existing_profile_name=True,
         )
 
     async def resume_task(
@@ -1349,11 +1697,14 @@ class SubagentManager:
                 "Wait for it to complete before resuming it."
             )
 
-        effective_config = self._merge_resume_config(record.config, config)
+        effective_config = self._apply_default_config(
+            self._merge_resume_config(record.config, config)
+        )
         effective_config.spawn_mode = self._record_spawn_mode(record)
         if record.agent_name and not effective_config.agent_name:
             effective_config.agent_name = record.agent_name
         effective_model = effective_config.model or self._parent_model
+        next_run_id = self._new_run_id()
         (
             resolved_spawner_session,
             resolved_spawner_channel,
@@ -1370,6 +1721,7 @@ class SubagentManager:
             record.agent_id,
             task=task,
             label=label,
+            run_id=next_run_id,
             parent_id=parent_id,
             spawner_session_key=resolved_spawner_session,
             spawner_channel=resolved_spawner_channel,
@@ -1380,7 +1732,10 @@ class SubagentManager:
         )
         self._persist_session_agent_state(record.agent_id)
 
-        logger.info(f"Resuming sub-agent task {task_id!r}: {task[:60]!r}")
+        logger.info(
+            f"Resuming sub-agent task {task_id!r}: "
+            f"run_id={record.run_id}, task={task[:60]!r}"
+        )
 
         await self._emit_event(SubagentEvent(
             event_type="spawning",
@@ -1391,6 +1746,7 @@ class SubagentManager:
             model_name=record.model_name,
             spawner_session_key=record.spawner_session_key,
             spawner_channel=record.spawner_channel,
+            metadata={"run_id": record.run_id},
         ))
         self._start_background_run(record)
 
@@ -1419,6 +1775,9 @@ class SubagentManager:
                 "agent_dir": str(AgentDirectory(self.workspace, name).root),
                 "specialization": profile.specialization,
                 "auto_route": profile.auto_route,
+                "allow_subagents": self._config_allows_nested_subagents(
+                    profile.to_subagent_config()
+                ),
                 "match_keywords": list(profile.match_keywords),
                 "match_examples": list(profile.match_examples),
                 "routing_mode": profile.routing_mode.value,
@@ -1458,12 +1817,21 @@ class SubagentManager:
             except Exception:
                 pass
 
+        for session_manager in self._persistent_session_managers.values():
+            try:
+                session_manager.close()
+            except Exception:
+                pass
+        self._persistent_session_managers.clear()
+
         self._tasks.clear()
         logger.info("SubagentManager cleanup complete")
 
     def get_status_summary(
         self,
         parent_id: str | None = None,
+        *,
+        spawner_session_key: str | None = None,
     ) -> dict[str, Any]:
         """Return a rich summary dict of sub-agent statuses.
 
@@ -1474,6 +1842,10 @@ class SubagentManager:
             self.registry.list_by_parent(parent_id)
             if parent_id
             else self.registry.list_all()
+        )
+        records = self._filter_records_for_requester(
+            records,
+            spawner_session_key=spawner_session_key,
         )
 
         active: list[dict[str, Any]] = []
@@ -1490,6 +1862,7 @@ class SubagentManager:
 
             entry = {
                 "agent_id": r.agent_id,
+                "run_id": r.run_id,
                 "label": r.label,
                 "state": r.state.value,
                 "depth": r.depth,
@@ -1498,6 +1871,7 @@ class SubagentManager:
                 "pending_descendants": pending_desc,
                 "spawn_mode": r.spawn_mode.value,
                 "agent_name": r.agent_name,
+                "allow_subagents": self._config_allows_nested_subagents(r.config),
             }
 
             if r.state in (SubagentState.PENDING, SubagentState.RUNNING):
@@ -1531,33 +1905,47 @@ class SubagentManager:
         from spoon_bot.agent.loop import AgentLoop
 
         task_text = task_override or record.task
+        started_at = time.time()
 
         if not is_restart:
             self.registry.transition(
                 record.agent_id,
                 SubagentState.RUNNING,
-                started_at=time.time(),
+                started_at=started_at,
             )
-            self._persist_session_agent_state(record.agent_id)
-            await self._emit_event(SubagentEvent(
-                event_type="started",
-                agent_id=record.agent_id,
-                label=record.label,
-                parent_id=record.parent_id,
-                depth=record.depth,
-                model_name=record.model_name,
-                spawner_session_key=record.spawner_session_key,
-                spawner_channel=record.spawner_channel,
-            ))
+        else:
+            self.registry.update_fields(
+                record.agent_id,
+                state=SubagentState.RUNNING,
+                started_at=started_at,
+            )
+        self._persist_session_agent_state(record.agent_id)
+        await self._emit_event(SubagentEvent(
+            event_type="started",
+            agent_id=record.agent_id,
+            label=record.label,
+            parent_id=record.parent_id,
+            depth=record.depth,
+            model_name=record.model_name,
+            spawner_session_key=record.spawner_session_key,
+            spawner_channel=record.spawner_channel,
+            metadata={"run_id": record.run_id, "restarted": is_restart},
+        ))
 
-        logger.info(f"Sub-agent {record.agent_id!r} starting task: {task_text[:80]!r}")
+        logger.info(
+            f"Sub-agent {record.agent_id!r} starting run {record.run_id!r}: "
+            f"{task_text[:80]!r}"
+        )
 
         child_agent: AgentLoop | None = None
         _steered = False
 
         try:
-            cfg = record.config
+            cfg = self._apply_default_config(record.config)
             effective_model = cfg.model or self._parent_model
+            effective_enabled_tools = self._resolve_child_enabled_tools(cfg)
+            effective_tool_profile = None if effective_enabled_tools is not None else cfg.tool_profile
+            child_session_manager = self._session_manager_for_record(record)
 
             child_agent = AgentLoop(
                 workspace=self.workspace,
@@ -1567,13 +1955,13 @@ class SubagentManager:
                 base_url=cfg.base_url or self._parent_base_url,
                 max_iterations=cfg.max_iterations,
                 session_key=record.session_key,
-                system_prompt=cfg.system_prompt or self._build_system_prompt(record),
-                enable_skills=cfg.enable_skills,
-                enabled_tools=cfg.enabled_tools,
-                tool_profile=cfg.tool_profile,
+                system_prompt=self._compose_system_prompt(record, cfg),
+                enable_skills=self._resolve_effective_enable_skills(cfg),
+                enabled_tools=effective_enabled_tools,
+                tool_profile=effective_tool_profile,
                 context_window=cfg.context_window,
                 auto_commit=False,
-                session_manager=self.session_manager,
+                session_manager=child_session_manager,
                 subagent_manager=self,
             )
 
@@ -1588,6 +1976,8 @@ class SubagentManager:
                 spawn_tool.set_spawner_context(
                     session_key=record.session_key,
                     channel=record.spawner_channel,
+                    metadata=dict(record.spawner_metadata),
+                    reply_to=record.spawner_reply_to,
                 )
 
             # Run the task — with optional timeout and thinking
@@ -1619,6 +2009,7 @@ class SubagentManager:
 
             result_obj = SubagentResult(
                 agent_id=record.agent_id,
+                run_id=record.run_id,
                 label=record.label,
                 state=SubagentState.COMPLETED,
                 result=result_text,
@@ -1631,7 +2022,10 @@ class SubagentManager:
             )
             await self._results.put(result_obj)
 
-            logger.info(f"Sub-agent {record.agent_id!r} completed in {elapsed}s")
+            logger.info(
+                f"Sub-agent {record.agent_id!r} run {record.run_id!r} "
+                f"completed in {elapsed}s"
+            )
 
             # Emit lifecycle event
             await self._emit_event(SubagentEvent(
@@ -1645,6 +2039,7 @@ class SubagentManager:
                 elapsed_seconds=elapsed,
                 spawner_session_key=record.spawner_session_key,
                 spawner_channel=record.spawner_channel,
+                metadata={"run_id": record.run_id},
             ))
 
             # Push-based delivery: announce result to spawner via bus
@@ -1667,6 +2062,7 @@ class SubagentManager:
             self._persist_session_agent_state(record.agent_id)
             result_obj = SubagentResult(
                 agent_id=record.agent_id,
+                run_id=record.run_id,
                 label=record.label,
                 state=SubagentState.FAILED,
                 error=error_msg,
@@ -1686,6 +2082,7 @@ class SubagentManager:
                 error=error_msg,
                 spawner_session_key=record.spawner_session_key,
                 spawner_channel=record.spawner_channel,
+                metadata={"run_id": record.run_id},
             ))
 
         except asyncio.CancelledError:
@@ -1696,14 +2093,41 @@ class SubagentManager:
                     pass
 
             # Check if this is a steer request (not a user cancellation)
-            steer_message = self._steer_requests.pop(record.agent_id, None)
-            if steer_message is not None:
+            steer_request = self._steer_requests.pop(record.agent_id, None)
+            if steer_request is not None:
                 # Steer: restart with the new message, preserve session history
                 _steered = True
-                logger.info(f"Sub-agent {record.agent_id!r} steered with new message")
+                next_message = str(steer_request.get("message", "")).strip() or record.task
+                next_run_id = str(steer_request.get("run_id", "")).strip() or self._new_run_id()
+                self.registry.update_fields(
+                    record.agent_id,
+                    run_id=next_run_id,
+                    task=next_message,
+                    result=None,
+                    error=None,
+                    started_at=None,
+                    completed_at=None,
+                    token_usage=None,
+                    frozen_result_text=None,
+                )
+                self._persist_session_agent_state(record.agent_id)
+                logger.info(
+                    f"Sub-agent {record.agent_id!r} steered to run {record.run_id!r}"
+                )
+                await self._emit_event(SubagentEvent(
+                    event_type="steered",
+                    agent_id=record.agent_id,
+                    label=record.label,
+                    parent_id=record.parent_id,
+                    depth=record.depth,
+                    model_name=record.model_name,
+                    spawner_session_key=record.spawner_session_key,
+                    spawner_channel=record.spawner_channel,
+                    metadata={"run_id": record.run_id, "task": next_message},
+                ))
                 self._start_background_run(
                     record,
-                    task_override=steer_message,
+                    task_override=next_message,
                     is_restart=True,
                 )
             else:
@@ -1716,6 +2140,7 @@ class SubagentManager:
                 self._persist_session_agent_state(record.agent_id)
                 result_obj = SubagentResult(
                     agent_id=record.agent_id,
+                    run_id=record.run_id,
                     label=record.label,
                     state=SubagentState.CANCELLED,
                     spawner_session_key=record.spawner_session_key,
@@ -1733,6 +2158,7 @@ class SubagentManager:
                     depth=record.depth,
                     spawner_session_key=record.spawner_session_key,
                     spawner_channel=record.spawner_channel,
+                    metadata={"run_id": record.run_id},
                 ))
 
         except Exception as exc:
@@ -1752,6 +2178,7 @@ class SubagentManager:
             self._persist_session_agent_state(record.agent_id)
             result_obj = SubagentResult(
                 agent_id=record.agent_id,
+                run_id=record.run_id,
                 label=record.label,
                 state=SubagentState.FAILED,
                 error=error_msg,
@@ -1771,6 +2198,7 @@ class SubagentManager:
                 error=error_msg,
                 spawner_session_key=record.spawner_session_key,
                 spawner_channel=record.spawner_channel,
+                metadata={"run_id": record.run_id},
             ))
 
         finally:
@@ -1784,8 +2212,21 @@ class SubagentManager:
         cfg: SubagentConfig,
     ) -> str:
         """Run the child agent process with optional extended thinking."""
-        if cfg.thinking_level and cfg.thinking_level != "off":
-            result_text, _ = await child_agent.process_with_thinking(task_text)
+        thinking_level = normalize_thinking_level(cfg.thinking_level)
+        if thinking_level and thinking_level != "off":
+            try:
+                result_text, _ = await child_agent.process_with_thinking(
+                    task_text,
+                    thinking_level=thinking_level,
+                )
+            except TypeError as exc:
+                if "thinking" not in str(exc):
+                    raise
+                logger.warning(
+                    "Child agent runtime does not support the requested thinking mode; "
+                    "falling back to standard processing."
+                )
+                result_text = await child_agent.process(task_text)
         else:
             result_text = await child_agent.process(task_text)
         return result_text or ""
@@ -1831,6 +2272,7 @@ class SubagentManager:
             f"[Sub-agent Completed] '{result.label}' ({result.agent_id}) "
             f"has {state}{elapsed_str}.\n"
             f"task_id: {result.agent_id}\n\n"
+            f"run_id: {result.run_id}\n\n"
             f"{content}"
         )
 
@@ -1839,6 +2281,7 @@ class SubagentManager:
         wake_metadata.update({
             "is_subagent_wake": True,
             "subagent_id": result.agent_id,
+            "subagent_run_id": result.run_id,
         })
         if result.spawner_reply_to is not None:
             wake_metadata.setdefault("reply_to", result.spawner_reply_to)
@@ -1896,21 +2339,66 @@ class SubagentManager:
             except Exception as exc:
                 logger.debug(f"Subagent event listener error: {exc}")
 
+    def _compose_system_prompt(
+        self,
+        record: SubagentRecord,
+        cfg: SubagentConfig | None = None,
+    ) -> str:
+        """Stack caller-provided prompt text above the runtime subagent contract."""
+        runtime_prompt = self._build_system_prompt(record).strip()
+        effective_cfg = cfg or record.config
+        custom_prompt = (effective_cfg.system_prompt or "").strip()
+        if not custom_prompt:
+            return runtime_prompt
+        return f"{custom_prompt}\n\n{runtime_prompt}"
+
     def _build_system_prompt(self, record: SubagentRecord) -> str:
         """Build a focused system prompt for the sub-agent."""
-        specialization_line = ""
-        if record.config.specialization:
-            specialization_line = (
-                f"Specialization: {record.config.specialization}\n"
-                "Treat requests that fall in this specialization as your primary responsibility.\n"
-            )
-        return (
-            f"You are a sub-agent (ID: {record.agent_id}) working on a specific subtask.\n"
-            f"{specialization_line}"
-            f"Your task: {record.task}\n\n"
-            f"Guidelines:\n"
-            f"- Focus exclusively on this task.\n"
-            f"- Be concise and deliver concrete, actionable results.\n"
-            f"- Do not spawn further sub-agents unless strictly necessary.\n"
-            f"- When done, provide a clear summary of results."
+        can_spawn_children = (
+            self._config_allows_nested_subagents(record.config)
+            and record.depth < self.max_depth
         )
+        lines = [
+            "# Subagent Context",
+            "",
+            f"You are a sub-agent session `{record.agent_id}` running execution `{record.run_id}`.",
+            f"Depth: {record.depth}/{self.max_depth}",
+            f"Task: {record.task}",
+            "",
+            "## Rules",
+            "1. Stay focused on this task only.",
+            "2. Return one concise final summary with concrete findings or changes.",
+            "3. Your result is auto-announced back to the requester; do not talk to the user directly.",
+            "4. Do not busy-poll for child status or send heartbeat-style updates.",
+            "5. Re-read only targeted context when prior tool output is truncated or compacted.",
+        ]
+        if record.config.specialization:
+            lines.extend([
+                "",
+                "## Specialization",
+                record.config.specialization,
+                "Treat matching requests as your primary responsibility.",
+            ])
+        if record.config.routing_mode == RoutingMode.ORCHESTRATED:
+            lines.extend([
+                "",
+                "## Routing Mode",
+                "This specialist is configured for orchestrated routing.",
+                "When a matching request arrives, you may coordinate nested workers and then synthesize the final result.",
+            ])
+        if can_spawn_children:
+            lines.extend([
+                "",
+                "## Orchestration",
+                "You are explicitly allowed to spawn nested sub-agents for parallel work.",
+                "Use the `spawn` tool only when delegation materially helps.",
+                "Child results are pushed back automatically; wait for expected completions before finalizing.",
+            ])
+        else:
+            lines.extend([
+                "",
+                "## Execution Mode",
+                "You are a leaf worker for this run.",
+                "Do not spawn further sub-agents from this session.",
+            ])
+        return "\n".join(lines)

@@ -628,7 +628,12 @@ class ChannelManager:
                 )
             _set_sub_ctx = getattr(self._agent, "set_subagent_context", None)
             if callable(_set_sub_ctx):
-                _set_sub_ctx(session_key=session_key, channel=message.channel)
+                _set_sub_ctx(
+                    session_key=session_key,
+                    channel=message.channel,
+                    metadata=message.metadata.copy(),
+                    reply_to=message.message_id,
+                )
 
             if think_level != "off":
                 response_text, thinking_content = await self._agent.process_with_thinking(

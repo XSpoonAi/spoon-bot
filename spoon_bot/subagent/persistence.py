@@ -182,18 +182,34 @@ class AgentDirectory:
     Directory layout:
         {workspace}/agents/{name}/
         ├── agent.json       Agent metadata (config, stats, timestamps)
-        └── sessions/        Session transcript files for this agent
+        └── sessions/        Session transcript files for this agent.
     """
 
     def __init__(self, workspace: Path, agent_name: str) -> None:
         self.root = Path(workspace) / "agents" / agent_name
         self.agent_name = agent_name
 
+    @property
+    def sessions_dir(self) -> Path:
+        """Return the transcript directory for this persistent agent."""
+        return self.root / "sessions"
+
     def ensure(self) -> Path:
         """Create the directory structure and return the root path."""
         self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / "sessions").mkdir(exist_ok=True)
+        self.sessions_dir.mkdir(exist_ok=True)
         return self.root
+
+    def build_session_manager(self) -> "SessionManager":
+        """Create a file-backed SessionManager rooted at this agent directory."""
+        from spoon_bot.session.manager import SessionManager
+        from spoon_bot.session.store import FileSessionStore
+
+        self.ensure()
+        return SessionManager(
+            workspace=self.root,
+            store=FileSessionStore(self.sessions_dir),
+        )
 
     def save_agent_json(self, record: SubagentRecord) -> None:
         """Persist agent metadata to agent.json."""
@@ -204,6 +220,7 @@ class AgentDirectory:
             last_active_at=record.completed_at or record.started_at or record.created_at,
             last_run_agent_id=record.agent_id,
             last_run_state=record.state.value,
+            session_key=record.session_key,
         )
         self.save_profile_json(profile)
 

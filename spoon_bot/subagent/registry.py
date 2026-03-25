@@ -269,6 +269,7 @@ class SubagentRegistry:
         *,
         task: str,
         label: str,
+        run_id: str | object = _UNSET,
         parent_id: str | None | object = _UNSET,
         spawner_session_key: str | None | object = _UNSET,
         spawner_channel: str | None | object = _UNSET,
@@ -290,6 +291,8 @@ class SubagentRegistry:
                 return False
             old_parent_id = record.parent_id
             old_depth = record.depth
+            if run_id is not _UNSET:
+                record.run_id = run_id
             record.task = task
             record.label = label
             if parent_id is not _UNSET:

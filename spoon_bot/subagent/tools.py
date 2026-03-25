@@ -27,7 +27,13 @@ from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.subagent.catalog import AGENT_CATALOG, format_roles_for_prompt, get_role
-from spoon_bot.subagent.models import CleanupMode, RoutingMode, SpawnMode, SubagentConfig
+from spoon_bot.subagent.models import (
+    CleanupMode,
+    RoutingMode,
+    SpawnMode,
+    SubagentConfig,
+    normalize_thinking_level,
+)
 
 if TYPE_CHECKING:
     from spoon_bot.subagent.manager import SubagentManager
@@ -65,6 +71,8 @@ class SubagentTool(Tool):
         self._spawner_context_bound = False
         self._spawner_session_key: str | None = None
         self._spawner_channel: str | None = None
+        self._spawner_metadata: dict[str, Any] = {}
+        self._spawner_reply_to: str | None = None
 
     def set_manager(self, manager: SubagentManager) -> None:
         """Inject the SubagentManager after tool registration."""
@@ -75,11 +83,15 @@ class SubagentTool(Tool):
         *,
         session_key: str | None,
         channel: str | None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> None:
         """Bind this tool instance to the session/channel that owns it."""
         self._spawner_context_bound = True
         self._spawner_session_key = session_key
         self._spawner_channel = channel
+        self._spawner_metadata = dict(metadata or {})
+        self._spawner_reply_to = reply_to
 
     def _effective_spawner_session_key(self) -> str | None:
         if self._spawner_context_bound:
@@ -94,6 +106,20 @@ class SubagentTool(Tool):
         if self._manager is None:
             return None
         return getattr(self._manager, "_current_spawner_channel", None)
+
+    def _effective_spawner_metadata(self) -> dict[str, Any]:
+        if self._spawner_context_bound:
+            return dict(self._spawner_metadata)
+        if self._manager is None:
+            return {}
+        return dict(getattr(self._manager, "_current_spawner_metadata", {}))
+
+    def _effective_spawner_reply_to(self) -> str | None:
+        if self._spawner_context_bound:
+            return self._spawner_reply_to
+        if self._manager is None:
+            return None
+        return getattr(self._manager, "_current_spawner_reply_to", None)
 
     # ------------------------------------------------------------------
     # Tool ABC
@@ -132,6 +158,8 @@ class SubagentTool(Tool):
             "  spawn(action='spawn', role='backend', task='Implement API based on plan: ...')\n"
             "  spawn(action='spawn', role='frontend', task='Build UI based on plan: ...')\n"
             "  spawn(action='wait', timeout=180)   # wait for both\n\n"
+            "Nested orchestration is opt-in: set `allow_subagents=true` only for\n"
+            "explicit orchestrator-style child agents.\n\n"
             "Tip: launch multiple independent sub-agents in parallel (one tool call each)\n"
             "to maximise throughput. Wait for results before spawning dependents."
         )
@@ -194,6 +222,14 @@ class SubagentTool(Tool):
                         "'steer', 'info')"
                     ),
                 },
+                "run_id": {
+                    "type": "string",
+                    "description": (
+                        "Execution run ID (for 'results' and 'wait'). "
+                        "Use this to wait for the current run of a reused session "
+                        "without picking up older buffered results."
+                    ),
+                },
                 "model": {
                     "type": "string",
                     "description": (
@@ -212,8 +248,15 @@ class SubagentTool(Tool):
                 "thinking": {
                     "type": "string",
                     "description": (
-                        "Enable extended thinking for supported models. "
-                        "Values: 'basic' or 'extended'."
+                        "Thinking mode for supported models. "
+                        "Values: 'off', 'basic', or 'extended'."
+                    ),
+                },
+                "enable_skills": {
+                    "type": "boolean",
+                    "description": (
+                        "Enable the child skill system explicitly. "
+                        "Omit this field to inherit the parent setting."
                     ),
                 },
                 "timeout_seconds": {
@@ -293,7 +336,17 @@ class SubagentTool(Tool):
                     "enum": ["direct", "orchestrated"],
                     "description": (
                         "How this specialist should be used when auto-routed. "
-                        "'direct' routes the whole request straight to it."
+                        "'direct' routes the request straight to the specialist. "
+                        "'orchestrated' lets the specialist coordinate nested workers "
+                        "before returning a final answer."
+                    ),
+                },
+                "allow_subagents": {
+                    "type": "boolean",
+                    "description": (
+                        "Allow this child to spawn nested sub-agents of its own. "
+                        "Keep false for normal workers; enable only for explicit "
+                        "orchestrators."
                     ),
                 },
             },
@@ -402,8 +455,13 @@ class SubagentTool(Tool):
         elif kwargs.get("tool_profile") and role_name:
             # Explicit override even when role is set
             config.tool_profile = kwargs["tool_profile"]
-        if kwargs.get("thinking"):
-            config.thinking_level = kwargs["thinking"]
+        if kwargs.get("thinking") is not None:
+            try:
+                config.thinking_level = normalize_thinking_level(kwargs["thinking"])
+            except ValueError as exc:
+                return f"Error: {exc}"
+        if kwargs.get("enable_skills") is not None:
+            config.enable_skills = bool(kwargs["enable_skills"])
         if kwargs.get("timeout_seconds"):
             try:
                 config.timeout_seconds = int(kwargs["timeout_seconds"])
@@ -449,12 +507,15 @@ class SubagentTool(Tool):
                     f"Error: invalid routing_mode {kwargs['routing_mode']!r}. "
                     "Use 'direct' or 'orchestrated'."
                 )
+        if kwargs.get("allow_subagents") is not None:
+            config.allow_subagents = bool(kwargs["allow_subagents"])
 
         has_explicit_config_override = any([
             role_name is not None,
             kwargs.get("model") is not None,
             kwargs.get("tool_profile") is not None,
             kwargs.get("thinking") is not None,
+            kwargs.get("enable_skills") is not None,
             kwargs.get("timeout_seconds") is not None,
             kwargs.get("spawn_mode") is not None,
             kwargs.get("cleanup") is not None,
@@ -464,6 +525,7 @@ class SubagentTool(Tool):
             kwargs.get("match_keywords") is not None,
             kwargs.get("match_examples") is not None,
             kwargs.get("routing_mode") is not None,
+            kwargs.get("allow_subagents") is not None,
         ])
         config_for_call = config if (not task_id or has_explicit_config_override) else None
 
@@ -482,6 +544,8 @@ class SubagentTool(Tool):
                 "config": config_for_call,
                 "spawner_session_key": self._effective_spawner_session_key(),
                 "spawner_channel": self._effective_spawner_channel(),
+                "spawner_metadata": self._effective_spawner_metadata(),
+                "spawner_reply_to": self._effective_spawner_reply_to(),
             }
             if task_id:
                 record = await self._manager.resume_task(
@@ -494,8 +558,14 @@ class SubagentTool(Tool):
                 intro = "Sub-agent spawned successfully."
             model_str = f" | model: {record.model_name}" if record.model_name else ""
             thinking_str = (
-                f" | thinking: {config.thinking_level}" if config.thinking_level else ""
+                f" | thinking: {record.config.thinking_level}" if record.config.thinking_level else ""
             )
+            if record.config.enable_skills is None:
+                skills_str = " | skills: inherit"
+            else:
+                skills_str = (
+                    f" | skills: {'on' if record.config.enable_skills else 'off'}"
+                )
             timeout_str = (
                 f" | timeout: {config.timeout_seconds}s" if config.timeout_seconds else ""
             )
@@ -507,13 +577,22 @@ class SubagentTool(Tool):
             route_str = ""
             if getattr(record.config, "auto_route", False):
                 route_str = " | auto-route: on"
+            nested_str = (
+                " | nested: on"
+                if (
+                    getattr(record.config, "allow_subagents", False)
+                    or getattr(record.config, "routing_mode", RoutingMode.DIRECT) == RoutingMode.ORCHESTRATED
+                )
+                else ""
+            )
             return (
                 f"{intro}\n"
                 f"  ID:      {record.agent_id}\n"
+                f"  Run ID:  {record.run_id}\n"
                 f"  Task ID: {record.agent_id}\n"
                 f"  Label:   {record.label}\n"
                 f"  Depth:   {record.depth}"
-                f"{role_str}{model_str}{thinking_str}{timeout_str}{mode_str}{route_str}\n\n"
+                f"{role_str}{model_str}{thinking_str}{skills_str}{timeout_str}{mode_str}{route_str}{nested_str}\n\n"
                 f"Use spawn(action='results') or spawn(action='wait', timeout=30) "
                 f"to retrieve its output when ready. "
                 f"Results will also be pushed automatically when the sub-agent completes.\n"
@@ -539,11 +618,14 @@ class SubagentTool(Tool):
                 parent_id=self._parent_agent_id,
                 spawner_session_key=self._effective_spawner_session_key(),
                 spawner_channel=self._effective_spawner_channel(),
+                spawner_metadata=self._effective_spawner_metadata(),
+                spawner_reply_to=self._effective_spawner_reply_to(),
             )
             model_str = f" | model: {record.model_name}" if record.model_name else ""
             return (
                 f"Session agent resumed successfully.\n"
                 f"  ID:    {record.agent_id}\n"
+                f"  Run ID: {record.run_id}\n"
                 f"  Task ID: {record.agent_id}\n"
                 f"  Name:  {agent_name}\n"
                 f"  Label: {record.label}{model_str}\n\n"
@@ -556,7 +638,8 @@ class SubagentTool(Tool):
 
     def _handle_status(self) -> str:
         summary = self._manager.get_status_summary(
-            parent_id=self._parent_agent_id
+            parent_id=self._parent_agent_id,
+            spawner_session_key=self._effective_spawner_session_key(),
         )
         if summary["total"] == 0:
             return "No sub-agents have been spawned."
@@ -580,7 +663,7 @@ class SubagentTool(Tool):
                     else ""
                 )
                 lines.append(
-                    f"  [{a['agent_id']}] {a['label']}: "
+                    f"  [{a['agent_id']}/{a['run_id']}] {a['label']}: "
                     f"{a['state']}{elapsed_str}{model_str}{mode_str}{desc_str}"
                 )
 
@@ -597,7 +680,7 @@ class SubagentTool(Tool):
                     else ""
                 )
                 lines.append(
-                    f"  [{a['agent_id']}] {a['label']}: "
+                    f"  [{a['agent_id']}/{a['run_id']}] {a['label']}: "
                     f"{a['state']}{elapsed_str}{model_str}{mode_str}"
                 )
 
@@ -605,9 +688,11 @@ class SubagentTool(Tool):
 
     async def _handle_results(self, kwargs: dict[str, Any]) -> str:
         timeout = float(kwargs.get("timeout", 0.0))
+        run_id = kwargs.get("run_id")
         results = await self._manager.collect_results(
             timeout=timeout,
             spawner_session_key=self._effective_spawner_session_key(),
+            run_id=run_id,
         )
         if not results:
             return (
@@ -619,11 +704,13 @@ class SubagentTool(Tool):
     async def _handle_wait(self, kwargs: dict[str, Any]) -> str:
         timeout = float(kwargs.get("timeout", 30.0))
         agent_id = kwargs.get("agent_id")
+        run_id = kwargs.get("run_id")
 
         results = await self._manager.collect_results(
             timeout=timeout,
             spawner_session_key=self._effective_spawner_session_key(),
             agent_id=agent_id,
+            run_id=run_id,
         )
 
         if not results:
@@ -637,12 +724,20 @@ class SubagentTool(Tool):
         agent_id = kwargs.get("agent_id")
         if agent_id:
             # Count descendants before cancelling for the message
-            record = self._manager.registry.get(agent_id)
+            info = await self._manager.get_info(
+                agent_id,
+                spawner_session_key=self._effective_spawner_session_key(),
+            )
+            record = self._manager.registry.get(agent_id) if info is not None else None
             descendants = (
                 self._manager.registry.get_descendants(agent_id)
                 if record else []
             )
-            success = await self._manager.cancel(agent_id, cascade=True)
+            success = await self._manager.cancel(
+                agent_id,
+                cascade=True,
+                spawner_session_key=self._effective_spawner_session_key(),
+            )
             if success:
                 desc_count = len(descendants)
                 desc_str = f" (+ {desc_count} descendants)" if desc_count else ""
@@ -653,7 +748,8 @@ class SubagentTool(Tool):
             )
         else:
             count = await self._manager.cancel_all(
-                parent_id=self._parent_agent_id
+                parent_id=self._parent_agent_id,
+                spawner_session_key=self._effective_spawner_session_key(),
             )
             return f"Cancellation requested for {count} sub-agent(s) (cascade)."
 
@@ -666,12 +762,18 @@ class SubagentTool(Tool):
         if not message:
             return "Error: 'message' is required for the 'steer' action."
 
-        result = await self._manager.steer(agent_id, message)
+        result = await self._manager.steer(
+            agent_id,
+            message,
+            spawner_session_key=self._effective_spawner_session_key(),
+        )
         status = result.get("status")
         msg = result.get("message", "")
 
         if status == "accepted":
-            return f"Steer accepted for sub-agent {agent_id}. {msg}"
+            run_id = result.get("run_id")
+            run_hint = f" New run: {run_id}." if run_id else ""
+            return f"Steer accepted for sub-agent {agent_id}.{run_hint} {msg}".strip()
         elif status == "rate_limited":
             return f"Rate limited: {msg}"
         elif status == "done":
@@ -684,11 +786,15 @@ class SubagentTool(Tool):
         if not agent_id:
             return "Error: 'agent_id' is required for the 'info' action."
 
-        info = await self._manager.get_info(agent_id)
+        info = await self._manager.get_info(
+            agent_id,
+            spawner_session_key=self._effective_spawner_session_key(),
+        )
         if info is None:
             return f"Sub-agent {agent_id!r} not found."
 
         lines = [f"Sub-agent {agent_id} info:"]
+        lines.append(f"  Run ID:       {info['run_id']}")
         lines.append(f"  Label:        {info['label']}")
         lines.append(f"  State:        {info['state']}")
         lines.append(f"  Task:         {info['task'][:100]}")
@@ -702,6 +808,13 @@ class SubagentTool(Tool):
             lines.append("  Auto-route:    on")
         if info.get("routing_mode"):
             lines.append(f"  Routing mode:  {info['routing_mode']}")
+        if info.get("allow_subagents"):
+            lines.append("  Nested spawn:  on")
+        if "effective_enable_skills" in info:
+            inherited = " (inherited)" if info.get("enable_skills") is None else ""
+            lines.append(
+                f"  Skills:       {'on' if info['effective_enable_skills'] else 'off'}{inherited}"
+            )
         if info.get("match_keywords"):
             lines.append(f"  Keywords:      {', '.join(info['match_keywords'])}")
         if info.get("thinking_level"):
@@ -737,7 +850,7 @@ class SubagentTool(Tool):
             )
             model_str = f" | {r.model_name}" if getattr(r, "model_name", None) else ""
             header = (
-                f"--- [{r.agent_id}] {r.label} "
+                f"--- [{r.agent_id}/{r.run_id}] {r.label} "
                 f"({r.state.value}{elapsed_str}{model_str}) ---"
             )
             content = r.result or r.error or "(no output)"
@@ -746,5 +859,7 @@ class SubagentTool(Tool):
                     content[:_RESULT_TRUNCATE_LEN]
                     + f"\n... [truncated — {len(content) - _RESULT_TRUNCATE_LEN} chars omitted]"
                 )
-            lines.append(f"\n{header}\ntask_id: {r.agent_id}\n{content}")
+            lines.append(
+                f"\n{header}\ntask_id: {r.agent_id}\nrun_id: {r.run_id}\n{content}"
+            )
         return "\n".join(lines)
