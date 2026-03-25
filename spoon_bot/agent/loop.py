@@ -1058,25 +1058,26 @@ class AgentLoop:
         reply_to: str | None = None,
     ) -> None:
         """Bind the spawn tool to the current requester session/channel."""
+        resolved_session_key = session_key or getattr(self, "session_key", None)
+        manager = getattr(self, "_subagent_manager", None)
+        if manager is not None:
+            manager.set_spawner_context(
+                session_key=resolved_session_key,
+                channel=channel,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+
         registry = getattr(self, "tools", None)
         if registry is None:
             return
         spawn_tool = registry.get("spawn")
         if spawn_tool and isinstance(spawn_tool, SubagentTool):
-            bound_channel = channel
-            if bound_channel is None:
-                bound_channel = getattr(spawn_tool, "_spawner_channel", None)
-            bound_metadata = metadata
-            if bound_metadata is None:
-                bound_metadata = getattr(spawn_tool, "_spawner_metadata", {})
-            bound_reply_to = reply_to
-            if bound_reply_to is None:
-                bound_reply_to = getattr(spawn_tool, "_spawner_reply_to", None)
             spawn_tool.set_spawner_context(
-                session_key=session_key or self.session_key,
-                channel=bound_channel,
-                metadata=bound_metadata,
-                reply_to=bound_reply_to,
+                session_key=resolved_session_key,
+                channel=channel,
+                metadata=metadata,
+                reply_to=reply_to,
             )
 
     def _persist_turn(self, user_message: str, assistant_message: str) -> None:
@@ -1219,6 +1220,9 @@ class AgentLoop:
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         session_key: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -1257,7 +1261,12 @@ class AgentLoop:
             logger.debug(f"Switched to session: {session_key}")
 
         current_session_key = getattr(self, "session_key", "default")
-        self.set_subagent_context(session_key=current_session_key)
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
 
         logger.info(f"Processing message: {message[:100]}...")
 
@@ -1913,6 +1922,9 @@ class AgentLoop:
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking: bool = False,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Stream a response with typed chunks.
@@ -1936,7 +1948,12 @@ class AgentLoop:
         logger.info(f"Streaming message: {message[:100]}...")
 
         current_session_key = getattr(self, "session_key", "default")
-        self.set_subagent_context(session_key=current_session_key)
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
 
         created = self._maybe_create_persistent_subagent_from_request(message)
         if isinstance(created, str):
@@ -2257,6 +2274,9 @@ class AgentLoop:
         attachments: list[dict[str, Any]] | None = None,
         session_key: str | None = None,
         thinking_level: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -2287,7 +2307,12 @@ class AgentLoop:
             logger.debug(f"Switched to session: {session_key}")
 
         current_session_key = getattr(self, "session_key", "default")
-        self.set_subagent_context(session_key=current_session_key)
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
 

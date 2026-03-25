@@ -938,6 +938,63 @@ class SubagentManager:
             setattr(effective, key, value)
         return effective
 
+    def _validate_activation_limits(
+        self,
+        *,
+        parent_id: str | None = None,
+        existing_record: SubagentRecord | None = None,
+    ) -> int:
+        """Validate depth and concurrency limits before activating a run."""
+        parent_depth = 0
+        parent_record: SubagentRecord | None = None
+        if parent_id:
+            parent_record = self.registry.get(parent_id)
+            if parent_record:
+                parent_depth = parent_record.depth
+                if not self._config_allows_nested_subagents(parent_record.config):
+                    raise ValueError(
+                        "Nested sub-agent spawning is disabled for this parent. "
+                        "Enable allow_subagents=true only for explicit orchestrator agents."
+                    )
+
+        child_depth = parent_depth + 1 if parent_record is not None else 1
+
+        max_subtree_depth = child_depth
+        if existing_record is not None:
+            descendants = self.registry.get_descendants(existing_record.agent_id)
+            if descendants:
+                max_descendant_delta = max(
+                    desc.depth - existing_record.depth for desc in descendants
+                )
+                max_subtree_depth = child_depth + max_descendant_delta
+
+        if max_subtree_depth > self.max_depth:
+            if max_subtree_depth == child_depth:
+                raise ValueError(
+                    f"Max spawn depth ({self.max_depth}) exceeded. "
+                    f"Parent depth={parent_depth}, requested child depth={child_depth}."
+                )
+            raise ValueError(
+                f"Max spawn depth ({self.max_depth}) exceeded. "
+                f"Resumed subtree would reach depth={max_subtree_depth}."
+            )
+
+        if parent_id:
+            active_children = self.registry.count_active_children(parent_id)
+            if active_children >= self.max_children_per_agent:
+                raise ValueError(
+                    f"Max children per agent ({self.max_children_per_agent}) "
+                    f"already reached for parent {parent_id}."
+                )
+
+        total_active = self.registry.count_active_total()
+        if total_active >= self.max_total_subagents:
+            raise ValueError(
+                f"Max total active sub-agents ({self.max_total_subagents}) reached."
+            )
+
+        return child_depth
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -975,41 +1032,7 @@ class SubagentManager:
         """
         cfg = self._apply_default_config(config)
 
-        # --- Depth check ---
-        parent_depth = 0
-        parent_record: SubagentRecord | None = None
-        if parent_id:
-            parent_record = self.registry.get(parent_id)
-            if parent_record:
-                parent_depth = parent_record.depth
-                if not self._config_allows_nested_subagents(parent_record.config):
-                    raise ValueError(
-                        "Nested sub-agent spawning is disabled for this parent. "
-                        "Enable allow_subagents=true only for explicit orchestrator agents."
-                    )
-        child_depth = parent_depth + 1
-
-        if child_depth > self.max_depth:
-            raise ValueError(
-                f"Max spawn depth ({self.max_depth}) exceeded. "
-                f"Parent depth={parent_depth}, requested child depth={child_depth}."
-            )
-
-        # --- Children-per-agent limit ---
-        if parent_id:
-            active_children = self.registry.count_active_children(parent_id)
-            if active_children >= self.max_children_per_agent:
-                raise ValueError(
-                    f"Max children per agent ({self.max_children_per_agent}) "
-                    f"already reached for parent {parent_id}."
-                )
-
-        # --- Total sub-agent limit ---
-        total_active = self.registry.count_active_total()
-        if total_active >= self.max_total_subagents:
-            raise ValueError(
-                f"Max total active sub-agents ({self.max_total_subagents}) reached."
-            )
+        child_depth = self._validate_activation_limits(parent_id=parent_id)
 
         # --- Session-mode validations ---
         agent_dir_path: str | None = None
@@ -1472,6 +1495,10 @@ class SubagentManager:
             spawner_reply_to=spawner_reply_to,
         )
         label = label or task[:60]
+        self._validate_activation_limits(
+            parent_id=parent_id,
+            existing_record=record,
+        )
         self.registry.prepare_for_resume(
             record.agent_id,
             task=task,
@@ -1717,6 +1744,10 @@ class SubagentManager:
             spawner_reply_to=spawner_reply_to,
         )
         label = task[:60]
+        self._validate_activation_limits(
+            parent_id=parent_id,
+            existing_record=record,
+        )
         self.registry.prepare_for_resume(
             record.agent_id,
             task=task,
@@ -2149,6 +2180,7 @@ class SubagentManager:
                     spawner_reply_to=record.spawner_reply_to,
                 )
                 await self._results.put(result_obj)
+                await self._announce_result(result_obj)
                 logger.info(f"Sub-agent {record.agent_id!r} was cancelled")
                 await self._emit_event(SubagentEvent(
                     event_type="cancelled",

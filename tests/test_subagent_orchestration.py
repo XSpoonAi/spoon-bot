@@ -420,6 +420,7 @@ async def test_subagent_manager_resume_task_reparents_and_updates_depth(workspac
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
+        max_depth=6,
     )
     monkeypatch.setattr(manager, "_start_background_run", lambda *args, **kwargs: None)
 
@@ -436,6 +437,7 @@ async def test_subagent_manager_resume_task_reparents_and_updates_depth(workspac
         task="parent b",
         state=SubagentState.COMPLETED,
         depth=3,
+        config=SubagentConfig(allow_subagents=True),
     )
     child = SubagentRecord(
         agent_id="sub_child",
@@ -470,6 +472,42 @@ async def test_subagent_manager_resume_task_reparents_and_updates_depth(workspac
     assert "sub_child" not in manager.registry.get("sub_parent_a").children
     assert "sub_child" in manager.registry.get("sub_parent_b").children
     assert manager.registry.get("sub_grandchild").depth == 5
+
+
+@pytest.mark.asyncio
+async def test_subagent_manager_resume_task_reparent_respects_max_depth(workspace_dir, monkeypatch):
+    manager = SubagentManager(
+        session_manager=SessionManager(workspace=workspace_dir),
+        workspace=workspace_dir,
+        max_depth=3,
+    )
+    monkeypatch.setattr(manager, "_start_background_run", lambda *args, **kwargs: None)
+
+    parent = SubagentRecord(
+        agent_id="sub_parent",
+        label="parent",
+        task="parent",
+        state=SubagentState.COMPLETED,
+        depth=3,
+        config=SubagentConfig(allow_subagents=True),
+    )
+    child = SubagentRecord(
+        agent_id="sub_child",
+        label="child",
+        task="child",
+        state=SubagentState.COMPLETED,
+        depth=1,
+    )
+
+    manager.registry.register(parent)
+    manager.registry.register(child)
+
+    with pytest.raises(ValueError, match="Max spawn depth"):
+        await manager.resume_task(
+            task_id="sub_child",
+            task="reparent past limit",
+            parent_id="sub_parent",
+        )
 
 
 @pytest.mark.asyncio
@@ -599,6 +637,56 @@ async def test_subagent_manager_announce_result_awaits_bus_publish(workspace_dir
     assert published[0].session_key == "session_root"
 
 
+@pytest.mark.asyncio
+async def test_run_subagent_announces_cancelled_result(workspace_dir, monkeypatch):
+    import spoon_bot.agent.loop as loop_module
+
+    started = asyncio.Event()
+
+    class FakeAgentLoop:
+        def __init__(self, *args, **kwargs):
+            self.tools = {}
+
+        async def initialize(self):
+            return None
+
+        async def process(self, task_text):
+            started.set()
+            await asyncio.Future()
+            return task_text
+
+        async def cleanup(self):
+            return None
+
+    monkeypatch.setattr(loop_module, "AgentLoop", FakeAgentLoop)
+
+    manager = SubagentManager(
+        session_manager=SessionManager(workspace=workspace_dir),
+        workspace=workspace_dir,
+    )
+    manager._announce_result = AsyncMock()  # type: ignore[method-assign]
+
+    record = SubagentRecord(
+        agent_id="sub_cancelled",
+        label="cancelled",
+        task="cancelled",
+        state=SubagentState.PENDING,
+        spawner_session_key="session_root",
+        spawner_channel="telegram:test",
+    )
+    manager.registry.register(record)
+
+    task = asyncio.create_task(manager._run_subagent(record))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    manager._announce_result.assert_awaited_once()
+    cancelled_result = manager._announce_result.await_args.args[0]
+    assert cancelled_result.agent_id == "sub_cancelled"
+    assert cancelled_result.state == SubagentState.CANCELLED
+
+
 def test_session_manager_archive_hides_deleted_file_sessions(workspace_dir):
     manager = SessionManager(workspace=workspace_dir)
     session = Session(session_key="alpha")
@@ -609,6 +697,7 @@ def test_session_manager_archive_hides_deleted_file_sessions(workspace_dir):
     assert manager.archive("alpha") is True
     assert manager.get("alpha") is None
     assert "alpha" not in manager.list_sessions()
+    assert not any(".deleted." in key for key in manager.list_sessions())
     assert any(".deleted." in path.name for path in (workspace_dir / "sessions").iterdir())
 
 
@@ -627,7 +716,7 @@ def test_session_manager_archive_exports_non_file_backends(workspace_dir):
     assert manager.get("alpha") is None
 
     archive_store = FileSessionStore(workspace_dir / "sessions_archived")
-    archived_keys = archive_store.list_session_keys()
+    archived_keys = archive_store.list_session_keys(include_archived=True)
     assert archived_keys
     archived_session = archive_store.load_session(archived_keys[0])
     assert archived_session is not None
@@ -1222,6 +1311,43 @@ async def test_resume_agent_reuses_persistent_profile_session_key_and_migrates_l
 
 
 @pytest.mark.asyncio
+async def test_resume_agent_enforces_total_active_limit(workspace_dir, monkeypatch):
+    manager = SubagentManager(
+        session_manager=SessionManager(workspace=workspace_dir),
+        workspace=workspace_dir,
+        max_total_subagents=1,
+    )
+    monkeypatch.setattr(manager, "_start_background_run", lambda *args, **kwargs: None)
+
+    active = SubagentRecord(
+        agent_id="sub_active",
+        label="active",
+        task="active",
+        state=SubagentState.RUNNING,
+    )
+    completed = SubagentRecord(
+        agent_id="sub_session",
+        label="session",
+        task="session",
+        state=SubagentState.COMPLETED,
+        config=SubagentConfig(
+            spawn_mode=SpawnMode.SESSION,
+            agent_name="planner",
+        ),
+        agent_name="planner",
+    )
+
+    manager.registry.register(active)
+    manager.registry.register(completed)
+
+    with pytest.raises(ValueError, match="Max total active sub-agents"):
+        await manager.resume_agent(
+            agent_name="planner",
+            task="resume despite limit",
+        )
+
+
+@pytest.mark.asyncio
 async def test_resume_agent_discovers_missing_profile_session_key_from_agent_scope(
     workspace_dir,
 ):
@@ -1667,6 +1793,47 @@ async def test_channel_manager_passes_metadata_to_set_subagent_context():
         metadata={"chat_id": 1001, "reply_to": "42"},
         reply_to="m1",
     )
+    agent.process.assert_awaited_once_with(
+        message="hello",
+        media=None,
+        session_key="telegram_spoon_1",
+        channel="telegram:spoon",
+        metadata={"chat_id": 1001, "reply_to": "42"},
+        reply_to="m1",
+    )
+
+
+def test_set_subagent_context_clears_stale_channel_metadata_when_omitted():
+    from spoon_bot.agent.loop import AgentLoop
+    from spoon_bot.subagent.tools import SubagentTool
+
+    manager = SimpleNamespace(set_spawner_context=Mock())
+    spawn_tool = SubagentTool(manager=manager)
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.session_key = "default"
+    loop._subagent_manager = manager
+    loop.tools = {"spawn": spawn_tool}
+
+    AgentLoop.set_subagent_context(
+        loop,
+        session_key="telegram-session",
+        channel="telegram:spoon",
+        metadata={"chat_id": 1001},
+        reply_to="m1",
+    )
+    AgentLoop.set_subagent_context(loop, session_key="rest-session")
+
+    assert spawn_tool._spawner_session_key == "rest-session"
+    assert spawn_tool._spawner_channel is None
+    assert spawn_tool._spawner_metadata == {}
+    assert spawn_tool._spawner_reply_to is None
+    assert manager.set_spawner_context.call_args_list[-1].kwargs == {
+        "session_key": "rest-session",
+        "channel": None,
+        "metadata": None,
+        "reply_to": None,
+    }
 
 
 def test_persistent_session_storage_migrates_legacy_shared_transcript(workspace_dir):

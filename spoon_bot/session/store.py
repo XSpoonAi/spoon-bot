@@ -164,8 +164,12 @@ class FileSessionStore(SessionStore):
             archived = True
         return archived
 
-    def list_session_keys(self) -> List[str]:
-        keys = {f.stem for f in self._dir.glob("*.jsonl")}
+    def list_session_keys(self, include_archived: bool = False) -> List[str]:
+        keys = {
+            f.stem
+            for f in self._dir.glob("*.jsonl")
+            if include_archived or ".deleted." not in f.stem
+        }
         return sorted(keys)
 
 

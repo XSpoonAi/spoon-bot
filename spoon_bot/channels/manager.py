@@ -640,6 +640,9 @@ class ChannelManager:
                     message=content,
                     media=media,
                     session_key=session_key,
+                    channel=message.channel,
+                    metadata=message.metadata.copy(),
+                    reply_to=message.message_id,
                 )
                 # Include thinking content in verbose mode
                 if message.metadata.get("verbose") and thinking_content:
@@ -652,6 +655,9 @@ class ChannelManager:
                     message=content,
                     media=media,
                     session_key=session_key,
+                    channel=message.channel,
+                    metadata=message.metadata.copy(),
+                    reply_to=message.message_id,
                 )
 
             self._circuit_breaker.record_success()
