@@ -120,17 +120,48 @@ class SubagentRegistry:
             return self._records.get(agent_id)
 
     def remove(self, agent_id: str) -> bool:
-        """Remove a record and unlink it from its parent's children list."""
+        """Remove a record, re-link its children to its parent, and unlink from parent."""
         with self._lock:
             record = self._records.pop(agent_id, None)
             if record is None:
                 return False
-            if record.parent_id and record.parent_id in self._records:
-                parent = self._records[record.parent_id]
+
+            grandparent_id = record.parent_id
+            grandparent = (
+                self._records.get(grandparent_id)
+                if grandparent_id
+                else None
+            )
+
+            # Unlink from parent's children list
+            if grandparent is not None:
                 try:
-                    parent.children.remove(agent_id)
+                    grandparent.children.remove(agent_id)
                 except ValueError:
                     pass
+
+            # Re-link children to grandparent so they don't become orphaned
+            for child_id in record.children:
+                child = self._records.get(child_id)
+                if child is None:
+                    continue
+                child.parent_id = grandparent_id
+                if grandparent is not None:
+                    if child_id not in grandparent.children:
+                        grandparent.children.append(child_id)
+                # Adjust depth for the re-linked child and all its descendants
+                depth_delta = -1 if record.depth > 0 else 0
+                if depth_delta:
+                    child.depth = max(0, child.depth + depth_delta)
+                    stack = list(child.children)
+                    while stack:
+                        desc_id = stack.pop()
+                        desc = self._records.get(desc_id)
+                        if desc is None:
+                            continue
+                        desc.depth = max(0, desc.depth + depth_delta)
+                        stack.extend(desc.children)
+
             self._persist()
             return True
 
