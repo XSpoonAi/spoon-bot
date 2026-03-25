@@ -1714,7 +1714,10 @@ class SubagentManager:
         spawner_reply_to: str | None = None,
     ) -> SubagentRecord:
         """Resume an existing sub-agent session by task_id / agent_id."""
-        record = self.registry.get(task_id)
+        record = self._get_scoped_record(
+            task_id,
+            spawner_session_key=spawner_session_key,
+        )
         if record is None:
             raise ValueError(f"Sub-agent task_id {task_id!r} was not found.")
 

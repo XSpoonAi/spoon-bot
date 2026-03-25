@@ -249,6 +249,7 @@ async def test_subagent_manager_resume_task_preserves_existing_config(workspace_
         label="old label",
         task="old task",
         state=SubagentState.COMPLETED,
+        spawner_session_key="session_nested",
         config=original_config,
         model_name="model-a",
         result="old result",
@@ -272,6 +273,38 @@ async def test_subagent_manager_resume_task_preserves_existing_config(workspace_
     assert resumed.spawner_session_key == "session_nested"
     assert resumed.spawner_channel == "telegram:test"
     assert resumed.result is None
+
+
+@pytest.mark.asyncio
+async def test_subagent_manager_resume_task_rejects_invisible_task_id(workspace_dir, monkeypatch):
+    manager = SubagentManager(
+        session_manager=SessionManager(workspace=workspace_dir),
+        workspace=workspace_dir,
+    )
+    monkeypatch.setattr(manager, "_start_background_run", lambda *args, **kwargs: None)
+
+    record = SubagentRecord(
+        agent_id="sub_other_scope",
+        label="other scope",
+        task="old task",
+        state=SubagentState.COMPLETED,
+        spawner_session_key="session_other",
+    )
+    manager.registry.register(record)
+    original_run_id = record.run_id
+
+    with pytest.raises(ValueError, match="was not found"):
+        await manager.resume_task(
+            task_id="sub_other_scope",
+            task="steal resume",
+            spawner_session_key="session_root",
+            spawner_channel="telegram:root",
+        )
+
+    assert record.run_id == original_run_id
+    assert record.task == "old task"
+    assert record.state == SubagentState.COMPLETED
+    assert record.spawner_session_key == "session_other"
 
 
 @pytest.mark.asyncio
