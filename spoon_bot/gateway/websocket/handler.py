@@ -42,9 +42,178 @@ from spoon_bot.gateway.websocket.protocol import (
     WSStreamChunk,
     parse_message,
 )
-from spoon_bot.gateway.websocket.workspace_fs import WorkspaceFSService
+from spoon_bot.gateway.websocket.workspace_fs import SANDBOX_WORKSPACE_ROOT, WorkspaceFSService
 from spoon_bot.gateway.websocket.workspace_terminal import WorkspaceTerminalService
 from spoon_bot.gateway.websocket.workspace_watch import WorkspaceWatchService
+
+
+# ---------------------------------------------------------------------------
+# Methods that are safe for concurrent (task-based) dispatch.
+# Path-sensitive fs/workspace ops rely on WorkspaceFSService locking to
+# serialize conflicting requests while allowing unrelated paths to proceed.
+# ---------------------------------------------------------------------------
+
+_CONCURRENT_METHODS: frozenset[str] = frozenset({
+    ClientMethod.FS_LIST.value,
+    ClientMethod.FS_STAT.value,
+    ClientMethod.FS_READ.value,
+    ClientMethod.FS_WRITE.value,
+    ClientMethod.FS_MKDIR.value,
+    ClientMethod.FS_RENAME.value,
+    ClientMethod.FS_REMOVE.value,
+    ClientMethod.FS_WATCH.value,
+    ClientMethod.FS_UNWATCH.value,
+    "workspace.tree",
+})
+_CONCURRENT_REQUEST_LIMIT = 16
+_ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this request):"
+
+
+def _workspace_root() -> Path:
+    """Return the resolved workspace root used for attachment/media validation."""
+    agent = get_agent()
+    workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+    return workspace.expanduser().resolve()
+
+
+def _resolve_workspace_file(path_str: str) -> Path | None:
+    """Resolve a file path and ensure it stays within the configured workspace."""
+    candidate = str(path_str or "").strip()
+    if not candidate:
+        return None
+
+    workspace = _workspace_root()
+    sandbox_root = SANDBOX_WORKSPACE_ROOT.rstrip("/")
+    try:
+        if candidate.startswith("/"):
+            normalized = Path(candidate).as_posix()
+            workspace_root_str = workspace.as_posix().rstrip("/")
+            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                relative = normalized[len(sandbox_root):].lstrip("/")
+                resolved = (workspace / relative).resolve(strict=True)
+            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                relative = normalized[len(workspace_root_str):].lstrip("/")
+                resolved = (workspace / relative).resolve(strict=True)
+            else:
+                resolved = Path(candidate).expanduser().resolve(strict=True)
+        else:
+            resolved = (workspace / candidate).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+    if resolved != workspace and workspace not in resolved.parents:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _string_list_from_any(raw: Any) -> list[str]:
+    """Best-effort normalize media payloads to a list of non-empty strings."""
+    if not isinstance(raw, list):
+        return []
+
+    items: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            value = item.strip()
+        else:
+            value = str(item).strip() if item is not None else ""
+        if value:
+            items.append(value)
+    return items
+
+
+def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
+    """Normalize attachment metadata from websocket params."""
+    if not isinstance(raw, list):
+        return []
+
+    attachments: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if not uri:
+            continue
+        attachment = dict(item)
+        attachment["uri"] = uri
+        attachment.setdefault("workspace_path", uri)
+        attachments.append(attachment)
+    return attachments
+
+
+def _validate_media_paths(media: list[str]) -> list[str]:
+    """Reject media paths that are missing or outside the sandbox workspace."""
+    invalid = [path for path in media if _resolve_workspace_file(path) is None]
+    if invalid:
+        raise ValueError(f"Invalid media path(s): {', '.join(invalid)}")
+    return media
+
+
+def _validate_attachment_paths(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reject attachment paths that are missing or outside the sandbox workspace."""
+    missing = [
+        str(item.get("workspace_path") or item.get("uri") or "").strip()
+        for item in attachments
+        if _resolve_workspace_file(str(item.get("workspace_path") or item.get("uri") or "").strip()) is None
+    ]
+    if missing:
+        raise ValueError(f"Invalid attachment path(s): {', '.join(missing)}")
+    return attachments
+
+
+def _derive_media_from_attachments(attachments: list[dict[str, Any]]) -> list[str]:
+    """Best-effort derive image media paths from attachment metadata."""
+    items: list[str] = []
+    for attachment in attachments:
+        path = str(attachment.get("workspace_path") or attachment.get("uri") or "").strip()
+        mime_type = str(attachment.get("mime_type") or attachment.get("file_type") or "").strip().lower()
+        if not path:
+            continue
+        if mime_type.startswith("image/") or Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+            items.append(path)
+    return items
+
+
+def _merge_attachment_context(message: str, attachments: list[dict[str, Any]]) -> str:
+    """Ensure request text contains workspace attachment references."""
+    if not attachments:
+        return message
+
+    normalized: list[tuple[dict[str, Any], str]] = []
+    for item in attachments:
+        path = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if path:
+            normalized.append((item, path))
+    if not normalized:
+        return message
+
+    text = message.strip()
+    if _ATTACHMENT_CONTEXT_HEADER in text and all(path in text for _, path in normalized):
+        return text
+
+    lines = [text] if text else [
+        "The user attached files without extra text. Inspect the files and answer based on their contents."
+    ]
+    lines.extend(["", _ATTACHMENT_CONTEXT_HEADER])
+    for item, path in normalized:
+        parts: list[str] = []
+        name = str(item.get("name") or item.get("file_name") or "").strip()
+        mime_type = str(item.get("mime_type") or item.get("file_type") or "").strip()
+        size = item.get("size") if "size" in item else item.get("file_size")
+        if name:
+            parts.append(f"name: {name}")
+        if mime_type:
+            parts.append(f"mime: {mime_type}")
+        if isinstance(size, int) and size > 0:
+            parts.append(f"size: {size} bytes")
+        line = f"- {path}"
+        if parts:
+            line += f" ({', '.join(parts)})"
+        lines.append(line)
+    lines.append("Use these attached workspace files as the primary source of truth for this request.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +380,14 @@ async def websocket_endpoint(
                                 handler._current_task = None
 
                         handler._current_task = asyncio.create_task(_run_chat())
+
+                    elif message.method in _CONCURRENT_METHODS:
+                        task = asyncio.create_task(
+                            handler._dispatch_concurrent_request(manager, conn_id, message),
+                        )
+                        handler._concurrent_tasks.add(task)
+                        task.add_done_callback(handler._concurrent_tasks.discard)
+
                     else:
                         response = await handler.handle_request(message)
                         await manager.send_message(conn_id, response)
@@ -252,14 +429,17 @@ class WebSocketHandler:
         self._current_task: asyncio.Task | None = None
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._chat_lock = asyncio.Lock()
+        self._concurrent_request_slots = asyncio.Semaphore(_CONCURRENT_REQUEST_LIMIT)
+        self._concurrent_tasks: set[asyncio.Task] = set()
         agent = get_agent()
         workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
+        yolo_mode = bool(getattr(agent, "yolo_mode", False))
         self._sandbox_id = _runtime_sandbox_id()
         self._workspace_watch_service = WorkspaceWatchService(
             workspace_root=workspace,
             emit_change=self._emit_workspace_change,
         )
-        self._workspace_fs_service = WorkspaceFSService(workspace_root=workspace)
+        self._workspace_fs_service = WorkspaceFSService(workspace_root=workspace, yolo_mode=yolo_mode)
         self._workspace_terminal_service = WorkspaceTerminalService(
             workspace_root=workspace,
             emit_stdout=self._emit_terminal_stdout,
@@ -338,6 +518,24 @@ class WebSocketHandler:
                 message="Internal handler error",  # Don't leak internals (#14)
             )
 
+    async def _dispatch_concurrent_request(
+        self,
+        manager,
+        connection_id: str,
+        request: WSRequest,
+    ) -> None:
+        """Run a concurrent-safe request with a bounded per-connection slot pool."""
+        async with self._concurrent_request_slots:
+            try:
+                response = await self.handle_request(request)
+                await manager.send_message(connection_id, response)
+            except Exception as exc:
+                logger.error(f"Concurrent RPC error ({request.method}): {exc}")
+                await manager.send_message(
+                    connection_id,
+                    WSError(id=request.id, code="HANDLER_ERROR", message=str(exc)),
+                )
+
     # ========== Chat ==========
 
     async def _handle_chat(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -355,9 +553,12 @@ class WebSocketHandler:
         if not conn:
             raise ValueError("Connection not found")
 
-        message = params.get("message", "")
+        attachments = _validate_attachment_paths(_normalize_attachment_refs(params.get("attachments")))
+        media = _string_list_from_any(params.get("media"))
+        media = _validate_media_paths(list(dict.fromkeys(media + _derive_media_from_attachments(attachments))))
+        message = _merge_attachment_context(str(params.get("message", "")), attachments)
         if not message:
-            raise ValueError("Message is required")
+            raise ValueError("Message or attachments are required")
 
         session_key = params.get("session_key", conn.session_key)
         # Validate session_key type
@@ -396,7 +597,7 @@ class WebSocketHandler:
                     if stream:
                         # Streaming mode: emit chunks via WSEvent
                         full_content = ""
-                        async for chunk_data in agent.stream(message=message, thinking=thinking):
+                        async for chunk_data in agent.stream(message=message, media=media, attachments=attachments, thinking=thinking):
                             check_budget("stream", config.budget.stream_timeout_ms, span.elapsed_ms)
                             if self._cancel_requested:
                                 break
@@ -473,9 +674,9 @@ class WebSocketHandler:
                     else:
                         # Non-streaming mode
                         if thinking:
-                            response, thinking_content = await agent.process_with_thinking(message=message)
+                            response, thinking_content = await agent.process_with_thinking(message=message, media=media, attachments=attachments)
                         else:
-                            response = await agent.process(message=message)
+                            response = await agent.process(message=message, media=media, attachments=attachments)
                             thinking_content = None
                         check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
@@ -589,6 +790,13 @@ class WebSocketHandler:
         return True
 
     async def _cleanup_resources(self) -> None:
+        # Cancel in-flight concurrent fs/workspace tasks
+        for task in list(self._concurrent_tasks):
+            if not task.done():
+                task.cancel()
+        if self._concurrent_tasks:
+            await asyncio.gather(*self._concurrent_tasks, return_exceptions=True)
+        self._concurrent_tasks.clear()
         await self._workspace_terminal_service.shutdown()
         await self._workspace_watch_service.close()
 
@@ -801,8 +1009,9 @@ class WebSocketHandler:
                     "version": "1.0",
                     "session_key": session_key,
                     "messages": [
-                        {"role": m.get("role", ""), "content": m.get("content", "")}
+                        dict(m)
                         for m in (session.messages if isinstance(session.messages, list) else [])
+                        if isinstance(m, dict)
                     ],
                 },
             }
@@ -827,14 +1036,29 @@ class WebSocketHandler:
 
         try:
             session = agent.sessions.get_or_create(session_key)
-            # Replace messages with imported ones
-            session.messages.clear()
+            imported_messages: list[tuple[str, str, dict[str, Any]]] = []
             for msg in messages:
                 if isinstance(msg, dict):
                     role = msg.get("role", "")
                     content = msg.get("content", "")
-                    if role and content:
-                        session.add_message(role, content)
+                    extras = {
+                        key: value
+                        for key, value in msg.items()
+                        if key not in {"role", "content", "timestamp"}
+                    }
+                    if "media" in extras:
+                        extras["media"] = _validate_media_paths(_string_list_from_any(extras.get("media")))
+                    if "attachments" in extras:
+                        extras["attachments"] = _validate_attachment_paths(
+                            _normalize_attachment_refs(extras.get("attachments"))
+                        )
+                    if role and (content or extras.get("attachments") or extras.get("media")):
+                        imported_messages.append((role, content, extras))
+
+            # Replace messages only after the full import payload validates.
+            session.messages.clear()
+            for role, content, extras in imported_messages:
+                session.add_message(role, content, **extras)
             agent.sessions.save(session)
 
             return {
@@ -844,6 +1068,8 @@ class WebSocketHandler:
                     "messages_imported": len(session.messages),
                 },
             }
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Session import failed: {e}")
             return {

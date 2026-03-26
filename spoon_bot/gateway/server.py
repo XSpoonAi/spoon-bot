@@ -91,6 +91,14 @@ async def _lifespan(app: FastAPI):
         _ctx_env = os.environ.get("CONTEXT_WINDOW")
         context_window = int(_ctx_env) if _ctx_env else None
 
+        # YOLO mode: operate directly in user's path without sandbox
+        yolo_mode = (
+            agent_cfg.get("yolo_mode")
+            or os.environ.get("SPOON_BOT_YOLO_MODE", "").lower() in ("1", "true", "yes")
+        )
+        if yolo_mode:
+            logger.info("YOLO mode enabled — agent will work directly in user path")
+
         create_kwargs: dict = dict(
             model=model,
             provider=provider,
@@ -103,6 +111,7 @@ async def _lifespan(app: FastAPI):
             session_store_dsn=session_store_dsn,
             session_store_db_path=session_store_db_path,
             context_window=context_window,
+            yolo_mode=bool(yolo_mode),
         )
         if agent_cfg.get("mcp_config") is not None:
             create_kwargs["mcp_config"] = agent_cfg["mcp_config"]
@@ -179,6 +188,7 @@ async def _lifespan(app: FastAPI):
     logger.info(f"  Provider : {agent_cfg.get('provider', '(not set)')}")
     logger.info(f"  Model    : {agent_cfg.get('model', '(not set)')}")
     logger.info(f"  Workspace: {agent_cfg.get('workspace', '/data/workspace')}")
+    logger.info(f"  YOLO mode: {bool(yolo_mode)}")
     if channel_manager:
         logger.info(
             f"  Channels : {channel_manager.running_channels_count} running "

@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 
 class ContextBuilder:
     """
@@ -18,15 +20,19 @@ class ContextBuilder:
     """
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
+    SANDBOX_WORKSPACE_ROOT = "/workspace"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, yolo_mode: bool = False):
         """
         Initialize context builder.
 
         Args:
             workspace: Path to the workspace directory.
+            yolo_mode: When True, the agent operates directly in the user's
+                       filesystem path without sandbox isolation.
         """
         self.workspace = Path(workspace).expanduser().resolve()
+        self.yolo_mode = yolo_mode
         self._memory_context: str = ""
         self._skills_summary: str = ""
         self._skill_context: str = ""
@@ -95,12 +101,20 @@ class ContextBuilder:
         else:
             shell_path = display_path
 
+        yolo_banner = ""
+        if self.yolo_mode:
+            yolo_banner = (
+                "\n**YOLO MODE ACTIVE** — You are operating directly on the "
+                "user's filesystem. All file reads, writes, and shell commands "
+                "execute against this real directory tree. Proceed with care.\n"
+            )
+
         return f"""# spoon-bot
 
 You are spoon-bot, an AI agent that completes tasks by calling tools.
 Current time: {now}
 Workspace: {display_path}
-
+{yolo_banner}
 ## Core Behavior — ALWAYS USE TOOLS
 
 You MUST use your tools to accomplish tasks. NEVER fabricate results, NEVER pretend to execute commands, NEVER invent output. If a tool exists for the job, call it.
@@ -199,10 +213,15 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
             return text
 
         images = []
+        skipped: list[str] = []
         for path in media:
-            p = Path(path)
+            p = self._resolve_media_path(path)
             mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
+            if p is None or not p.is_file():
+                skipped.append(f"{path}: missing file")
+                continue
+            if not mime or not mime.startswith("image/"):
+                skipped.append(f"{path}: unsupported mime {mime or 'unknown'}")
                 continue
             try:
                 b64 = base64.b64encode(p.read_bytes()).decode()
@@ -210,12 +229,44 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"}
                 })
-            except Exception:
-                pass
+            except Exception as exc:
+                skipped.append(f"{path}: {exc}")
+
+        if skipped:
+            logger.warning(
+                "Skipped media inputs while building multimodal content: {}",
+                "; ".join(skipped),
+            )
 
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
+
+    def _resolve_media_path(self, path: str) -> Path | None:
+        """Resolve runtime media refs, including /workspace aliases and workspace-relative paths."""
+        candidate = str(path or "").strip()
+        if not candidate:
+            return None
+
+        sandbox_root = self.SANDBOX_WORKSPACE_ROOT.rstrip("/")
+        workspace_root_str = self.workspace.as_posix().rstrip("/")
+        try:
+            if candidate.startswith("/"):
+                normalized = Path(candidate).as_posix()
+                if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                    relative = normalized[len(sandbox_root):].lstrip("/")
+                    resolved = (self.workspace / relative).resolve(strict=True)
+                elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                    relative = normalized[len(workspace_root_str):].lstrip("/")
+                    resolved = (self.workspace / relative).resolve(strict=True)
+                else:
+                    resolved = Path(candidate).expanduser().resolve(strict=True)
+            else:
+                resolved = (self.workspace / candidate).resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            return None
+
+        return resolved if resolved.is_file() else None
 
     def add_tool_result(
         self,
