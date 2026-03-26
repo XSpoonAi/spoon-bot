@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,7 +16,13 @@ from spoon_bot.channels.base import ChannelConfig, ChannelMode
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_feishu_config(**extra_kwargs) -> ChannelConfig:
+def _make_feishu_config(
+    *,
+    mode: ChannelMode = ChannelMode.GATEWAY,
+    webhook_path: str | None = None,
+    webhook_secret: str | None = None,
+    **extra_kwargs,
+) -> ChannelConfig:
     """Return a minimal ChannelConfig for FeishuChannel."""
     defaults = {
         "app_id": "cli_test",
@@ -26,7 +35,13 @@ def _make_feishu_config(**extra_kwargs) -> ChannelConfig:
         "require_mention": True,
     }
     defaults.update(extra_kwargs)
-    return ChannelConfig(name="feishu", mode=ChannelMode.GATEWAY, **defaults)
+    return ChannelConfig(
+        name="feishu",
+        mode=mode,
+        webhook_path=webhook_path,
+        webhook_secret=webhook_secret,
+        **defaults,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +80,12 @@ class TestFeishuChannel:
             config_no_secret = _make_feishu_config(app_id="id", app_secret="")
             with pytest.raises(ValueError, match="app_secret"):
                 FeishuChannel(config_no_secret, "bot")
+
+    def test_package_exports_channel_class(self):
+        """The feishu package should expose FeishuChannel via __init__.py."""
+        from spoon_bot.channels.feishu import FeishuChannel
+
+        assert FeishuChannel.__name__ == "FeishuChannel"
 
     def test_init_extracts_config(self):
         """FeishuChannel reads all fields from config.extra."""
@@ -171,6 +192,89 @@ class TestFeishuChannel:
         ch = self._make_channel()
         ch._bot_open_id = "ou_bot"
         assert ch._is_bot_mentioned([]) is False
+
+    def test_dedup_cache_enforces_max_size(self):
+        """Dedup cache should drop the oldest ids after reaching the hard cap."""
+        ch = self._make_channel()
+
+        with patch("spoon_bot.channels.feishu.channel.MESSAGE_DEDUP_MAX", 2), \
+             patch("spoon_bot.channels.feishu.channel.MESSAGE_DEDUP_TTL", 300), \
+             patch("spoon_bot.channels.feishu.channel.time.monotonic", side_effect=[1.0, 2.0, 3.0]):
+            assert ch._is_duplicate_message("m1") is False
+            assert ch._is_duplicate_message("m2") is False
+            assert ch._is_duplicate_message("m3") is False
+
+        assert set(ch._processed_messages) == {"m2", "m3"}
+
+    def test_dedup_cache_expires_old_entries(self):
+        """Expired dedup entries should not block a message forever."""
+        ch = self._make_channel()
+
+        with patch("spoon_bot.channels.feishu.channel.MESSAGE_DEDUP_TTL", 10), \
+             patch("spoon_bot.channels.feishu.channel.time.monotonic", side_effect=[100.0, 111.0]):
+            assert ch._is_duplicate_message("msg-1") is False
+            assert ch._is_duplicate_message("msg-1") is False
+
+        assert ch._processed_messages == {"msg-1": 111.0}
+
+    @pytest.mark.asyncio
+    async def test_handle_webhook_uses_sdk_event_dispatcher(self):
+        """Webhook mode should delegate raw requests to the SDK dispatcher."""
+        ch = self._make_channel(mode=ChannelMode.WEBHOOK, webhook_path="/feishu/events")
+
+        def _dispatch(req):
+            assert req.uri == "/feishu/events"
+            assert req.body == b'{"type":"url_verification"}'
+            assert req.headers.get("X-Lark-Request-Timestamp") == "123"
+            return SimpleNamespace(status_code=200, content=b'{"challenge":"abc"}')
+
+        class DummyRequest:
+            headers = {"x-lark-request-timestamp": "123"}
+            url = SimpleNamespace(path="/feishu/events")
+
+            async def body(self):
+                return b'{"type":"url_verification"}'
+
+        ch._event_handler = SimpleNamespace(do=_dispatch)
+
+        assert await ch.handle_webhook(DummyRequest()) == {"challenge": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_stop_disconnects_websocket_thread(self):
+        """stop() should disable reconnect, disconnect, and join the WS thread."""
+        ch = self._make_channel()
+        ready = threading.Event()
+        loop = asyncio.new_event_loop()
+
+        def _run_loop():
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            loop.run_forever()
+            loop.close()
+
+        thread = threading.Thread(target=_run_loop, daemon=True)
+        thread.start()
+        assert ready.wait(1), "worker event loop did not start"
+
+        disconnect_called = threading.Event()
+
+        class DummyClient:
+            def __init__(self):
+                self._auto_reconnect = True
+
+            async def _disconnect(self):
+                disconnect_called.set()
+
+        ch._running = True
+        ch._ws_client = DummyClient()
+        ch._ws_loop = loop
+        ch._ws_thread = thread
+
+        await ch.stop()
+
+        assert disconnect_called.is_set()
+        assert ch._ws_client is None
+        assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------

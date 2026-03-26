@@ -1,1 +1,5 @@
-fatal: path 'spoon_bot/channels/feishu/__init__.py' exists on disk, but not in 'feat/discord-integration'
+"""Feishu channel implementation."""
+
+from spoon_bot.channels.feishu.channel import FeishuChannel
+
+__all__ = ["FeishuChannel"]

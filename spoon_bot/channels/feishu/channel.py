@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -74,6 +75,16 @@ _DOMAIN_MAP = {
 }
 
 
+class _CaseInsensitiveHeaders(dict[str, str]):
+    """Case-insensitive header mapping for SDK webhook validation."""
+
+    def __init__(self, headers: Any):
+        super().__init__((str(key).lower(), str(value)) for key, value in headers.items())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return super().get(str(key).lower(), default)
+
+
 class FeishuChannel(BaseChannel):
     """
     Feishu/Lark bot channel.
@@ -127,6 +138,10 @@ class FeishuChannel(BaseChannel):
         self._api_client: Any | None = None  # lark.Client for sending
         self._ws_client: Any | None = None   # lark.ws.Client for receiving
         self._ws_thread: threading.Thread | None = None
+        self._ws_loop: asyncio.AbstractEventLoop | None = None
+        self._ws_event_handler: Any | None = None
+        self._event_handler: Any | None = None
+        self._ws_stop_requested = threading.Event()
         self._bot_open_id: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -215,21 +230,25 @@ class FeishuChannel(BaseChannel):
     def _is_duplicate_message(self, message_id: str) -> bool:
         """Check if message was already processed. Records it if new.
 
-        Fix #6: Uses a monotonic-time based TTL to prune stale entries.
-        Prevents duplicate processing on WS reconnects.
+        Uses monotonic timestamps so stale entries can expire even if the
+        process clock changes, and enforces a hard upper bound on tracked ids.
         """
         now = time.monotonic()
+        cutoff = now - MESSAGE_DEDUP_TTL
         with self._dedup_lock:
-            if message_id in self._processed_messages:
+            existing = self._processed_messages.get(message_id)
+            if existing is not None and existing > cutoff:
                 return True
+            self._processed_messages = {
+                key: ts
+                for key, ts in self._processed_messages.items()
+                if ts > cutoff
+            }
             self._processed_messages[message_id] = now
-            # Prune old entries when exceeding max
-            if len(self._processed_messages) > MESSAGE_DEDUP_MAX:
-                cutoff = now - MESSAGE_DEDUP_TTL
-                self._processed_messages = {
-                    k: v for k, v in self._processed_messages.items()
-                    if v > cutoff
-                }
+            overflow = len(self._processed_messages) - MESSAGE_DEDUP_MAX
+            if overflow > 0:
+                for stale_id in list(self._processed_messages)[:overflow]:
+                    self._processed_messages.pop(stale_id, None)
         return False
 
     # ------------------------------------------------------------------
@@ -744,6 +763,7 @@ class FeishuChannel(BaseChannel):
         to the new one), then call ``start()``.
         """
         new_loop = asyncio.new_event_loop()
+        self._ws_loop = new_loop
         asyncio.set_event_loop(new_loop)
 
         # Patch the module-level loop so lark's ws.Client uses this thread's loop
@@ -758,10 +778,92 @@ class FeishuChannel(BaseChannel):
                 log_level=lark.LogLevel.DEBUG,
             )
             self._ws_client.start()
+        except RuntimeError as e:
+            if self._ws_stop_requested.is_set():
+                logger.debug(f"[{self.full_name}] WebSocket loop stopped: {e}")
+            else:
+                logger.error(f"[{self.full_name}] WebSocket client error: {e}")
         except Exception as e:
-            logger.error(f"[{self.full_name}] WebSocket client error: {e}")
+            if self._ws_stop_requested.is_set():
+                logger.debug(f"[{self.full_name}] WebSocket shutdown complete")
+            else:
+                logger.error(f"[{self.full_name}] WebSocket client error: {e}")
         finally:
+            pending = [task for task in asyncio.all_tasks(new_loop) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                try:
+                    new_loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                except Exception:
+                    pass
+            self._ws_client = None
+            self._ws_loop = None
+            asyncio.set_event_loop(None)
             new_loop.close()
+
+    async def _shutdown_ws_runtime(self) -> None:
+        """Disconnect the SDK client and wait for the worker thread to exit."""
+        ws_client = self._ws_client
+        ws_loop = self._ws_loop
+        ws_thread = self._ws_thread
+
+        if ws_client is not None:
+            setattr(ws_client, "_auto_reconnect", False)
+
+        if ws_loop is not None and ws_loop.is_running():
+            if ws_client is not None:
+                disconnect = getattr(ws_client, "_disconnect", None)
+                if disconnect is not None:
+                    future = asyncio.run_coroutine_threadsafe(disconnect(), ws_loop)
+                    try:
+                        await asyncio.wait_for(asyncio.wrap_future(future), timeout=5)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[{self.full_name}] Timed out while disconnecting WebSocket client")
+                    except Exception as e:
+                        logger.warning(f"[{self.full_name}] WebSocket disconnect error: {e}")
+            ws_loop.call_soon_threadsafe(ws_loop.stop)
+
+        if ws_thread and ws_thread.is_alive():
+            await asyncio.to_thread(ws_thread.join, 5)
+            if ws_thread.is_alive():
+                logger.warning(f"[{self.full_name}] WebSocket thread did not exit cleanly")
+
+    async def handle_webhook(self, request: Any) -> dict[str, Any]:
+        """Handle incoming Feishu webhook requests via the SDK event dispatcher."""
+        if self.config.mode != ChannelMode.WEBHOOK:
+            raise RuntimeError(f"{self.full_name} is not configured for webhook mode")
+        if self._event_handler is None:
+            raise RuntimeError(f"{self.full_name} webhook handler is not initialized")
+
+        body = await request.body()
+        path = getattr(getattr(request, "url", None), "path", None)
+        raw_request = SimpleNamespace(
+            uri=path or self.config.webhook_path or "/feishu/events",
+            headers=_CaseInsensitiveHeaders(request.headers),
+            body=body,
+        )
+        response = self._event_handler.do(raw_request)
+        status_code = getattr(response, "status_code", 200)
+        content = getattr(response, "content", b"") or b""
+        text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+
+        if text:
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = {"ok": status_code < 400, "text": text}
+        else:
+            payload = {"ok": status_code < 400}
+
+        if isinstance(payload, dict) and status_code >= 400:
+            payload.setdefault("ok", False)
+            payload.setdefault("error", text or "Feishu webhook request failed")
+            payload.setdefault("status_code", status_code)
+
+        return payload
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -771,6 +873,7 @@ class FeishuChannel(BaseChannel):
         """Start the Feishu bot (WebSocket or Webhook mode)."""
         self._set_status(ChannelStatus.STARTING)
         self._loop = asyncio.get_running_loop()
+        self._ws_stop_requested.clear()
 
         try:
             domain_url = _DOMAIN_MAP.get(self.domain, _DOMAIN_MAP["feishu"])
@@ -850,6 +953,7 @@ class FeishuChannel(BaseChannel):
             return
 
         try:
+            self._ws_stop_requested.set()
             if self._health_check_task:
                 self._health_check_task.cancel()
                 try:
@@ -857,9 +961,12 @@ class FeishuChannel(BaseChannel):
                 except asyncio.CancelledError:
                     pass
 
-            # lark.ws.Client has no clean stop() method; the daemon thread
-            # will be cleaned up automatically when the process exits.
+            await self._shutdown_ws_runtime()
             self._ws_client = None
+            self._ws_thread = None
+            self._ws_loop = None
+            self._ws_event_handler = None
+            self._event_handler = None
 
             # Fix #15: Clean up pending typing reactions
             self._typing_reactions.clear()
