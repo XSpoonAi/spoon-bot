@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import re
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -349,6 +352,218 @@ class FeishuChannel(BaseChannel):
         return keys
 
     @staticmethod
+    def _guess_image_suffix(payload: bytes) -> str:
+        """Best-effort file extension detection for downloaded image payloads."""
+        if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if payload.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if payload.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
+        if payload.startswith(b"BM"):
+            return ".bmp"
+        if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+            return ".webp"
+        return ".png"
+
+    def _media_storage_root(self) -> Path:
+        """Return the directory used for downloaded inbound media."""
+        workspace = getattr(self._agent_loop, "workspace", None)
+        if workspace:
+            return Path(workspace) / ".channel_media" / "feishu" / self.account_id
+        return Path(tempfile.gettempdir()) / "spoon-bot-media" / "feishu" / self.account_id
+
+    def _path_for_agent(self, file_path: Path) -> str:
+        """Return a workspace-relative path when possible, else an absolute path."""
+        workspace = getattr(self._agent_loop, "workspace", None)
+        if workspace:
+            try:
+                return file_path.relative_to(Path(workspace)).as_posix()
+            except ValueError:
+                pass
+        return str(file_path)
+
+    def _persist_downloaded_media(self, payload: bytes, *, stem: str, suffix: str) -> tuple[Path, str]:
+        """Persist downloaded media to disk and return both file path forms."""
+        root = self._media_storage_root()
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            delete=False,
+            dir=root,
+            prefix=f"{stem}-",
+            suffix=suffix,
+        ) as handle:
+            handle.write(payload)
+            file_path = Path(handle.name)
+        return file_path, self._path_for_agent(file_path)
+
+    @staticmethod
+    def _attachment_ref(
+        agent_path: str,
+        *,
+        file_name: str,
+        file_type: str,
+        mime_type: str | None,
+        size: int,
+    ) -> dict[str, Any]:
+        """Build attachment metadata for AgentLoop attachment context."""
+        attachment = {
+            "uri": agent_path,
+            "workspace_path": agent_path,
+            "name": file_name,
+            "file_name": file_name,
+            "file_type": file_type,
+            "size": size,
+        }
+        if mime_type:
+            attachment["mime_type"] = mime_type
+        return attachment
+
+    def _materialize_image_attachment(
+        self,
+        image_key: str,
+        *,
+        stem: str,
+        file_name: str | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Download a Feishu image and persist it for agent consumption."""
+        if not self._media or not image_key:
+            return None
+
+        payload = self._media.download_image(image_key)
+        suffix = Path(file_name).suffix if file_name else ""
+        if not suffix:
+            suffix = self._guess_image_suffix(payload)
+        if file_name and not Path(file_name).suffix:
+            display_name = f"{file_name}{suffix}"
+        else:
+            display_name = file_name or f"{stem}{suffix}"
+        _, agent_path = self._persist_downloaded_media(payload, stem=stem, suffix=suffix)
+        mime_type = mimetypes.guess_type(display_name)[0] or mimetypes.guess_type(f"x{suffix}")[0]
+
+        return (
+            agent_path,
+            self._attachment_ref(
+                agent_path,
+                file_name=display_name,
+                file_type=MSG_TYPE_IMAGE,
+                mime_type=mime_type,
+                size=len(payload),
+            ),
+        )
+
+    def _materialize_file_attachment(
+        self,
+        *,
+        message_id: str,
+        file_key: str,
+        resource_type: str,
+        stem: str,
+        file_name: str,
+        file_type: str,
+    ) -> dict[str, Any] | None:
+        """Download a Feishu file/audio/video resource and persist it."""
+        if not self._media or not file_key:
+            return None
+
+        payload = self._media.download_file(message_id, file_key, resource_type)
+        suffix = Path(file_name).suffix
+        if not suffix:
+            suffix = {
+                MSG_TYPE_AUDIO: ".opus",
+                MSG_TYPE_VIDEO: ".mp4",
+                MSG_TYPE_STICKER: ".webp",
+            }.get(file_type, ".bin")
+            file_name = f"{file_name}{suffix}"
+        _, agent_path = self._persist_downloaded_media(payload, stem=stem, suffix=suffix)
+        mime_type = mimetypes.guess_type(file_name)[0]
+
+        return self._attachment_ref(
+            agent_path,
+            file_name=file_name,
+            file_type=file_type,
+            mime_type=mime_type,
+            size=len(payload),
+        )
+
+    def _materialize_inbound_media(
+        self,
+        *,
+        message_id: str,
+        content: dict[str, Any],
+        msg_type: str,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Download inbound Feishu media into workspace-backed files."""
+        if not self._media:
+            return [], []
+
+        media_paths: list[str] = []
+        attachments: list[dict[str, Any]] = []
+
+        try:
+            if msg_type == MSG_TYPE_POST:
+                for index, image_key in enumerate(self._extract_post_image_keys(content), start=1):
+                    item = self._materialize_image_attachment(
+                        image_key,
+                        stem=f"{message_id}-post-image-{index}",
+                    )
+                    if item is None:
+                        continue
+                    media_path, attachment = item
+                    media_paths.append(media_path)
+                    attachments.append(attachment)
+
+            elif msg_type == MSG_TYPE_IMAGE:
+                item = self._materialize_image_attachment(
+                    content.get("image_key", ""),
+                    stem=f"{message_id}-image",
+                )
+                if item is not None:
+                    media_path, attachment = item
+                    media_paths.append(media_path)
+                    attachments.append(attachment)
+
+            elif msg_type in (MSG_TYPE_FILE, MSG_TYPE_AUDIO, MSG_TYPE_STICKER):
+                attachment = self._materialize_file_attachment(
+                    message_id=message_id,
+                    file_key=content.get("file_key", ""),
+                    resource_type="audio" if msg_type == MSG_TYPE_AUDIO else "file",
+                    stem=f"{message_id}-{msg_type}",
+                    file_name=content.get("file_name") or f"{msg_type}-{message_id}",
+                    file_type=msg_type,
+                )
+                if attachment is not None:
+                    attachments.append(attachment)
+
+            elif msg_type == MSG_TYPE_VIDEO:
+                video_attachment = self._materialize_file_attachment(
+                    message_id=message_id,
+                    file_key=content.get("file_key", ""),
+                    resource_type="video",
+                    stem=f"{message_id}-video",
+                    file_name=content.get("file_name") or f"video-{message_id}",
+                    file_type=MSG_TYPE_VIDEO,
+                )
+                if video_attachment is not None:
+                    attachments.append(video_attachment)
+
+                thumbnail = self._materialize_image_attachment(
+                    content.get("image_key", ""),
+                    stem=f"{message_id}-video-thumbnail",
+                    file_name=f"video-thumbnail-{message_id}.png",
+                )
+                if thumbnail is not None:
+                    media_path, attachment = thumbnail
+                    media_paths.append(media_path)
+                    attachments.append(attachment)
+
+        except Exception as e:
+            logger.warning(f"[{self.full_name}] Failed to materialize {msg_type} media: {e}")
+
+        return media_paths, attachments
+
+    @staticmethod
     def _parse_media_keys(content: dict, msg_type: str) -> list[str]:
         """Extract media keys from message content by message type.
 
@@ -676,7 +891,8 @@ class FeishuChannel(BaseChannel):
                     text = content_json.get("text", "").strip()
                     if chat_type == CHAT_TYPE_GROUP:
                         text = channel_ref._strip_mention_tokens(text)
-                    media_keys: list[str] = []
+                    media_paths: list[str] = []
+                    attachments: list[dict[str, Any]] = []
 
                 elif msg_type == MSG_TYPE_POST:
                     # Fix #9: Pass bot_open_id to skip bot @mention residue
@@ -685,15 +901,22 @@ class FeishuChannel(BaseChannel):
                     )
                     if chat_type == CHAT_TYPE_GROUP:
                         text = channel_ref._strip_mention_tokens(text)
-                    # Fix #16: Extract image keys from post elements
-                    media_keys = channel_ref._extract_post_image_keys(content_json)
+                    media_paths, attachments = channel_ref._materialize_inbound_media(
+                        message_id=message_id,
+                        content=content_json,
+                        msg_type=msg_type,
+                    )
 
                 else:
                     # image / file / audio / video / sticker
                     text = f"[{msg_type}]"
-                    media_keys = channel_ref._parse_media_keys(content_json, msg_type)
+                    media_paths, attachments = channel_ref._materialize_inbound_media(
+                        message_id=message_id,
+                        content=content_json,
+                        msg_type=msg_type,
+                    )
 
-                if not text and not media_keys:
+                if not text and not media_paths and not attachments:
                     return
 
                 # Fix #11: Resolve sender name directly (we're already in a thread,
@@ -712,14 +935,16 @@ class FeishuChannel(BaseChannel):
                     sender_id=sender_id,
                     sender_name=sender_name,
                     message_id=message_id,
-                    media=media_keys,
+                    media=media_paths,
                     metadata={
                         "chat_id": chat_id,
                         "chat_type": chat_type,
+                        "is_dm": chat_type == CHAT_TYPE_P2P,
                         "message_id": message_id,
                         "msg_type": msg_type,
                         "think_level": "off",
                         "verbose": False,
+                        "attachments": attachments,
                     },
                 )
 
@@ -845,7 +1070,7 @@ class FeishuChannel(BaseChannel):
             headers=_CaseInsensitiveHeaders(request.headers),
             body=body,
         )
-        response = self._event_handler.do(raw_request)
+        response = await asyncio.to_thread(self._event_handler.do, raw_request)
         status_code = getattr(response, "status_code", 200)
         content = getattr(response, "content", b"") or b""
         text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
@@ -1017,6 +1242,11 @@ class FeishuChannel(BaseChannel):
         # RENDER_MODE_AUTO: detect markdown
         return MSG_TYPE_INTERACTIVE if should_use_card(text) else MSG_TYPE_TEXT
 
+    @staticmethod
+    def _resolve_reply_target(message: OutboundMessage) -> str | None:
+        """Return the message id this outbound message should reply to."""
+        return message.reply_to or message.metadata.get("message_id")
+
     async def send(self, message: OutboundMessage) -> None:
         """Send a response message to Feishu."""
         if not self._api_client:
@@ -1029,7 +1259,7 @@ class FeishuChannel(BaseChannel):
             return
 
         chat_id: str | None = message.metadata.get("chat_id")
-        message_id: str | None = message.metadata.get("message_id")
+        reply_target = self._resolve_reply_target(message)
 
         if not chat_id:
             logger.error(f"[{self.full_name}] No chat_id in message metadata")
@@ -1045,7 +1275,7 @@ class FeishuChannel(BaseChannel):
             else:
                 content_str = json.dumps({"text": chunk})
 
-            reply_to = message_id if i == 0 else None  # Reply only for the first chunk
+            reply_to = reply_target if i == 0 else None  # Reply only for the first chunk
 
             # Fix #7: Capture all loop variables as default params to avoid
             # closure-over-mutable-variable issues

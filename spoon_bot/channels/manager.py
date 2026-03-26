@@ -607,6 +607,8 @@ class ChannelManager:
             # Route based on think/verbose metadata from channel
             think_level = message.metadata.get("think_level", "off")
             media = message.media if message.has_media else None
+            raw_attachments = message.metadata.get("attachments")
+            attachments = raw_attachments if isinstance(raw_attachments, list) else None
             session_key = message.session_key or None
 
             if think_level != "off":
@@ -614,6 +616,7 @@ class ChannelManager:
                     message=content,
                     media=media,
                     session_key=session_key,
+                    attachments=attachments,
                 )
                 # Include thinking content in verbose mode
                 if message.metadata.get("verbose") and thinking_content:
@@ -626,6 +629,7 @@ class ChannelManager:
                     message=content,
                     media=media,
                     session_key=session_key,
+                    attachments=attachments,
                 )
 
             self._circuit_breaker.record_success()

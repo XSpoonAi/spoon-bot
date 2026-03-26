@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -86,6 +87,55 @@ class TestFeishuChannel:
         from spoon_bot.channels.feishu import FeishuChannel
 
         assert FeishuChannel.__name__ == "FeishuChannel"
+
+    def test_materialize_image_media_to_workspace_relative_path(self, tmp_path):
+        """Inbound image messages should become workspace-backed file paths."""
+        ch = self._make_channel()
+        ch._agent_loop = SimpleNamespace(workspace=tmp_path)
+        ch._media = SimpleNamespace(download_image=lambda image_key: b"\x89PNG\r\n\x1a\npng")
+
+        media, attachments = ch._materialize_inbound_media(
+            message_id="msg-1",
+            content={"image_key": "img_123"},
+            msg_type="image",
+        )
+
+        assert len(media) == 1
+        stored = tmp_path / Path(media[0])
+        assert stored.is_file()
+        assert attachments[0]["workspace_path"] == media[0]
+        assert attachments[0]["mime_type"] == "image/png"
+
+    def test_materialize_file_attachment_without_multimodal_media(self, tmp_path):
+        """Non-image Feishu files should still be exposed as agent attachments."""
+        ch = self._make_channel()
+        ch._agent_loop = SimpleNamespace(workspace=tmp_path)
+        ch._media = SimpleNamespace(
+            download_file=lambda message_id, file_key, resource_type: b"hello"
+        )
+
+        media, attachments = ch._materialize_inbound_media(
+            message_id="msg-2",
+            content={"file_key": "file_123", "file_name": "notes.txt"},
+            msg_type="file",
+        )
+
+        assert media == []
+        assert attachments[0]["workspace_path"].endswith(".txt")
+        assert attachments[0]["mime_type"] == "text/plain"
+
+    def test_resolve_reply_target_prefers_reply_to(self):
+        """Generic reply_to should win over Feishu-specific metadata fallback."""
+        from spoon_bot.bus.events import OutboundMessage
+
+        ch = self._make_channel()
+        outbound = OutboundMessage(
+            content="hello",
+            reply_to="reply-mid",
+            metadata={"message_id": "meta-mid", "chat_id": "chat-1"},
+        )
+
+        assert ch._resolve_reply_target(outbound) == "reply-mid"
 
     def test_init_extracts_config(self):
         """FeishuChannel reads all fields from config.extra."""
@@ -238,6 +288,33 @@ class TestFeishuChannel:
         ch._event_handler = SimpleNamespace(do=_dispatch)
 
         assert await ch.handle_webhook(DummyRequest()) == {"challenge": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_handle_webhook_runs_dispatcher_off_thread(self):
+        """Webhook dispatch should use a worker thread to avoid blocking the loop."""
+        ch = self._make_channel(mode=ChannelMode.WEBHOOK, webhook_path="/feishu/events")
+
+        class DummyRequest:
+            headers = {}
+            url = SimpleNamespace(path="/feishu/events")
+
+            async def body(self):
+                return b"{}"
+
+        thread_ids: list[int] = []
+
+        def _dispatch(_req):
+            import threading as _threading
+
+            thread_ids.append(_threading.get_ident())
+            return SimpleNamespace(status_code=200, content=b'{"ok":true}')
+
+        ch._event_handler = SimpleNamespace(do=_dispatch)
+
+        result = await ch.handle_webhook(DummyRequest())
+
+        assert result == {"ok": True}
+        assert thread_ids and thread_ids[0] != threading.get_ident()
 
     @pytest.mark.asyncio
     async def test_stop_disconnects_websocket_thread(self):
