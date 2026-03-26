@@ -46,6 +46,14 @@ ROUTER_FILE = API_V1 / "router.py"
 DEFAULT_OUT = ROOT / "docs" / "api.md"
 
 
+def _display_path(path: Path) -> str:
+    """Return a stable POSIX-style path for generated documentation."""
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except Exception:
+        return path.as_posix()
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -185,7 +193,7 @@ def extract_endpoints(file_path: Path, prefix: str = "") -> list[EndpointInfo]:
                 request_model=request_model,
                 response_model=response_model,
                 auth_required=has_user_dep,
-                source_file=str(file_path.relative_to(ROOT)),
+                source_file=_display_path(file_path),
                 line_number=node.lineno,
             ))
 
@@ -226,7 +234,7 @@ def extract_pydantic_models(file_path: Path) -> list[ModelInfo]:
             name=node.name,
             docstring=_get_docstring(node),
             fields=fields,
-            source_file=str(file_path.relative_to(ROOT)),
+            source_file=_display_path(file_path),
         ))
 
     return models
@@ -795,7 +803,7 @@ def generate_markdown(out_path: Path) -> str:
     # Request models
     w("### Request Models")
     w()
-    w(f"*Source: `{MODELS_REQ.relative_to(ROOT)}`*")
+    w(f"*Source: `{_display_path(MODELS_REQ)}`*")
     w()
     req_models = extract_pydantic_models(MODELS_REQ)
     for model in req_models:
@@ -815,7 +823,7 @@ def generate_markdown(out_path: Path) -> str:
     # Response models
     w("### Response Models")
     w()
-    w(f"*Source: `{MODELS_RESP.relative_to(ROOT)}`*")
+    w(f"*Source: `{_display_path(MODELS_RESP)}`*")
     w()
     resp_models = extract_pydantic_models(MODELS_RESP)
     for model in resp_models:

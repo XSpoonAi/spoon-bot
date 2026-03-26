@@ -199,6 +199,41 @@ class SessionManager:
             self._sessions.pop(session_key, None)
             return self._store.delete_session(session_key)
 
+    def archive(self, session_key: str) -> bool:
+        """Archive a session when the backend supports it.
+
+        File-backed stores rename the transcript files with a ``.deleted.*``
+        marker for auditability. Other backends export a file-backed archive
+        copy when a workspace is available, then delete the source row.
+        """
+        with self._lock:
+            self._sessions.pop(session_key, None)
+            archive_fn = getattr(self._store, "archive_session", None)
+            if callable(archive_fn):
+                return bool(archive_fn(session_key))
+            session = self._store.load_session(session_key)
+            if session is not None and self.workspace is not None:
+                from spoon_bot.session.store import FileSessionStore
+
+                archived_key = (
+                    f"{session_key}.deleted.{int(datetime.now().timestamp())}"
+                )
+                archived_session = Session(
+                    session_key=archived_key,
+                    created_at=session.created_at,
+                    updated_at=session.updated_at,
+                    messages=list(session.messages),
+                    metadata={
+                        **session.metadata,
+                        "archived_from_session_key": session.session_key,
+                        "archived_from_backend": type(self._store).__name__,
+                    },
+                )
+                FileSessionStore(self.workspace / "sessions_archived").save_session(
+                    archived_session
+                )
+            return self._store.delete_session(session_key)
+
     def list_sessions(self) -> list[str]:
         """List all session keys (from cache + backend)."""
         with self._lock:

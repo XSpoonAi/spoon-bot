@@ -8,7 +8,6 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging as stdlib_logging
 from collections import Counter
@@ -89,7 +88,10 @@ from spoon_bot.agent.tools.self_config import (
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
 from spoon_bot.services.hotreload import HotReloadService
-from spoon_bot.services.spawn import SpawnTool
+from spoon_bot.subagent.manager import SubagentManager
+from spoon_bot.subagent.tools import SubagentTool
+from spoon_bot.subagent.catalog import format_roles_for_prompt
+from spoon_bot.subagent.models import SubagentState
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
@@ -329,6 +331,8 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        session_manager: SessionManager | None = None,
+        subagent_manager: SubagentManager | None = None,
         session_store_backend: str = "file",
         session_store_dsn: str | None = None,
         session_store_db_path: str | None = None,
@@ -359,6 +363,8 @@ class AgentLoop:
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
             tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            session_manager: Existing SessionManager to reuse for persistence.
+            subagent_manager: Existing SubagentManager to reuse for child agents.
             session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
             session_store_dsn: PostgreSQL DSN for 'postgres' backend.
             session_store_db_path: SQLite DB path for 'sqlite' backend.
@@ -416,22 +422,26 @@ class AgentLoop:
             logger.info(f"YOLO mode enabled — operating directly in: {self.workspace}")
 
         # Session persistence — configurable backend
-        _store_backend = session_store_backend or "file"
-        _store_db_path = session_store_db_path
-        if _store_backend == "sqlite" and not _store_db_path:
-            _store_db_path = str(self.workspace / "sessions.db")
-        try:
-            _session_store = create_session_store(
-                backend=_store_backend,
-                workspace=self.workspace,
-                db_path=_store_db_path,
-                dsn=session_store_dsn,
-            )
-            self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
-            logger.info(f"Session store: {_store_backend}")
-        except Exception as exc:
-            logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
-            self.sessions = SessionManager(self.workspace)
+        if session_manager is not None:
+            self.sessions = session_manager
+            logger.info("Session store: inherited from parent SessionManager")
+        else:
+            _store_backend = session_store_backend or "file"
+            _store_db_path = session_store_db_path
+            if _store_backend == "sqlite" and not _store_db_path:
+                _store_db_path = str(self.workspace / "sessions.db")
+            try:
+                _session_store = create_session_store(
+                    backend=_store_backend,
+                    workspace=self.workspace,
+                    db_path=_store_db_path,
+                    dsn=session_store_dsn,
+                )
+                self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
+                logger.info(f"Session store: {_store_backend}")
+            except Exception as exc:
+                logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
+                self.sessions = SessionManager(self.workspace)
 
         # Memory store — semantic (memsearch) or file-based
         self._memsearch_config: MemSearchConfig | None = None
@@ -461,6 +471,33 @@ class AgentLoop:
             self.memory = MemoryStore(self.workspace)
 
         self._git = GitManager(self.workspace) if auto_commit else None
+
+        # Sub-agent manager — shares this agent's SessionManager so sub-agents
+        # can reuse the same persistence backend with their own unique session keys.
+        if subagent_manager is not None:
+            self._subagent_manager = subagent_manager
+            self._owns_subagent_manager = False
+        else:
+            self._subagent_manager = SubagentManager(
+                session_manager=self.sessions,
+                workspace=self.workspace,
+                max_depth=self._config.subagent.max_depth,
+                max_children_per_agent=self._config.subagent.max_children_per_agent,
+                max_total_subagents=self._config.subagent.max_total_subagents,
+                parent_model=model,
+                parent_provider=provider,
+                parent_api_key=api_key,
+                parent_base_url=base_url,
+                parent_enable_skills=enable_skills,
+                default_model=self._config.subagent.default_model,
+                default_tool_profile=self._config.subagent.default_tool_profile,
+                persist_runs=self._config.subagent.persist_runs,
+                persist_file=self._config.subagent.persist_file,
+                archive_after_minutes=self._config.subagent.archive_after_minutes,
+                sweeper_interval_seconds=self._config.subagent.sweeper_interval_seconds,
+                max_persistent_agents=self._config.subagent.max_persistent_agents,
+            )
+            self._owns_subagent_manager = True
 
         # Skill paths: runtime workspace + bundled skills shipped with spoon-bot
         self._skill_paths = [self.workspace / "skills"]
@@ -507,6 +544,7 @@ class AgentLoop:
 
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
+        self._last_response_source = self._build_response_source()
 
         active_count = len(self.tools)
         total_count = len(self.tools._tools)
@@ -514,6 +552,34 @@ class AgentLoop:
             f"AgentLoop created: model={model}, provider={provider}, "
             f"tools={active_count}/{total_count}, session={session_key}"
         )
+
+    @staticmethod
+    def _build_response_source(
+        *,
+        source_type: str = "agent",
+        subagent_id: str | None = None,
+        subagent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Build machine-readable metadata describing who produced a result."""
+        return {
+            "type": source_type,
+            "is_subagent": source_type == "subagent",
+            "subagent_id": subagent_id,
+            "subagent_name": subagent_name,
+        }
+
+    def _set_last_response_source(
+        self,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Store and return the latest result source metadata."""
+        resolved = dict(source or self._build_response_source())
+        self._last_response_source = resolved
+        return dict(resolved)
+
+    def get_last_response_source(self) -> dict[str, Any]:
+        """Return the latest result source metadata."""
+        return dict(getattr(self, "_last_response_source", self._build_response_source()))
 
     async def initialize(self) -> None:
         """Initialize spoon-core components."""
@@ -584,6 +650,51 @@ class AgentLoop:
                     system_prompt += f"\n## Agent Memory (from soul.md)\n{soul_content}\n"
             except Exception:
                 pass
+
+        # ----------------------------------------------------------------
+        # Multi-Agent Orchestration section
+        # Injected when the SubagentTool (spawn) is available.
+        # Mirrors opencode task.txt's usage notes and openclaw's
+        # sessions-spawn-tool description pattern.
+        # ----------------------------------------------------------------
+        if "spawn" in self.tools.get_active_tools():
+            roles_block = format_roles_for_prompt()
+            system_prompt += (
+                "\n\n## Multi-Agent Orchestration\n\n"
+                "You are an **Orchestrator**. For complex tasks (e.g. 'build a user "
+                "management system', 'implement a REST API with frontend'), decompose "
+                "the work and delegate to specialised sub-agents using the `spawn` tool.\n\n"
+                "**You decide which agents to use and in what order** — there is no fixed "
+                "pipeline. Use your judgement based on the task requirements.\n\n"
+                "### Available specialised agent roles\n"
+                f"{roles_block}\n\n"
+                "### When to use sub-agents\n"
+                "- Complex tasks requiring multiple specialised skills\n"
+                "- Tasks that benefit from sequential specialisation "
+                "(e.g. plan → implement → review)\n"
+                "- Research + implementation tasks that can be parallelised\n\n"
+                "### When NOT to use sub-agents\n"
+                "- Simple, single-step tasks (file reads, quick questions, small edits)\n"
+                "- Tasks you can complete directly in a few tool calls\n\n"
+                "### Orchestration workflow (decide autonomously)\n"
+                "1. For complex tasks, start with `spawn(action='spawn', role='planner', "
+                "task='Analyse requirements for: <user request>')` to get a technical plan\n"
+                "2. Wait for the planner: `spawn(action='wait', timeout=120)`\n"
+                "3. Based on the plan, spawn implementation agents as needed:\n"
+                "   - `spawn(action='spawn', role='backend', task='...<plan context>...')`\n"
+                "   - `spawn(action='spawn', role='frontend', task='...<plan context>...')`\n"
+                "   - Launch independent agents in parallel (multiple tool calls at once)\n"
+                "4. Wait for results: `spawn(action='wait', timeout=180)`\n"
+                "5. Optionally spawn a `reviewer` to check the implementation\n"
+                "6. Summarise all results to the user\n\n"
+                "### Key rules (from opencode task.txt)\n"
+                "- Each sub-agent starts with a **fresh context** — provide all necessary "
+                "context in the `task` parameter\n"
+                "- The sub-agent's output is NOT visible to the user until you summarise it\n"
+                "- Use `task_id` from a result to resume the same sub-agent session later\n"
+                "- Use `spawn(action='list_roles')` to see all available roles at runtime\n"
+            )
+            logger.info("Injected Multi-Agent Orchestration section into system prompt")
 
         # NOTE: inactive-tools prompt is built later, after skill tools are
         # registered so that skill-provided tools are included in the list.
@@ -666,7 +777,6 @@ class AgentLoop:
         # and can cause the model to summarize instead of continue).
         self._agent.next_step_prompt = self.DEFAULT_NEXT_STEP_PROMPT
         self._agent._custom_next_step_prompt = True
-        self._agent._spoon_bot_base_think = self._agent.think
 
         # Build dynamic-tools prompt now that all tools (native + skill) are registered
         inactive_tools = self.tools.get_inactive_tools()
@@ -691,6 +801,9 @@ class AgentLoop:
             f"mcp_servers={len(self._mcp_tools)}, "
             f"skills_enabled={self._enable_skills}"
         )
+
+        # Start sub-agent archive sweeper (no-op if persistence is disabled)
+        await self._subagent_manager.start_sweeper()
 
         # Start background hot-reload service if enabled
         if self._auto_reload:
@@ -751,8 +864,9 @@ class AgentLoop:
             ],
         ))
 
-        # Background task tool
-        self.tools.register(SpawnTool())
+        # Sub-agent tool — replaces the old placeholder SpawnTool
+        spawn_tool = SubagentTool(manager=getattr(self, "_subagent_manager", None))
+        self.tools.register(spawn_tool)
 
         # Web tools
         self.tools.register(WebSearchTool())
@@ -988,7 +1102,14 @@ class AgentLoop:
         return {"skills": skills_result, "mcp": mcp_result}
 
     async def cleanup(self) -> None:
-        """Shut down all managed resources (MCP tools, skills, etc.)."""
+        """Shut down all managed resources (MCP tools, skills, sub-agents, etc.)."""
+        # Cleanup sub-agents first so they can still access tools during their own cleanup
+        if hasattr(self, "_subagent_manager") and getattr(self, "_owns_subagent_manager", True):
+            try:
+                await self._subagent_manager.cleanup()
+            except Exception as exc:
+                logger.debug(f"Sub-agent manager cleanup: {exc}")
+
         # Cleanup MCP tools
         for mcp_tool in self._mcp_tools:
             for method in ("close", "cleanup", "shutdown"):
@@ -1099,7 +1220,8 @@ class AgentLoop:
             attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
             if raw_attachments and len(attachments) != len(raw_attachments):
                 logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
-            content = self._build_runtime_message_content(
+
+            runtime_content = self._build_runtime_message_content(
                 role,
                 content,
                 media=media,
@@ -1107,7 +1229,7 @@ class AgentLoop:
             )
 
             try:
-                await self._agent.add_message(role, content)
+                await self._agent.add_message(role, runtime_content)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -1143,12 +1265,196 @@ class AgentLoop:
             return self.context._build_user_content(text_content, media)
         return text_content
 
+    def set_subagent_context(
+        self,
+        *,
+        session_key: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
+    ) -> None:
+        """Bind the spawn tool to the current requester session/channel."""
+        resolved_session_key = session_key or getattr(self, "session_key", None)
+        manager = getattr(self, "_subagent_manager", None)
+        if manager is not None:
+            manager.set_spawner_context(
+                session_key=resolved_session_key,
+                channel=channel,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+
+        registry = getattr(self, "tools", None)
+        if registry is None:
+            return
+        spawn_tool = registry.get("spawn")
+        if spawn_tool and isinstance(spawn_tool, SubagentTool):
+            spawn_tool.set_spawner_context(
+                session_key=resolved_session_key,
+                channel=channel,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+
+    def _persist_turn(
+        self,
+        user_message: str,
+        assistant_message: str,
+        *,
+        media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Save a completed user/assistant turn to session storage."""
+        try:
+            save_kwargs: dict[str, Any] = {}
+            if media:
+                save_kwargs["media"] = list(media)
+            if attachments:
+                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(user_message, attachments or []),
+                **save_kwargs,
+            )
+            self._session.add_message("assistant", assistant_message)
+            self.sessions.save(self._session)
+        except Exception as e:
+            logger.warning(f"Failed to save session: {e}")
+
+    def _should_skip_specialist_auto_route(self, message: str) -> bool:
+        """Return True when the current message should not be auto-routed."""
+        stripped = message.lstrip()
+        return (
+            self.session_key.startswith("subagent-")
+            or stripped.startswith("[Sub-agent Completed]")
+        )
+
+    def _maybe_create_persistent_subagent_from_request(
+        self,
+        message: str,
+    ) -> str | None:
+        """Create a persistent subagent from a natural-language user request."""
+        if self._should_skip_specialist_auto_route(message):
+            return None
+        parsed = self._subagent_manager.parse_persistent_subagent_request(message)
+        if parsed is None:
+            return None
+
+        profile = self._subagent_manager.create_persistent_subagent(
+            description=parsed["specialization"],
+        )
+        keywords = ", ".join(profile.match_keywords[:8]) or "(none)"
+        response = (
+            f"Persistent subagent `{profile.name}` created.\n"
+            f"Specialization: {profile.specialization}\n"
+            f"Auto-route: {'ON' if profile.auto_route else 'OFF'}\n"
+            f"Tool profile: {profile.tool_profile}\n"
+            f"Keywords: {keywords}\n\n"
+            "Future matching requests will be routed to this subagent automatically."
+        )
+        return response
+
+    async def _maybe_route_to_persistent_specialist_result(
+        self,
+        message: str,
+    ) -> tuple[str, str | None, dict[str, Any]] | None:
+        """Attempt to route a matching top-level request to a persistent subagent."""
+        if self._should_skip_specialist_auto_route(message):
+            return None
+
+        matched = self._subagent_manager.find_best_auto_route_specialist(message)
+        if matched is None:
+            return None
+
+        agent_name = matched["agent_name"]
+        reason_text = ", ".join(matched["reasons"]) or "high-confidence subagent match"
+        logger.info(
+            f"Auto-routing request to persistent subagent {agent_name!r} "
+            f"(score={matched['score']}; {reason_text})"
+        )
+
+        current_channel = getattr(self._subagent_manager, "_current_spawner_channel", None)
+        current_metadata = getattr(self._subagent_manager, "_current_spawner_metadata", {})
+        current_reply_to = getattr(self._subagent_manager, "_current_spawner_reply_to", None)
+        record = await self._subagent_manager.dispatch_persistent_subagent(
+            agent_name=agent_name,
+            task=message,
+            spawner_session_key=self.session_key,
+            spawner_channel=current_channel,
+            spawner_metadata=current_metadata,
+            spawner_reply_to=current_reply_to,
+        )
+        wait_timeout = float(record.config.timeout_seconds or 300)
+        results = await self._subagent_manager.collect_results(
+            timeout=wait_timeout,
+            spawner_session_key=self.session_key,
+            agent_id=record.agent_id,
+            run_id=record.run_id,
+        )
+        if not results:
+            response = (
+                f"Auto-routed to subagent `{agent_name}`, but it did not finish "
+                f"within {int(wait_timeout)}s."
+            )
+            note = (
+                f"Auto-routed to persistent subagent {agent_name} "
+                f"(score={matched['score']}; {reason_text})."
+            )
+            return (
+                response,
+                note,
+                self._build_response_source(
+                    source_type="subagent",
+                    subagent_id=record.agent_id,
+                    subagent_name=agent_name,
+                ),
+            )
+
+        result = results[-1]
+        source = self._build_response_source(
+            source_type="subagent",
+            subagent_id=result.agent_id or record.agent_id,
+            subagent_name=agent_name,
+        )
+        if result.state == SubagentState.COMPLETED:
+            result_text = self._filter_execution_steps(result.result or "(no output)")
+            response = f"Subagent `{agent_name}` handled this request.\n\n{result_text}"
+        elif result.state == SubagentState.FAILED:
+            response = (
+                f"Subagent `{agent_name}` failed while handling this request.\n\n"
+                f"{result.error or '(no error message)'}"
+            )
+        elif result.state == SubagentState.CANCELLED:
+            response = f"Subagent `{agent_name}` was cancelled before finishing."
+        else:
+            response = result.result or result.error or f"Subagent `{agent_name}` returned no output."
+
+        note = (
+            f"Auto-routed to persistent subagent {agent_name} "
+            f"(score={matched['score']}; {reason_text})."
+        )
+        return response, note, source
+
+    async def _maybe_route_to_persistent_specialist(
+        self,
+        message: str,
+    ) -> tuple[str, str | None] | None:
+        """Backward-compatible wrapper without source metadata."""
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if routed is None:
+            return None
+        response, note, _source = routed
+        return response, note
+
     async def process(
         self,
         message: str,
         media: list[str] | None = None,
-        session_key: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_key: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -1162,6 +1468,14 @@ class AgentLoop:
         Returns:
             The agent's response text.
         """
+        AgentLoop._set_last_response_source(self)
+
+        # Switch session if requested
+        if session_key and session_key != self.session_key:
+            self.session_key = session_key
+            self._session = self.sessions.get_or_create(session_key)
+            logger.info(f"Switched to session: {session_key}")
+
         # Honour stop request from previous /stop command
         if self._stop_requested:
             self._stop_requested = False
@@ -1178,7 +1492,32 @@ class AgentLoop:
             self.session_key = session_key
             logger.debug(f"Switched to session: {session_key}")
 
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
         logger.info(f"Processing message: {message[:100]}...")
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            self._persist_turn(message, created)
+            return created
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, _route_note, route_source = routed
+            AgentLoop._set_last_response_source(self, route_source)
+            self._persist_turn(message, routed_content)
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
+            return routed_content
 
         # Refresh memory context
         try:
@@ -1207,14 +1546,6 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
-        runtime_message = self._build_runtime_message_content(
-            "user",
-            message,
-            media=media,
-            attachments=attachments,
-        )
-        if isinstance(runtime_message, str):
-            message = runtime_message
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1223,22 +1554,19 @@ class AgentLoop:
 
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
-        await self._agent.add_message("user", runtime_message)
 
         # Run agent — with recovery for LLM API errors (context overflow, etc.)
         # Retry up to 2 times on ANY error, with increasingly aggressive compression.
         _max_retries = 2
-        retry_requires_runtime_message_check = False
         try:
             for _attempt in range(_max_retries + 1):
                 try:
-                    if (
-                        retry_requires_runtime_message_check
-                        and not self._recent_runtime_has_user_message_content(runtime_message)
-                    ):
-                        await self._agent.add_message("user", runtime_message)
-                    retry_requires_runtime_message_check = False
-                    result = await self._agent.run()
+                    run_kwargs: dict[str, Any] = {}
+                    if media:
+                        run_kwargs["media"] = media
+                    if attachments:
+                        run_kwargs["attachments"] = attachments
+                    result = await self._agent.run(message, **run_kwargs)
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -1276,14 +1604,12 @@ class AgentLoop:
                     if _attempt < _max_retries:
                         logger.warning("Compressing context and retrying...")
                         # First retry: normal compression. Second: force-compress.
-                        compression_actions = 0
                         if _attempt == 0:
-                            compression_actions = self._compress_runtime_context()
-                            if compression_actions == 0:
-                                compression_actions += self._force_compress_runtime_context()
+                            compressed = self._compress_runtime_context()
+                            if compressed == 0:
+                                self._force_compress_runtime_context()
                         else:
-                            compression_actions = self._force_compress_runtime_context()
-                        retry_requires_runtime_message_check = True
+                            self._force_compress_runtime_context()
                         # Reset agent state so it can re-enter run()
                         if hasattr(self._agent, 'state'):
                             self._agent.state = AgentState.IDLE
@@ -1303,21 +1629,13 @@ class AgentLoop:
                 self._agent.current_step = 0
 
         # Save to session
-        try:
-            save_kwargs: dict[str, Any] = {}
-            if media:
-                save_kwargs["media"] = list(media)
-            if attachments:
-                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-            self._session.add_message(
-                "user",
-                _strip_attachment_context(message, attachments or []),
-                **save_kwargs,
-            )
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
-        except Exception as e:
-            logger.warning(f"Failed to save session: {e}")
+        self._persist_turn(
+            message,
+            final_content,
+            media=media,
+            attachments=attachments,
+        )
+        AgentLoop._set_last_response_source(self)
 
         # Auto-commit workspace changes
         if self._auto_commit and self._git:
@@ -1406,14 +1724,6 @@ class AgentLoop:
         if extracted:
             return extracted
         return str(content)
-
-    @classmethod
-    def _message_content_fingerprint(cls, content: Any) -> str:
-        """Create a stable string fingerprint for runtime content comparisons."""
-        serialized = cls._serialize_message_content(content)
-        if isinstance(serialized, str):
-            return f"str:{serialized}"
-        return json.dumps(serialized, sort_keys=True, ensure_ascii=True, default=str)
 
     @classmethod
     def _multimodal_content_summary(cls, content: list[Any], max_text_chars: int) -> str:
@@ -1540,33 +1850,11 @@ class AgentLoop:
         text = msg.content if isinstance(msg.content, str) else ''
         return text.startswith('[ORIGINAL USER REQUEST]') or text.startswith('Focus on the user')
 
-    def _recent_runtime_has_user_message_content(
-        self,
-        content: Any,
-        recent_messages: int = 10,
-    ) -> bool:
-        """Check whether recent runtime memory still contains the active user request."""
-        if not self._agent or not hasattr(self._agent, "memory"):
-            return False
-        messages = getattr(self._agent.memory, "messages", None)
-        if not isinstance(messages, list) or not messages:
-            return False
-
-        target = self._message_content_fingerprint(content)
-        for msg in reversed(messages[-recent_messages:]):
-            role = getattr(msg, "role", None)
-            role = role.value if hasattr(role, "value") else role
-            if role != "user":
-                continue
-            if self._is_next_step_user_msg(msg):
-                continue
-            if self._message_content_fingerprint(getattr(msg, "content", None)) == target:
-                return True
-        return False
-
     @staticmethod
     def _callable_accepts_kwarg(func: Any, kwarg: str) -> bool:
         """Return True when *func* can accept *kwarg* as a keyword argument."""
+        import inspect
+
         try:
             signature = inspect.signature(func)
         except (TypeError, ValueError):
@@ -2028,6 +2316,9 @@ class AgentLoop:
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking: bool = False,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Stream a response with typed chunks.
@@ -2042,13 +2333,66 @@ class AgentLoop:
               type:     "content" | "thinking" | "tool_call" | "tool_result" | "done"
               delta:    Incremental text (may be empty for non-text events)
               metadata: Extra context (tool name, args, step number, etc.)
+              source:   Machine-readable producer metadata for this output
         """
         if not self._initialized:
             await self.initialize()
 
+        current_source = AgentLoop._set_last_response_source(self)
         logger.info(f"Streaming message: {message[:100]}...")
 
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            if created:
+                full_content = created
+                yield {
+                    "type": "content",
+                    "delta": created,
+                    "metadata": {"persistent_subagent_created": True},
+                    "source": current_source,
+                }
+                yield {
+                    "type": "done",
+                    "delta": "",
+                    "metadata": {"content": full_content},
+                    "source": current_source,
+                }
+                self._persist_turn(message, full_content)
+            return
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, _route_note, current_source = routed
+            AgentLoop._set_last_response_source(self, current_source)
+            full_content = routed_content or ""
+            if full_content:
+                yield {
+                    "type": "content",
+                    "delta": full_content,
+                    "metadata": {"auto_routed_to_subagent": True},
+                    "source": current_source,
+                }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": full_content},
+                "source": current_source,
+            }
+            if full_content:
+                self._persist_turn(message, full_content)
+            return
+
         # Refresh memory context
+        bg_task: asyncio.Task | None = None
+
         try:
             memory_context = self.memory.get_memory_context()
             if memory_context:
@@ -2057,20 +2401,9 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
-        stream_completed = False
-        stream_cancelled = False
-        bg_task: asyncio.Task[None] | None = None
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
-        runtime_message = self._build_runtime_message_content(
-            "user",
-            message,
-            media=media,
-            attachments=attachments,
-        )
-        if isinstance(runtime_message, str):
-            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
@@ -2092,18 +2425,30 @@ class AgentLoop:
                 except (asyncio.TimeoutError, Exception):
                     break
 
-            await self._agent.add_message("user", runtime_message)
-
             # 2. Start run() in background
             run_result_text = ""
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    run_kwargs: dict[str, Any] = {}
-                    if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
-                        run_kwargs["thinking"] = True
-                    result = await self._agent.run(**run_kwargs)
+                    run_kwargs: dict[str, Any] = {"request": message}
+                    if media:
+                        run_kwargs["media"] = media
+                    if attachments:
+                        run_kwargs["attachments"] = attachments
+
+                    if thinking:
+                        try:
+                            result = await self._agent.run(
+                                thinking=True,
+                                **run_kwargs,
+                            )
+                        except TypeError as exc:
+                            if "thinking" not in str(exc):
+                                raise
+                            result = await self._agent.run(**run_kwargs)
+                    else:
+                        result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2166,9 +2511,8 @@ class AgentLoop:
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
-                    stream_cancelled = True
-                    logger.warning("Streaming cancelled while waiting for output")
-                    raise
+                    logger.warning("Streaming cancelled")
+                    break
                 except Exception as e:
                     logger.warning(f"Queue get error: {type(e).__name__}: {e}")
                     continue
@@ -2200,6 +2544,7 @@ class AgentLoop:
                             "type": "error",
                             "delta": chunk.get("delta", ""),
                             "metadata": chunk.get("metadata", {}),
+                            "source": current_source,
                         }
                         continue
 
@@ -2224,6 +2569,7 @@ class AgentLoop:
                                     "name": fn_name,
                                     "arguments": fn_args,
                                 },
+                                "source": current_source,
                             }
                         continue
                     # Support both "content" and "delta" keys (#10)
@@ -2243,7 +2589,12 @@ class AgentLoop:
                     full_content += delta
 
                 if delta:
-                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+                    yield {
+                        "type": chunk_type,
+                        "delta": delta,
+                        "metadata": metadata,
+                        "source": current_source,
+                    }
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
 
@@ -2265,54 +2616,62 @@ class AgentLoop:
                     "type": "content",
                     "delta": run_result_text,
                     "metadata": {"fallback": "run_result_no_chunks"},
+                    "source": current_source,
                 }
 
             # Emit done
-            stream_completed = True
-            yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": full_content},
+                "source": current_source,
+            }
 
-        except asyncio.CancelledError:
-            stream_cancelled = True
-            logger.warning("Streaming cancelled")
-            raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            stream_completed = True
-            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
-            yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
+            current_source = AgentLoop.get_last_response_source(self)
+            yield {
+                "type": "error",
+                "delta": str(e),
+                "metadata": {"error": str(e)},
+                "source": current_source,
+            }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"error": str(e)},
+                "source": current_source,
+            }
         finally:
             self._restore_agent_think()
-            if bg_task is not None and not bg_task.done():
+            if bg_task and not bg_task.done():
                 bg_task.cancel()
                 try:
-                    await asyncio.wait_for(bg_task, timeout=5.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    await bg_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
                     pass
 
         # Save to session only if we got actual content
-        if full_content and stream_completed and not stream_cancelled:
-            try:
-                save_kwargs: dict[str, Any] = {}
-                if media:
-                    save_kwargs["media"] = list(media)
-                if attachments:
-                    save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-                self._session.add_message(
-                    "user",
-                    _strip_attachment_context(message, attachments or []),
-                    **save_kwargs,
-                )
-                self._session.add_message("assistant", full_content)
-                self.sessions.save(self._session)
-            except Exception as e:
-                logger.warning(f"Failed to save session after streaming: {e}")
+        if full_content:
+            self._persist_turn(
+                message,
+                full_content,
+                media=media,
+                attachments=attachments,
+            )
 
     async def process_with_thinking(
         self,
         message: str,
         media: list[str] | None = None,
-        session_key: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_key: str | None = None,
+        thinking_level: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -2325,6 +2684,14 @@ class AgentLoop:
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
         """
+        AgentLoop._set_last_response_source(self)
+
+        # Switch session if requested
+        if session_key and session_key != self.session_key:
+            self.session_key = session_key
+            self._session = self.sessions.get_or_create(session_key)
+            logger.info(f"Switched to session: {session_key}")
+
         if not self._initialized:
             await self.initialize()
 
@@ -2334,7 +2701,32 @@ class AgentLoop:
             self.session_key = session_key
             logger.debug(f"Switched to session: {session_key}")
 
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
         logger.info(f"Processing message (with thinking): {message[:100]}...")
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            self._persist_turn(message, created)
+            return created, "Created persistent subagent from natural-language request."
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, route_note, route_source = routed
+            AgentLoop._set_last_response_source(self, route_source)
+            self._persist_turn(message, routed_content)
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
+            return routed_content, route_note
 
         # Refresh memory context
         try:
@@ -2346,26 +2738,49 @@ class AgentLoop:
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
-        runtime_message = self._build_runtime_message_content(
-            "user",
-            message,
-            media=media,
-            attachments=attachments,
-        )
-        if isinstance(runtime_message, str):
-            message = runtime_message
 
         _base_prompt = self._build_step_prompt(message)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
-        await self._agent.add_message("user", runtime_message)
 
         # Run agent with thinking enabled
         try:
             run_kwargs: dict[str, Any] = {}
-            if self._callable_accepts_kwarg(self._agent.run, "thinking"):
-                run_kwargs["thinking"] = True
-            result = await self._agent.run(**run_kwargs)
+            if media:
+                run_kwargs["media"] = media
+            if attachments:
+                run_kwargs["attachments"] = attachments
+            requested_thinking = thinking_level or True
+            try:
+                result = await self._agent.run(
+                    message,
+                    thinking=requested_thinking,
+                    **run_kwargs,
+                )
+            except TypeError as exc:
+                if "thinking" not in str(exc):
+                    raise
+                if requested_thinking is not True:
+                    try:
+                        result = await self._agent.run(
+                            message,
+                            thinking=True,
+                            **run_kwargs,
+                        )
+                    except TypeError as nested_exc:
+                        if "thinking" not in str(nested_exc):
+                            raise
+                        logger.warning(
+                            "Agent runtime does not support explicit thinking mode; "
+                            "falling back to a standard run."
+                        )
+                        result = await self._agent.run(message, **run_kwargs)
+                else:
+                    logger.warning(
+                        "Agent runtime does not support explicit thinking mode; "
+                        "falling back to a standard run."
+                    )
+                    result = await self._agent.run(message, **run_kwargs)
 
             # Extract content and thinking
             if hasattr(result, "content"):
@@ -2388,21 +2803,13 @@ class AgentLoop:
             self._restore_agent_think()
 
         # Save to session
-        try:
-            save_kwargs: dict[str, Any] = {}
-            if media:
-                save_kwargs["media"] = list(media)
-            if attachments:
-                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
-            self._session.add_message(
-                "user",
-                _strip_attachment_context(message, attachments or []),
-                **save_kwargs,
-            )
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
-        except Exception as e:
-            logger.warning(f"Failed to save session: {e}")
+        self._persist_turn(
+            message,
+            final_content,
+            media=media,
+            attachments=attachments,
+        )
+        AgentLoop._set_last_response_source(self)
 
         # Auto-commit workspace changes
         if self._auto_commit and self._git:
@@ -2842,6 +3249,11 @@ class AgentLoop:
     def agent(self) -> SpoonReactMCP | SpoonReactSkill | None:
         """Access the underlying spoon-core agent."""
         return self._agent
+
+    @property
+    def subagent_manager(self) -> SubagentManager | None:
+        """Expose sub-agent manager for external access (e.g. slash commands)."""
+        return getattr(self, "_subagent_manager", None)
 
 
 async def create_agent(

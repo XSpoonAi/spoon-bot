@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:293`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:314`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:722`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:749`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:597`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:624`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:497`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:522`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:533`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:558`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:566`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:593`*
 
 ---
 
@@ -716,6 +716,17 @@ Audio transcription information.
 | `duration_seconds` | `float | None` | None |
 | `provider` | `str` | 'whisper' |
 
+#### `ResponseSource`
+
+Machine-readable metadata describing who produced a response.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `type` | `str` | 'agent' |
+| `is_subagent` | `bool` | False |
+| `subagent_id` | `str | None` | None |
+| `subagent_name` | `str | None` | None |
+
 #### `ChatResponse`
 
 Chat response model.
@@ -727,6 +738,7 @@ Chat response model.
 | `usage` | `UsageInfo | None` | None |
 | `thinking_content` | `str | None` | None |
 | `transcription` | `TranscriptionInfo | None` | None |
+| `source` | `ResponseSource | None` | None |
 
 #### `StreamChunk`
 
@@ -737,6 +749,7 @@ Streaming response chunk model.
 | `type` | `str` | *(required)* |
 | `delta` | `str` | '' |
 | `metadata` | `dict[str, Any]` | Field(default_factory=dict) |
+| `source` | `ResponseSource | None` | None |
 
 #### `SessionInfo`
 
