@@ -25,6 +25,7 @@ class Connection:
     connected_at: datetime = field(default_factory=datetime.utcnow)
     last_activity: datetime = field(default_factory=datetime.utcnow)
     subscriptions: set[str] = field(default_factory=set)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def update_activity(self) -> None:
         """Update last activity timestamp."""
@@ -158,15 +159,33 @@ class ConnectionManager:
         if not conn:
             return False
 
-        try:
-            data = message.to_dict() if isinstance(message, WSMessage) else message
-            await conn.websocket.send_json(data)
-            conn.update_activity()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send message to {connection_id}: {e}")
-            await self.disconnect(connection_id)
-            return False
+        data = message.to_dict() if isinstance(message, WSMessage) else message
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                async with conn.send_lock:
+                    await conn.websocket.send_json(data)
+                conn.update_activity()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"send_message to {connection_id} failed (attempt "
+                        f"{attempt + 1}/{max_retries + 1}): {e}"
+                    )
+                    await asyncio.sleep(0.1 * (attempt + 1))
+                    if connection_id not in self._connections:
+                        return False
+                    continue
+                logger.error(
+                    f"Failed to send message to {connection_id} after "
+                    f"{max_retries + 1} attempts: {e}"
+                )
+                await self.disconnect(connection_id)
+                return False
+        return False
 
     async def send_to_user(
         self,

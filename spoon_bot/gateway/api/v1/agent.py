@@ -23,7 +23,7 @@ from spoon_bot.gateway.app import (
 )
 from spoon_bot.gateway.auth.dependencies import CurrentUser
 from spoon_bot.gateway.errors import TimeoutCode, build_timeout_error_detail
-from spoon_bot.gateway.models.requests import ChatRequest
+from spoon_bot.gateway.models.requests import AsyncChatRequest, ChatRequest
 from spoon_bot.gateway.models.responses import (
     APIResponse,
     MetaInfo,
@@ -42,6 +42,13 @@ from spoon_bot.gateway.observability.tracing import (
     TimerSpan,
     build_timing_payload,
     new_trace_id,
+)
+from spoon_bot.gateway.websocket.handler import (
+    _derive_media_from_attachments,
+    _merge_attachment_context,
+    _normalize_attachment_refs,
+    _validate_attachment_paths,
+    _validate_media_paths,
 )
 
 logger = getLogger(__name__)
@@ -65,6 +72,41 @@ def _resolve_session_key(request_session_key: str, user: CurrentUser) -> str:
     ):
         session_key = user.session_key
     return session_key
+
+
+def _raise_request_validation_error(exc: ValueError) -> None:
+    """Convert client-supplied validation failures into 4xx responses."""
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"code": "INVALID_REQUEST", "message": str(exc)},
+    )
+
+
+def _prepare_attachment_inputs(
+    message: str,
+    media: list[str] | None,
+    attachments: list[dict[str, Any]] | None,
+) -> tuple[str, list[str], list[dict[str, Any]]]:
+    """Normalize and validate attachment/media inputs for agent requests."""
+    try:
+        normalized_attachments = _validate_attachment_paths(
+            _normalize_attachment_refs(attachments or [])
+        )
+        normalized_media = _validate_media_paths(
+            list(
+                dict.fromkeys(
+                    (media or []) + _derive_media_from_attachments(normalized_attachments)
+                )
+            )
+        )
+    except ValueError as exc:
+        _raise_request_validation_error(exc)
+
+    return (
+        _merge_attachment_context(message, normalized_attachments),
+        normalized_media,
+        normalized_attachments,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +189,7 @@ async def _stream_sse(
     agent,
     message: str,
     media: list[str] | None,
+    attachments: list[dict[str, Any]] | None,
     thinking: bool,
     *,
     session_key: str | None = None,
@@ -178,6 +221,8 @@ async def _stream_sse(
             kwargs = {"message": message, "thinking": thinking}
             if media:
                 kwargs["media"] = media
+            if attachments:
+                kwargs["attachments"] = attachments
 
             try:
                 async for chunk_data in agent.stream(**kwargs):
@@ -282,13 +327,20 @@ async def chat(
                 language=request.audio_language,
             )
 
+        message, media, attachments = _prepare_attachment_inputs(
+            message,
+            request.media,
+            request.attachments,
+        )
+
         # Streaming mode: return SSE
         if stream:
             return StreamingResponse(
                 _stream_sse(
                     agent,
                     message,
-                    request.media or None,
+                    media or None,
+                    attachments or None,
                     thinking,
                     session_key=session_key,
                     trace_id=trace_id,
@@ -311,8 +363,10 @@ async def chat(
                 _switch_session(agent, session_key)
 
                 kwargs = {"message": message}
-                if request.media:
-                    kwargs["media"] = request.media
+                if media:
+                    kwargs["media"] = media
+                if attachments:
+                    kwargs["attachments"] = attachments
 
                 thinking_content = None
                 if thinking:
@@ -441,7 +495,7 @@ async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str
 
 @router.post("/chat/async")
 async def chat_async(
-    request: ChatRequest,
+    request: AsyncChatRequest,
     user: CurrentUser,
 ) -> dict:
     """
@@ -465,9 +519,7 @@ async def chat_async(
     task = AsyncTask(task_id=task_id, owner_user_id=owner_user_id)
     _task_store[task_id] = task
 
-    bg = asyncio.create_task(
-        _run_async_task(task, agent, request.message, session_key=session_key)
-    )
+    bg = asyncio.create_task(_run_async_task(task, agent, request.message, session_key=session_key))
     task._bg_task = bg
 
     return {
@@ -678,6 +730,7 @@ async def voice_chat(
     """Send voice + optional text to the agent (multipart upload)."""
     request_id = f"req_{uuid4().hex[:12]}"
     start_time = time.time()
+    trace_id = new_trace_id()
 
     config = get_config()
     if not config.audio.enabled:
@@ -716,12 +769,22 @@ async def voice_chat(
 
     if stream:
         return StreamingResponse(
-            _stream_sse(agent, processed_message, None, False, session_key=session_key),
+            _stream_sse(
+                agent,
+                processed_message,
+                None,
+                None,
+                False,
+                session_key=session_key,
+                trace_id=trace_id,
+                request_id=request_id,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Request-ID": request_id,
+                "X-Trace-ID": trace_id,
             },
         )
 

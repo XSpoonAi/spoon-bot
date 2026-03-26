@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -576,6 +577,89 @@ class TestAgentLoopStream:
         agent._session.add_message.assert_any_call("assistant", "hello")
         agent.sessions.save.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_stream_close_cancels_background_run_and_skips_session_save(self):
+        """Closing the stream should stop the background run and avoid persisting stale output."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        run_cancelled = asyncio.Event()
+
+        async def mock_run(request):
+            await agent._agent.output_queue.put({"content": "hello"})
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                run_cancelled.set()
+                raise
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+
+        stream = AgentLoop.stream(agent, message="test message")
+        first_chunk = await stream.__anext__()
+
+        assert first_chunk["type"] == "content"
+        assert first_chunk["delta"] == "hello"
+
+        await stream.aclose()
+        await asyncio.wait_for(run_cancelled.wait(), timeout=1.0)
+
+        agent.sessions.save.assert_not_called()
+        agent._session.add_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_install_anti_loop_tracker_does_not_stack_previous_request_prompt(self):
+        """A new request should not inherit the previous request's anti-loop wrapper."""
+        from pathlib import Path
+        from spoon_bot.agent.loop import AgentLoop
+
+        seen_prompts = []
+
+        async def base_think():
+            seen_prompts.append(agent._agent.next_step_prompt)
+            return True
+
+        tool_call = MagicMock()
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"cd /workspace && ls -la .agents/skills/pdf"}'
+
+        agent = MagicMock(spec=AgentLoop)
+        agent.workspace = Path("/workspace")
+        agent._agent = MagicMock()
+        agent._agent.think = base_think
+        agent._agent._spoon_bot_base_think = base_think
+        agent._agent.next_step_prompt = ""
+        agent._agent.tool_calls = [tool_call]
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._compress_runtime_context = MagicMock(return_value=0)
+
+        AgentLoop._install_anti_loop_tracker(agent, "prompt one")
+        agent._agent.next_step_prompt = "prompt one"
+        await agent._agent.think()
+
+        AgentLoop._install_anti_loop_tracker(agent, "prompt two")
+        agent._agent.next_step_prompt = "prompt two"
+        await agent._agent.think()
+
+        assert seen_prompts[-1] == "prompt two"
+
 
 @pytest.mark.requires_spoon_core
 class TestAgentLoopProcessWithThinking:
@@ -1058,7 +1142,7 @@ class TestBackwardCompatibility:
 
         assert response.status_code == 200
 
-    def test_media_field_still_works(self):
+    def test_media_field_still_works(self, tmp_path: Path):
         """Media field should still work in non-streaming mode."""
         mock_agent = MagicMock()
         mock_agent.process = AsyncMock(return_value="processed with media")
@@ -1066,15 +1150,19 @@ class TestBackwardCompatibility:
         mock_agent.tools = MagicMock()
         mock_agent.tools.list_tools = MagicMock(return_value=[])
         mock_agent.skills = []
+        mock_agent.workspace = tmp_path
 
         app = _create_test_app(mock_agent)
         client = TestClient(app)
+
+        image_path = tmp_path / "image.png"
+        image_path.write_bytes(b"png")
 
         response = client.post(
             "/v1/agent/chat",
             json={
                 "message": "analyze this",
-                "media": ["/path/to/image.png"],
+                "media": [str(image_path)],
             },
         )
 

@@ -76,3 +76,7 @@ test_spoon.py
 
 # Config file with credentials
 config.yaml
+
+workspace/*
+sessions/*
+memory/*

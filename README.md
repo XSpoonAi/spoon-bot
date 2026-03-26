@@ -503,7 +503,7 @@ The agent includes its context budget in the system prompt, allowing it to adjus
 │                       SPOON-BOT TOOLS                            │
 ├──────────────────────────────────────────────────────────────────┤
 │  Native OS Tools (Always Available, Priority)                    │
-│  ├── shell           Execute commands (60s timeout, 10KB limit)  │
+│  ├── shell           Execute commands (3600s timeout, 10KB limit) │
 │  ├── read_file       Read file contents                          │
 │  ├── write_file      Write content to file                       │
 │  ├── edit_file       Edit file by replacing text                 │

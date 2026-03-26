@@ -204,7 +204,7 @@ class SelfConfigTool(Tool):
         return {
             "model": "claude-sonnet-4.6",
             "max_iterations": 50,
-            "shell_timeout": 60,
+            "shell_timeout": 3600,
             "max_output": 10000,
             "provider": "anthropic",
         }

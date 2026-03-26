@@ -372,7 +372,7 @@ class ShellTool(Tool):
 
     def __init__(
         self,
-        timeout: int = 60,
+        timeout: int = 3600,
         max_output: int = 10000,
         working_dir: str | None = None,
         whitelist_mode: bool = False,
@@ -389,7 +389,7 @@ class ShellTool(Tool):
         Initialize shell tool.
 
         Args:
-            timeout: Command timeout in seconds (default 60).
+            timeout: Command timeout in seconds (default 3600).
             max_output: Maximum output characters (default 10000).
             working_dir: Default working directory.
             whitelist_mode: If True, only allow whitelisted commands.

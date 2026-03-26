@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ChatOptions(BaseModel):
@@ -23,6 +23,7 @@ class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=100000)
     session_key: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     media: list[str] = Field(default_factory=list, max_length=10)
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     options: ChatOptions | None = None
 
     # Audio fields (alternative to text message)
@@ -48,6 +49,24 @@ class ChatRequest(BaseModel):
     def sanitize_message(cls, v: str) -> str:
         """Remove control characters except newlines."""
         return "".join(c for c in v if c.isprintable() or c in "\n\r\t")
+
+
+class AsyncChatRequest(BaseModel):
+    """Async chat request model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(..., min_length=1, max_length=100000)
+    session_key: str = Field(default="default", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
+
+    @field_validator("message")
+    @classmethod
+    def sanitize_message(cls, v: str) -> str:
+        """Remove control characters except newlines and reject blank prompts."""
+        sanitized = "".join(c for c in v if c.isprintable() or c in "\n\r\t")
+        if not sanitized.strip():
+            raise ValueError("message must not be blank")
+        return sanitized
 
 
 class LoginRequest(BaseModel):
