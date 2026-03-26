@@ -1938,8 +1938,6 @@ class AgentLoop:
                 if not content or not content.strip():
                     break
                 safe_text = mask_secrets(content.strip())
-                if len(safe_text) > 500:
-                    safe_text = safe_text[:500] + "…"
                 logger.info(f"💭 Agent reasoning: {safe_text}")
                 break
 
