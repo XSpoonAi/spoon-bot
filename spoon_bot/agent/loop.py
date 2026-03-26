@@ -111,6 +111,187 @@ if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
 
 
+_ATTACHMENT_CONTEXT_HEADER = "Attached workspace files (source of truth for this request):"
+_ATTACHMENT_ONLY_PLACEHOLDER = (
+    "The user attached files without extra text. Inspect the files and answer based on their contents."
+)
+_SANDBOX_WORKSPACE_ROOT = "/workspace"
+
+
+def _workspace_root_path(workspace: Path | str | None) -> Path:
+    """Resolve the workspace root used to validate persisted file references."""
+    return Path(workspace or Path.home() / ".spoon-bot" / "workspace").expanduser().resolve()
+
+
+def _resolve_workspace_file(path_str: str, workspace: Path | str | None) -> Path | None:
+    """Resolve a file path and ensure it stays within the configured workspace."""
+    candidate = str(path_str or "").strip()
+    if not candidate:
+        return None
+
+    workspace_root = _workspace_root_path(workspace)
+    sandbox_root = _SANDBOX_WORKSPACE_ROOT.rstrip("/")
+    try:
+        if candidate.startswith("/"):
+            normalized = Path(candidate).as_posix()
+            workspace_root_str = workspace_root.as_posix().rstrip("/")
+            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
+                relative = normalized[len(sandbox_root):].lstrip("/")
+                resolved = (workspace_root / relative).resolve(strict=True)
+            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                relative = normalized[len(workspace_root_str):].lstrip("/")
+                resolved = (workspace_root / relative).resolve(strict=True)
+            else:
+                resolved = Path(candidate).expanduser().resolve(strict=True)
+        else:
+            resolved = (workspace_root / candidate).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+
+    if resolved != workspace_root and workspace_root not in resolved.parents:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _normalize_media_list(raw: Any) -> list[str]:
+    """Normalize stored media payloads to a list of non-empty file paths."""
+    if not isinstance(raw, list):
+        return []
+
+    items: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            value = item.strip()
+        else:
+            value = str(item).strip() if item is not None else ""
+        if value:
+            items.append(value)
+    return items
+
+
+def _sanitize_media_list(raw: Any, workspace: Path | str | None) -> list[str]:
+    """Keep only workspace-backed media paths from persisted session metadata."""
+    return [
+        path
+        for path in _normalize_media_list(raw)
+        if _resolve_workspace_file(path, workspace) is not None
+    ]
+
+
+def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
+    """Normalize stored attachment references from session metadata."""
+    if not isinstance(raw, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if not uri:
+            continue
+        attachment = dict(item)
+        attachment["uri"] = uri
+        attachment.setdefault("workspace_path", uri)
+        normalized.append(attachment)
+    return normalized
+
+
+def _sanitize_attachment_refs(raw: Any, workspace: Path | str | None) -> list[dict[str, Any]]:
+    """Keep only workspace-backed attachment references from persisted metadata."""
+    sanitized: list[dict[str, Any]] = []
+    for item in _normalize_attachment_refs(raw):
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if _resolve_workspace_file(uri, workspace) is None:
+            continue
+        sanitized.append(item)
+    return sanitized
+
+
+def _attachment_context_entries(attachments: list[dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    """Return normalized attachment entries with resolved display paths."""
+    normalized_items: list[tuple[dict[str, Any], str]] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        uri = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if uri:
+            normalized_items.append((item, uri))
+    return normalized_items
+
+
+def _build_attachment_context_lines(attachments: list[dict[str, Any]]) -> list[str]:
+    """Build the synthetic attachment context block appended to prompts."""
+    normalized_items = _attachment_context_entries(attachments)
+    if not normalized_items:
+        return []
+
+    lines = [_ATTACHMENT_CONTEXT_HEADER]
+    for item, uri in normalized_items:
+        name = str(item.get("name") or item.get("file_name") or "").strip()
+        mime_type = str(item.get("mime_type") or item.get("file_type") or "").strip()
+        size = item.get("size") if "size" in item else item.get("file_size")
+        suffix = []
+        if name:
+            suffix.append(f"name: {name}")
+        if mime_type:
+            suffix.append(f"mime: {mime_type}")
+        if isinstance(size, int) and size > 0:
+            suffix.append(f"size: {size} bytes")
+        line = f"- {uri}"
+        if suffix:
+            line += f" ({', '.join(suffix)})"
+        lines.append(line)
+    lines.append("Use these attached workspace files as the primary source of truth for this request.")
+    return lines
+
+
+def _ensure_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Append attachment path context unless it is already present in content."""
+    if not attachments:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    normalized_items = _attachment_context_entries(attachments)
+    uris = [uri for _, uri in normalized_items]
+    if not uris:
+        return text
+    if _ATTACHMENT_CONTEXT_HEADER in text and all(uri in text for uri in uris):
+        return text
+
+    lines = [text.strip()] if text.strip() else [_ATTACHMENT_ONLY_PLACEHOLDER]
+    lines.extend(["", *_build_attachment_context_lines(attachments)])
+    return "\n".join(lines)
+
+
+def _strip_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Remove the exact synthetic attachment block so sessions keep user-authored text only."""
+    if not attachments:
+        return content
+
+    text = content if isinstance(content, str) else str(content)
+    if _ATTACHMENT_CONTEXT_HEADER not in text:
+        return text
+
+    context_lines = _build_attachment_context_lines(attachments)
+    if not context_lines:
+        return text
+
+    delimiter = f"\n\n{context_lines[0]}\n"
+    if delimiter not in text:
+        return text
+
+    prefix, suffix = text.split(delimiter, 1)
+    expected_suffix = "\n".join(context_lines[1:])
+    if suffix != expected_suffix:
+        return text
+    if prefix == _ATTACHMENT_ONLY_PLACEHOLDER:
+        return ""
+    return prefix
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine using spoon-core SDK.
@@ -1013,7 +1194,12 @@ class AgentLoop:
             return 0
 
         injected_count = 0
-        for msg in self._session.get_history():
+        history_messages = (
+            self._session.get_messages()
+            if hasattr(self._session, "get_messages")
+            else self._session.get_history()
+        )
+        for msg in history_messages:
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
                 continue
@@ -1025,8 +1211,25 @@ class AgentLoop:
                 except Exception:
                     content = str(content)
 
+            raw_media = _normalize_media_list(msg.get("media"))
+            media = _sanitize_media_list(raw_media, self.workspace)
+            if raw_media and len(media) != len(raw_media):
+                logger.warning("Dropped invalid persisted media refs outside workspace during history sync")
+
+            raw_attachments = _normalize_attachment_refs(msg.get("attachments"))
+            attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
+            if raw_attachments and len(attachments) != len(raw_attachments):
+                logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
+
+            runtime_content = self._build_runtime_message_content(
+                role,
+                content,
+                media=media,
+                attachments=attachments,
+            )
+
             try:
-                await self._agent.add_message(role, content)
+                await self._agent.add_message(role, runtime_content)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -1048,6 +1251,19 @@ class AgentLoop:
             f"estimated_tokens~{estimated_tokens}, "
             f"trimmed_messages={trimmed_count}"
         )
+
+    def _build_runtime_message_content(
+        self,
+        role: str,
+        content: str,
+        media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Build message content in the format expected by spoon-core runtime memory."""
+        text_content = _ensure_attachment_context(content, attachments or [])
+        if role == "user" and media:
+            return self.context._build_user_content(text_content, media)
+        return text_content
 
     def set_subagent_context(
         self,
@@ -1080,10 +1296,26 @@ class AgentLoop:
                 reply_to=reply_to,
             )
 
-    def _persist_turn(self, user_message: str, assistant_message: str) -> None:
+    def _persist_turn(
+        self,
+        user_message: str,
+        assistant_message: str,
+        *,
+        media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Save a completed user/assistant turn to session storage."""
         try:
-            self._session.add_message("user", user_message)
+            save_kwargs: dict[str, Any] = {}
+            if media:
+                save_kwargs["media"] = list(media)
+            if attachments:
+                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(user_message, attachments or []),
+                **save_kwargs,
+            )
             self._session.add_message("assistant", assistant_message)
             self.sessions.save(self._session)
         except Exception as e:
@@ -1267,7 +1499,6 @@ class AgentLoop:
             metadata=metadata,
             reply_to=reply_to,
         )
-
         logger.info(f"Processing message: {message[:100]}...")
 
         created = self._maybe_create_persistent_subagent_from_request(message)
@@ -1333,6 +1564,8 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if media:
                         run_kwargs["media"] = media
+                    if attachments:
+                        run_kwargs["attachments"] = attachments
                     result = await self._agent.run(message, **run_kwargs)
 
                     logger.debug(f"Agent result type: {type(result)}")
@@ -1387,6 +1620,7 @@ class AgentLoop:
                     raise
         finally:
             # Always ensure agent is back in IDLE state after processing
+            self._restore_agent_think()
             if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
                 logger.warning(
                     f"Post-run cleanup: resetting agent from {self._agent.state} to IDLE"
@@ -1395,7 +1629,12 @@ class AgentLoop:
                 self._agent.current_step = 0
 
         # Save to session
-        self._persist_turn(message, final_content)
+        self._persist_turn(
+            message,
+            final_content,
+            media=media,
+            attachments=attachments,
+        )
         AgentLoop._set_last_response_source(self)
 
         # Auto-commit workspace changes
@@ -1447,14 +1686,153 @@ class AgentLoop:
             logger.warning(f"Failed to extract content from agent memory: {exc}")
         return ""
 
-    @staticmethod
-    def _msg_char_count(msg) -> int:
+    @classmethod
+    def _serialize_message_content(cls, content: Any) -> Any:
+        """Convert message content into JSON-serializable Python objects."""
+        if content is None or isinstance(content, (str, int, float, bool)):
+            return content
+        if isinstance(content, list):
+            return [cls._serialize_message_content(item) for item in content]
+        if isinstance(content, dict):
+            return {
+                str(key): cls._serialize_message_content(value)
+                for key, value in content.items()
+            }
+        if hasattr(content, "model_dump"):
+            try:
+                dumped = content.model_dump(exclude_none=True)
+            except TypeError:
+                dumped = content.model_dump()
+            return cls._serialize_message_content(dumped)
+
+        extracted: dict[str, Any] = {}
+        for attr in (
+            "type",
+            "text",
+            "image_url",
+            "source",
+            "file_path",
+            "media_type",
+            "filename",
+            "name",
+            "url",
+            "detail",
+            "data",
+        ):
+            if hasattr(content, attr):
+                extracted[attr] = cls._serialize_message_content(getattr(content, attr))
+        if extracted:
+            return extracted
+        return str(content)
+
+    @classmethod
+    def _multimodal_content_summary(cls, content: list[Any], max_text_chars: int) -> str:
+        """Summarize multimodal content while dropping heavy binary payloads."""
+        serialized = cls._serialize_message_content(content)
+        if not isinstance(serialized, list):
+            text = str(serialized or "")
+            return text[:max_text_chars] if max_text_chars and len(text) > max_text_chars else text
+
+        text_parts: list[str] = []
+        image_count = 0
+        document_count = 0
+        file_refs: list[str] = []
+
+        for block in serialized:
+            if isinstance(block, dict):
+                block_type = str(block.get("type") or "")
+                if block_type == "text":
+                    text = str(block.get("text") or "")
+                    if text:
+                        text_parts.append(text)
+                    continue
+                if block_type in {"image", "image_url"}:
+                    image_count += 1
+                    continue
+                if block_type == "document":
+                    document_count += 1
+                    continue
+                if block_type == "file":
+                    file_path = str(block.get("file_path") or "")
+                    if file_path:
+                        file_refs.append(Path(file_path).name or file_path)
+                    continue
+            elif block:
+                text_parts.append(str(block))
+
+        text = "\n".join(part for part in text_parts if part).strip()
+        if max_text_chars and len(text) > max_text_chars:
+            text = text[:max_text_chars] + f"\n...[truncated {len(text) - max_text_chars} chars]"
+
+        summary_parts = [text] if text else []
+        if image_count:
+            summary_parts.append(f"[{image_count} image attachment(s) omitted during context compression]")
+        if document_count:
+            summary_parts.append(f"[{document_count} document attachment(s) omitted during context compression]")
+        if file_refs:
+            shown = ", ".join(file_refs[:3])
+            more = "" if len(file_refs) <= 3 else f" (+{len(file_refs) - 3} more)"
+            summary_parts.append(f"[File attachment reference(s): {shown}{more}]")
+        if not summary_parts:
+            summary_parts.append("[Multimodal content omitted during context compression]")
+        return "\n".join(summary_parts)
+
+    @classmethod
+    def _compress_message_content(cls, content: Any, max_chars: int) -> Any:
+        """Truncate text content and summarize multimodal content for recovery."""
+        if isinstance(content, str):
+            if len(content) <= max_chars:
+                return content
+            return content[:max_chars] + f"\n...[truncated {len(content) - max_chars} chars]"
+        if isinstance(content, list):
+            return cls._multimodal_content_summary(content, max_chars)
+        return content
+
+    @classmethod
+    def _message_content_char_count(cls, content: Any) -> int:
+        """Return an approximate character count for text and multimodal payloads."""
+        if content is None:
+            return 0
+        if isinstance(content, str):
+            return len(content)
+        if not isinstance(content, list):
+            return len(str(content))
+
+        total = 0
+        serialized = cls._serialize_message_content(content)
+        for block in serialized if isinstance(serialized, list) else [serialized]:
+            if isinstance(block, dict):
+                block_type = str(block.get("type") or "")
+                if block_type == "text":
+                    total += len(str(block.get("text") or ""))
+                    continue
+                if block_type == "image_url":
+                    total += len(str((block.get("image_url") or {}).get("url") or ""))
+                    continue
+                if block_type == "image":
+                    source = block.get("source") or {}
+                    total += len(str(source.get("media_type") or ""))
+                    total += len(str(source.get("data") or ""))
+                    continue
+                if block_type == "document":
+                    source = block.get("source") or {}
+                    total += len(str(source.get("media_type") or ""))
+                    total += len(str(source.get("data") or ""))
+                    total += len(str(block.get("filename") or ""))
+                    continue
+                if block_type == "file":
+                    total += len(str(block.get("file_path") or ""))
+                    total += len(str(block.get("media_type") or ""))
+                    continue
+                total += len(json.dumps(block, sort_keys=True, ensure_ascii=True, default=str))
+                continue
+            total += len(str(block))
+        return total
+
+    @classmethod
+    def _msg_char_count(cls, msg) -> int:
         """Return total character count of a message's content."""
-        if isinstance(msg.content, str):
-            return len(msg.content)
-        if isinstance(msg.content, list):
-            return sum(len(getattr(b, 'text', '')) for b in msg.content)
-        return 0
+        return cls._message_content_char_count(getattr(msg, "content", None))
 
     def _estimate_runtime_tokens(self) -> int:
         """Rough token estimate from the agent's runtime messages (~4 chars/token)."""
@@ -1604,9 +1982,10 @@ class AgentLoop:
         max_content = 300
         for i in range(1, max(1, len(messages) - keep_tail)):
             msg = messages[i]
-            if isinstance(msg.content, str) and len(msg.content) > max_content:
-                orig = len(msg.content)
-                msg.content = msg.content[:max_content] + f"\n...[truncated {orig - max_content} chars]"
+            original_content = getattr(msg, "content", None)
+            compressed_content = self._compress_message_content(original_content, max_content)
+            if compressed_content != original_content:
+                msg.content = compressed_content
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
@@ -1649,8 +2028,10 @@ class AgentLoop:
 
         # Truncate ALL messages to 150 chars
         for msg in messages:
-            if isinstance(msg.content, str) and len(msg.content) > 150:
-                msg.content = msg.content[:150] + "\n...[force-truncated]"
+            original_content = getattr(msg, "content", None)
+            compressed_content = self._compress_message_content(original_content, 150)
+            if compressed_content != original_content:
+                msg.content = compressed_content
                 compressed += 1
 
         # Drop all but first + last 6 messages
@@ -1680,8 +2061,12 @@ class AgentLoop:
             return
 
         agent_loop = self
-        original_think = getattr(agent, '_spoon_bot_base_think', agent.think)
-        agent._spoon_bot_base_think = original_think
+        original_think = getattr(agent, "_spoon_bot_base_think", None)
+        if original_think is None:
+            original_think = agent.think
+            setattr(agent, "_spoon_bot_base_think", original_think)
+        else:
+            agent.think = original_think
         call_tracker: Counter = Counter()
         detail_tracker: Counter = Counter()
         read_files: set = set()
@@ -1859,6 +2244,15 @@ class AgentLoop:
                 logger.info(f"Tool call: {name}({safe_args})")
 
         agent.think = _tracked_think
+
+    def _restore_agent_think(self) -> None:
+        """Restore the agent's base think() implementation after a request."""
+        agent = self._agent
+        if agent is None:
+            return
+        original_think = getattr(agent, "_spoon_bot_base_think", None)
+        if original_think is not None:
+            agent.think = original_think
 
     def _filter_execution_steps(self, content: str) -> str:
         """
@@ -2249,6 +2643,7 @@ class AgentLoop:
                 "source": current_source,
             }
         finally:
+            self._restore_agent_think()
             if bg_task and not bg_task.done():
                 bg_task.cancel()
                 try:
@@ -2260,12 +2655,12 @@ class AgentLoop:
 
         # Save to session only if we got actual content
         if full_content:
-            try:
-                self._session.add_message("user", message)
-                self._session.add_message("assistant", full_content)
-                self.sessions.save(self._session)
-            except Exception as e:
-                logger.warning(f"Failed to save session after streaming: {e}")
+            self._persist_turn(
+                message,
+                full_content,
+                media=media,
+                attachments=attachments,
+            )
 
     async def process_with_thinking(
         self,
@@ -2313,7 +2708,6 @@ class AgentLoop:
             metadata=metadata,
             reply_to=reply_to,
         )
-
         logger.info(f"Processing message (with thinking): {message[:100]}...")
 
         created = self._maybe_create_persistent_subagent_from_request(message)
@@ -2354,6 +2748,8 @@ class AgentLoop:
             run_kwargs: dict[str, Any] = {}
             if media:
                 run_kwargs["media"] = media
+            if attachments:
+                run_kwargs["attachments"] = attachments
             requested_thinking = thinking_level or True
             try:
                 result = await self._agent.run(
@@ -2403,9 +2799,16 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             raise
+        finally:
+            self._restore_agent_think()
 
         # Save to session
-        self._persist_turn(message, final_content)
+        self._persist_turn(
+            message,
+            final_content,
+            media=media,
+            attachments=attachments,
+        )
         AgentLoop._set_last_response_source(self)
 
         # Auto-commit workspace changes
