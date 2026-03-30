@@ -115,8 +115,8 @@ class TestConfigPriority:
         assert result["provider"] == "openrouter"
         assert result["model"] == "mistral-large"
 
-    def test_channel_agent_config_overrides_tool_profile(self, tmp_path):
-        """Enabled channel account agent_config should override top-level tool_profile."""
+    def test_load_agent_config_does_not_globally_merge_channel_overrides(self, tmp_path):
+        """Top-level agent config should remain global; channel overrides are applied later by ChannelManager."""
         cfg_path = self._write_yaml(tmp_path, """\
             agent:
               provider: openrouter
@@ -135,38 +135,50 @@ class TestConfigPriority:
         from spoon_bot.channels.config import load_agent_config
 
         result = load_agent_config(cfg_path)
-        assert result["tool_profile"] == "full"
+        assert result["tool_profile"] == "core"
 
-    def test_channel_agent_config_merges_enabled_tools_and_mcp(self, tmp_path):
-        """Channel agent_config should merge enabled_tools + mcp_config into agent config."""
-        cfg_path = self._write_yaml(tmp_path, """\
-            agent:
-              provider: openrouter
-              model: anthropic/claude-sonnet-4
-              enabled_tools: ["shell"]
-              mcp_servers:
-                top:
-                  command: npx
-                  args: ["-y", "top-server"]
-            channels:
-              telegram:
-                enabled: true
-                accounts:
-                  - name: spoon
-                    token: "fake-token"
-                    agent_config:
-                      enabled_tools: ["self_upgrade", "shell"]
-                      mcp_config:
-                        github:
-                          command: npx
-                          args: ["-y", "@modelcontextprotocol/server-github"]
-        """)
+    def test_merge_agent_config_applies_channel_override_when_requested(self):
+        """ChannelManager should merge channel agent_config explicitly when creating dedicated agents."""
+        from spoon_bot.channels.config import merge_agent_config
 
-        from spoon_bot.channels.config import load_agent_config
+        result = merge_agent_config(
+            {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+                "enabled_tools": ["shell"],
+                "mcp_config": {
+                    "top": {
+                        "command": "npx",
+                        "args": ["-y", "top-server"],
+                    }
+                },
+            },
+            {
+                "enabled_tools": ["self_upgrade", "shell"],
+                "mcp_config": {
+                    "github": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github"],
+                    }
+                },
+            },
+        )
 
-        result = load_agent_config(cfg_path)
         assert result["enabled_tools"] == ["self_upgrade", "shell"]
         assert set(result["mcp_config"].keys()) == {"top", "github"}
+
+    def test_build_group_safe_agent_override_disables_risky_tools(self):
+        """Group-safe overrides should force a web-only tool set and disable yolo_mode."""
+        from spoon_bot.channels.config import (
+            build_group_safe_agent_override,
+            uses_risky_local_tools,
+        )
+
+        result = build_group_safe_agent_override({"enabled_tools": ["web_fetch"]})
+
+        assert result["enabled_tools"] == ["web_fetch"]
+        assert result["yolo_mode"] is False
+        assert uses_risky_local_tools(result) is False
 
     def test_mcp_servers_alias_and_env_resolution(self, tmp_path, monkeypatch):
         """Top-level mcp_servers should map to mcp_config with ${VAR} resolution."""
@@ -298,3 +310,153 @@ class TestCliEnabledOverride:
 
         sig = inspect.signature(init_channels)
         assert sig.parameters["cli_enabled"].default is False
+
+
+class TestManagedChannelAgents:
+    """ChannelManager should isolate external channel agents and downgrade group chats."""
+
+    @pytest.mark.asyncio
+    async def test_handle_message_routes_group_messages_to_group_safe_agent(self):
+        from spoon_bot.bus.events import InboundMessage
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._agent = MagicMock()
+        manager._channel_agents["feishu:testbot"] = MagicMock()
+        manager._channel_agents["feishu:testbot"].process = AsyncMock(return_value="main")
+        manager._group_agents["feishu:testbot"] = MagicMock()
+        manager._group_agents["feishu:testbot"].process = AsyncMock(return_value="safe")
+
+        message = InboundMessage(
+            content="show files",
+            channel="feishu:testbot",
+            sender_id="u1",
+            sender_name="Alice",
+            metadata={"chat_type": "group", "is_dm": False},
+        )
+
+        response = await manager._handle_message(message)
+
+        assert response is not None
+        manager._group_agents["feishu:testbot"].process.assert_awaited_once_with(
+            message="[Alice]: show files",
+            media=None,
+            session_key="default",
+            attachments=None,
+        )
+        manager._channel_agents["feishu:testbot"].process.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_all_creates_dedicated_channel_and_group_agents(self, tmp_path):
+        from spoon_bot.channels.base import ChannelConfig, ChannelMode
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._bus = MagicMock()
+        manager._bus.start = AsyncMock()
+        manager._bus.stop = AsyncMock()
+        manager._bus.is_running = False
+
+        default_agent = MagicMock(provider="openai", model="gpt-4o-mini", workspace=tmp_path)
+        manager.set_agent(
+            default_agent,
+            agent_config={
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "workspace": str(tmp_path),
+                "tool_profile": "coding",
+            },
+        )
+
+        channel = MagicMock()
+        channel.full_name = "feishu:team_bot"
+        channel.name = "feishu"
+        channel.config = ChannelConfig(
+            name="feishu",
+            mode=ChannelMode.GATEWAY,
+            enabled=True,
+            app_id="cli_x",
+            app_secret="secret",
+            group_policy="allowlist",
+            group_allow_from=["oc_team"],
+            group_agent_config={},
+        )
+        channel.start = AsyncMock()
+        channel.stop = AsyncMock()
+        channel.attach_bus = MagicMock()
+        channel.set_agent = MagicMock()
+        channel.is_running = False
+        manager._channels[channel.full_name] = channel
+
+        created_main = MagicMock()
+        created_main.cleanup = AsyncMock()
+        created_group = MagicMock()
+        created_group.cleanup = AsyncMock()
+
+        with patch("spoon_bot.agent.loop.create_agent", new=AsyncMock(side_effect=[created_main, created_group])) as mock_create:
+            await manager.start_all()
+
+        assert manager._channel_agents["feishu:team_bot"] is created_main
+        assert manager._group_agents["feishu:team_bot"] is created_group
+        channel.set_agent.assert_any_call(created_main)
+        channel.start.assert_awaited_once()
+        assert mock_create.await_count == 2
+
+        main_kwargs = mock_create.await_args_list[0].kwargs
+        group_kwargs = mock_create.await_args_list[1].kwargs
+        assert main_kwargs["workspace"].endswith("channels\\feishu_team_bot")
+        assert group_kwargs["workspace"] == main_kwargs["workspace"]
+        assert group_kwargs["enabled_tools"] == {"web_fetch", "web_search"}
+        assert group_kwargs["yolo_mode"] is False
+
+        await manager.stop_all()
+        created_main.cleanup.assert_awaited_once()
+        created_group.cleanup.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_start_all_rejects_unsafe_group_agent_config(self, tmp_path):
+        from spoon_bot.channels.base import ChannelConfig, ChannelMode
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._bus = MagicMock()
+        manager._bus.start = AsyncMock()
+        manager._bus.stop = AsyncMock()
+        manager._bus.is_running = False
+
+        default_agent = MagicMock(provider="openai", model="gpt-4o-mini", workspace=tmp_path)
+        manager.set_agent(
+            default_agent,
+            agent_config={
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "workspace": str(tmp_path),
+            },
+        )
+
+        channel = MagicMock()
+        channel.full_name = "feishu:unsafe_bot"
+        channel.name = "feishu"
+        channel.config = ChannelConfig(
+            name="feishu",
+            mode=ChannelMode.GATEWAY,
+            enabled=True,
+            app_id="cli_x",
+            app_secret="secret",
+            group_policy="allowlist",
+            group_allow_from=["oc_team"],
+            group_agent_config={"enabled_tools": ["shell"]},
+        )
+        channel.start = AsyncMock()
+        channel.stop = AsyncMock()
+        channel.attach_bus = MagicMock()
+        channel.set_agent = MagicMock()
+        channel.is_running = False
+        manager._channels[channel.full_name] = channel
+
+        with patch("spoon_bot.agent.loop.create_agent", new=AsyncMock()) as mock_create:
+            with pytest.raises(ValueError, match="group_agent_config may not enable local shell/filesystem tools"):
+                await manager.start_all()
+
+        mock_create.assert_not_awaited()
+        manager._bus.start.assert_not_awaited()

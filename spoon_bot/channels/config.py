@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,12 @@ from typing import Any
 import yaml
 from loguru import logger
 
+from spoon_bot.agent.tools.registry import (
+    CORE_TOOLS,
+    GROUP_SAFE_TOOLS,
+    RISKY_LOCAL_TOOLS,
+    TOOL_PROFILES,
+)
 from spoon_bot.channels.base import ChannelConfig, ChannelMode
 
 
@@ -294,6 +301,10 @@ class ChannelsConfig:
                 if env_uid:
                     allowed_users = [env_uid]
 
+            allow_from = account.get("allow_from", allowed_users)
+            group_allow_from = account.get("group_allow_from", allowed_chats)
+            group_sender_allow_from = account.get("group_sender_allow_from", [])
+
             config = ChannelConfig(
                 **common,
                 webhook_path=account.get("webhook_url"),
@@ -305,11 +316,18 @@ class ChannelsConfig:
                 domain=account.get("domain", "feishu"),
                 allowed_chats=allowed_chats,
                 allowed_users=allowed_users,
+                dm_policy=account.get("dm_policy", "open"),
+                allow_from=allow_from,
+                group_policy=account.get("group_policy", "allowlist"),
+                group_allow_from=group_allow_from,
+                group_sender_allow_from=group_sender_allow_from,
+                group_session_scope=account.get("group_session_scope", "group_sender"),
                 require_mention=account.get("require_mention", True),
                 typing_indicator=account.get("typing_indicator", True),
                 typing_mode=account.get("typing_mode", "reaction"),
                 typing_emoji=account.get("typing_emoji", "Typing"),
                 render_mode=account.get("render_mode", "auto"),
+                group_agent_config=account.get("group_agent_config", {}),
             )
             configs.append((config, name))
 
@@ -498,6 +516,111 @@ def _find_and_load_yaml(config_path: str | Path | None = None) -> dict[str, Any]
     return data
 
 
+def _resolve_env_deep(value: Any) -> Any:
+    """Resolve ${VAR} references inside nested config structures."""
+    if isinstance(value, str):
+        return ChannelsConfig._resolve_env(value)
+    if isinstance(value, list):
+        return [_resolve_env_deep(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _resolve_env_deep(v) for k, v in value.items()}
+    return value
+
+
+def normalize_agent_override(agent_override: dict[str, Any] | None) -> dict[str, Any]:
+    """Resolve env refs and normalize aliases inside an agent override block."""
+    if not isinstance(agent_override, dict):
+        return {}
+
+    normalized = _resolve_env_deep(copy.deepcopy(agent_override))
+    if not isinstance(normalized, dict):
+        return {}
+
+    if "mcp_config" not in normalized and isinstance(normalized.get("mcp_servers"), dict):
+        normalized["mcp_config"] = normalized.pop("mcp_servers")
+
+    return normalized
+
+
+def merge_agent_config(
+    base_config: dict[str, Any] | None,
+    override_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge top-level agent config with a channel/account override."""
+    merged = copy.deepcopy(base_config or {})
+    override = normalize_agent_override(override_config)
+    if not override:
+        return merged
+
+    # tool_profile should replace inherited explicit enabled_tools
+    if "tool_profile" in override and "enabled_tools" not in override:
+        merged.pop("enabled_tools", None)
+    if "enabled_tools" in override:
+        merged["enabled_tools"] = [
+            str(name).strip()
+            for name in override["enabled_tools"]
+            if isinstance(name, str) and name.strip()
+        ]
+        if "tool_profile" not in override:
+            merged.pop("tool_profile", None)
+
+    override_mcp = override.get("mcp_config")
+    if isinstance(override_mcp, dict):
+        base_mcp = merged.get("mcp_config")
+        merged["mcp_config"] = {
+            **(copy.deepcopy(base_mcp) if isinstance(base_mcp, dict) else {}),
+            **copy.deepcopy(override_mcp),
+        }
+
+    for key, value in override.items():
+        if key in {"enabled_tools", "mcp_config"}:
+            continue
+        merged[key] = copy.deepcopy(value)
+
+    return merged
+
+
+def resolve_enabled_tools(agent_config: dict[str, Any] | None) -> set[str]:
+    """Resolve the effective tool set for an agent config."""
+    config = agent_config or {}
+    enabled_tools = config.get("enabled_tools")
+    if isinstance(enabled_tools, (list, set, tuple)):
+        return {
+            str(name).strip()
+            for name in enabled_tools
+            if isinstance(name, str) and name.strip()
+        }
+
+    tool_profile = config.get("tool_profile")
+    if isinstance(tool_profile, str) and tool_profile.strip():
+        profile = TOOL_PROFILES.get(tool_profile.strip())
+        if profile is None:
+            available = ", ".join(sorted(TOOL_PROFILES.keys()))
+            raise ValueError(
+                f"Unknown tool profile '{tool_profile}'. Available: {available}"
+            )
+        return set(profile)
+
+    return set(CORE_TOOLS)
+
+
+def uses_risky_local_tools(agent_config: dict[str, Any] | None) -> bool:
+    """Return True when the agent config enables local shell/filesystem tools."""
+    return bool(resolve_enabled_tools(agent_config) & RISKY_LOCAL_TOOLS)
+
+
+def build_group_safe_agent_override(
+    extra_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a safe-by-default override for externally triggered group chats."""
+    safe_override: dict[str, Any] = {
+        "tool_profile": "group_safe",
+        "enabled_tools": sorted(GROUP_SAFE_TOOLS),
+        "yolo_mode": False,
+    }
+    return merge_agent_config(safe_override, extra_override)
+
+
 def load_channels_config(config_path: str | Path | None = None) -> ChannelsConfig:
     """
     Load channels configuration from YAML file.
@@ -565,118 +688,11 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
     agent_raw: dict[str, Any] = full_config.get("agent", {}) if full_config else {}
 
-    def _resolve_env_deep(value: Any) -> Any:
-        """Resolve ${VAR} in nested dict/list values."""
-        if isinstance(value, str):
-            return ChannelsConfig._resolve_env(value)
-        if isinstance(value, list):
-            return [_resolve_env_deep(v) for v in value]
-        if isinstance(value, dict):
-            return {k: _resolve_env_deep(v) for k, v in value.items()}
-        return value
-
     resolved: dict[str, Any] = _resolve_env_deep(agent_raw) if isinstance(agent_raw, dict) else {}
 
     # Backward-compatible alias: mcp_servers -> mcp_config
     if "mcp_config" not in resolved and isinstance(resolved.get("mcp_servers"), dict):
         resolved["mcp_config"] = resolved.pop("mcp_servers")
-
-    # Merge channel account-level agent overrides into effective global config.
-    # Current runtime uses one shared agent for all channels, so we merge these
-    # settings rather than applying them per-account.
-    channels_cfg = full_config.get("channels", {}) if isinstance(full_config, dict) else {}
-    if isinstance(channels_cfg, dict):
-        profile_rank = {"core": 0, "research": 1, "web3": 1, "coding": 2, "full": 3}
-        selected_profile: str | None = None
-        selected_profile_source: str | None = None
-        merged_enabled_tools: set[str] = set()
-        merged_mcp_config: dict[str, Any] = {}
-        scalar_fields = {
-            "max_iterations",
-            "enable_skills",
-            "shell_timeout",
-            "max_output",
-            "context_window",
-            "session_store_backend",
-            "session_store_dsn",
-            "session_store_db_path",
-        }
-
-        for channel_name, channel_cfg in channels_cfg.items():
-            if not isinstance(channel_cfg, dict):
-                continue
-            if not channel_cfg.get("enabled", False):
-                continue
-            accounts = channel_cfg.get("accounts", [])
-            if not isinstance(accounts, list):
-                continue
-
-            for account in accounts:
-                if not isinstance(account, dict):
-                    continue
-                account_name = account.get("name", "default")
-                agent_override_raw = account.get("agent_config")
-                if not isinstance(agent_override_raw, dict) or not agent_override_raw:
-                    continue
-
-                agent_override = _resolve_env_deep(agent_override_raw)
-                source = f"{channel_name}:{account_name}"
-
-                profile = agent_override.get("tool_profile")
-                if isinstance(profile, str):
-                    rank = profile_rank.get(profile, -1)
-                    current_rank = profile_rank.get(selected_profile, -1) if selected_profile else -1
-                    if rank >= current_rank:
-                        selected_profile = profile
-                        selected_profile_source = source
-
-                enabled_tools = agent_override.get("enabled_tools")
-                if isinstance(enabled_tools, list):
-                    for name in enabled_tools:
-                        if isinstance(name, str) and name.strip():
-                            merged_enabled_tools.add(name.strip())
-
-                override_mcp = agent_override.get("mcp_config")
-                if override_mcp is None:
-                    override_mcp = agent_override.get("mcp_servers")
-                if isinstance(override_mcp, dict):
-                    for server_name, server_cfg in override_mcp.items():
-                        if isinstance(server_cfg, dict):
-                            merged_mcp_config[server_name] = server_cfg
-
-                for field in scalar_fields:
-                    if field not in agent_override:
-                        continue
-                    value = agent_override.get(field)
-                    if field in resolved and resolved[field] != value:
-                        logger.info(
-                            f"Agent config field '{field}' overridden by channel account "
-                            f"'{source}'"
-                        )
-                    resolved[field] = value
-
-        if selected_profile:
-            if "tool_profile" in resolved and resolved["tool_profile"] != selected_profile:
-                logger.info(
-                    f"Agent tool_profile overridden by channel account "
-                    f"'{selected_profile_source}' -> '{selected_profile}'"
-                )
-            resolved["tool_profile"] = selected_profile
-
-        if merged_enabled_tools:
-            existing = resolved.get("enabled_tools", [])
-            if isinstance(existing, list):
-                for name in existing:
-                    if isinstance(name, str) and name.strip():
-                        merged_enabled_tools.add(name.strip())
-            resolved["enabled_tools"] = sorted(merged_enabled_tools)
-
-        if merged_mcp_config:
-            base_mcp = {}
-            if isinstance(resolved.get("mcp_config"), dict):
-                base_mcp = dict(resolved["mcp_config"])
-            base_mcp.update(merged_mcp_config)
-            resolved["mcp_config"] = base_mcp
 
     # ------------------------------------------------------------------
     # 2. Overlay env vars for fields NOT already set by YAML
@@ -823,15 +839,26 @@ def create_default_config(output_path: str | Path) -> None:
                 "enabled": False,
                 "accounts": [
                     {
-                        "name": "enterprise_bot",
+                        "name": "feishu_ws_bot",
+                        "mode": "ws",
+                        "domain": "feishu",
                         "app_id": "${FEISHU_APP_ID}",
                         "app_secret": "${FEISHU_APP_SECRET}",
-                        "verification_token": "${FEISHU_VERIFICATION_TOKEN}",
-                        "encrypt_key": "${FEISHU_ENCRYPT_KEY}",
+                        "dm_policy": "open",
+                        "allow_from": [],
+                        "group_policy": "allowlist",
+                        "group_allow_from": [],
+                        "group_sender_allow_from": [],
+                        "group_session_scope": "group_sender",
                         "typing_indicator": True,
-                        "typing_mode": "reaction",
+                        "typing_mode": "placeholder",
                         "typing_emoji": "Typing",
-                        "webhook_url": "https://your-domain.com/feishu/webhook",
+                        "require_mention": True,
+                        "allowed_chats": [],
+                        "allowed_users": [],
+                        "group_agent_config": {
+                            "tool_profile": "group_safe",
+                        },
                     }
                 ],
             },

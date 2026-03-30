@@ -110,21 +110,83 @@ channels:
   feishu:
     enabled: false  # Set to true to enable
     accounts:
-      - name: "your_bot_name"
+      # China-region Feishu app via WebSocket (long connection)
+      - name: "feishu_ws_bot"
+        mode: "ws"               # ws = long connection, webhook = callback mode
+        domain: "feishu"         # feishu for China-region Feishu, lark for international Lark
         app_id: "${FEISHU_APP_ID}"
         app_secret: "${FEISHU_APP_SECRET}"
-        verification_token: "${FEISHU_VERIFICATION_TOKEN}"
-        encrypt_key: "${FEISHU_ENCRYPT_KEY}"  # Optional: for event encryption
+        dm_policy: "open"        # open | allowlist | disabled
+        allow_from: []           # DM sender allowlist when dm_policy=allowlist
+        group_policy: "allowlist"  # open | allowlist | disabled
+        group_allow_from: []     # Group/chat allowlist (recommended for local bots)
+        group_sender_allow_from: []  # Optional per-sender allowlist inside groups
+        group_session_scope: "group_sender"  # group | group_sender | group_topic | group_topic_sender
         typing_indicator: true
-        typing_mode: "reaction"  # reaction or placeholder
-        typing_emoji: "Typing"  # e.g. Typing / ONIT / THINK / EYES
-
-        # Webhook URL (configured in Feishu admin panel)
-        webhook_url: "https://your-domain.com/feishu/webhook"
+        typing_mode: "placeholder"  # placeholder for animated Typing..., reaction for emoji only
+        typing_emoji: "Typing"      # Used only when typing_mode: reaction
+        require_mention: true       # In groups, require @bot before processing
+        allowed_chats: []           # Legacy alias for group_allow_from
+        allowed_users: []           # Legacy alias for allow_from
 
         # Agent configuration
         agent_config:
           tool_profile: "research"
+
+        # Group chats should use a downgraded agent profile
+        group_agent_config:
+          tool_profile: "group_safe"
+
+      # International Lark app via WebSocket (long connection)
+      - name: "lark_ws_bot"
+        mode: "ws"
+        domain: "lark"
+        app_id: "${FEISHU_APP_ID}"
+        app_secret: "${FEISHU_APP_SECRET}"
+        dm_policy: "open"
+        allow_from: []
+        group_policy: "allowlist"
+        group_allow_from: []
+        group_sender_allow_from: []
+        group_session_scope: "group_sender"
+        typing_indicator: true
+        typing_mode: "placeholder"
+        require_mention: true
+
+        # Agent configuration
+        agent_config:
+          tool_profile: "research"
+
+        group_agent_config:
+          tool_profile: "group_safe"
+
+      # Feishu / Lark webhook example
+      # Keep one webhook account only if your app is configured for callback URLs.
+      - name: "feishu_webhook_bot"
+        mode: "webhook"
+        domain: "feishu"         # Change to "lark" for international Lark
+        app_id: "${FEISHU_APP_ID}"
+        app_secret: "${FEISHU_APP_SECRET}"
+        verification_token: "${FEISHU_VERIFICATION_TOKEN}"
+        encrypt_key: "${FEISHU_ENCRYPT_KEY}"  # Optional: required only if event encryption is enabled
+        webhook_url: "https://your-domain.com/feishu/events"
+        dm_policy: "open"
+        allow_from: []
+        group_policy: "allowlist"
+        group_allow_from: []
+        group_sender_allow_from: []
+        group_session_scope: "group_sender"
+        typing_indicator: true
+        typing_mode: "reaction"
+        typing_emoji: "Typing"
+        require_mention: true
+
+        # Agent configuration
+        agent_config:
+          tool_profile: "research"
+
+        group_agent_config:
+          tool_profile: "group_safe"
 
   # ========== CLI (Terminal) ==========
   cli:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -11,7 +12,13 @@ from loguru import logger
 from spoon_bot.bus.events import InboundMessage, OutboundMessage
 from spoon_bot.bus.queue import MessageBus
 from spoon_bot.channels.base import BaseChannel, ChannelStatus
-from spoon_bot.channels.config import ChannelsConfig, load_channels_config
+from spoon_bot.channels.config import (
+    ChannelsConfig,
+    build_group_safe_agent_override,
+    load_channels_config,
+    merge_agent_config,
+    uses_risky_local_tools,
+)
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
@@ -97,11 +104,23 @@ class ChannelManager:
         self._bus = bus or MessageBus()
         self._channels: dict[str, BaseChannel] = {}
         self._agent: AgentLoop | None = None
+        self._default_agent: AgentLoop | None = None
+        self._default_agent_config: dict[str, Any] = {}
+        self._config_path: Path | None = None
+        self._channel_agents: dict[str, AgentLoop] = {}
+        self._group_agents: dict[str, AgentLoop] = {}
+        self._agent_init_lock = asyncio.Lock()
         self._running = False
         self._health_check_task: asyncio.Task | None = None
         self._circuit_breaker = _CircuitBreaker()
 
-    def set_agent(self, agent: AgentLoop) -> None:
+    def set_agent(
+        self,
+        agent: AgentLoop,
+        *,
+        agent_config: dict[str, Any] | None = None,
+        config_path: str | Path | None = None,
+    ) -> None:
         """
         Set the agent for handling messages.
 
@@ -109,6 +128,26 @@ class ChannelManager:
             agent: AgentLoop instance.
         """
         self._agent = agent
+        self._default_agent = agent
+        self._default_agent_config = copy.deepcopy(agent_config or {})
+        self._default_agent_config.setdefault("provider", getattr(agent, "provider", None))
+        self._default_agent_config.setdefault("model", getattr(agent, "model", None))
+        workspace = getattr(agent, "workspace", None)
+        if workspace is not None:
+            self._default_agent_config.setdefault("workspace", str(workspace))
+        base_url = getattr(agent, "base_url", None)
+        if base_url is not None:
+            self._default_agent_config.setdefault("base_url", base_url)
+        self._default_agent_config = {
+            key: value
+            for key, value in self._default_agent_config.items()
+            if value is not None
+        }
+        self._config_path = (
+            Path(config_path).expanduser()
+            if config_path is not None
+            else self._config_path
+        )
         self._bus.set_handler(self._handle_message)
 
         # Align bus concurrency with agent pool size so neither is wasted.
@@ -121,7 +160,8 @@ class ChannelManager:
 
         # Propagate agent reference to all existing channels
         for channel in self._channels.values():
-            channel.set_agent(agent)
+            channel_agent = self._channel_agents.get(channel.full_name, agent)
+            channel.set_agent(channel_agent)
         logger.info("Agent attached to ChannelManager")
 
     def add_channel(self, channel: BaseChannel) -> None:
@@ -133,7 +173,8 @@ class ChannelManager:
         """
         channel.attach_bus(self._bus)
         if self._agent:
-            channel.set_agent(self._agent)
+            channel_agent = self._channel_agents.get(channel.full_name, self._agent)
+            channel.set_agent(channel_agent)
         self._channels[channel.full_name] = channel
         logger.info(f"Added channel: {channel.full_name}")
 
@@ -149,9 +190,237 @@ class ChannelManager:
         """
         if name in self._channels:
             del self._channels[name]
+            self._group_agents.pop(name, None)
+            self._channel_agents.pop(name, None)
             logger.info(f"Removed channel: {name}")
             return True
         return False
+
+    @staticmethod
+    def _sanitize_workspace_segment(name: str) -> str:
+        """Return a filesystem-safe workspace segment for a channel/account."""
+        safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
+        return safe.strip("_") or "channel"
+
+    def _default_workspace_root(self) -> Path:
+        """Resolve the base workspace root inherited by managed channel agents."""
+        if self._default_agent is not None:
+            workspace = getattr(self._default_agent, "workspace", None)
+            if workspace:
+                return Path(str(workspace)).expanduser()
+        workspace = self._default_agent_config.get("workspace")
+        if workspace:
+            return Path(str(workspace)).expanduser()
+        return Path.home() / ".spoon-bot" / "workspace"
+
+    def _derive_channel_workspace(
+        self,
+        channel_name: str,
+        channel_override: dict[str, Any] | None,
+    ) -> str:
+        """Pick the workspace for a dedicated channel agent."""
+        workspace = (
+            channel_override.get("workspace")
+            if isinstance(channel_override, dict)
+            else None
+        )
+        if workspace:
+            return str(Path(str(workspace)).expanduser())
+        base_workspace = self._default_workspace_root()
+        channel_workspace = (
+            base_workspace
+            / "channels"
+            / self._sanitize_workspace_segment(channel_name)
+        )
+        return str(channel_workspace)
+
+    def _channel_agent_config(self, channel: BaseChannel) -> dict[str, Any]:
+        """Merge top-level agent config with a channel/account-specific override."""
+        return merge_agent_config(
+            self._default_agent_config,
+            channel.config.extra.get("agent_config"),
+        )
+
+    def _group_agent_config(
+        self,
+        channel: BaseChannel,
+        channel_agent_config: dict[str, Any],
+        channel_workspace: str,
+    ) -> dict[str, Any]:
+        """Build the safe group-chat agent config for an external channel."""
+        group_override = channel.config.extra.get("group_agent_config")
+        group_config = merge_agent_config(
+            channel_agent_config,
+            build_group_safe_agent_override(group_override),
+        )
+        # Group chats share the per-channel workspace so inbound media/attachments
+        # remain visible, but they must not escalate tool access.
+        group_config["workspace"] = channel_workspace
+        return group_config
+
+    @staticmethod
+    def _group_policy_enabled(channel: BaseChannel) -> bool:
+        """Return True when this channel is configured to handle group chats."""
+        if channel.name != "feishu":
+            return False
+        policy = str(channel.config.extra.get("group_policy", "allowlist")).strip().lower()
+        return policy != "disabled"
+
+    def _validate_group_agent_config(
+        self,
+        channel: BaseChannel,
+        group_agent_config: dict[str, Any],
+    ) -> None:
+        """Reject unsafe group-chat agent configs at startup."""
+        if bool(group_agent_config.get("yolo_mode")):
+            raise ValueError(
+                f"[{channel.full_name}] group_agent_config may not enable yolo_mode for group chats"
+            )
+        if uses_risky_local_tools(group_agent_config):
+            raise ValueError(
+                f"[{channel.full_name}] group_agent_config may not enable local shell/filesystem tools"
+            )
+
+    async def _create_managed_agent(
+        self,
+        agent_config: dict[str, Any],
+        *,
+        session_key: str,
+    ) -> AgentLoop:
+        """Create an AgentLoop from a resolved agent config."""
+        from spoon_bot.agent.loop import create_agent
+
+        create_kwargs: dict[str, Any] = {
+            "model": agent_config.get("model"),
+            "provider": agent_config.get("provider"),
+            "api_key": agent_config.get("api_key"),
+            "base_url": agent_config.get("base_url"),
+            "workspace": agent_config.get("workspace"),
+            "enable_skills": agent_config.get("enable_skills", True),
+            "session_key": session_key,
+            "config_path": self._config_path,
+            "yolo_mode": bool(agent_config.get("yolo_mode", False)),
+        }
+        if agent_config.get("mcp_config") is not None:
+            create_kwargs["mcp_config"] = agent_config["mcp_config"]
+        if agent_config.get("shell_timeout") is not None:
+            create_kwargs["shell_timeout"] = int(agent_config["shell_timeout"])
+        if agent_config.get("max_output") is not None:
+            create_kwargs["max_output"] = int(agent_config["max_output"])
+        if agent_config.get("context_window") is not None:
+            create_kwargs["context_window"] = int(agent_config["context_window"])
+        if agent_config.get("enabled_tools") is not None:
+            create_kwargs["enabled_tools"] = set(agent_config["enabled_tools"])
+        if agent_config.get("tool_profile") is not None:
+            create_kwargs["tool_profile"] = agent_config["tool_profile"]
+        if agent_config.get("session_store_backend") is not None:
+            create_kwargs["session_store_backend"] = agent_config["session_store_backend"]
+        if agent_config.get("session_store_dsn") is not None:
+            create_kwargs["session_store_dsn"] = agent_config["session_store_dsn"]
+        if agent_config.get("session_store_db_path") is not None:
+            create_kwargs["session_store_db_path"] = agent_config["session_store_db_path"]
+        if agent_config.get("max_iterations") is not None:
+            create_kwargs["max_iterations"] = int(agent_config["max_iterations"])
+        if agent_config.get("auto_reload"):
+            create_kwargs["auto_reload"] = True
+            if agent_config.get("auto_reload_interval") is not None:
+                create_kwargs["auto_reload_interval"] = float(
+                    agent_config["auto_reload_interval"]
+                )
+        if agent_config.get("auto_commit") is not None:
+            create_kwargs["auto_commit"] = bool(agent_config["auto_commit"])
+
+        return await create_agent(**create_kwargs)
+
+    async def _ensure_channel_agent(self, channel: BaseChannel) -> AgentLoop | None:
+        """Create and attach a dedicated agent for an external channel."""
+        if channel.name == "cli":
+            return self._default_agent
+        if not self._default_agent:
+            return self._agent
+        existing = self._channel_agents.get(channel.full_name)
+        if existing is not None:
+            channel.set_agent(existing)
+            return existing
+
+        async with self._agent_init_lock:
+            existing = self._channel_agents.get(channel.full_name)
+            if existing is not None:
+                channel.set_agent(existing)
+                return existing
+
+            channel_agent_config = self._channel_agent_config(channel)
+            channel_workspace = self._derive_channel_workspace(
+                channel.full_name,
+                channel.config.extra.get("agent_config"),
+            )
+            channel_agent_config["workspace"] = channel_workspace
+            group_agent_config: dict[str, Any] | None = None
+            if self._group_policy_enabled(channel):
+                group_agent_config = self._group_agent_config(
+                    channel,
+                    channel_agent_config,
+                    channel_workspace,
+                )
+                self._validate_group_agent_config(channel, group_agent_config)
+
+            logger.info(
+                f"Creating dedicated agent for {channel.full_name} "
+                f"(workspace={channel_workspace})"
+            )
+            channel_agent = await self._create_managed_agent(
+                channel_agent_config,
+                session_key=channel.full_name,
+            )
+            self._channel_agents[channel.full_name] = channel_agent
+            channel.set_agent(channel_agent)
+
+            if group_agent_config is not None:
+                logger.info(
+                    f"Creating safe group agent for {channel.full_name} "
+                    f"(workspace={channel_workspace})"
+                )
+                self._group_agents[channel.full_name] = await self._create_managed_agent(
+                    group_agent_config,
+                    session_key=f"{channel.full_name}:group",
+                )
+
+            return channel_agent
+
+    async def _ensure_channel_agents(
+        self,
+        channels: list[BaseChannel] | None = None,
+    ) -> None:
+        """Ensure all requested channels have dedicated runtime agents."""
+        if not self._default_agent:
+            return
+        targets = channels if channels is not None else list(self._channels.values())
+        for channel in targets:
+            await self._ensure_channel_agent(channel)
+
+    async def _cleanup_isolated_agents(self) -> None:
+        """Cleanup dedicated per-channel agents owned by the manager."""
+        managed_agents: dict[int, AgentLoop] = {}
+        for agent in list(self._group_agents.values()) + list(self._channel_agents.values()):
+            managed_agents[id(agent)] = agent
+
+        self._group_agents.clear()
+        self._channel_agents.clear()
+
+        for agent in managed_agents.values():
+            try:
+                await agent.cleanup()
+            except Exception as e:
+                logger.debug(f"Managed agent cleanup failed: {e}")
+
+    def _select_agent_for_message(self, message: InboundMessage) -> AgentLoop | None:
+        """Choose the runtime agent for an inbound message."""
+        is_dm = bool(message.metadata.get("is_dm", False))
+        if not is_dm:
+            group_agent = self._group_agents.get(message.channel)
+            if group_agent is not None:
+                return group_agent
+        return self._channel_agents.get(message.channel) or self._agent
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """
@@ -314,6 +583,8 @@ class ChannelManager:
         Raises:
             ImportError: If required channel dependencies are missing
         """
+        if config_path is not None:
+            self._config_path = Path(config_path).expanduser()
         self._config = load_channels_config(config_path)
         logger.info("Configuration loaded, creating channels...")
 
@@ -394,6 +665,8 @@ class ChannelManager:
             logger.warning("ChannelManager already running")
             return
 
+        await self._ensure_channel_agents()
+
         # Start message bus
         await self._bus.start()
 
@@ -429,6 +702,13 @@ class ChannelManager:
         if not self._agent:
             raise RuntimeError("No agent set. Call set_agent() first.")
 
+        matching_channels = [
+            ch
+            for ch in self._channels.values()
+            if ch.name in channel_names or ch.full_name in channel_names
+        ]
+        await self._ensure_channel_agents(matching_channels)
+
         # Start message bus if not running
         if not self._bus.is_running:
             await self._bus.start()
@@ -458,7 +738,7 @@ class ChannelManager:
 
     async def stop_all(self) -> None:
         """Stop all channels and the message bus."""
-        if not self._running:
+        if not self._running and not self._channel_agents and not self._group_agents:
             return
 
         # Stop health check
@@ -469,15 +749,18 @@ class ChannelManager:
             except asyncio.CancelledError:
                 pass
 
-        # Stop all channels
-        for channel in self._channels.values():
-            try:
-                await channel.stop()
-            except Exception as e:
-                logger.error(f"Failed to stop channel {channel.full_name}: {e}")
+        if self._running:
+            # Stop all channels
+            for channel in self._channels.values():
+                try:
+                    await channel.stop()
+                except Exception as e:
+                    logger.error(f"Failed to stop channel {channel.full_name}: {e}")
 
-        # Stop message bus
-        await self._bus.stop()
+            # Stop message bus
+            await self._bus.stop()
+
+        await self._cleanup_isolated_agents()
 
         self._running = False
         logger.info("ChannelManager stopped")
@@ -563,7 +846,8 @@ class ChannelManager:
         Returns:
             Agent's response as OutboundMessage.
         """
-        if not self._agent:
+        agent = self._select_agent_for_message(message)
+        if not agent:
             logger.error("No agent set")
             return None
 
@@ -612,7 +896,7 @@ class ChannelManager:
             session_key = message.session_key or None
 
             if think_level != "off":
-                response_text, thinking_content = await self._agent.process_with_thinking(
+                response_text, thinking_content = await agent.process_with_thinking(
                     message=content,
                     media=media,
                     session_key=session_key,
@@ -625,7 +909,7 @@ class ChannelManager:
                         f"---\n\n{response_text}"
                     )
             else:
-                response_text = await self._agent.process(
+                response_text = await agent.process(
                     message=content,
                     media=media,
                     session_key=session_key,

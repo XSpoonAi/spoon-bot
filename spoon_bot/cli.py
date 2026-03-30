@@ -1047,7 +1047,7 @@ async def _run_gateway(
 
     # Create channel manager
     manager = ChannelManager()
-    manager.set_agent(agent)
+    manager.set_agent(agent, agent_config=agent_cfg, config_path=config)
 
     # Load channels from config
     try:

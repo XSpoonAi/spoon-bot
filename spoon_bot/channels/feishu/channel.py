@@ -85,6 +85,23 @@ _TYPING_MODE_REACTION = "reaction"
 _TYPING_MODE_PLACEHOLDER = "placeholder"
 _TYPING_PLACEHOLDER_INTERVAL_SECONDS = 0.8
 _TYPING_PLACEHOLDER_FRAMES = ("Typing.", "Typing..", "Typing...")
+_DM_POLICY_OPEN = "open"
+_DM_POLICY_ALLOWLIST = "allowlist"
+_DM_POLICY_DISABLED = "disabled"
+_DM_POLICY_PAIRING = "pairing"
+_GROUP_POLICY_OPEN = "open"
+_GROUP_POLICY_ALLOWLIST = "allowlist"
+_GROUP_POLICY_DISABLED = "disabled"
+_GROUP_SESSION_SCOPE_GROUP = "group"
+_GROUP_SESSION_SCOPE_GROUP_SENDER = "group_sender"
+_GROUP_SESSION_SCOPE_GROUP_TOPIC = "group_topic"
+_GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER = "group_topic_sender"
+_GROUP_SESSION_SCOPES = {
+    _GROUP_SESSION_SCOPE_GROUP,
+    _GROUP_SESSION_SCOPE_GROUP_SENDER,
+    _GROUP_SESSION_SCOPE_GROUP_TOPIC,
+    _GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER,
+}
 
 
 class _CaseInsensitiveHeaders(dict[str, str]):
@@ -152,6 +169,24 @@ class FeishuChannel(BaseChannel):
         self.domain: str = config.extra.get("domain", "feishu")
         self.allowed_chats: set[str] = set(config.extra.get("allowed_chats", []))
         self.allowed_users: set[str] = set(config.extra.get("allowed_users", []))
+        self.allow_from: set[str] = set(
+            config.extra.get("allow_from", config.extra.get("allowed_users", []))
+        )
+        self.dm_policy: str = self._normalize_dm_policy(
+            config.extra.get("dm_policy", _DM_POLICY_OPEN)
+        )
+        self.group_policy: str = self._normalize_group_policy(
+            config.extra.get("group_policy", _GROUP_POLICY_ALLOWLIST)
+        )
+        self.group_allow_from: set[str] = set(
+            config.extra.get("group_allow_from", config.extra.get("allowed_chats", []))
+        )
+        self.group_sender_allow_from: set[str] = set(
+            config.extra.get("group_sender_allow_from", [])
+        )
+        self.group_session_scope: str = self._normalize_group_session_scope(
+            config.extra.get("group_session_scope", _GROUP_SESSION_SCOPE_GROUP_SENDER)
+        )
         self.require_mention: bool = config.extra.get("require_mention", True)
         self.render_mode: str = config.extra.get("render_mode", RENDER_MODE_AUTO)
         self.typing_indicator: bool = config.extra.get("typing_indicator", True)
@@ -198,6 +233,73 @@ class FeishuChannel(BaseChannel):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_dm_policy(value: Any) -> str:
+        """Normalize DM policy, mapping unsupported pairing to allowlist."""
+        policy = str(value or _DM_POLICY_OPEN).strip().lower()
+        if policy == _DM_POLICY_PAIRING:
+            return _DM_POLICY_ALLOWLIST
+        if policy in {_DM_POLICY_OPEN, _DM_POLICY_ALLOWLIST, _DM_POLICY_DISABLED}:
+            return policy
+        return _DM_POLICY_OPEN
+
+    @staticmethod
+    def _normalize_group_policy(value: Any) -> str:
+        """Normalize group access policy."""
+        policy = str(value or _GROUP_POLICY_ALLOWLIST).strip().lower()
+        if policy in {_GROUP_POLICY_OPEN, _GROUP_POLICY_ALLOWLIST, _GROUP_POLICY_DISABLED}:
+            return policy
+        return _GROUP_POLICY_ALLOWLIST
+
+    @staticmethod
+    def _normalize_group_session_scope(value: Any) -> str:
+        """Normalize group session scoping mode."""
+        scope = str(value or _GROUP_SESSION_SCOPE_GROUP_SENDER).strip().lower()
+        if scope in _GROUP_SESSION_SCOPES:
+            return scope
+        return _GROUP_SESSION_SCOPE_GROUP_SENDER
+
+    @staticmethod
+    def _is_group_chat(chat_type: str) -> bool:
+        """Return True when a message belongs to a group context."""
+        return chat_type != CHAT_TYPE_P2P
+
+    @staticmethod
+    def _extract_thread_id(message: Any) -> str | None:
+        """Extract a best-effort topic/thread identifier for scoped sessions."""
+        for attr in ("thread_id", "root_id", "parent_id"):
+            value = getattr(message, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _build_session_key(
+        self,
+        *,
+        chat_id: str,
+        chat_type: str,
+        sender_id: str,
+        thread_id: str | None = None,
+    ) -> str:
+        """Build a session key honoring the configured group session scope."""
+        if not self._is_group_chat(chat_type):
+            return f"feishu_{self.account_id}_{chat_id}"
+
+        parts = [chat_id]
+        if self.group_session_scope in {
+            _GROUP_SESSION_SCOPE_GROUP_TOPIC,
+            _GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER,
+        } and thread_id:
+            parts.extend(["topic", thread_id])
+
+        if self.group_session_scope in {
+            _GROUP_SESSION_SCOPE_GROUP_SENDER,
+            _GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER,
+        }:
+            parts.extend(["sender", sender_id])
+
+        return f"feishu_{self.account_id}_{':'.join(parts)}"
 
     @staticmethod
     def _split_message(content: str, max_length: int) -> list[str]:
@@ -416,6 +518,39 @@ class FeishuChannel(BaseChannel):
 
         if self.allowed_chats and chat_id not in self.allowed_chats:
             logger.debug(f"[{self.full_name}] Chat not in allowlist: {chat_id}")
+            return False
+
+        if self._is_group_chat(chat_type):
+            if self.group_policy == _GROUP_POLICY_DISABLED:
+                logger.debug(f"[{self.full_name}] Group access disabled for chat: {chat_id}")
+                return False
+
+            if (
+                self.group_policy == _GROUP_POLICY_ALLOWLIST
+                and chat_id not in self.group_allow_from
+            ):
+                logger.debug(
+                    f"[{self.full_name}] Group chat not in group_allow_from: {chat_id}"
+                )
+                return False
+
+            if self.group_sender_allow_from and sender_id not in self.group_sender_allow_from:
+                logger.debug(
+                    f"[{self.full_name}] Group sender not in group_sender_allow_from: {sender_id}"
+                )
+                return False
+
+            if self.require_mention and not self._is_bot_mentioned(mentions):
+                logger.debug(f"[{self.full_name}] Bot not mentioned in group message")
+                return False
+            return True
+
+        if self.dm_policy == _DM_POLICY_DISABLED:
+            logger.debug(f"[{self.full_name}] DM access disabled for sender: {sender_id}")
+            return False
+
+        if self.dm_policy == _DM_POLICY_ALLOWLIST and sender_id not in self.allow_from:
+            logger.debug(f"[{self.full_name}] DM sender not in allow_from: {sender_id}")
             return False
 
         if chat_type == CHAT_TYPE_GROUP and self.require_mention:
@@ -1193,6 +1328,7 @@ class FeishuChannel(BaseChannel):
                 chat_type: str = message.chat_type  # "p2p" or "group"
                 sender_id: str = sender.sender_id.open_id
                 mentions = getattr(message, "mentions", None)
+                thread_id = channel_ref._extract_thread_id(message)
 
                 if not channel_ref._check_access(sender_id, chat_id, chat_type, mentions):
                     return
@@ -1200,7 +1336,7 @@ class FeishuChannel(BaseChannel):
                 # P0-2: Parse content by type
                 if msg_type == MSG_TYPE_TEXT:
                     text = content_json.get("text", "").strip()
-                    if chat_type == CHAT_TYPE_GROUP:
+                    if channel_ref._is_group_chat(chat_type):
                         text = channel_ref._strip_mention_tokens(text)
                     media_paths: list[str] = []
                     attachments: list[dict[str, Any]] = []
@@ -1210,7 +1346,7 @@ class FeishuChannel(BaseChannel):
                     text = channel_ref._parse_post_content(
                         content_json, channel_ref._bot_open_id
                     )
-                    if chat_type == CHAT_TYPE_GROUP:
+                    if channel_ref._is_group_chat(chat_type):
                         text = channel_ref._strip_mention_tokens(text)
                     media_paths, attachments = channel_ref._materialize_inbound_media(
                         message_id=message_id,
@@ -1237,7 +1373,12 @@ class FeishuChannel(BaseChannel):
                 except Exception:
                     sender_name = sender_id
 
-                session_key = f"feishu_{channel_ref.account_id}_{chat_id}"
+                session_key = channel_ref._build_session_key(
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    sender_id=sender_id,
+                    thread_id=thread_id,
+                )
                 message_create_time = (
                     getattr(message, "create_time", None)
                     or getattr(message, "message_create_time", None)
@@ -1255,9 +1396,15 @@ class FeishuChannel(BaseChannel):
                         "chat_id": chat_id,
                         "chat_type": chat_type,
                         "is_dm": chat_type == CHAT_TYPE_P2P,
+                        "thread_id": thread_id,
                         "message_id": message_id,
                         "message_create_time": message_create_time,
                         "msg_type": msg_type,
+                        "session_scope": (
+                            "dm"
+                            if chat_type == CHAT_TYPE_P2P
+                            else channel_ref.group_session_scope
+                        ),
                         "think_level": "off",
                         "verbose": False,
                         "attachments": attachments,

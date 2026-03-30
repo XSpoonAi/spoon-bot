@@ -31,6 +31,13 @@ def _make_feishu_config(
         "verification_token": "",
         "encrypt_key": "",
         "domain": "feishu",
+        "dm_policy": "open",
+        "allow_from": [],
+        "group_policy": "open",
+        "group_allow_from": [],
+        "group_sender_allow_from": [],
+        "group_session_scope": "group_sender",
+        "group_agent_config": {},
         "allowed_chats": [],
         "allowed_users": [],
         "require_mention": True,
@@ -159,6 +166,8 @@ class TestFeishuChannel:
         assert ch.typing_indicator is False
         assert ch.typing_mode == "placeholder"
         assert ch.typing_emoji == "THINK"
+        assert ch.group_policy == "open"
+        assert ch.group_session_scope == "group_sender"
 
     def test_init_defaults_typing_emoji_to_typing(self):
         """Feishu typing indicator should default to the Typing emoji."""
@@ -293,6 +302,31 @@ class TestFeishuChannel:
         ch = self._make_channel(allowed_chats=["oc_allowed"])
         assert ch._check_access("ou_anyone", "oc_other", "group", None) is False
 
+    def test_check_access_group_policy_allowlist_blocks_unlisted_chat(self):
+        """Group allowlist should block chats outside group_allow_from."""
+        ch = self._make_channel(group_policy="allowlist", group_allow_from=["oc_allowed"])
+        assert ch._check_access("ou_user", "oc_other", "group", None) is False
+
+    def test_check_access_group_policy_allowlist_allows_listed_chat(self):
+        """Group allowlist should allow explicitly listed chats."""
+        ch = self._make_channel(
+            group_policy="allowlist",
+            group_allow_from=["oc_allowed"],
+            require_mention=False,
+        )
+        assert ch._check_access("ou_user", "oc_allowed", "group", None) is True
+
+    def test_check_access_group_sender_allowlist(self):
+        """Only approved senders may trigger the bot inside allowed groups."""
+        ch = self._make_channel(
+            group_policy="allowlist",
+            group_allow_from=["oc_allowed"],
+            group_sender_allow_from=["ou_allowed"],
+            require_mention=False,
+        )
+        assert ch._check_access("ou_other", "oc_allowed", "group", None) is False
+        assert ch._check_access("ou_allowed", "oc_allowed", "group", None) is True
+
     def test_check_access_group_mention_required(self):
         """Group messages without @mention are rejected when require_mention=True."""
         ch = self._make_channel(require_mention=True)
@@ -307,6 +341,17 @@ class TestFeishuChannel:
         ch._bot_open_id = "ou_bot"
         # p2p chat — mention check is skipped
         assert ch._check_access("ou_user", "chat1", "p2p", None) is True
+
+    def test_check_access_dm_allowlist(self):
+        """DM allowlist should reject unapproved senders."""
+        ch = self._make_channel(dm_policy="allowlist", allow_from=["ou_allowed"])
+        assert ch._check_access("ou_other", "chat1", "p2p", None) is False
+        assert ch._check_access("ou_allowed", "chat1", "p2p", None) is True
+
+    def test_check_access_dm_disabled(self):
+        """DM policy disabled should reject direct messages."""
+        ch = self._make_channel(dm_policy="disabled")
+        assert ch._check_access("ou_user", "chat1", "p2p", None) is False
 
     def test_check_access_group_with_mention(self):
         """Group messages with the bot mentioned are accepted."""
@@ -330,6 +375,42 @@ class TestFeishuChannel:
         ch = self._make_channel()
         ch._bot_open_id = "ou_bot"
         assert ch._is_bot_mentioned([]) is False
+
+    def test_build_session_key_isolates_group_senders_by_default(self):
+        """Default group_session_scope should isolate each sender in group chats."""
+        ch = self._make_channel(group_session_scope="group_sender")
+
+        alice = ch._build_session_key(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_id="ou_alice",
+        )
+        bob = ch._build_session_key(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_id="ou_bob",
+        )
+
+        assert alice != bob
+        assert alice.endswith("oc_group:sender:ou_alice")
+        assert bob.endswith("oc_group:sender:ou_bob")
+
+    def test_build_session_key_can_share_group_context(self):
+        """group scope should keep one shared session per chat."""
+        ch = self._make_channel(group_session_scope="group")
+
+        alice = ch._build_session_key(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_id="ou_alice",
+        )
+        bob = ch._build_session_key(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_id="ou_bob",
+        )
+
+        assert alice == bob == "feishu_testbot_oc_group"
 
     def test_dedup_cache_enforces_max_size(self):
         """Dedup cache should drop the oldest ids after reaching the hard cap."""
@@ -722,6 +803,46 @@ class TestFeishuConfig:
         cfg = load_channels_config(path)
         config, _ = cfg.get_feishu_configs()[0]
         assert "oc_abc123" in config.extra["allowed_chats"]
+        assert "oc_abc123" in config.extra["group_allow_from"]
+
+    def test_dm_and_group_policies_default_to_safe_values(self, tmp_path):
+        """Feishu config should default DMs open but groups allowlisted and isolated by sender."""
+        from spoon_bot.channels.config import load_channels_config
+        path = self._make_yaml({}, tmp_path)
+        cfg = load_channels_config(path)
+        config, _ = cfg.get_feishu_configs()[0]
+        assert config.extra["dm_policy"] == "open"
+        assert config.extra["allow_from"] == []
+        assert config.extra["group_policy"] == "allowlist"
+        assert config.extra["group_allow_from"] == []
+        assert config.extra["group_sender_allow_from"] == []
+        assert config.extra["group_session_scope"] == "group_sender"
+        assert config.extra["group_agent_config"] == {}
+
+    def test_group_access_settings_pass_through(self, tmp_path):
+        """Feishu-specific DM/group policies should be preserved in ChannelConfig.extra."""
+        from spoon_bot.channels.config import load_channels_config
+        path = self._make_yaml(
+            {
+                "dm_policy": "allowlist",
+                "allow_from": ["ou_me"],
+                "group_policy": "allowlist",
+                "group_allow_from": ["oc_team"],
+                "group_sender_allow_from": ["ou_me"],
+                "group_session_scope": "group",
+                "group_agent_config": {"tool_profile": "group_safe"},
+            },
+            tmp_path,
+        )
+        cfg = load_channels_config(path)
+        config, _ = cfg.get_feishu_configs()[0]
+        assert config.extra["dm_policy"] == "allowlist"
+        assert config.extra["allow_from"] == ["ou_me"]
+        assert config.extra["group_policy"] == "allowlist"
+        assert config.extra["group_allow_from"] == ["oc_team"]
+        assert config.extra["group_sender_allow_from"] == ["ou_me"]
+        assert config.extra["group_session_scope"] == "group"
+        assert config.extra["group_agent_config"] == {"tool_profile": "group_safe"}
 
     def test_require_mention_default_true(self, tmp_path):
         """require_mention defaults to True."""
