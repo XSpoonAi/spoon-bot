@@ -1154,6 +1154,15 @@ class FeishuChannel(BaseChannel):
         """Build the lark EventDispatcherHandler that receives messages."""
         channel_ref = self
 
+        def on_p2p_chat_entered(data: Any) -> None:
+            """No-op callback for bot p2p chat access events."""
+            event = getattr(data, "event", None)
+            chat_id = getattr(event, "chat_id", None)
+            logger.debug(
+                f"[{channel_ref.full_name}] Ignoring bot p2p chat entered event"
+                f" chat_id={chat_id}"
+            )
+
         def on_message_receive(data: Any) -> None:
             """Callback for im.message.receive_v1 events."""
             try:
@@ -1271,6 +1280,9 @@ class FeishuChannel(BaseChannel):
         handler = (
             lark.EventDispatcherHandler.builder(
                 self.encrypt_key, self.verification_token, lark.LogLevel.DEBUG
+            )
+            .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
+                on_p2p_chat_entered
             )
             .register_p2_im_message_receive_v1(on_message_receive)
             .build()

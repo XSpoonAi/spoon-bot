@@ -211,6 +211,37 @@ class TestFeishuChannel:
             domain="https://open.larksuite.com",
         )
 
+    def test_build_event_handler_registers_chat_access_event(self):
+        """WS event handler should register the p2p chat access event as a no-op."""
+        ch = self._make_channel()
+        registered: dict[str, object] = {}
+        built_handler = object()
+
+        class FakeBuilder:
+            def register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self, callback):
+                registered["chat_access"] = callback
+                return self
+
+            def register_p2_im_message_receive_v1(self, callback):
+                registered["message_receive"] = callback
+                return self
+
+            def build(self):
+                return built_handler
+
+        with patch("spoon_bot.channels.feishu.channel.lark", create=True) as mock_lark:
+            mock_lark.EventDispatcherHandler.builder.return_value = FakeBuilder()
+            mock_lark.LogLevel.DEBUG = "debug"
+
+            assert ch._build_event_handler() is built_handler
+
+        assert "chat_access" in registered
+        assert "message_receive" in registered
+
+        ch.publish = AsyncMock()
+        registered["chat_access"](SimpleNamespace(event=SimpleNamespace(chat_id="oc_chat")))
+        ch.publish.assert_not_called()
+
     def test_split_message_short(self):
         """Short messages are returned as a single chunk."""
         from spoon_bot.channels.feishu.channel import FeishuChannel
