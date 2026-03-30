@@ -115,6 +115,9 @@ channels:
         app_secret: "${FEISHU_APP_SECRET}"
         verification_token: "${FEISHU_VERIFICATION_TOKEN}"
         encrypt_key: "${FEISHU_ENCRYPT_KEY}"  # Optional: for event encryption
+        typing_indicator: true
+        typing_mode: "reaction"  # reaction or placeholder
+        typing_emoji: "Typing"  # e.g. Typing / ONIT / THINK / EYES
 
         # Webhook URL (configured in Feishu admin panel)
         webhook_url: "https://your-domain.com/feishu/webhook"

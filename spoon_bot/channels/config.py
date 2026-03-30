@@ -306,6 +306,9 @@ class ChannelsConfig:
                 allowed_chats=allowed_chats,
                 allowed_users=allowed_users,
                 require_mention=account.get("require_mention", True),
+                typing_indicator=account.get("typing_indicator", True),
+                typing_mode=account.get("typing_mode", "reaction"),
+                typing_emoji=account.get("typing_emoji", "Typing"),
                 render_mode=account.get("render_mode", "auto"),
             )
             configs.append((config, name))
@@ -825,6 +828,9 @@ def create_default_config(output_path: str | Path) -> None:
                         "app_secret": "${FEISHU_APP_SECRET}",
                         "verification_token": "${FEISHU_VERIFICATION_TOKEN}",
                         "encrypt_key": "${FEISHU_ENCRYPT_KEY}",
+                        "typing_indicator": True,
+                        "typing_mode": "reaction",
+                        "typing_emoji": "Typing",
                         "webhook_url": "https://your-domain.com/feishu/webhook",
                     }
                 ],

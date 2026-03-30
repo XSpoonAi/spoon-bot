@@ -6,7 +6,7 @@ import asyncio
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -146,6 +146,9 @@ class TestFeishuChannel:
             allowed_chats=["chat1"],
             allowed_users=["ou_user1"],
             require_mention=False,
+            typing_indicator=False,
+            typing_mode="placeholder",
+            typing_emoji="THINK",
         )
         assert ch.app_id == "myapp"
         assert ch.app_secret == "mysecret"
@@ -153,6 +156,17 @@ class TestFeishuChannel:
         assert "chat1" in ch.allowed_chats
         assert "ou_user1" in ch.allowed_users
         assert ch.require_mention is False
+        assert ch.typing_indicator is False
+        assert ch.typing_mode == "placeholder"
+        assert ch.typing_emoji == "THINK"
+
+    def test_init_defaults_typing_emoji_to_typing(self):
+        """Feishu typing indicator should default to the Typing emoji."""
+        ch = self._make_channel()
+
+        assert ch.typing_indicator is True
+        assert ch.typing_mode == "reaction"
+        assert ch.typing_emoji == "Typing"
 
     def test_build_api_client_uses_configured_domain(self):
         """Outbound API client should honor the configured Lark domain."""
@@ -309,6 +323,220 @@ class TestFeishuChannel:
             assert ch._is_duplicate_message("msg-1") is False
 
         assert ch._processed_messages == {"msg-1": 111.0}
+
+    def test_normalize_epoch_ms_accepts_seconds_and_milliseconds(self):
+        """Epoch timestamps should normalize to milliseconds."""
+        ch = self._make_channel()
+
+        assert ch._normalize_epoch_ms(1711795200) == 1711795200000
+        assert ch._normalize_epoch_ms(1711795200000) == 1711795200000
+        assert ch._normalize_epoch_ms("1711795200") == 1711795200000
+
+    def test_extract_typing_backoff_code_from_response_and_exception_shapes(self):
+        """Backoff helper should detect Feishu quota/rate-limit codes."""
+        ch = self._make_channel()
+
+        assert ch._extract_typing_backoff_code(SimpleNamespace(code=429)) == 429
+        assert ch._extract_typing_backoff_code(
+            SimpleNamespace(response=SimpleNamespace(status=429, data=None))
+        ) == 429
+        assert ch._extract_typing_backoff_code(
+            SimpleNamespace(response=SimpleNamespace(status=500, data=SimpleNamespace(code=99991403)))
+        ) == 99991403
+        assert ch._extract_typing_backoff_code(SimpleNamespace(code=500)) is None
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_uses_configured_typing_emoji(self):
+        """Typing reaction should use the configured emoji and store the reaction id."""
+        ch = self._make_channel(typing_emoji="THINK")
+        message = SimpleNamespace(metadata={"message_id": "msg-1"})
+
+        with patch.object(ch, "_add_reaction", AsyncMock(return_value="reaction-1")) as mock_add:
+            await ch.on_processing_start(message)
+
+        mock_add.assert_awaited_once_with("msg-1", "THINK")
+        assert ch._typing_reactions["msg-1"] == "reaction-1"
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_skips_when_typing_indicator_disabled(self):
+        """Typing indicator can be disabled per Feishu account config."""
+        ch = self._make_channel(typing_indicator=False)
+        message = SimpleNamespace(metadata={"message_id": "msg-1"})
+
+        with patch.object(ch, "_add_reaction", AsyncMock()) as mock_add:
+            await ch.on_processing_start(message)
+
+        mock_add.assert_not_awaited()
+        assert ch._typing_reactions == {}
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_skips_when_typing_reaction_already_active(self):
+        """Typing indicator should not be re-added when the message is already marked active."""
+        ch = self._make_channel()
+        ch._typing_reactions["msg-1"] = "reaction-1"
+        message = SimpleNamespace(metadata={"message_id": "msg-1"})
+
+        with patch.object(ch, "_add_reaction", AsyncMock()) as mock_add:
+            await ch.on_processing_start(message)
+
+        mock_add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_skips_for_stale_messages(self):
+        """Old replayed messages should not get a fresh typing indicator."""
+        ch = self._make_channel()
+        message = SimpleNamespace(
+            metadata={
+                "message_id": "msg-1",
+                "message_create_time": 1711795200000,
+            }
+        )
+
+        with patch("spoon_bot.channels.feishu.channel.time.time", return_value=1711795381), \
+             patch.object(ch, "_add_reaction", AsyncMock()) as mock_add:
+            await ch.on_processing_start(message)
+
+        mock_add.assert_not_awaited()
+        assert ch._typing_reactions == {}
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_skips_when_typing_backoff_active(self):
+        """Rate-limit backoff should temporarily suppress new typing indicators."""
+        ch = self._make_channel()
+        message = SimpleNamespace(metadata={"message_id": "msg-1"})
+
+        with patch("spoon_bot.channels.feishu.channel.time.monotonic", return_value=10.0), \
+             patch.object(ch, "_add_reaction", AsyncMock()) as mock_add:
+            ch._typing_backoff_until = 20.0
+            await ch.on_processing_start(message)
+
+        mock_add.assert_not_awaited()
+        assert ch._typing_reactions == {}
+
+    @pytest.mark.asyncio
+    async def test_on_processing_end_removes_active_typing_reaction(self):
+        """Typing reaction should be removed when processing completes."""
+        ch = self._make_channel()
+        ch._typing_reactions["msg-1"] = "reaction-1"
+        message = SimpleNamespace(metadata={"message_id": "msg-1"})
+
+        with patch.object(ch, "_remove_reaction", AsyncMock()) as mock_remove:
+            await ch.on_processing_end(message)
+
+        mock_remove.assert_awaited_once_with("msg-1", "reaction-1")
+        assert "msg-1" not in ch._typing_reactions
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_placeholder_mode_creates_placeholder_and_task(self):
+        """Placeholder typing mode should send an initial reply and start the animation loop."""
+        ch = self._make_channel(typing_mode="placeholder")
+        message = SimpleNamespace(metadata={"message_id": "msg-1", "chat_id": "chat-1"})
+
+        async def fake_loop(_msg_id, state):
+            await state.stop_event.wait()
+
+        mock_loop = AsyncMock(side_effect=fake_loop)
+        with patch.object(ch, "_send_api_message", AsyncMock(return_value="typing-mid")) as mock_send, \
+             patch.object(ch, "_typing_placeholder_loop", mock_loop):
+            await ch.on_processing_start(message)
+            await asyncio.sleep(0)
+            state = ch._typing_placeholders["msg-1"]
+            await ch.on_processing_end(message)
+
+        mock_send.assert_awaited_once_with(
+            chat_id="chat-1",
+            content="Typing.",
+            msg_type="interactive",
+            reply_to="msg-1",
+        )
+        assert state.placeholder_message_id == "typing-mid"
+        assert state.stop_event.is_set()
+        assert state.task is not None and state.task.done()
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_placeholder_mode_skips_stale_messages(self):
+        """Placeholder typing should not start for stale replayed messages."""
+        ch = self._make_channel(typing_mode="placeholder")
+        message = SimpleNamespace(
+            metadata={
+                "message_id": "msg-1",
+                "chat_id": "chat-1",
+                "message_create_time": 1711795200000,
+            }
+        )
+
+        with patch("spoon_bot.channels.feishu.channel.time.time", return_value=1711795381), \
+             patch.object(ch, "_send_api_message", AsyncMock()) as mock_send:
+            await ch.on_processing_start(message)
+
+        mock_send.assert_not_awaited()
+        assert ch._typing_placeholders == {}
+
+    @pytest.mark.asyncio
+    async def test_send_placeholder_mode_edits_first_chunk_and_sends_remainder(self):
+        """Placeholder typing should patch the first chunk into the placeholder message."""
+        from spoon_bot.bus.events import OutboundMessage
+
+        ch = self._make_channel(typing_mode="placeholder")
+        ch._api_client = object()
+        ch._typing_placeholders["reply-mid"] = SimpleNamespace(
+            placeholder_message_id="typing-mid",
+            stop_event=asyncio.Event(),
+            task=None,
+        )
+        outbound = OutboundMessage(
+            content="ignored",
+            reply_to="reply-mid",
+            metadata={"chat_id": "chat-1"},
+        )
+
+        with patch.object(ch, "_split_message", return_value=["first", "second"]), \
+             patch.object(ch, "_determine_msg_type", side_effect=["text", "text"]), \
+             patch.object(ch, "_edit_message", AsyncMock(return_value=True)) as mock_edit, \
+             patch.object(ch, "_send_api_message", AsyncMock(return_value="msg-2")) as mock_send:
+            await ch.send(outbound)
+
+        mock_edit.assert_awaited_once_with("typing-mid", "first", "interactive")
+        mock_send.assert_awaited_once_with(
+            chat_id="chat-1",
+            content="second",
+            msg_type="text",
+            reply_to=None,
+        )
+        assert "reply-mid" not in ch._typing_placeholders
+
+    @pytest.mark.asyncio
+    async def test_send_placeholder_mode_falls_back_to_reply_when_edit_fails(self):
+        """If patching the placeholder fails, the first chunk should fall back to a normal reply."""
+        from spoon_bot.bus.events import OutboundMessage
+
+        ch = self._make_channel(typing_mode="placeholder")
+        ch._api_client = object()
+        ch._typing_placeholders["reply-mid"] = SimpleNamespace(
+            placeholder_message_id="typing-mid",
+            stop_event=asyncio.Event(),
+            task=None,
+        )
+        outbound = OutboundMessage(
+            content="ignored",
+            reply_to="reply-mid",
+            metadata={"chat_id": "chat-1"},
+        )
+
+        with patch.object(ch, "_split_message", return_value=["first"]), \
+             patch.object(ch, "_determine_msg_type", return_value="text"), \
+             patch.object(ch, "_edit_message", AsyncMock(return_value=False)) as mock_edit, \
+             patch.object(ch, "_send_api_message", AsyncMock(return_value="msg-1")) as mock_send:
+            await ch.send(outbound)
+
+        mock_edit.assert_awaited_once_with("typing-mid", "first", "interactive")
+        mock_send.assert_awaited_once_with(
+            chat_id="chat-1",
+            content="first",
+            msg_type="text",
+            reply_to="reply-mid",
+        )
+        assert "reply-mid" not in ch._typing_placeholders
 
     @pytest.mark.asyncio
     async def test_handle_webhook_uses_sdk_event_dispatcher(self):
@@ -479,3 +707,30 @@ class TestFeishuConfig:
         cfg = load_channels_config(path)
         config, _ = cfg.get_feishu_configs()[0]
         assert config.extra["require_mention"] is False
+
+    def test_typing_indicator_defaults_true(self, tmp_path):
+        """typing_indicator defaults to True for Feishu accounts."""
+        from spoon_bot.channels.config import load_channels_config
+        path = self._make_yaml({}, tmp_path)
+        cfg = load_channels_config(path)
+        config, _ = cfg.get_feishu_configs()[0]
+        assert config.extra["typing_indicator"] is True
+        assert config.extra["typing_mode"] == "reaction"
+        assert config.extra["typing_emoji"] == "Typing"
+
+    def test_typing_settings_passed_through(self, tmp_path):
+        """typing indicator settings are passed into ChannelConfig.extra."""
+        from spoon_bot.channels.config import load_channels_config
+        path = self._make_yaml(
+            {
+                "typing_indicator": False,
+                "typing_mode": "placeholder",
+                "typing_emoji": "THINK",
+            },
+            tmp_path,
+        )
+        cfg = load_channels_config(path)
+        config, _ = cfg.get_feishu_configs()[0]
+        assert config.extra["typing_indicator"] is False
+        assert config.extra["typing_mode"] == "placeholder"
+        assert config.extra["typing_emoji"] == "THINK"

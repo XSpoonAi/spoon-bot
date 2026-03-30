@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import mimetypes
 import re
@@ -23,7 +24,7 @@ from spoon_bot.channels.feishu.cards import build_markdown_card, should_use_card
 from spoon_bot.channels.feishu.constants import (
     CHAT_TYPE_GROUP,
     CHAT_TYPE_P2P,
-    EMOJI_ONIT,
+    EMOJI_TYPING,
     MESSAGE_DEDUP_MAX,
     MESSAGE_DEDUP_TTL,
     MSG_TYPE_AUDIO,
@@ -77,6 +78,14 @@ _DOMAIN_MAP = {
     "lark": "https://open.larksuite.com",
 }
 
+_TYPING_INDICATOR_MAX_AGE_MS = 2 * 60_000
+_TYPING_BACKOFF_CODES = {429, 99991400, 99991403}
+_TYPING_BACKOFF_SECONDS = 60.0
+_TYPING_MODE_REACTION = "reaction"
+_TYPING_MODE_PLACEHOLDER = "placeholder"
+_TYPING_PLACEHOLDER_INTERVAL_SECONDS = 0.8
+_TYPING_PLACEHOLDER_FRAMES = ("Typing.", "Typing..", "Typing...")
+
 
 class _CaseInsensitiveHeaders(dict[str, str]):
     """Case-insensitive header mapping for SDK webhook validation."""
@@ -86,6 +95,15 @@ class _CaseInsensitiveHeaders(dict[str, str]):
 
     def get(self, key: str, default: Any = None) -> Any:
         return super().get(str(key).lower(), default)
+
+
+@dataclass(slots=True)
+class _TypingPlaceholderState:
+    """Runtime state for an animated typing placeholder message."""
+
+    placeholder_message_id: str
+    stop_event: asyncio.Event
+    task: asyncio.Task[None] | None = None
 
 
 class FeishuChannel(BaseChannel):
@@ -136,6 +154,17 @@ class FeishuChannel(BaseChannel):
         self.allowed_users: set[str] = set(config.extra.get("allowed_users", []))
         self.require_mention: bool = config.extra.get("require_mention", True)
         self.render_mode: str = config.extra.get("render_mode", RENDER_MODE_AUTO)
+        self.typing_indicator: bool = config.extra.get("typing_indicator", True)
+        raw_typing_mode = str(
+            config.extra.get("typing_mode", _TYPING_MODE_REACTION) or ""
+        ).strip().lower()
+        self.typing_mode: str = (
+            raw_typing_mode
+            if raw_typing_mode in {_TYPING_MODE_REACTION, _TYPING_MODE_PLACEHOLDER}
+            else _TYPING_MODE_REACTION
+        )
+        raw_typing_emoji = str(config.extra.get("typing_emoji", EMOJI_TYPING) or "").strip()
+        self.typing_emoji: str = raw_typing_emoji or EMOJI_TYPING
 
         # Runtime state
         self._api_client: Any | None = None  # lark.Client for sending
@@ -154,6 +183,8 @@ class FeishuChannel(BaseChannel):
         # P0-4: Typing indicator — maps message_id -> reaction_id
         # Empty string "" is used as a sentinel meaning "reaction pending"
         self._typing_reactions: dict[str, str] = {}
+        self._typing_placeholders: dict[str, _TypingPlaceholderState] = {}
+        self._typing_backoff_until: float = 0.0
 
         # P0-6: Sender name cache — maps open_id -> (name, monotonic_ts)
         # Fix #1: Protected by _cache_lock for thread safety
@@ -195,6 +226,145 @@ class FeishuChannel(BaseChannel):
     def _get_domain_url(self) -> str:
         """Resolve the configured Feishu/Lark domain to the SDK base URL."""
         return _DOMAIN_MAP.get(self.domain, _DOMAIN_MAP["feishu"])
+
+    @staticmethod
+    def _normalize_epoch_ms(value: Any) -> int | None:
+        """Normalize a timestamp value to epoch milliseconds."""
+        if value in (None, ""):
+            return None
+        try:
+            ts = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        if ts < 10_000_000_000:
+            ts *= 1000
+        return ts
+
+    @staticmethod
+    def _extract_typing_backoff_code(value: Any) -> int | None:
+        """Extract a Feishu backoff/rate-limit code from a response or exception."""
+        if value is None:
+            return None
+
+        code = getattr(value, "code", None)
+        if isinstance(code, int) and code in _TYPING_BACKOFF_CODES:
+            return code
+
+        response = getattr(value, "response", None)
+        status = getattr(response, "status", None)
+        if isinstance(status, int) and status in _TYPING_BACKOFF_CODES:
+            return status
+
+        data = getattr(response, "data", None)
+        data_code = getattr(data, "code", None) if data is not None else None
+        if isinstance(data_code, int) and data_code in _TYPING_BACKOFF_CODES:
+            return data_code
+
+        return None
+
+    def _activate_typing_backoff(self, code: int) -> None:
+        """Suppress typing indicators temporarily after rate-limit/quota failures."""
+        self._typing_backoff_until = max(
+            self._typing_backoff_until,
+            time.monotonic() + _TYPING_BACKOFF_SECONDS,
+        )
+        logger.warning(
+            f"[{self.full_name}] Typing indicator backing off after Feishu API code {code}"
+        )
+
+    def _typing_backoff_active(self) -> bool:
+        """Return True when typing indicator retries are temporarily suppressed."""
+        return time.monotonic() < self._typing_backoff_until
+
+    def _is_stale_typing_message(self, message: InboundMessage) -> bool:
+        """Return True when the inbound message is too old for a fresh typing indicator."""
+        message_create_time_ms = self._normalize_epoch_ms(
+            message.metadata.get("message_create_time")
+        )
+        if message_create_time_ms is None:
+            return False
+        return int(time.time() * 1000) - message_create_time_ms > _TYPING_INDICATOR_MAX_AGE_MS
+
+    @staticmethod
+    def _extract_response_message_id(response: Any) -> str | None:
+        """Best-effort extraction of a sent message id from SDK responses."""
+        data = getattr(response, "data", None)
+        if data is None:
+            return None
+        message_id = getattr(data, "message_id", None)
+        if isinstance(message_id, str) and message_id:
+            return message_id
+        body = getattr(data, "body", None)
+        body_message_id = getattr(body, "message_id", None) if body is not None else None
+        if isinstance(body_message_id, str) and body_message_id:
+            return body_message_id
+        return None
+
+    def _serialize_outbound_content(self, content: str, msg_type: str) -> str:
+        """Serialize text/card content into the Feishu API payload format."""
+        if msg_type == MSG_TYPE_INTERACTIVE:
+            return build_markdown_card(content)
+        return json.dumps({"text": content})
+
+    async def _send_api_message(
+        self,
+        *,
+        chat_id: str | None,
+        content: str,
+        msg_type: str,
+        reply_to: str | None = None,
+    ) -> str | None:
+        """Send a Feishu message and return the created message id when available."""
+        if not self._api_client:
+            raise RuntimeError(f"[{self.full_name}] API client not initialized")
+
+        content_str = self._serialize_outbound_content(content, msg_type)
+
+        async def _send() -> Any:
+            if reply_to:
+                request = (
+                    ReplyMessageRequest.builder()
+                    .message_id(reply_to)
+                    .request_body(
+                        ReplyMessageRequestBody.builder()
+                        .content(content_str)
+                        .msg_type(msg_type)
+                        .build()
+                    )
+                    .build()
+                )
+                response = await asyncio.to_thread(
+                    self._api_client.im.v1.message.reply, request
+                )
+            else:
+                if not chat_id:
+                    raise RuntimeError(f"[{self.full_name}] No chat_id in message metadata")
+                request = (
+                    CreateMessageRequest.builder()
+                    .receive_id_type("chat_id")
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(chat_id)
+                        .content(content_str)
+                        .msg_type(msg_type)
+                        .build()
+                    )
+                    .build()
+                )
+                response = await asyncio.to_thread(
+                    self._api_client.im.v1.message.create, request
+                )
+
+            success = getattr(response, "success", None)
+            if not callable(success) or not success():
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "")
+                logger.error(f"[{self.full_name}] Send failed: code={code}, msg={msg}")
+                raise RuntimeError(f"Feishu API error: {msg}")
+            return response
+
+        response = await self.send_with_retry(_send)
+        return self._extract_response_message_id(response)
 
     def _build_api_client(self) -> Any:
         """Build the SDK API client used for outbound requests."""
@@ -619,7 +789,7 @@ class FeishuChannel(BaseChannel):
     # P0-4: Emoji reactions
     # ------------------------------------------------------------------
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = EMOJI_ONIT) -> str | None:
+    async def _add_reaction(self, message_id: str, emoji_type: str = EMOJI_TYPING) -> str | None:
         """Add an emoji reaction to a message. Returns reaction_id or None on failure."""
         if not self._api_client:
             return None
@@ -641,10 +811,16 @@ class FeishuChannel(BaseChannel):
             )
             if response.success():
                 return response.data.reaction_id
+            backoff_code = self._extract_typing_backoff_code(response)
+            if backoff_code is not None:
+                self._activate_typing_backoff(backoff_code)
             logger.debug(
                 f"[{self.full_name}] Add reaction failed: code={response.code}, msg={response.msg}"
             )
         except Exception as e:
+            backoff_code = self._extract_typing_backoff_code(e)
+            if backoff_code is not None:
+                self._activate_typing_backoff(backoff_code)
             logger.debug(f"[{self.full_name}] Add reaction error: {e}")
         return None
 
@@ -663,11 +839,27 @@ class FeishuChannel(BaseChannel):
                     .reaction_id(reaction_id)
                     .build()
                 )
-                await asyncio.to_thread(
+                response = await asyncio.to_thread(
                     self._api_client.im.v1.message_reaction.delete, request
                 )
-                return  # Success
+                success = getattr(response, "success", None)
+                if not callable(success) or success():
+                    return  # Success
+                backoff_code = self._extract_typing_backoff_code(response)
+                if backoff_code is not None:
+                    self._activate_typing_backoff(backoff_code)
+                    return
+                logger.debug(
+                    f"[{self.full_name}] Remove reaction failed: "
+                    f"code={getattr(response, 'code', 'unknown')}, "
+                    f"msg={getattr(response, 'msg', '')}"
+                )
+                return
             except Exception as e:
+                backoff_code = self._extract_typing_backoff_code(e)
+                if backoff_code is not None:
+                    self._activate_typing_backoff(backoff_code)
+                    return
                 if attempt == 0:
                     logger.debug(f"[{self.full_name}] Remove reaction retry after: {e}")
                     await asyncio.sleep(0.5)
@@ -677,20 +869,111 @@ class FeishuChannel(BaseChannel):
                         f"(msg={message_id}, reaction={reaction_id}): {e}"
                     )
 
-    async def on_processing_start(self, message: InboundMessage) -> None:
-        """Add typing-indicator reaction when agent begins processing.
+    async def _typing_placeholder_loop(
+        self, source_message_id: str, state: _TypingPlaceholderState
+    ) -> None:
+        """Animate a placeholder message as `Typing.` -> `Typing...` while work runs."""
+        frame_index = 1
+        try:
+            while not state.stop_event.is_set():
+                await asyncio.sleep(_TYPING_PLACEHOLDER_INTERVAL_SECONDS)
+                if state.stop_event.is_set():
+                    break
+                frame = _TYPING_PLACEHOLDER_FRAMES[frame_index % len(_TYPING_PLACEHOLDER_FRAMES)]
+                updated = await self._edit_message(
+                    state.placeholder_message_id,
+                    frame,
+                    MSG_TYPE_INTERACTIVE,
+                )
+                if not updated:
+                    logger.debug(
+                        f"[{self.full_name}] Stopping typing placeholder updates for "
+                        f"{source_message_id}: edit failed"
+                    )
+                    break
+                frame_index += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(
+                f"[{self.full_name}] Typing placeholder loop failed for "
+                f"{source_message_id}: {e}"
+            )
 
-        Fix #2: Pre-registers a sentinel ("") to prevent race condition with
-        on_processing_end. If end fires before the reaction is created, the
-        sentinel is popped and the reaction is cleaned up immediately after
-        creation.
-        """
+    async def _start_typing_placeholder(
+        self, message: InboundMessage, msg_id: str
+    ) -> None:
+        """Create and animate a placeholder reply that simulates typing."""
+        if msg_id in self._typing_placeholders:
+            return
+
+        reply_to = message.metadata.get("message_id")
+        chat_id = message.metadata.get("chat_id")
+        if not reply_to and not chat_id:
+            return
+
+        try:
+            placeholder_message_id = await self._send_api_message(
+                chat_id=chat_id,
+                content=_TYPING_PLACEHOLDER_FRAMES[0],
+                msg_type=MSG_TYPE_INTERACTIVE,
+                reply_to=reply_to,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[{self.full_name}] Failed to create typing placeholder for {msg_id}: {e}"
+            )
+            return
+
+        if not placeholder_message_id:
+            return
+
+        state = _TypingPlaceholderState(
+            placeholder_message_id=placeholder_message_id,
+            stop_event=asyncio.Event(),
+        )
+        state.task = asyncio.create_task(
+            self._typing_placeholder_loop(msg_id, state),
+            name=f"feishu-typing-placeholder-{msg_id}",
+        )
+        self._typing_placeholders[msg_id] = state
+
+    async def _stop_typing_placeholder(self, msg_id: str) -> None:
+        """Stop the placeholder animation but keep the message for final patching."""
+        state = self._typing_placeholders.get(msg_id)
+        if not state:
+            return
+        state.stop_event.set()
+        task = state.task
+        if task and not task.done():
+            try:
+                await task
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(
+                    f"[{self.full_name}] Typing placeholder cleanup failed for "
+                    f"{msg_id}: {e}"
+                )
+
+    async def on_processing_start(self, message: InboundMessage) -> None:
+        """Show the configured Feishu typing indicator when agent work begins."""
+        if not self.typing_indicator:
+            return
         msg_id: str | None = message.metadata.get("message_id")
         if not msg_id:
             return
-        # Pre-register sentinel before the await
+        if self._is_stale_typing_message(message):
+            return
+        if self.typing_mode == _TYPING_MODE_PLACEHOLDER:
+            await self._start_typing_placeholder(message, msg_id)
+            return
+        if msg_id in self._typing_reactions:
+            return
+        if self._typing_backoff_active():
+            return
         self._typing_reactions[msg_id] = ""
-        reaction_id = await self._add_reaction(msg_id, EMOJI_ONIT)
+        reaction_id = await self._add_reaction(msg_id, self.typing_emoji)
         if reaction_id:
             if msg_id in self._typing_reactions:
                 # on_processing_end hasn't run yet — store the real id
@@ -703,14 +986,12 @@ class FeishuChannel(BaseChannel):
             self._typing_reactions.pop(msg_id, None)
 
     async def on_processing_end(self, message: InboundMessage) -> None:
-        """Remove typing-indicator reaction when agent finishes.
-
-        Fix #2: Only removes if there's an actual reaction_id (truthy).
-        An empty sentinel means the reaction is still being created and
-        on_processing_start will handle cleanup.
-        """
+        """Stop the configured Feishu typing indicator when agent work ends."""
         msg_id: str | None = message.metadata.get("message_id")
         if not msg_id:
+            return
+        if self.typing_mode == _TYPING_MODE_PLACEHOLDER:
+            await self._stop_typing_placeholder(msg_id)
             return
         reaction_id = self._typing_reactions.pop(msg_id, None)
         if reaction_id:  # Has actual reaction_id (empty sentinel is falsy)
@@ -736,11 +1017,7 @@ class FeishuChannel(BaseChannel):
         if not self._api_client:
             return False
         try:
-            if msg_type == MSG_TYPE_TEXT:
-                content_str = json.dumps({"text": content})
-            else:
-                content_str = content  # already a JSON string for interactive
-
+            content_str = self._serialize_outbound_content(content, msg_type)
             request = (
                 PatchMessageRequest.builder()
                 .message_id(message_id)
@@ -952,6 +1229,10 @@ class FeishuChannel(BaseChannel):
                     sender_name = sender_id
 
                 session_key = f"feishu_{channel_ref.account_id}_{chat_id}"
+                message_create_time = (
+                    getattr(message, "create_time", None)
+                    or getattr(message, "message_create_time", None)
+                )
 
                 inbound = InboundMessage(
                     content=text,
@@ -966,6 +1247,7 @@ class FeishuChannel(BaseChannel):
                         "chat_type": chat_type,
                         "is_dm": chat_type == CHAT_TYPE_P2P,
                         "message_id": message_id,
+                        "message_create_time": message_create_time,
                         "msg_type": msg_type,
                         "think_level": "off",
                         "verbose": False,
@@ -1204,7 +1486,16 @@ class FeishuChannel(BaseChannel):
             self._ws_event_handler = None
             self._event_handler = None
 
-            # Fix #15: Clean up pending typing reactions
+            placeholder_tasks: list[asyncio.Task[None]] = []
+            for state in self._typing_placeholders.values():
+                state.stop_event.set()
+                task = state.task
+                if task and not task.done():
+                    placeholder_tasks.append(task)
+                    task.cancel()
+            if placeholder_tasks:
+                await asyncio.gather(*placeholder_tasks, return_exceptions=True)
+            self._typing_placeholders.clear()
             self._typing_reactions.clear()
 
             self._running = False
@@ -1271,70 +1562,36 @@ class FeishuChannel(BaseChannel):
 
         chat_id: str | None = message.metadata.get("chat_id")
         reply_target = self._resolve_reply_target(message)
+        placeholder_state = (
+            self._typing_placeholders.pop(reply_target, None)
+            if self.typing_mode == _TYPING_MODE_PLACEHOLDER and reply_target
+            else None
+        )
 
-        if not chat_id:
+        if not chat_id and not reply_target and placeholder_state is None:
             logger.error(f"[{self.full_name}] No chat_id in message metadata")
             return
 
         chunks = self._split_message(message.content, SAFE_MESSAGE_LENGTH)
 
         for i, chunk in enumerate(chunks):
-            # P0-1: Determine format for this chunk
             out_msg_type = self._determine_msg_type(chunk)
-            if out_msg_type == MSG_TYPE_INTERACTIVE:
-                content_str = build_markdown_card(chunk)
-            else:
-                content_str = json.dumps({"text": chunk})
-
-            reply_to = reply_target if i == 0 else None  # Reply only for the first chunk
-
-            # Fix #7: Capture all loop variables as default params to avoid
-            # closure-over-mutable-variable issues
-            async def _send(
-                text: str = content_str,
-                mtype: str = out_msg_type,
-                reply_mid: str | None = reply_to,
-                cid: str = chat_id,
-            ) -> None:
-                if reply_mid:
-                    request = (
-                        ReplyMessageRequest.builder()
-                        .message_id(reply_mid)
-                        .request_body(
-                            ReplyMessageRequestBody.builder()
-                            .content(text)
-                            .msg_type(mtype)
-                            .build()
-                        )
-                        .build()
-                    )
-                    response = await asyncio.to_thread(
-                        self._api_client.im.v1.message.reply, request
-                    )
-                else:
-                    request = (
-                        CreateMessageRequest.builder()
-                        .receive_id_type("chat_id")
-                        .request_body(
-                            CreateMessageRequestBody.builder()
-                            .receive_id(cid)
-                            .content(text)
-                            .msg_type(mtype)
-                            .build()
-                        )
-                        .build()
-                    )
-                    response = await asyncio.to_thread(
-                        self._api_client.im.v1.message.create, request
-                    )
-
-                if not response.success():
-                    logger.error(
-                        f"[{self.full_name}] Send failed: "
-                        f"code={response.code}, msg={response.msg}"
-                    )
-                    raise RuntimeError(f"Feishu API error: {response.msg}")
-
-            await self.send_with_retry(_send)
+            if i == 0 and placeholder_state is not None:
+                updated = await self._edit_message(
+                    placeholder_state.placeholder_message_id,
+                    chunk,
+                    MSG_TYPE_INTERACTIVE,
+                )
+                if updated:
+                    if i < len(chunks) - 1:
+                        await asyncio.sleep(0.5)
+                    continue
+            reply_to = reply_target if i == 0 else None
+            await self._send_api_message(
+                chat_id=chat_id,
+                content=chunk,
+                msg_type=out_msg_type,
+                reply_to=reply_to,
+            )
             if i < len(chunks) - 1:
                 await asyncio.sleep(0.5)
