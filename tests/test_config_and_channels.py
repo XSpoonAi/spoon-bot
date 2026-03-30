@@ -280,16 +280,14 @@ class TestCliEnabledOverride:
 
     def test_add_cli_channel_when_missing(self, manager):
         """--cli should add CLI channel even if config didn't enable it."""
+        from spoon_bot.channels.cli_channel import CLIChannel
+
         assert "cli:default" not in manager.channel_names
 
-        # Use a mock because CLIChannel() has a pre-existing constructor
-        # issue (passes string where ChannelConfig is expected).
-        cli_ch = MagicMock()
-        cli_ch.full_name = "cli:default"
-        cli_ch.name = "cli"
-        cli_ch.attach_bus = MagicMock()
+        cli_ch = CLIChannel()
         manager.add_channel(cli_ch)
         assert "cli:default" in manager.channel_names
+        assert manager._channels["cli:default"].name == "cli"
 
     def test_bootstrap_init_channels_removes_cli_by_default(self):
         """init_channels(cli_enabled=False) must remove the CLI channel."""
