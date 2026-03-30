@@ -192,6 +192,31 @@ class FeishuChannel(BaseChannel):
         """Remove Feishu @mention tokens (@_user_N) from message text."""
         return re.sub(r"@_user_\d+", "", text).strip()
 
+    def _get_domain_url(self) -> str:
+        """Resolve the configured Feishu/Lark domain to the SDK base URL."""
+        return _DOMAIN_MAP.get(self.domain, _DOMAIN_MAP["feishu"])
+
+    def _build_api_client(self) -> Any:
+        """Build the SDK API client used for outbound requests."""
+        return (
+            lark.Client.builder()
+            .app_id(self.app_id)
+            .app_secret(self.app_secret)
+            .domain(self._get_domain_url())
+            .log_level(lark.LogLevel.INFO)
+            .build()
+        )
+
+    def _build_ws_client(self) -> Any:
+        """Build the SDK WebSocket client used for inbound events."""
+        return lark.ws.Client(
+            self.app_id,
+            self.app_secret,
+            event_handler=self._ws_event_handler,
+            log_level=lark.LogLevel.DEBUG,
+            domain=self._get_domain_url(),
+        )
+
     def _is_bot_mentioned(self, mentions: list[Any] | None) -> bool:
         """Return True if the bot is mentioned in the message mentions list."""
         if not mentions:
@@ -802,7 +827,7 @@ class FeishuChannel(BaseChannel):
         Uses urllib to avoid dependency on lark-oapi's raw request API
         which may vary across SDK versions.
         """
-        domain_url = _DOMAIN_MAP.get(self.domain, _DOMAIN_MAP["feishu"])
+        domain_url = self._get_domain_url()
         try:
             # Step 1: Get tenant access token
             token_data = json.dumps({
@@ -996,12 +1021,7 @@ class FeishuChannel(BaseChannel):
         ws_module.loop = new_loop
 
         try:
-            self._ws_client = lark.ws.Client(
-                self.app_id,
-                self.app_secret,
-                event_handler=self._ws_event_handler,
-                log_level=lark.LogLevel.DEBUG,
-            )
+            self._ws_client = self._build_ws_client()
             self._ws_client.start()
         except RuntimeError as e:
             if self._ws_stop_requested.is_set():
@@ -1101,17 +1121,8 @@ class FeishuChannel(BaseChannel):
         self._ws_stop_requested.clear()
 
         try:
-            domain_url = _DOMAIN_MAP.get(self.domain, _DOMAIN_MAP["feishu"])
-
             # API client for sending messages
-            self._api_client = (
-                lark.Client.builder()
-                .app_id(self.app_id)
-                .app_secret(self.app_secret)
-                .domain(domain_url)
-                .log_level(lark.LogLevel.INFO)
-                .build()
-            )
+            self._api_client = self._build_api_client()
 
             # P0-3: Initialise media helper
             self._media = FeishuMedia(self._api_client)

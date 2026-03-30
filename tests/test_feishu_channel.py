@@ -154,6 +154,49 @@ class TestFeishuChannel:
         assert "ou_user1" in ch.allowed_users
         assert ch.require_mention is False
 
+    def test_build_api_client_uses_configured_domain(self):
+        """Outbound API client should honor the configured Lark domain."""
+        ch = self._make_channel(domain="lark")
+
+        with patch("spoon_bot.channels.feishu.channel.lark", create=True) as mock_lark:
+            builder = MagicMock()
+            fake_client = object()
+            builder.app_id.return_value = builder
+            builder.app_secret.return_value = builder
+            builder.domain.return_value = builder
+            builder.log_level.return_value = builder
+            builder.build.return_value = fake_client
+            mock_lark.Client.builder.return_value = builder
+            mock_lark.LogLevel.INFO = "info"
+
+            assert ch._build_api_client() is fake_client
+
+        builder.app_id.assert_called_once_with("cli_test")
+        builder.app_secret.assert_called_once_with("secret")
+        builder.domain.assert_called_once_with("https://open.larksuite.com")
+        builder.log_level.assert_called_once_with("info")
+        builder.build.assert_called_once_with()
+
+    def test_build_ws_client_uses_configured_domain(self):
+        """WS client should honor the configured Lark domain."""
+        ch = self._make_channel(domain="lark")
+        ch._ws_event_handler = object()
+
+        with patch("spoon_bot.channels.feishu.channel.lark", create=True) as mock_lark:
+            fake_client = object()
+            mock_lark.LogLevel.DEBUG = "debug"
+            mock_lark.ws.Client.return_value = fake_client
+
+            assert ch._build_ws_client() is fake_client
+
+        mock_lark.ws.Client.assert_called_once_with(
+            "cli_test",
+            "secret",
+            event_handler=ch._ws_event_handler,
+            log_level="debug",
+            domain="https://open.larksuite.com",
+        )
+
     def test_split_message_short(self):
         """Short messages are returned as a single chunk."""
         from spoon_bot.channels.feishu.channel import FeishuChannel
