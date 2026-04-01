@@ -116,8 +116,8 @@ channels:
         domain: "feishu"         # feishu for China-region Feishu, lark for international Lark
         app_id: "${FEISHU_APP_ID}"
         app_secret: "${FEISHU_APP_SECRET}"
-        dm_policy: "open"        # open | allowlist | disabled
-        allow_from: []           # DM sender allowlist when dm_policy=allowlist
+        dm_policy: "pairing"     # pairing | open | allowlist | disabled
+        allow_from: []           # pairing admins / DM allowlist; also admins who can authorize a group by inviting the bot; open requires "*"
         group_policy: "allowlist"  # open | allowlist | disabled
         group_allow_from: []     # Group/chat allowlist (recommended for local bots)
         group_sender_allow_from: []  # Optional per-sender allowlist inside groups
@@ -125,9 +125,24 @@ channels:
         typing_indicator: true
         typing_mode: "placeholder"  # placeholder for animated Typing..., reaction for emoji only
         typing_emoji: "Typing"      # Used only when typing_mode: reaction
-        require_mention: true       # In groups, require @bot before processing
+        # require_mention: true     # Optional override; open groups default false, others default true
         allowed_chats: []           # Legacy alias for group_allow_from
         allowed_users: []           # Legacy alias for allow_from
+        groups:
+          "oc_xxx_group_id":
+            allow_from: ["ou_owner_open_id"]   # Per-group sender allowlist overrides global sender allowlist
+            require_mention: false
+            group_session_scope: "group_topic"
+            agent_config:
+              tool_profile: "group_safe"
+        # If an allowlisted admin in allow_from invites the bot into a new group,
+        # that group can also become dynamically authorized while the inviter
+        # remains in the group.
+        dms:
+          "ou_owner_open_id":
+            enabled: true
+            agent_config:
+              tool_profile: "coding"
 
         # Agent configuration
         agent_config:
@@ -143,7 +158,7 @@ channels:
         domain: "lark"
         app_id: "${FEISHU_APP_ID}"
         app_secret: "${FEISHU_APP_SECRET}"
-        dm_policy: "open"
+        dm_policy: "pairing"
         allow_from: []
         group_policy: "allowlist"
         group_allow_from: []
@@ -151,7 +166,7 @@ channels:
         group_session_scope: "group_sender"
         typing_indicator: true
         typing_mode: "placeholder"
-        require_mention: true
+        # require_mention: true
 
         # Agent configuration
         agent_config:
@@ -170,7 +185,7 @@ channels:
         verification_token: "${FEISHU_VERIFICATION_TOKEN}"
         encrypt_key: "${FEISHU_ENCRYPT_KEY}"  # Optional: required only if event encryption is enabled
         webhook_url: "https://your-domain.com/feishu/events"
-        dm_policy: "open"
+        dm_policy: "pairing"
         allow_from: []
         group_policy: "allowlist"
         group_allow_from: []
@@ -179,7 +194,7 @@ channels:
         typing_indicator: true
         typing_mode: "reaction"
         typing_emoji: "Typing"
-        require_mention: true
+        # require_mention: true
 
         # Agent configuration
         agent_config:

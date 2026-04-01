@@ -347,6 +347,131 @@ class TestManagedChannelAgents:
         manager._channel_agents["feishu:testbot"].process.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_handle_message_creates_scoped_group_agent_for_group_override(self, tmp_path):
+        from spoon_bot.bus.events import InboundMessage
+        from spoon_bot.channels.base import ChannelConfig, ChannelMode
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._bus = MagicMock()
+        manager._bus.set_handler = MagicMock()
+
+        default_agent = MagicMock(provider="openai", model="gpt-4o-mini", workspace=tmp_path)
+        manager.set_agent(
+            default_agent,
+            agent_config={
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "workspace": str(tmp_path),
+                "tool_profile": "coding",
+            },
+        )
+
+        channel = MagicMock()
+        channel.full_name = "feishu:team_bot"
+        channel.name = "feishu"
+        channel.config = ChannelConfig(
+            name="feishu",
+            mode=ChannelMode.GATEWAY,
+            enabled=True,
+            app_id="cli_x",
+            app_secret="secret",
+            group_policy="allowlist",
+            group_allow_from=["oc_team"],
+            group_agent_config={},
+        )
+        channel.on_processing_start = AsyncMock()
+        channel.on_processing_end = AsyncMock()
+        manager._channels[channel.full_name] = channel
+
+        scoped_agent = MagicMock()
+        scoped_agent.process = AsyncMock(return_value="scoped")
+        scoped_agent.cleanup = AsyncMock()
+
+        message = InboundMessage(
+            content="hello",
+            channel="feishu:team_bot",
+            sender_id="ou_alice",
+            sender_name="Alice",
+            metadata={
+                "chat_type": "group",
+                "is_dm": False,
+                "agent_scope_key": "group:oc_team",
+                "runtime_agent_override": {"tool_profile": "group_safe"},
+            },
+        )
+
+        with patch("spoon_bot.agent.loop.create_agent", new=AsyncMock(return_value=scoped_agent)) as mock_create:
+            response = await manager._handle_message(message)
+
+        assert response is not None
+        assert response.content == "scoped"
+        assert manager._scoped_agents["feishu:team_bot:group:oc_team"] is scoped_agent
+        scoped_agent.process.assert_awaited_once_with(
+            message="[Alice]: hello",
+            media=None,
+            session_key="default",
+            attachments=None,
+        )
+        assert mock_create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_message_rejects_unsafe_scoped_group_override(self, tmp_path):
+        from spoon_bot.bus.events import InboundMessage
+        from spoon_bot.channels.base import ChannelConfig, ChannelMode
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._bus = MagicMock()
+        manager._bus.set_handler = MagicMock()
+
+        default_agent = MagicMock(provider="openai", model="gpt-4o-mini", workspace=tmp_path)
+        manager.set_agent(
+            default_agent,
+            agent_config={
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "workspace": str(tmp_path),
+            },
+        )
+
+        channel = MagicMock()
+        channel.full_name = "feishu:unsafe_scope_bot"
+        channel.name = "feishu"
+        channel.config = ChannelConfig(
+            name="feishu",
+            mode=ChannelMode.GATEWAY,
+            enabled=True,
+            app_id="cli_x",
+            app_secret="secret",
+            group_policy="allowlist",
+            group_allow_from=["oc_team"],
+            group_agent_config={},
+        )
+        channel.on_processing_start = AsyncMock()
+        channel.on_processing_end = AsyncMock()
+        manager._channels[channel.full_name] = channel
+
+        message = InboundMessage(
+            content="list files",
+            channel="feishu:unsafe_scope_bot",
+            sender_id="ou_alice",
+            sender_name="Alice",
+            metadata={
+                "chat_type": "group",
+                "is_dm": False,
+                "agent_scope_key": "group:oc_team",
+                "runtime_agent_override": {"enabled_tools": ["shell"]},
+            },
+        )
+
+        with patch("spoon_bot.agent.loop.create_agent", new=AsyncMock()) as mock_create:
+            with pytest.raises(ValueError, match="may not enable local shell/filesystem tools"):
+                await manager._handle_message(message)
+
+        mock_create.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_start_all_creates_dedicated_channel_and_group_agents(self, tmp_path):
         from spoon_bot.channels.base import ChannelConfig, ChannelMode
         from spoon_bot.channels.manager import ChannelManager

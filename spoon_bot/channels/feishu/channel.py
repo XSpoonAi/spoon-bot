@@ -44,6 +44,13 @@ from spoon_bot.channels.feishu.constants import (
     SUPPORTED_MSG_TYPES,
 )
 from spoon_bot.channels.feishu.media import FeishuMedia
+from spoon_bot.channels.feishu.policy import (
+    FeishuAccessDecision,
+    feishu_allowlist_allows,
+    normalize_feishu_allow_entry,
+    normalize_feishu_allowlist,
+    resolve_feishu_access,
+)
 
 try:
     import lark_oapi as lark
@@ -53,6 +60,7 @@ try:
         CreateMessageReactionRequest,
         CreateMessageReactionRequestBody,
         DeleteMessageReactionRequest,
+        GetChatMembersRequest,
         PatchMessageRequest,
         PatchMessageRequestBody,
         ReplyMessageRequest,
@@ -102,6 +110,9 @@ _GROUP_SESSION_SCOPES = {
     _GROUP_SESSION_SCOPE_GROUP_TOPIC,
     _GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER,
 }
+_PAIRING_CHALLENGE_COOLDOWN_SECONDS = 300.0
+_GROUP_AUTH_MEMBERSHIP_TTL_SECONDS = 120.0
+_PAIRING_COMMAND_PATTERN = re.compile(r"^/(?:pair|pairing)\s+allow\s+(\S+)\s*$", re.IGNORECASE)
 
 
 class _CaseInsensitiveHeaders(dict[str, str]):
@@ -167,27 +178,37 @@ class FeishuChannel(BaseChannel):
         self.verification_token: str = config.extra.get("verification_token", "")
         self.encrypt_key: str = config.extra.get("encrypt_key", "")
         self.domain: str = config.extra.get("domain", "feishu")
-        self.allowed_chats: set[str] = set(config.extra.get("allowed_chats", []))
-        self.allowed_users: set[str] = set(config.extra.get("allowed_users", []))
+        self.allowed_chats: set[str] = set(
+            normalize_feishu_allowlist(config.extra.get("allowed_chats", []))
+        )
+        self.allowed_users: set[str] = set(
+            normalize_feishu_allowlist(config.extra.get("allowed_users", []))
+        )
         self.allow_from: set[str] = set(
-            config.extra.get("allow_from", config.extra.get("allowed_users", []))
+            normalize_feishu_allowlist(
+                config.extra.get("allow_from", config.extra.get("allowed_users", []))
+            )
         )
         self.dm_policy: str = self._normalize_dm_policy(
-            config.extra.get("dm_policy", _DM_POLICY_OPEN)
+            config.extra.get("dm_policy", _DM_POLICY_PAIRING)
         )
         self.group_policy: str = self._normalize_group_policy(
             config.extra.get("group_policy", _GROUP_POLICY_ALLOWLIST)
         )
         self.group_allow_from: set[str] = set(
-            config.extra.get("group_allow_from", config.extra.get("allowed_chats", []))
+            normalize_feishu_allowlist(
+                config.extra.get("group_allow_from", config.extra.get("allowed_chats", []))
+            )
         )
         self.group_sender_allow_from: set[str] = set(
-            config.extra.get("group_sender_allow_from", [])
+            normalize_feishu_allowlist(config.extra.get("group_sender_allow_from", []))
         )
         self.group_session_scope: str = self._normalize_group_session_scope(
             config.extra.get("group_session_scope", _GROUP_SESSION_SCOPE_GROUP_SENDER)
         )
-        self.require_mention: bool = config.extra.get("require_mention", True)
+        self.require_mention: bool | None = config.extra.get("require_mention")
+        self.groups: dict[str, dict[str, Any]] = dict(config.extra.get("groups", {}) or {})
+        self.dms: dict[str, dict[str, Any]] = dict(config.extra.get("dms", {}) or {})
         self.render_mode: str = config.extra.get("render_mode", RENDER_MODE_AUTO)
         self.typing_indicator: bool = config.extra.get("typing_indicator", True)
         raw_typing_mode = str(
@@ -229,6 +250,9 @@ class FeishuChannel(BaseChannel):
         # Fix #6: Message deduplication — maps message_id -> monotonic_ts
         self._processed_messages: dict[str, float] = {}
         self._dedup_lock = threading.Lock()
+        self._pairing_lock = threading.Lock()
+        self._group_auth_lock = threading.Lock()
+        self._group_auth_membership_cache: dict[tuple[str, str], tuple[bool, float]] = {}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -236,11 +260,14 @@ class FeishuChannel(BaseChannel):
 
     @staticmethod
     def _normalize_dm_policy(value: Any) -> str:
-        """Normalize DM policy, mapping unsupported pairing to allowlist."""
+        """Normalize DM policy."""
         policy = str(value or _DM_POLICY_OPEN).strip().lower()
-        if policy == _DM_POLICY_PAIRING:
-            return _DM_POLICY_ALLOWLIST
-        if policy in {_DM_POLICY_OPEN, _DM_POLICY_ALLOWLIST, _DM_POLICY_DISABLED}:
+        if policy in {
+            _DM_POLICY_OPEN,
+            _DM_POLICY_ALLOWLIST,
+            _DM_POLICY_DISABLED,
+            _DM_POLICY_PAIRING,
+        }:
             return policy
         return _DM_POLICY_OPEN
 
@@ -281,19 +308,21 @@ class FeishuChannel(BaseChannel):
         chat_type: str,
         sender_id: str,
         thread_id: str | None = None,
+        group_session_scope: str | None = None,
     ) -> str:
         """Build a session key honoring the configured group session scope."""
         if not self._is_group_chat(chat_type):
             return f"feishu_{self.account_id}_{chat_id}"
 
+        effective_scope = group_session_scope or self.group_session_scope
         parts = [chat_id]
-        if self.group_session_scope in {
+        if effective_scope in {
             _GROUP_SESSION_SCOPE_GROUP_TOPIC,
             _GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER,
         } and thread_id:
             parts.extend(["topic", thread_id])
 
-        if self.group_session_scope in {
+        if effective_scope in {
             _GROUP_SESSION_SCOPE_GROUP_SENDER,
             _GROUP_SESSION_SCOPE_GROUP_TOPIC_SENDER,
         }:
@@ -504,61 +533,551 @@ class FeishuChannel(BaseChannel):
                 pass
         return False
 
+    def _pairing_store_path(self) -> Path:
+        """Return the on-disk allow-store path for Feishu DM pairing."""
+        return (
+            Path.home()
+            / ".spoon-bot"
+            / "pairing"
+            / "feishu"
+            / f"{self.account_id}.json"
+        )
+
+    def _load_pairing_store_locked(self) -> dict[str, Any]:
+        """Load the pairing allow store. Caller must hold ``_pairing_lock``."""
+        path = self._pairing_store_path()
+        if not path.exists():
+            return {"allowed_from": [], "pending": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[{self.full_name}] Failed to read pairing store: {e}")
+            return {"allowed_from": [], "pending": {}}
+
+        allowed_from = normalize_feishu_allowlist(data.get("allowed_from", []))
+        raw_pending = data.get("pending", {})
+        pending: dict[str, float] = {}
+        if isinstance(raw_pending, dict):
+            for raw_sender, raw_ts in raw_pending.items():
+                sender_key = normalize_feishu_allow_entry(raw_sender)
+                if not sender_key:
+                    continue
+                try:
+                    pending[sender_key] = float(raw_ts)
+                except (TypeError, ValueError):
+                    continue
+        return {"allowed_from": list(allowed_from), "pending": pending}
+
+    def _save_pairing_store_locked(self, store: dict[str, Any]) -> None:
+        """Persist the pairing allow store. Caller must hold ``_pairing_lock``."""
+        path = self._pairing_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "allowed_from": list(normalize_feishu_allowlist(store.get("allowed_from", []))),
+            "pending": {
+                normalize_feishu_allow_entry(sender): float(ts)
+                for sender, ts in (store.get("pending", {}) or {}).items()
+                if normalize_feishu_allow_entry(sender)
+            },
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _get_pairing_allow_from(self) -> tuple[str, ...]:
+        """Return the normalized allowlist persisted by DM pairing approvals."""
+        with self._pairing_lock:
+            store = self._load_pairing_store_locked()
+            return tuple(store.get("allowed_from", []))
+
+    def _approve_pairing_sender(self, sender_id: str) -> tuple[bool, str]:
+        """Approve one sender for future DM access."""
+        normalized_sender = normalize_feishu_allow_entry(sender_id)
+        if not normalized_sender or normalized_sender == "*":
+            return False, normalized_sender
+
+        with self._pairing_lock:
+            store = self._load_pairing_store_locked()
+            allowed_from = list(store.get("allowed_from", []))
+            already_allowed = normalized_sender in allowed_from
+            if not already_allowed:
+                allowed_from.append(normalized_sender)
+                store["allowed_from"] = list(normalize_feishu_allowlist(allowed_from))
+            pending = store.get("pending", {})
+            if isinstance(pending, dict):
+                pending.pop(normalized_sender, None)
+                store["pending"] = pending
+            self._save_pairing_store_locked(store)
+
+        return not already_allowed, normalized_sender
+
+    def _build_pairing_challenge_text(self, sender_id: str) -> str:
+        """Return the DM pairing challenge shown to unauthorized senders."""
+        normalized_sender = normalize_feishu_allow_entry(sender_id) or sender_id
+        if self.allow_from:
+            return (
+                "你当前还没有权限私聊使用这个机器人。\n\n"
+                "你的飞书用户 ID：\n"
+                f"{normalized_sender}\n\n"
+                "这串 ID 是你在飞书里的唯一身份标识，管理员需要用它来为你开通权限。\n"
+                "请把这串 ID 发给机器人管理员，开通后你就可以正常私聊机器人了。\n\n"
+                "管理员可使用以下命令开通：\n"
+                f"/pair allow {normalized_sender}"
+            )
+        return (
+            "你当前还没有权限私聊使用这个机器人。\n\n"
+            "你的飞书用户 ID：\n"
+            f"{normalized_sender}\n\n"
+            "这串 ID 是你在飞书里的唯一身份标识。\n"
+            "当前机器人还没有配置审批管理员，请把这串 ID 发给机器人维护者处理。"
+        )
+
+    @staticmethod
+    def _extract_user_id_candidates(user_id_obj: Any) -> list[str]:
+        """Extract normalized candidate IDs from a Feishu SDK user-id object."""
+        candidates: list[str] = []
+        for attr in ("open_id", "user_id", "union_id"):
+            value = getattr(user_id_obj, attr, None)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = normalize_feishu_allow_entry(candidate)
+            if normalized and normalized not in seen:
+                deduped.append(candidate.strip())
+                seen.add(normalized)
+        return deduped
+
+    @staticmethod
+    def _extract_user_id_fields(user_id_obj: Any) -> dict[str, str]:
+        """Extract typed user-id fields from a Feishu SDK user-id object."""
+        fields: dict[str, str] = {}
+        for attr in ("open_id", "user_id", "union_id"):
+            value = getattr(user_id_obj, attr, None)
+            if isinstance(value, str) and value.strip():
+                fields[attr] = value.strip()
+        return fields
+
+    def _group_authorization_store_path(self) -> Path:
+        """Return the on-disk store for dynamically authorized Feishu groups."""
+        return (
+            Path.home()
+            / ".spoon-bot"
+            / "group-access"
+            / "feishu"
+            / f"{self.account_id}.json"
+        )
+
+    def _load_group_authorization_store_locked(self) -> dict[str, Any]:
+        """Load the dynamic group authorization store. Caller must hold the lock."""
+        path = self._group_authorization_store_path()
+        if not path.exists():
+            return {"groups": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[{self.full_name}] Failed to read group authorization store: {e}")
+            return {"groups": {}}
+
+        groups: dict[str, dict[str, Any]] = {}
+        raw_groups = data.get("groups", {})
+        if isinstance(raw_groups, dict):
+            for raw_chat_id, raw_record in raw_groups.items():
+                chat_id = str(raw_chat_id or "").strip()
+                if not chat_id or not isinstance(raw_record, dict):
+                    continue
+                inviter_id = normalize_feishu_allow_entry(raw_record.get("inviter_id"))
+                if not inviter_id:
+                    continue
+                inviter_id_type = str(raw_record.get("inviter_id_type", "open_id") or "open_id").strip().lower()
+                try:
+                    authorized_at = float(raw_record.get("authorized_at", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    authorized_at = 0.0
+                groups[chat_id] = {
+                    "inviter_id": inviter_id,
+                    "inviter_id_type": inviter_id_type,
+                    "authorized_at": authorized_at,
+                }
+        return {"groups": groups}
+
+    def _save_group_authorization_store_locked(self, store: dict[str, Any]) -> None:
+        """Persist the dynamic group authorization store. Caller must hold the lock."""
+        path = self._group_authorization_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        groups: dict[str, Any] = {}
+        for raw_chat_id, raw_record in (store.get("groups", {}) or {}).items():
+            chat_id = str(raw_chat_id or "").strip()
+            if not chat_id or not isinstance(raw_record, dict):
+                continue
+            inviter_id = normalize_feishu_allow_entry(raw_record.get("inviter_id"))
+            if not inviter_id:
+                continue
+            groups[chat_id] = {
+                "inviter_id": inviter_id,
+                "inviter_id_type": str(raw_record.get("inviter_id_type", "open_id") or "open_id").strip().lower(),
+                "authorized_at": float(raw_record.get("authorized_at", 0.0) or 0.0),
+            }
+        path.write_text(
+            json.dumps({"groups": groups}, ensure_ascii=True, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _cache_group_authorization_membership(
+        self,
+        *,
+        chat_id: str,
+        inviter_id: str,
+        is_member: bool,
+    ) -> None:
+        """Cache the inviter membership verdict for a dynamically authorized group."""
+        cache_key = (chat_id, inviter_id)
+        self._group_auth_membership_cache[cache_key] = (is_member, time.monotonic())
+
+    def _get_cached_group_authorization_membership(
+        self,
+        *,
+        chat_id: str,
+        inviter_id: str,
+    ) -> bool | None:
+        """Return a cached inviter membership verdict when still fresh."""
+        cache_key = (chat_id, inviter_id)
+        cached = self._group_auth_membership_cache.get(cache_key)
+        if cached is None:
+            return None
+        is_member, checked_at = cached
+        if time.monotonic() - checked_at > _GROUP_AUTH_MEMBERSHIP_TTL_SECONDS:
+            self._group_auth_membership_cache.pop(cache_key, None)
+            return None
+        return is_member
+
+    def _prune_group_authorization_cache(self, *, chat_id: str, inviter_id: str | None = None) -> None:
+        """Drop cached membership verdicts for one authorized group."""
+        normalized_inviter = normalize_feishu_allow_entry(inviter_id) if inviter_id else None
+        keys_to_remove = [
+            key
+            for key in self._group_auth_membership_cache
+            if key[0] == chat_id and (normalized_inviter is None or key[1] == normalized_inviter)
+        ]
+        for key in keys_to_remove:
+            self._group_auth_membership_cache.pop(key, None)
+
+    def _authorize_group_via_admin_invite(
+        self,
+        *,
+        chat_id: str,
+        inviter_id: str,
+        inviter_id_type: str = "open_id",
+    ) -> bool:
+        """Persist a dynamic group authorization granted by an allowlisted inviter."""
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_inviter = normalize_feishu_allow_entry(inviter_id)
+        normalized_inviter_type = str(inviter_id_type or "open_id").strip().lower()
+        if not normalized_chat_id or not normalized_inviter:
+            return False
+
+        changed = False
+        with self._group_auth_lock:
+            store = self._load_group_authorization_store_locked()
+            groups = dict(store.get("groups", {}))
+            existing = groups.get(normalized_chat_id)
+            record = {
+                "inviter_id": normalized_inviter,
+                "inviter_id_type": normalized_inviter_type,
+                "authorized_at": time.time(),
+            }
+            if existing != record:
+                groups[normalized_chat_id] = record
+                store["groups"] = groups
+                self._save_group_authorization_store_locked(store)
+                changed = True
+            self._cache_group_authorization_membership(
+                chat_id=normalized_chat_id,
+                inviter_id=normalized_inviter,
+                is_member=True,
+            )
+        return changed
+
+    def _revoke_group_authorization(self, *, chat_id: str) -> bool:
+        """Remove a dynamic group authorization for this Feishu account."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return False
+
+        removed = False
+        inviter_id: str | None = None
+        with self._group_auth_lock:
+            store = self._load_group_authorization_store_locked()
+            groups = dict(store.get("groups", {}))
+            record = groups.pop(normalized_chat_id, None)
+            if record is not None:
+                inviter_id = str(record.get("inviter_id") or "")
+                store["groups"] = groups
+                self._save_group_authorization_store_locked(store)
+                removed = True
+        self._prune_group_authorization_cache(chat_id=normalized_chat_id, inviter_id=inviter_id)
+        return removed
+
+    def _get_group_authorization_record(self, *, chat_id: str) -> dict[str, Any] | None:
+        """Return the stored dynamic authorization record for one chat."""
+        normalized_chat_id = str(chat_id or "").strip()
+        if not normalized_chat_id:
+            return None
+        with self._group_auth_lock:
+            store = self._load_group_authorization_store_locked()
+            record = store.get("groups", {}).get(normalized_chat_id)
+            return dict(record) if isinstance(record, dict) else None
+
+    def _is_user_still_in_chat_sync(
+        self,
+        *,
+        chat_id: str,
+        inviter_id: str,
+        inviter_id_type: str = "open_id",
+    ) -> bool:
+        """Return True when the inviter is still a member of the target group chat."""
+        if not self._api_client:
+            return False
+
+        normalized_id_type = str(inviter_id_type or "open_id").strip().lower()
+        if normalized_id_type not in {"open_id", "user_id"}:
+            return False
+
+        page_token: str | None = None
+        normalized_inviter = normalize_feishu_allow_entry(inviter_id)
+        while True:
+            builder = (
+                GetChatMembersRequest.builder()
+                .chat_id(chat_id)
+                .member_id_type(normalized_id_type)
+                .page_size(100)
+            )
+            if page_token:
+                builder = builder.page_token(page_token)
+            request = builder.build()
+            response = self._api_client.im.v1.chat_members.get(request)
+            success = getattr(response, "success", None)
+            if not callable(success) or not success():
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "")
+                raise RuntimeError(f"Feishu chat member lookup failed: code={code}, msg={msg}")
+
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            for item in items:
+                member_id = normalize_feishu_allow_entry(getattr(item, "member_id", None))
+                if member_id and member_id == normalized_inviter:
+                    return True
+
+            has_more = bool(getattr(getattr(response, "data", None), "has_more", False))
+            if not has_more:
+                return False
+            page_token = getattr(getattr(response, "data", None), "page_token", None)
+            if not isinstance(page_token, str) or not page_token:
+                return False
+
+    def _resolve_dynamic_group_authorizer(self, *, chat_id: str) -> str | None:
+        """Return the inviter ID for a still-valid dynamically authorized group."""
+        record = self._get_group_authorization_record(chat_id=chat_id)
+        if not isinstance(record, dict):
+            return None
+
+        inviter_id = normalize_feishu_allow_entry(record.get("inviter_id"))
+        inviter_id_type = str(record.get("inviter_id_type", "open_id") or "open_id").strip().lower()
+        if not inviter_id:
+            self._revoke_group_authorization(chat_id=chat_id)
+            return None
+
+        cached = self._get_cached_group_authorization_membership(
+            chat_id=chat_id,
+            inviter_id=inviter_id,
+        )
+        if cached is not None:
+            if cached:
+                return inviter_id
+            self._revoke_group_authorization(chat_id=chat_id)
+            return None
+
+        try:
+            is_member = self._is_user_still_in_chat_sync(
+                chat_id=chat_id,
+                inviter_id=inviter_id,
+                inviter_id_type=inviter_id_type,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{self.full_name}] Failed to verify inviter membership for {chat_id}: {e}"
+            )
+            self._cache_group_authorization_membership(
+                chat_id=chat_id,
+                inviter_id=inviter_id,
+                is_member=False,
+            )
+            self._revoke_group_authorization(chat_id=chat_id)
+            return None
+
+        self._cache_group_authorization_membership(
+            chat_id=chat_id,
+            inviter_id=inviter_id,
+            is_member=is_member,
+        )
+        if is_member:
+            return inviter_id
+
+        self._revoke_group_authorization(chat_id=chat_id)
+        return None
+
+    def _schedule_background_coroutine(self, coro: Any, *, label: str) -> None:
+        """Run a coroutine on the channel event loop from the WS callback thread."""
+        loop = self._loop
+        if not loop or not loop.is_running():
+            logger.error(f"[{self.full_name}] Event loop not available for {label}")
+            return
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+
+        def _done_callback(done_future: Any) -> None:
+            try:
+                done_future.result()
+            except Exception as e:
+                logger.error(f"[{self.full_name}] {label} failed: {e}")
+
+        future.add_done_callback(_done_callback)
+
+    async def _issue_pairing_challenge(
+        self,
+        *,
+        chat_id: str,
+        sender_id: str,
+        reply_to: str | None,
+    ) -> None:
+        """Send a throttled pairing challenge reply for unauthorized DM users."""
+        normalized_sender = normalize_feishu_allow_entry(sender_id)
+        if not normalized_sender:
+            return
+
+        should_send = False
+        with self._pairing_lock:
+            store = self._load_pairing_store_locked()
+            pending = store.setdefault("pending", {})
+            now = time.time()
+            last_sent = float(pending.get(normalized_sender, 0.0) or 0.0)
+            if now - last_sent >= _PAIRING_CHALLENGE_COOLDOWN_SECONDS:
+                pending[normalized_sender] = now
+                store["pending"] = pending
+                self._save_pairing_store_locked(store)
+                should_send = True
+
+        if not should_send:
+            return
+
+        await self._send_api_message(
+            chat_id=chat_id,
+            content=self._build_pairing_challenge_text(sender_id),
+            msg_type=MSG_TYPE_TEXT,
+            reply_to=reply_to,
+        )
+
+    async def _handle_pairing_command(
+        self,
+        *,
+        sender_candidates: list[str],
+        chat_id: str,
+        reply_to: str,
+        text: str,
+    ) -> bool:
+        """Handle local DM pairing approval commands without invoking the agent."""
+        match = _PAIRING_COMMAND_PATTERN.match(text.strip())
+        if match is None:
+            return False
+
+        if not feishu_allowlist_allows(self.allow_from, candidates=sender_candidates):
+            await self._send_api_message(
+                chat_id=chat_id,
+                content=(
+                    "You are not allowed to approve DM pairings. "
+                    "Add your Feishu ID to allow_from first."
+                ),
+                msg_type=MSG_TYPE_TEXT,
+                reply_to=reply_to,
+            )
+            return True
+
+        added, approved_sender = self._approve_pairing_sender(match.group(1))
+        if not approved_sender:
+            content = "Invalid Feishu ID. Usage: /pair allow <sender_id>"
+        elif added:
+            content = f"Approved {approved_sender} for direct-message access."
+        else:
+            content = f"{approved_sender} is already approved for direct-message access."
+
+        await self._send_api_message(
+            chat_id=chat_id,
+            content=content,
+            msg_type=MSG_TYPE_TEXT,
+            reply_to=reply_to,
+        )
+        return True
+
+    def _resolve_access_decision(
+        self,
+        *,
+        sender_id: str,
+        sender_ids: list[str] | None,
+        chat_id: str,
+        chat_type: str,
+        mentions: list[Any] | None,
+    ) -> FeishuAccessDecision:
+        """Resolve the effective access decision for one inbound message."""
+        sender_candidates = list(sender_ids or [])
+        if sender_id and sender_id not in sender_candidates:
+            sender_candidates.insert(0, sender_id)
+        effective_allowed_chats = set(self.allowed_chats)
+        effective_group_allow_from = set(self.group_allow_from)
+        if chat_type != CHAT_TYPE_P2P:
+            dynamic_inviter = self._resolve_dynamic_group_authorizer(chat_id=chat_id)
+            if dynamic_inviter:
+                effective_allowed_chats.add(str(chat_id).strip())
+                effective_group_allow_from.add(str(chat_id).strip())
+
+        decision = resolve_feishu_access(
+            sender_candidates=sender_candidates,
+            chat_id=chat_id,
+            is_direct_message=chat_type == CHAT_TYPE_P2P,
+            mentioned_bot=self._is_bot_mentioned(mentions),
+            allowed_users=self.allowed_users,
+            allowed_chats=effective_allowed_chats,
+            dm_policy=self.dm_policy,
+            allow_from=self.allow_from,
+            pairing_allow_from=self._get_pairing_allow_from(),
+            group_policy=self.group_policy,
+            group_allow_from=effective_group_allow_from,
+            group_sender_allow_from=self.group_sender_allow_from,
+            groups=self.groups,
+            dms=self.dms,
+            require_mention=self.require_mention,
+            group_session_scope=self.group_session_scope,
+        )
+        if not decision.allowed and decision.reason:
+            logger.debug(f"[{self.full_name}] Access denied: {decision.reason}")
+        return decision
+
     def _check_access(
         self,
         sender_id: str,
         chat_id: str,
         chat_type: str,
         mentions: list[Any] | None,
+        sender_ids: list[str] | None = None,
     ) -> bool:
         """Return True if this message should be processed."""
-        if self.allowed_users and sender_id not in self.allowed_users:
-            logger.debug(f"[{self.full_name}] Unauthorized user: {sender_id}")
-            return False
-
-        if self.allowed_chats and chat_id not in self.allowed_chats:
-            logger.debug(f"[{self.full_name}] Chat not in allowlist: {chat_id}")
-            return False
-
-        if self._is_group_chat(chat_type):
-            if self.group_policy == _GROUP_POLICY_DISABLED:
-                logger.debug(f"[{self.full_name}] Group access disabled for chat: {chat_id}")
-                return False
-
-            if (
-                self.group_policy == _GROUP_POLICY_ALLOWLIST
-                and chat_id not in self.group_allow_from
-            ):
-                logger.debug(
-                    f"[{self.full_name}] Group chat not in group_allow_from: {chat_id}"
-                )
-                return False
-
-            if self.group_sender_allow_from and sender_id not in self.group_sender_allow_from:
-                logger.debug(
-                    f"[{self.full_name}] Group sender not in group_sender_allow_from: {sender_id}"
-                )
-                return False
-
-            if self.require_mention and not self._is_bot_mentioned(mentions):
-                logger.debug(f"[{self.full_name}] Bot not mentioned in group message")
-                return False
-            return True
-
-        if self.dm_policy == _DM_POLICY_DISABLED:
-            logger.debug(f"[{self.full_name}] DM access disabled for sender: {sender_id}")
-            return False
-
-        if self.dm_policy == _DM_POLICY_ALLOWLIST and sender_id not in self.allow_from:
-            logger.debug(f"[{self.full_name}] DM sender not in allow_from: {sender_id}")
-            return False
-
-        if chat_type == CHAT_TYPE_GROUP and self.require_mention:
-            if not self._is_bot_mentioned(mentions):
-                logger.debug(f"[{self.full_name}] Bot not mentioned in group message")
-                return False
-
-        return True
+        return self._resolve_access_decision(
+            sender_id=sender_id,
+            sender_ids=sender_ids,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            mentions=mentions,
+        ).allowed
 
     def _is_duplicate_message(self, message_id: str) -> bool:
         """Check if message was already processed. Records it if new.
@@ -1298,6 +1817,60 @@ class FeishuChannel(BaseChannel):
                 f" chat_id={chat_id}"
             )
 
+        def on_group_bot_added(data: Any) -> None:
+            """Authorize a group when an allowlisted admin invites the bot into it."""
+            try:
+                event = getattr(data, "event", None)
+                chat_id = getattr(event, "chat_id", None)
+                operator = getattr(event, "operator_id", None)
+                sender_fields = channel_ref._extract_user_id_fields(operator)
+                sender_candidates = list(sender_fields.values())
+                if not isinstance(chat_id, str) or not chat_id.strip():
+                    logger.debug(f"[{channel_ref.full_name}] Missing chat_id in bot added event")
+                    return
+                if not sender_candidates:
+                    logger.debug(
+                        f"[{channel_ref.full_name}] Missing operator_id in bot added event chat_id={chat_id}"
+                    )
+                    return
+                if not feishu_allowlist_allows(channel_ref.allow_from, candidates=sender_candidates):
+                    logger.debug(
+                        f"[{channel_ref.full_name}] Ignoring bot add event from non-admin"
+                        f" chat_id={chat_id} operator={sender_candidates[0]}"
+                    )
+                    return
+                inviter_id_type = "open_id"
+                inviter_id = sender_fields.get("open_id")
+                if inviter_id is None:
+                    inviter_id_type = "user_id" if "user_id" in sender_fields else "union_id"
+                    inviter_id = sender_fields.get(inviter_id_type, sender_candidates[0])
+                inviter_id = normalize_feishu_allow_entry(inviter_id) or inviter_id
+                changed = channel_ref._authorize_group_via_admin_invite(
+                    chat_id=chat_id,
+                    inviter_id=inviter_id,
+                    inviter_id_type=inviter_id_type,
+                )
+                action = "Authorized" if changed else "Refreshed"
+                logger.info(
+                    f"[{channel_ref.full_name}] {action} group {chat_id} via admin invite {inviter_id}"
+                )
+            except Exception as e:
+                logger.error(f"[{channel_ref.full_name}] Error handling bot added event: {e}")
+
+        def on_group_bot_deleted(data: Any) -> None:
+            """Clean up dynamic authorization when the bot leaves a group."""
+            try:
+                event = getattr(data, "event", None)
+                chat_id = getattr(event, "chat_id", None)
+                if not isinstance(chat_id, str) or not chat_id.strip():
+                    return
+                if channel_ref._revoke_group_authorization(chat_id=chat_id):
+                    logger.info(
+                        f"[{channel_ref.full_name}] Revoked dynamic authorization for group {chat_id}"
+                    )
+            except Exception as e:
+                logger.error(f"[{channel_ref.full_name}] Error handling bot deleted event: {e}")
+
         def on_message_receive(data: Any) -> None:
             """Callback for im.message.receive_v1 events."""
             try:
@@ -1326,11 +1899,40 @@ class FeishuChannel(BaseChannel):
 
                 chat_id: str = message.chat_id
                 chat_type: str = message.chat_type  # "p2p" or "group"
-                sender_id: str = sender.sender_id.open_id
+                sender_ids = [
+                    candidate
+                    for candidate in (
+                        getattr(sender.sender_id, "open_id", None),
+                        getattr(sender.sender_id, "user_id", None),
+                        getattr(sender.sender_id, "union_id", None),
+                    )
+                    if isinstance(candidate, str) and candidate.strip()
+                ]
+                if not sender_ids:
+                    logger.debug(
+                        f"[{channel_ref.full_name}] Missing sender identifiers for {message_id}"
+                    )
+                    return
+                sender_id: str = sender_ids[0]
                 mentions = getattr(message, "mentions", None)
                 thread_id = channel_ref._extract_thread_id(message)
-
-                if not channel_ref._check_access(sender_id, chat_id, chat_type, mentions):
+                decision = channel_ref._resolve_access_decision(
+                    sender_id=sender_id,
+                    sender_ids=sender_ids,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    mentions=mentions,
+                )
+                if not decision.allowed:
+                    if decision.pairing_required:
+                        channel_ref._schedule_background_coroutine(
+                            channel_ref._issue_pairing_challenge(
+                                chat_id=chat_id,
+                                sender_id=sender_id,
+                                reply_to=message_id,
+                            ),
+                            label=f"pairing challenge for {sender_id}",
+                        )
                     return
 
                 # P0-2: Parse content by type
@@ -1366,6 +1968,19 @@ class FeishuChannel(BaseChannel):
                 if not text and not media_paths and not attachments:
                     return
 
+                if chat_type == CHAT_TYPE_P2P and msg_type == MSG_TYPE_TEXT:
+                    if _PAIRING_COMMAND_PATTERN.match(text.strip()):
+                        channel_ref._schedule_background_coroutine(
+                            channel_ref._handle_pairing_command(
+                                sender_candidates=sender_ids,
+                                chat_id=chat_id,
+                                reply_to=message_id,
+                                text=text,
+                            ),
+                            label=f"pairing command from {sender_id}",
+                        )
+                        return
+
                 # Fix #11: Resolve sender name directly (we're already in a thread,
                 # no need to bridge through the async event loop)
                 try:
@@ -1373,16 +1988,40 @@ class FeishuChannel(BaseChannel):
                 except Exception:
                     sender_name = sender_id
 
+                effective_group_scope = (
+                    decision.group_session_scope
+                    if chat_type != CHAT_TYPE_P2P
+                    else "dm"
+                )
                 session_key = channel_ref._build_session_key(
                     chat_id=chat_id,
                     chat_type=chat_type,
                     sender_id=sender_id,
                     thread_id=thread_id,
+                    group_session_scope=decision.group_session_scope,
                 )
                 message_create_time = (
                     getattr(message, "create_time", None)
                     or getattr(message, "message_create_time", None)
                 )
+                group_config = decision.group_config if chat_type != CHAT_TYPE_P2P else {}
+                dm_config = decision.dm_config if chat_type == CHAT_TYPE_P2P else {}
+                runtime_agent_override = None
+                agent_scope_key = None
+                if chat_type == CHAT_TYPE_P2P:
+                    dm_agent_config = dm_config.get("agent_config")
+                    if isinstance(dm_agent_config, dict) and dm_agent_config:
+                        runtime_agent_override = dm_agent_config
+                        agent_scope_key = (
+                            f"dm:{normalize_feishu_allow_entry(sender_id) or sender_id}"
+                        )
+                else:
+                    group_agent_override = group_config.get("agent_config")
+                    if isinstance(group_agent_override, dict) and group_agent_override:
+                        runtime_agent_override = group_agent_override
+                        agent_scope_key = (
+                            f"group:{normalize_feishu_allow_entry(chat_id) or chat_id}"
+                        )
 
                 inbound = InboundMessage(
                     content=text,
@@ -1400,11 +2039,13 @@ class FeishuChannel(BaseChannel):
                         "message_id": message_id,
                         "message_create_time": message_create_time,
                         "msg_type": msg_type,
-                        "session_scope": (
-                            "dm"
-                            if chat_type == CHAT_TYPE_P2P
-                            else channel_ref.group_session_scope
-                        ),
+                        "session_scope": effective_group_scope,
+                        "require_mention": decision.require_mention,
+                        "group_config": group_config,
+                        "dm_config": dm_config,
+                        "reply_in_thread": bool(group_config.get("reply_in_thread", False)),
+                        "agent_scope_key": agent_scope_key,
+                        "runtime_agent_override": runtime_agent_override,
                         "think_level": "off",
                         "verbose": False,
                         "attachments": attachments,
@@ -1431,6 +2072,8 @@ class FeishuChannel(BaseChannel):
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
                 on_p2p_chat_entered
             )
+            .register_p2_im_chat_member_bot_added_v1(on_group_bot_added)
+            .register_p2_im_chat_member_bot_deleted_v1(on_group_bot_deleted)
             .register_p2_im_message_receive_v1(on_message_receive)
             .build()
         )

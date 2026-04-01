@@ -109,6 +109,7 @@ class ChannelManager:
         self._config_path: Path | None = None
         self._channel_agents: dict[str, AgentLoop] = {}
         self._group_agents: dict[str, AgentLoop] = {}
+        self._scoped_agents: dict[str, AgentLoop] = {}
         self._agent_init_lock = asyncio.Lock()
         self._running = False
         self._health_check_task: asyncio.Task | None = None
@@ -192,6 +193,9 @@ class ChannelManager:
             del self._channels[name]
             self._group_agents.pop(name, None)
             self._channel_agents.pop(name, None)
+            scoped_keys = [key for key in self._scoped_agents if key.startswith(f"{name}:")]
+            for key in scoped_keys:
+                self._scoped_agents.pop(key, None)
             logger.info(f"Removed channel: {name}")
             return True
         return False
@@ -401,11 +405,16 @@ class ChannelManager:
     async def _cleanup_isolated_agents(self) -> None:
         """Cleanup dedicated per-channel agents owned by the manager."""
         managed_agents: dict[int, AgentLoop] = {}
-        for agent in list(self._group_agents.values()) + list(self._channel_agents.values()):
+        for agent in (
+            list(self._group_agents.values())
+            + list(self._channel_agents.values())
+            + list(self._scoped_agents.values())
+        ):
             managed_agents[id(agent)] = agent
 
         self._group_agents.clear()
         self._channel_agents.clear()
+        self._scoped_agents.clear()
 
         for agent in managed_agents.values():
             try:
@@ -421,6 +430,76 @@ class ChannelManager:
             if group_agent is not None:
                 return group_agent
         return self._channel_agents.get(message.channel) or self._agent
+
+    @staticmethod
+    def _scoped_agent_cache_key(channel_name: str, scope_key: str) -> str:
+        """Build a stable cache key for scoped runtime agents."""
+        return f"{channel_name}:{scope_key}"
+
+    async def _ensure_scoped_agent_for_message(
+        self,
+        channel: BaseChannel | None,
+        message: InboundMessage,
+    ) -> AgentLoop | None:
+        """Create a dedicated scoped agent for per-group or per-DM overrides."""
+        if channel is None or not self._default_agent:
+            return None
+
+        scope_key = message.metadata.get("agent_scope_key")
+        override = message.metadata.get("runtime_agent_override")
+        if not isinstance(scope_key, str) or not scope_key.strip():
+            return None
+        if not isinstance(override, dict) or not override:
+            return None
+
+        cache_key = self._scoped_agent_cache_key(channel.full_name, scope_key.strip())
+        existing = self._scoped_agents.get(cache_key)
+        if existing is not None:
+            return existing
+
+        async with self._agent_init_lock:
+            existing = self._scoped_agents.get(cache_key)
+            if existing is not None:
+                return existing
+
+            channel_agent_config = self._channel_agent_config(channel)
+            channel_workspace = self._derive_channel_workspace(
+                channel.full_name,
+                channel.config.extra.get("agent_config"),
+            )
+            channel_agent_config["workspace"] = channel_workspace
+
+            is_dm = bool(message.metadata.get("is_dm", False))
+            if is_dm:
+                scoped_agent_config = merge_agent_config(channel_agent_config, override)
+            else:
+                base_group_config = self._group_agent_config(
+                    channel,
+                    channel_agent_config,
+                    channel_workspace,
+                )
+                scoped_agent_config = merge_agent_config(base_group_config, override)
+                scoped_agent_config["workspace"] = channel_workspace
+                self._validate_group_agent_config(channel, scoped_agent_config)
+
+            logger.info(f"Creating scoped agent for {cache_key}")
+            scoped_agent = await self._create_managed_agent(
+                scoped_agent_config,
+                session_key=cache_key,
+            )
+            self._scoped_agents[cache_key] = scoped_agent
+            return scoped_agent
+
+    async def _resolve_agent_for_message(
+        self,
+        channel: BaseChannel | None,
+        message: InboundMessage,
+    ) -> AgentLoop | None:
+        """Resolve the runtime agent for one message, including scoped overrides."""
+        scoped_agent = await self._ensure_scoped_agent_for_message(channel, message)
+        if scoped_agent is not None:
+            return scoped_agent
+        return self._select_agent_for_message(message)
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """
@@ -846,7 +925,8 @@ class ChannelManager:
         Returns:
             Agent's response as OutboundMessage.
         """
-        agent = self._select_agent_for_message(message)
+        channel = self._channels.get(message.channel)
+        agent = await self._resolve_agent_for_message(channel, message)
         if not agent:
             logger.error("No agent set")
             return None
@@ -867,7 +947,6 @@ class ChannelManager:
             )
 
         # Notify channel that processing is starting (typing indicators, etc.)
-        channel = self._channels.get(message.channel)
         if channel:
             try:
                 await channel.on_processing_start(message)

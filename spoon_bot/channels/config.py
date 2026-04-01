@@ -17,6 +17,7 @@ from spoon_bot.agent.tools.registry import (
     TOOL_PROFILES,
 )
 from spoon_bot.channels.base import ChannelConfig, ChannelMode
+from spoon_bot.channels.feishu.policy import normalize_feishu_allowlist
 
 
 class ConfigValidationError(ValueError):
@@ -138,6 +139,53 @@ class ChannelsConfig:
                         f"[{channel_type}] {account_name}.{field}: "
                         f"{value} not set, using env fallback"
                     )
+
+            if channel_type == "feishu":
+                self._validate_feishu_account(account_name, account)
+
+    def _validate_feishu_account(self, account_name: str, account: dict[str, Any]) -> None:
+        """Validate Feishu-specific account fields and security-sensitive defaults."""
+        groups = account.get("groups", {})
+        if groups is not None and not isinstance(groups, dict):
+            raise ConfigValidationError(
+                "feishu",
+                f"{account_name}.groups",
+                f"must be a dict, got {type(groups).__name__}",
+            )
+        for group_id, group_cfg in (groups or {}).items():
+            if group_cfg is not None and not isinstance(group_cfg, dict):
+                raise ConfigValidationError(
+                    "feishu",
+                    f"{account_name}.groups.{group_id}",
+                    f"must be a dict, got {type(group_cfg).__name__}",
+                )
+
+        dms = account.get("dms", {})
+        if dms is not None and not isinstance(dms, dict):
+            raise ConfigValidationError(
+                "feishu",
+                f"{account_name}.dms",
+                f"must be a dict, got {type(dms).__name__}",
+            )
+        for sender_id, dm_cfg in (dms or {}).items():
+            if dm_cfg is not None and not isinstance(dm_cfg, dict):
+                raise ConfigValidationError(
+                    "feishu",
+                    f"{account_name}.dms.{sender_id}",
+                    f"must be a dict, got {type(dm_cfg).__name__}",
+                )
+
+        dm_policy = str(account.get("dm_policy", "pairing") or "").strip().lower()
+        if dm_policy == "open":
+            allow_from = normalize_feishu_allowlist(
+                account.get("allow_from", account.get("allowed_users", []))
+            )
+            if "*" not in allow_from:
+                raise ConfigValidationError(
+                    "feishu",
+                    f"{account_name}.allow_from",
+                    'dm_policy="open" requires allow_from to include "*"',
+                )
 
     def _build_common_config(
         self,
@@ -301,9 +349,14 @@ class ChannelsConfig:
                 if env_uid:
                     allowed_users = [env_uid]
 
-            allow_from = account.get("allow_from", allowed_users)
-            group_allow_from = account.get("group_allow_from", allowed_chats)
-            group_sender_allow_from = account.get("group_sender_allow_from", [])
+            allow_from = _resolve_env_deep(account.get("allow_from", allowed_users))
+            group_allow_from = _resolve_env_deep(account.get("group_allow_from", allowed_chats))
+            group_sender_allow_from = _resolve_env_deep(
+                account.get("group_sender_allow_from", [])
+            )
+            groups = _resolve_env_deep(account.get("groups", {})) or {}
+            dms = _resolve_env_deep(account.get("dms", {})) or {}
+            group_agent_config = _resolve_env_deep(account.get("group_agent_config", {})) or {}
 
             config = ChannelConfig(
                 **common,
@@ -316,18 +369,20 @@ class ChannelsConfig:
                 domain=account.get("domain", "feishu"),
                 allowed_chats=allowed_chats,
                 allowed_users=allowed_users,
-                dm_policy=account.get("dm_policy", "open"),
+                dm_policy=account.get("dm_policy", "pairing"),
                 allow_from=allow_from,
                 group_policy=account.get("group_policy", "allowlist"),
                 group_allow_from=group_allow_from,
                 group_sender_allow_from=group_sender_allow_from,
                 group_session_scope=account.get("group_session_scope", "group_sender"),
-                require_mention=account.get("require_mention", True),
+                require_mention=account.get("require_mention"),
                 typing_indicator=account.get("typing_indicator", True),
                 typing_mode=account.get("typing_mode", "reaction"),
                 typing_emoji=account.get("typing_emoji", "Typing"),
                 render_mode=account.get("render_mode", "auto"),
-                group_agent_config=account.get("group_agent_config", {}),
+                group_agent_config=group_agent_config,
+                groups=groups,
+                dms=dms,
             )
             configs.append((config, name))
 
@@ -844,7 +899,7 @@ def create_default_config(output_path: str | Path) -> None:
                         "domain": "feishu",
                         "app_id": "${FEISHU_APP_ID}",
                         "app_secret": "${FEISHU_APP_SECRET}",
-                        "dm_policy": "open",
+                        "dm_policy": "pairing",
                         "allow_from": [],
                         "group_policy": "allowlist",
                         "group_allow_from": [],
@@ -853,9 +908,10 @@ def create_default_config(output_path: str | Path) -> None:
                         "typing_indicator": True,
                         "typing_mode": "placeholder",
                         "typing_emoji": "Typing",
-                        "require_mention": True,
                         "allowed_chats": [],
                         "allowed_users": [],
+                        "groups": {},
+                        "dms": {},
                         "group_agent_config": {
                             "tool_profile": "group_safe",
                         },

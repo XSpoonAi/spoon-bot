@@ -221,7 +221,7 @@ class TestFeishuChannel:
         )
 
     def test_build_event_handler_registers_chat_access_event(self):
-        """WS event handler should register the p2p chat access event as a no-op."""
+        """WS event handler should register p2p access, bot member, and message events."""
         ch = self._make_channel()
         registered: dict[str, object] = {}
         built_handler = object()
@@ -229,6 +229,14 @@ class TestFeishuChannel:
         class FakeBuilder:
             def register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self, callback):
                 registered["chat_access"] = callback
+                return self
+
+            def register_p2_im_chat_member_bot_added_v1(self, callback):
+                registered["bot_added"] = callback
+                return self
+
+            def register_p2_im_chat_member_bot_deleted_v1(self, callback):
+                registered["bot_deleted"] = callback
                 return self
 
             def register_p2_im_message_receive_v1(self, callback):
@@ -245,11 +253,126 @@ class TestFeishuChannel:
             assert ch._build_event_handler() is built_handler
 
         assert "chat_access" in registered
+        assert "bot_added" in registered
+        assert "bot_deleted" in registered
         assert "message_receive" in registered
 
         ch.publish = AsyncMock()
         registered["chat_access"](SimpleNamespace(event=SimpleNamespace(chat_id="oc_chat")))
         ch.publish.assert_not_called()
+
+    def test_bot_added_event_authorizes_group_for_allowlisted_admin(self):
+        """Allowlisted inviters should dynamically authorize the group when adding the bot."""
+        ch = self._make_channel(allow_from=["ou_admin"])
+        registered: dict[str, object] = {}
+
+        class FakeBuilder:
+            def register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self, callback):
+                return self
+
+            def register_p2_im_chat_member_bot_added_v1(self, callback):
+                registered["bot_added"] = callback
+                return self
+
+            def register_p2_im_chat_member_bot_deleted_v1(self, callback):
+                return self
+
+            def register_p2_im_message_receive_v1(self, callback):
+                return self
+
+            def build(self):
+                return object()
+
+        with patch("spoon_bot.channels.feishu.channel.lark", create=True) as mock_lark, \
+             patch.object(ch, "_authorize_group_via_admin_invite", return_value=True) as mock_authorize:
+            mock_lark.EventDispatcherHandler.builder.return_value = FakeBuilder()
+            mock_lark.LogLevel.DEBUG = "debug"
+            ch._build_event_handler()
+            registered["bot_added"](
+                SimpleNamespace(
+                    event=SimpleNamespace(
+                        chat_id="oc_group",
+                        operator_id=SimpleNamespace(open_id="ou_admin"),
+                    )
+                )
+            )
+
+        mock_authorize.assert_called_once_with(
+            chat_id="oc_group",
+            inviter_id="ou_admin",
+            inviter_id_type="open_id",
+        )
+
+    def test_bot_added_event_ignores_non_admin_inviter(self):
+        """Non-admin inviters should not dynamically authorize the group."""
+        ch = self._make_channel(allow_from=["ou_admin"])
+        registered: dict[str, object] = {}
+
+        class FakeBuilder:
+            def register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self, callback):
+                return self
+
+            def register_p2_im_chat_member_bot_added_v1(self, callback):
+                registered["bot_added"] = callback
+                return self
+
+            def register_p2_im_chat_member_bot_deleted_v1(self, callback):
+                return self
+
+            def register_p2_im_message_receive_v1(self, callback):
+                return self
+
+            def build(self):
+                return object()
+
+        with patch("spoon_bot.channels.feishu.channel.lark", create=True) as mock_lark, \
+             patch.object(ch, "_authorize_group_via_admin_invite", return_value=True) as mock_authorize:
+            mock_lark.EventDispatcherHandler.builder.return_value = FakeBuilder()
+            mock_lark.LogLevel.DEBUG = "debug"
+            ch._build_event_handler()
+            registered["bot_added"](
+                SimpleNamespace(
+                    event=SimpleNamespace(
+                        chat_id="oc_group",
+                        operator_id=SimpleNamespace(open_id="ou_other"),
+                    )
+                )
+            )
+
+        mock_authorize.assert_not_called()
+
+    def test_bot_deleted_event_revokes_dynamic_group_authorization(self):
+        """Removing the bot from a group should revoke any dynamic authorization for that chat."""
+        ch = self._make_channel()
+        registered: dict[str, object] = {}
+
+        class FakeBuilder:
+            def register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self, callback):
+                return self
+
+            def register_p2_im_chat_member_bot_added_v1(self, callback):
+                return self
+
+            def register_p2_im_chat_member_bot_deleted_v1(self, callback):
+                registered["bot_deleted"] = callback
+                return self
+
+            def register_p2_im_message_receive_v1(self, callback):
+                return self
+
+            def build(self):
+                return object()
+
+        with patch("spoon_bot.channels.feishu.channel.lark", create=True) as mock_lark, \
+             patch.object(ch, "_revoke_group_authorization", return_value=True) as mock_revoke:
+            mock_lark.EventDispatcherHandler.builder.return_value = FakeBuilder()
+            mock_lark.LogLevel.DEBUG = "debug"
+            ch._build_event_handler()
+            registered["bot_deleted"](
+                SimpleNamespace(event=SimpleNamespace(chat_id="oc_group"))
+            )
+
+        mock_revoke.assert_called_once_with(chat_id="oc_group")
 
     def test_split_message_short(self):
         """Short messages are returned as a single chunk."""
@@ -327,6 +450,23 @@ class TestFeishuChannel:
         assert ch._check_access("ou_other", "oc_allowed", "group", None) is False
         assert ch._check_access("ou_allowed", "oc_allowed", "group", None) is True
 
+    def test_check_access_group_sender_allowlist_prefers_per_group_override(self):
+        """Per-group sender allowlist should override the global group sender allowlist."""
+        ch = self._make_channel(
+            group_policy="allowlist",
+            group_allow_from=["oc_allowed"],
+            group_sender_allow_from=["ou_global"],
+            groups={
+                "oc_allowed": {
+                    "allow_from": ["ou_group_only"],
+                    "require_mention": False,
+                }
+            },
+        )
+
+        assert ch._check_access("ou_global", "oc_allowed", "group", None) is False
+        assert ch._check_access("ou_group_only", "oc_allowed", "group", None) is True
+
     def test_check_access_group_mention_required(self):
         """Group messages without @mention are rejected when require_mention=True."""
         ch = self._make_channel(require_mention=True)
@@ -348,6 +488,41 @@ class TestFeishuChannel:
         assert ch._check_access("ou_other", "chat1", "p2p", None) is False
         assert ch._check_access("ou_allowed", "chat1", "p2p", None) is True
 
+    def test_check_access_dm_pairing_requires_challenge_for_unknown_sender(self, tmp_path):
+        """pairing mode should deny unknown DM senders and mark the decision for challenge flow."""
+        ch = self._make_channel(dm_policy="pairing", allow_from=["ou_admin"])
+
+        with patch.object(ch, "_pairing_store_path", return_value=tmp_path / "pairing.json"):
+            decision = ch._resolve_access_decision(
+                sender_id="ou_other",
+                sender_ids=["ou_other"],
+                chat_id="chat1",
+                chat_type="p2p",
+                mentions=None,
+            )
+
+        assert decision.allowed is False
+        assert decision.pairing_required is True
+
+    def test_check_access_dm_per_sender_config_can_disable_sender(self):
+        """Per-sender DM config should be able to disable access even when sender is allowlisted."""
+        ch = self._make_channel(
+            dm_policy="allowlist",
+            allow_from=["ou_allowed"],
+            dms={"ou_allowed": {"enabled": False}},
+        )
+
+        decision = ch._resolve_access_decision(
+            sender_id="ou_allowed",
+            sender_ids=["ou_allowed"],
+            chat_id="chat1",
+            chat_type="p2p",
+            mentions=None,
+        )
+
+        assert decision.allowed is False
+        assert decision.reason == "dm disabled by per-sender config"
+
     def test_check_access_dm_disabled(self):
         """DM policy disabled should reject direct messages."""
         ch = self._make_channel(dm_policy="disabled")
@@ -362,6 +537,103 @@ class TestFeishuChannel:
         mention.id.open_id = "ou_bot"
 
         assert ch._check_access("ou_user", "chat1", "group", [mention]) is True
+
+    def test_group_policy_open_defaults_to_no_mention_when_unset(self):
+        """Open groups should default require_mention to False when not explicitly configured."""
+        ch = self._make_channel(group_policy="open", require_mention=None)
+
+        assert ch._check_access("ou_user", "oc_group", "group", []) is True
+
+    def test_group_policy_allowlist_defaults_to_require_mention_when_unset(self):
+        """Non-open groups should default require_mention to True when unset."""
+        ch = self._make_channel(
+            group_policy="allowlist",
+            group_allow_from=["oc_group"],
+            require_mention=None,
+        )
+        ch._bot_open_id = "ou_bot"
+
+        assert ch._check_access("ou_user", "oc_group", "group", []) is False
+
+    def test_group_config_can_override_session_scope(self):
+        """Per-group session scope should override the account-level default."""
+        ch = self._make_channel(
+            group_policy="allowlist",
+            group_allow_from=["oc_group"],
+            group_session_scope="group",
+            groups={
+                "oc_group": {
+                    "group_session_scope": "group_topic_sender",
+                    "require_mention": False,
+                }
+            },
+        )
+
+        decision = ch._resolve_access_decision(
+            sender_id="ou_user",
+            sender_ids=["ou_user"],
+            chat_id="oc_group",
+            chat_type="group",
+            mentions=None,
+        )
+        session_key = ch._build_session_key(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_id="ou_user",
+            thread_id="omt_root",
+            group_session_scope=decision.group_session_scope,
+        )
+
+        assert decision.allowed is True
+        assert decision.group_session_scope == "group_topic_sender"
+        assert session_key.endswith("oc_group:topic:omt_root:sender:ou_user")
+
+    def test_dynamic_group_authorization_allows_group_not_in_static_allowlist(self, tmp_path):
+        """Admin-invited groups should be allowed even when absent from group_allow_from."""
+        ch = self._make_channel(
+            allow_from=["ou_admin"],
+            group_policy="allowlist",
+            group_allow_from=[],
+            require_mention=False,
+        )
+
+        with patch.object(ch, "_group_authorization_store_path", return_value=tmp_path / "groups.json"), \
+             patch.object(ch, "_is_user_still_in_chat_sync", return_value=True):
+            assert ch._authorize_group_via_admin_invite(chat_id="oc_team", inviter_id="ou_admin") is True
+            decision = ch._resolve_access_decision(
+                sender_id="ou_member",
+                sender_ids=["ou_member"],
+                chat_id="oc_team",
+                chat_type="group",
+                mentions=None,
+            )
+
+        assert decision.allowed is True
+
+    def test_dynamic_group_authorization_revokes_when_inviter_left_group(self, tmp_path):
+        """Dynamic group authorization should be revoked when the inviter no longer belongs to the chat."""
+        ch = self._make_channel(
+            allow_from=["ou_admin"],
+            group_policy="allowlist",
+            group_allow_from=[],
+            require_mention=False,
+        )
+        store_path = tmp_path / "groups.json"
+
+        with patch.object(ch, "_group_authorization_store_path", return_value=store_path), \
+             patch.object(ch, "_is_user_still_in_chat_sync", return_value=False):
+            assert ch._authorize_group_via_admin_invite(chat_id="oc_team", inviter_id="ou_admin") is True
+            ch._group_auth_membership_cache.clear()
+            decision = ch._resolve_access_decision(
+                sender_id="ou_member",
+                sender_ids=["ou_member"],
+                chat_id="oc_team",
+                chat_type="group",
+                mentions=None,
+            )
+
+        assert decision.allowed is False
+        assert ch._get_group_authorization_record(chat_id="oc_team") is None
 
     def test_is_bot_mentioned_no_open_id_yet(self):
         """When bot_open_id is unknown, _is_bot_mentioned returns True (accept all)."""
@@ -537,6 +809,49 @@ class TestFeishuChannel:
 
         mock_remove.assert_awaited_once_with("msg-1", "reaction-1")
         assert "msg-1" not in ch._typing_reactions
+
+    @pytest.mark.asyncio
+    async def test_handle_pairing_command_updates_allow_store(self, tmp_path):
+        """Approved admins should be able to persist a DM pairing approval via local command."""
+        ch = self._make_channel(dm_policy="pairing", allow_from=["ou_admin"])
+        store_path = tmp_path / "pairing.json"
+
+        with patch.object(ch, "_pairing_store_path", return_value=store_path), \
+             patch.object(ch, "_send_api_message", AsyncMock(return_value="mid")) as mock_send:
+            handled = await ch._handle_pairing_command(
+                sender_candidates=["ou_admin"],
+                chat_id="chat1",
+                reply_to="msg-1",
+                text="/pair allow ou_new_user",
+            )
+            pairing_allow_from = ch._get_pairing_allow_from()
+
+        assert handled is True
+        assert pairing_allow_from == ("ou_new_user",)
+        mock_send.assert_awaited_once()
+
+    def test_pairing_challenge_text_explains_user_id_and_admin_action(self):
+        """Unauthorized DM users should see a user-facing explanation of their Feishu ID."""
+        ch = self._make_channel(dm_policy="pairing", allow_from=["ou_admin"])
+
+        text = ch._build_pairing_challenge_text("ou_new_user")
+
+        assert "你当前还没有权限私聊使用这个机器人。" in text
+        assert "你的飞书用户 ID：" in text
+        assert "这串 ID 是你在飞书里的唯一身份标识" in text
+        assert "请把这串 ID 发给机器人管理员" in text
+        assert "/pair allow ou_new_user" in text
+
+    def test_pairing_challenge_text_without_admins_points_to_maintainer(self):
+        """When no pairing admins are configured, the message should direct users to the maintainer."""
+        ch = self._make_channel(dm_policy="pairing", allow_from=[])
+
+        text = ch._build_pairing_challenge_text("ou_new_user")
+
+        assert "你当前还没有权限私聊使用这个机器人。" in text
+        assert "你的飞书用户 ID：" in text
+        assert "当前机器人还没有配置审批管理员" in text
+        assert "请把这串 ID 发给机器人维护者处理。" in text
 
     @pytest.mark.asyncio
     async def test_on_processing_start_placeholder_mode_creates_placeholder_and_task(self):
@@ -806,17 +1121,19 @@ class TestFeishuConfig:
         assert "oc_abc123" in config.extra["group_allow_from"]
 
     def test_dm_and_group_policies_default_to_safe_values(self, tmp_path):
-        """Feishu config should default DMs open but groups allowlisted and isolated by sender."""
+        """Feishu config should default DMs to pairing and groups to allowlisted sender isolation."""
         from spoon_bot.channels.config import load_channels_config
         path = self._make_yaml({}, tmp_path)
         cfg = load_channels_config(path)
         config, _ = cfg.get_feishu_configs()[0]
-        assert config.extra["dm_policy"] == "open"
+        assert config.extra["dm_policy"] == "pairing"
         assert config.extra["allow_from"] == []
         assert config.extra["group_policy"] == "allowlist"
         assert config.extra["group_allow_from"] == []
         assert config.extra["group_sender_allow_from"] == []
         assert config.extra["group_session_scope"] == "group_sender"
+        assert config.extra["groups"] == {}
+        assert config.extra["dms"] == {}
         assert config.extra["group_agent_config"] == {}
 
     def test_group_access_settings_pass_through(self, tmp_path):
@@ -844,13 +1161,66 @@ class TestFeishuConfig:
         assert config.extra["group_session_scope"] == "group"
         assert config.extra["group_agent_config"] == {"tool_profile": "group_safe"}
 
-    def test_require_mention_default_true(self, tmp_path):
-        """require_mention defaults to True."""
+    def test_allow_from_supports_env_var_admin_open_id(self, tmp_path, monkeypatch):
+        """allow_from entries should resolve ${VAR} placeholders for local admin config."""
+        from spoon_bot.channels.config import load_channels_config
+
+        monkeypatch.setenv("FEISHU_ADMIN_OPEN_ID", "ou_admin")
+        path = self._make_yaml({"allow_from": ["${FEISHU_ADMIN_OPEN_ID}"]}, tmp_path)
+
+        cfg = load_channels_config(path)
+        config, _ = cfg.get_feishu_configs()[0]
+
+        assert config.extra["allow_from"] == ["ou_admin"]
+
+    def test_groups_and_dms_pass_through(self, tmp_path):
+        """Per-group and per-DM override blocks should be preserved in ChannelConfig.extra."""
+        from spoon_bot.channels.config import load_channels_config
+        path = self._make_yaml(
+            {
+                "groups": {
+                    "oc_team": {
+                        "allow_from": ["ou_owner"],
+                        "require_mention": False,
+                        "group_session_scope": "group_topic",
+                        "agent_config": {"tool_profile": "group_safe"},
+                    }
+                },
+                "dms": {
+                    "ou_owner": {
+                        "enabled": True,
+                        "agent_config": {"tool_profile": "coding"},
+                    }
+                },
+            },
+            tmp_path,
+        )
+        cfg = load_channels_config(path)
+        config, _ = cfg.get_feishu_configs()[0]
+        assert config.extra["groups"]["oc_team"]["allow_from"] == ["ou_owner"]
+        assert config.extra["groups"]["oc_team"]["agent_config"] == {
+            "tool_profile": "group_safe"
+        }
+        assert config.extra["dms"]["ou_owner"]["agent_config"] == {
+            "tool_profile": "coding"
+        }
+
+    def test_open_dm_policy_requires_wildcard_allow_from(self, tmp_path):
+        """dm_policy=open should require an explicit wildcard allow_from entry."""
+        from spoon_bot.channels.config import ConfigValidationError, load_channels_config
+
+        path = self._make_yaml({"dm_policy": "open", "allow_from": []}, tmp_path)
+
+        with pytest.raises(ConfigValidationError, match='dm_policy="open"'):
+            load_channels_config(path)
+
+    def test_require_mention_defaults_to_none_for_policy_resolution(self, tmp_path):
+        """require_mention should stay unset so group policy can derive the default."""
         from spoon_bot.channels.config import load_channels_config
         path = self._make_yaml({}, tmp_path)
         cfg = load_channels_config(path)
         config, _ = cfg.get_feishu_configs()[0]
-        assert config.extra["require_mention"] is True
+        assert config.extra["require_mention"] is None
 
     def test_require_mention_can_be_disabled(self, tmp_path):
         """require_mention can be set to False."""
