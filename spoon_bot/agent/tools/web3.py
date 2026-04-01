@@ -7,6 +7,29 @@ import os
 from typing import Any
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.wallet import DEFAULT_WALLET_NETWORK
+
+
+SUPPORTED_WEB3_CHAINS = frozenset({
+    "ethereum", "polygon", "arbitrum", "optimism", "base",
+    "bsc", "avalanche", "fantom", "sepolia", "goerli",
+    "neox", "neox_testnet",
+})
+
+NETWORK_SYMBOLS = {
+    "ethereum": "ETH",
+    "sepolia": "ETH",
+    "goerli": "ETH",
+    "polygon": "MATIC",
+    "arbitrum": "ETH",
+    "optimism": "ETH",
+    "base": "ETH",
+    "bsc": "BNB",
+    "avalanche": "AVAX",
+    "fantom": "FTM",
+    "neox": "GAS",
+    "neox_testnet": "GAS",
+}
 
 
 class BalanceCheckTool(Tool):
@@ -18,10 +41,7 @@ class BalanceCheckTool(Tool):
     """
 
     # Supported chains and their default RPC endpoints (env var overrides)
-    SUPPORTED_CHAINS = frozenset({
-        "ethereum", "polygon", "arbitrum", "optimism", "base",
-        "bsc", "avalanche", "fantom", "sepolia", "goerli"
-    })
+    SUPPORTED_CHAINS = SUPPORTED_WEB3_CHAINS
 
     def __init__(self, default_rpc_url: str | None = None):
         """
@@ -40,7 +60,7 @@ class BalanceCheckTool(Tool):
     def description(self) -> str:
         return (
             "Check wallet balance for native tokens and ERC20 tokens. "
-            "Supports multiple chains: ethereum, polygon, arbitrum, optimism, base, bsc, avalanche."
+            "Defaults to Neo X mainnet and also supports Neo X testnet plus common EVM networks."
         )
 
     @property
@@ -84,7 +104,7 @@ class BalanceCheckTool(Tool):
     async def execute(
         self,
         address: str | None = None,
-        chain: str = "ethereum",
+        chain: str = DEFAULT_WALLET_NETWORK,
         tokens: list[str] | None = None,
         **kwargs: Any,
     ) -> str:
@@ -135,19 +155,7 @@ class BalanceCheckTool(Tool):
             )
 
         def _native_symbol(chain_name: str) -> str:
-            symbols = {
-                "ethereum": "ETH",
-                "sepolia": "ETH",
-                "goerli": "ETH",
-                "polygon": "MATIC",
-                "arbitrum": "ETH",
-                "optimism": "ETH",
-                "base": "ETH",
-                "bsc": "BNB",
-                "avalanche": "AVAX",
-                "fantom": "FTM",
-            }
-            return symbols.get(chain_name, "NATIVE")
+            return NETWORK_SYMBOLS.get(chain_name, "NATIVE")
 
         def _fetch_balances() -> dict[str, Any]:
             web3 = Web3(Web3.HTTPProvider(rpc_url))
@@ -237,10 +245,7 @@ class TransferTool(Tool):
     This tool handles real value and transactions are irreversible.
     """
 
-    SUPPORTED_CHAINS = frozenset({
-        "ethereum", "polygon", "arbitrum", "optimism", "base",
-        "bsc", "avalanche", "fantom", "sepolia", "goerli"
-    })
+    SUPPORTED_CHAINS = SUPPORTED_WEB3_CHAINS
 
     def __init__(self, require_confirmation: bool = True):
         """
@@ -310,7 +315,7 @@ class TransferTool(Tool):
         to_address: str,
         amount: str,
         token: str = "native",
-        chain: str = "ethereum",
+        chain: str = DEFAULT_WALLET_NETWORK,
         confirm: bool = False,
         **kwargs: Any,
     ) -> str:
@@ -346,7 +351,7 @@ class TransferTool(Tool):
 
         # Validate address format (basic check)
         if not to_address.startswith("0x") or len(to_address) != 42:
-            return f"Error: Invalid address format. Expected 0x followed by 40 hex characters."
+            return "Error: Invalid address format. Expected 0x followed by 40 hex characters."
 
         # Check amount is valid number
         try:
@@ -397,7 +402,7 @@ class SwapTool(Tool):
 
     SUPPORTED_CHAINS = frozenset({
         "ethereum", "polygon", "arbitrum", "optimism", "base",
-        "bsc", "avalanche"
+        "bsc", "avalanche", "neox", "neox_testnet",
     })
 
     # Common DEX routers by chain (would be used in real implementation)
@@ -409,6 +414,8 @@ class SwapTool(Tool):
         "base": "Aerodrome / Uniswap V3",
         "bsc": "PancakeSwap",
         "avalanche": "TraderJoe / Pangolin",
+        "neox": "Neo X DEX / custom router",
+        "neox_testnet": "Neo X testnet DEX / custom router",
     }
 
     def __init__(self, require_confirmation: bool = True, max_slippage: float = 5.0):
@@ -485,7 +492,7 @@ class SwapTool(Tool):
         from_token: str,
         to_token: str,
         amount: str,
-        chain: str = "ethereum",
+        chain: str = DEFAULT_WALLET_NETWORK,
         slippage: float = 0.5,
         confirm: bool = False,
         **kwargs: Any,
@@ -588,10 +595,7 @@ class ContractCallTool(Tool):
     SAFETY: Write operations require explicit confirmation.
     """
 
-    SUPPORTED_CHAINS = frozenset({
-        "ethereum", "polygon", "arbitrum", "optimism", "base",
-        "bsc", "avalanche", "fantom", "sepolia", "goerli"
-    })
+    SUPPORTED_CHAINS = SUPPORTED_WEB3_CHAINS
 
     def __init__(self, require_confirmation: bool = True):
         """
@@ -674,7 +678,7 @@ class ContractCallTool(Tool):
         contract_address: str,
         method: str,
         args: list[Any] | None = None,
-        chain: str = "ethereum",
+        chain: str = DEFAULT_WALLET_NETWORK,
         value: str | None = None,
         is_write: bool = False,
         abi: str | None = None,

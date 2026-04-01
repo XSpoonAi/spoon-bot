@@ -8,6 +8,7 @@ import re
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -586,7 +587,19 @@ class ShellTool(Tool):
         cwd: str,
     ) -> tuple[bytes, bytes, int]:
         """Synchronous subprocess execution (called via run_in_executor)."""
+        env = os.environ.copy()
+        userprofile = env.get("USERPROFILE", "").strip()
+        if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
+            env["HOME"] = userprofile.replace("\\", "/")
         if sys.platform == "win32":
+            # Keep HOME aligned with the real Windows user profile so tools that
+            # resolve "~" (e.g. wallet loaders) do not drift to "/root".
+            home_path = str(Path.home())
+            env["USERPROFILE"] = home_path
+            env["HOME"] = home_path.replace("\\", "/")
+            if len(home_path) >= 2 and home_path[1] == ":":
+                env["HOMEDRIVE"] = home_path[:2]
+                env["HOMEPATH"] = home_path[2:] or "\\"
             bash = self._find_bash()
             if bash:
                 cwd = cwd.replace("\\", "/")
@@ -594,10 +607,11 @@ class ShellTool(Tool):
                 # Git Bash receives valid POSIX paths (C:\foo -> /c/foo).
                 command = self._convert_win_paths_to_posix(command)
                 result = subprocess.run(
-                    [bash, "--login", "-c", command],
+                    [bash, "-c", command],
                     capture_output=True,
                     stdin=subprocess.DEVNULL,
                     cwd=cwd,
+                    env=env,
                     timeout=self.timeout,
                 )
             else:
@@ -607,6 +621,7 @@ class ShellTool(Tool):
                     stdin=subprocess.DEVNULL,
                     shell=True,
                     cwd=cwd,
+                    env=env,
                     timeout=self.timeout,
                 )
         elif self.use_shell:
@@ -617,6 +632,7 @@ class ShellTool(Tool):
                 shell=True,
                 executable="/bin/sh",
                 cwd=cwd,
+                env=env,
                 timeout=self.timeout,
             )
         else:
@@ -628,6 +644,7 @@ class ShellTool(Tool):
                 capture_output=True,
                 stdin=subprocess.DEVNULL,
                 cwd=cwd,
+                env=env,
                 timeout=self.timeout,
             )
         return result.stdout, result.stderr, result.returncode

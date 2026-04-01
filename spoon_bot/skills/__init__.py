@@ -27,3 +27,10 @@ except ImportError:
         "spoon-bot requires spoon-core SDK for skill functionality. "
         "Install with: pip install spoon-ai"
     )
+
+from spoon_bot.skills.builtin import builtin_skills_root, ensure_builtin_skills
+
+__all__ += [
+    "builtin_skills_root",
+    "ensure_builtin_skills",
+]
