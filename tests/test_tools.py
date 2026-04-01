@@ -114,7 +114,14 @@ class TestShellTool:
         assert captured["args"][0][1] == "-c"
         env = captured["kwargs"]["env"]
         assert env["USERPROFILE"] == str(Path.home())
-        assert env["HOME"] == str(Path.home()).replace("\\", "/")
+        assert env["HOME"] == tool._windows_home_to_bash(str(Path.home()))
+
+    def test_windows_home_to_bash_path(self):
+        """Windows home paths should be converted to Git Bash POSIX form."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        assert ShellTool._windows_home_to_bash(r"C:\Users\Ricky") == "/c/Users/Ricky"
+        assert ShellTool._windows_home_to_bash("/already/posix") == "/already/posix"
 
 
 class TestCommandValidator:

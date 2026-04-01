@@ -547,16 +547,27 @@ class ShellTool(Tool):
         """Find a usable bash executable on the system."""
         import shutil
 
+        candidates = (
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        )
+        if sys.platform != "win32":
+            bash = shutil.which("bash")
+            if bash:
+                return bash
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
         bash = shutil.which("bash")
         if bash:
             return bash
-        for candidate in (
-            r"C:\Program Files\Git\bin\bash.exe",
-            r"C:\Program Files\Git\usr\bin\bash.exe",
-            r"C:\Windows\System32\bash.exe",
-        ):
-            if os.path.isfile(candidate):
-                return candidate
+        if sys.platform == "win32":
+            for candidate in (
+                r"C:\Windows\System32\bash.exe",
+                r"C:\Users\Ricky\AppData\Local\Microsoft\WindowsApps\bash.exe",
+            ):
+                if os.path.isfile(candidate):
+                    return candidate
         return None
 
     @staticmethod
@@ -581,6 +592,16 @@ class ShellTool(Tool):
         # consume tokens that belong to the next shell argument.
         return re.sub(r'([A-Za-z]):\\([^\s"\']*)', _replace, command)
 
+    @staticmethod
+    def _windows_home_to_bash(home_path: str) -> str:
+        """Convert a Windows home path into the POSIX form expected by Git Bash."""
+        normalized = home_path.replace("\\", "/")
+        match = re.match(r"^([A-Za-z]):/(.*)$", normalized)
+        if not match:
+            return normalized
+        drive, rest = match.groups()
+        return f"/{drive.lower()}/{rest}" if rest else f"/{drive.lower()}"
+
     def _run_sync(
         self,
         command: str,
@@ -596,12 +617,12 @@ class ShellTool(Tool):
             # resolve "~" (e.g. wallet loaders) do not drift to "/root".
             home_path = str(Path.home())
             env["USERPROFILE"] = home_path
-            env["HOME"] = home_path.replace("\\", "/")
             if len(home_path) >= 2 and home_path[1] == ":":
                 env["HOMEDRIVE"] = home_path[:2]
                 env["HOMEPATH"] = home_path[2:] or "\\"
             bash = self._find_bash()
             if bash:
+                env["HOME"] = self._windows_home_to_bash(home_path)
                 cwd = cwd.replace("\\", "/")
                 # Convert any Windows-style paths inside the command so that
                 # Git Bash receives valid POSIX paths (C:\foo -> /c/foo).
@@ -615,6 +636,7 @@ class ShellTool(Tool):
                     timeout=self.timeout,
                 )
             else:
+                env["HOME"] = home_path.replace("\\", "/")
                 result = subprocess.run(
                     command,
                     capture_output=True,
