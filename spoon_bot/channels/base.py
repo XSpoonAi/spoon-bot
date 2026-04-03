@@ -301,21 +301,6 @@ class BaseChannel(ABC):
             self._status = ChannelStatus.ERROR
             self._error = e
 
-    async def on_processing_start(self, message: "InboundMessage") -> None:
-        """Called by ChannelManager when message processing actually begins.
-
-        Override in subclasses to show typing indicators, status updates, etc.
-        This is intentionally separate from message receipt — it fires only
-        after the bus semaphore is acquired, so the agent is truly working.
-        """
-
-    async def on_processing_end(self, message: "InboundMessage") -> None:
-        """Called by ChannelManager when message processing ends (success or error).
-
-        Override in subclasses to stop typing indicators, clean up state, etc.
-        Always called via ``finally``, guaranteed to run even on exceptions.
-        """
-
     def _update_heartbeat(self) -> None:
         """Update last heartbeat timestamp."""
         self._last_heartbeat = datetime.now()
@@ -334,6 +319,21 @@ class BaseChannel(ABC):
             logger.error(f"[{self.full_name}] Status changed to {status.value}: {error}")
         else:
             logger.info(f"[{self.full_name}] Status changed to {status.value}")
+
+    async def on_processing_start(self, message: "InboundMessage") -> None:
+        """Called by ChannelManager when message processing actually begins.
+
+        Override in subclasses to show typing indicators, status updates, etc.
+        This is intentionally separate from message receipt -- it fires only
+        after the bus semaphore is acquired, so the agent is truly working.
+        """
+
+    async def on_processing_end(self, message: "InboundMessage") -> None:
+        """Called by ChannelManager when message processing ends (success or error).
+
+        Override in subclasses to stop typing indicators, clean up state, etc.
+        Always called via ``finally``, guaranteed to run even on exceptions.
+        """
 
     @property
     def is_attached(self) -> bool:
