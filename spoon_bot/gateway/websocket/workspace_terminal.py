@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import posixpath
 import signal
+import shlex
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -48,7 +50,10 @@ class WorkspaceTerminalService:
         emit_closed: TermClosedCallback,
         sandbox_id: str = "runtime",
     ) -> None:
-        self._workspace_root = workspace_root.resolve()
+        # Keep the configured sandbox root as a logical path (for example
+        # "/workspace") instead of resolving symlinks to provider-specific
+        # mount paths like "/__modal/volumes/...".
+        self._workspace_root = workspace_root.absolute()
         self._emit_stdout = emit_stdout
         self._emit_closed = emit_closed
         self._sandbox_id = sandbox_id.strip() or "runtime"
@@ -178,18 +183,20 @@ class WorkspaceTerminalService:
     ) -> TerminalSession:
         validated_cols = self._validate_dimension(cols, "cols")
         validated_rows = self._validate_dimension(rows, "rows")
+        spawn_env = dict(env)
+        spawn_env["PWD"] = str(cwd)
 
         if os.name == "posix":
             master_fd, slave_fd = os.openpty()
             _set_pty_winsize(master_fd, validated_rows, validated_cols)
             try:
                 process = subprocess.Popen(
-                    _shell_argv(shell),
+                    _shell_argv(shell, cwd),
                     stdin=slave_fd,
                     stdout=slave_fd,
                     stderr=slave_fd,
                     cwd=str(cwd),
-                    env=env,
+                    env=spawn_env,
                     start_new_session=True,
                 )
             finally:
@@ -207,12 +214,12 @@ class WorkspaceTerminalService:
             )
 
         process = subprocess.Popen(
-            _shell_argv(shell),
+            _shell_argv(shell, cwd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(cwd),
-            env=env,
+            env=spawn_env,
         )
         return TerminalSession(
             term_id=term_id,
@@ -309,21 +316,23 @@ class WorkspaceTerminalService:
 
     def _resolve_workspace_path(self, requested_path: str) -> Path:
         raw_path = str(requested_path or "").strip()
+        workspace_root_str = self._workspace_root.as_posix().rstrip("/") or "/"
         if raw_path == "" or raw_path == SANDBOX_WORKSPACE_ROOT:
             target = self._workspace_root
         elif raw_path.startswith("/"):
-            normalized = Path(raw_path).as_posix()
+            normalized = posixpath.normpath(raw_path)
             sandbox_root = SANDBOX_WORKSPACE_ROOT.rstrip("/")
             if normalized != sandbox_root and not normalized.startswith(sandbox_root + "/"):
-                workspace_root_str = self._workspace_root.as_posix().rstrip("/")
                 if normalized != workspace_root_str and not normalized.startswith(workspace_root_str + "/"):
                     raise ValueError("Path is outside workspace boundary")
                 relative = normalized[len(workspace_root_str):].lstrip("/")
             else:
                 relative = normalized[len(sandbox_root):].lstrip("/")
-            target = (self._workspace_root / relative).resolve(strict=False)
+            target = Path(
+                workspace_root_str if not relative else posixpath.join(workspace_root_str, relative)
+            )
         else:
-            target = (self._workspace_root / raw_path).resolve(strict=False)
+            target = Path(posixpath.normpath(posixpath.join(workspace_root_str, raw_path)))
 
         try:
             target.relative_to(self._workspace_root)
@@ -371,8 +380,17 @@ class WorkspaceTerminalService:
             process.wait(timeout=2)
 
 
-def _shell_argv(shell: str) -> list[str]:
-    return [shell.strip()]
+def _shell_argv(shell: str, cwd: Path | None = None) -> list[str]:
+    normalized_shell = shell.strip()
+    if os.name == "posix" and cwd is not None:
+        quoted_cwd = shlex.quote(str(cwd))
+        quoted_shell = shlex.quote(normalized_shell)
+        return [
+            "/bin/sh",
+            "-lc",
+            f"cd {quoted_cwd} && export PWD={quoted_cwd} && exec {quoted_shell} -i",
+        ]
+    return [normalized_shell]
 
 
 def _set_pty_winsize(fd: int, rows: int, cols: int) -> None:
