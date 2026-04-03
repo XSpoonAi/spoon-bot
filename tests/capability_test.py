@@ -109,7 +109,7 @@ async def test_basic_instruction(results: list[TestResult]):
     t = TestResult("1. Basic instruction following")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             text, resp, _ = await chat(ws, "What is 2 + 3? Reply with just the number.")
@@ -138,7 +138,7 @@ async def test_structured_output(results: list[TestResult]):
     t = TestResult("2. Structured output (JSON)")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             text, resp, _ = await chat(
@@ -186,7 +186,7 @@ async def test_reasoning(results: list[TestResult]):
     t = TestResult("3. Reasoning / logic problem")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             text, resp, _ = await chat(
@@ -228,7 +228,7 @@ async def test_streaming_quality(results: list[TestResult]):
     t = TestResult("4. Streaming response quality + chunk count")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             full_text, resp, events = await stream_chat(
@@ -286,7 +286,7 @@ async def test_multi_turn(results: list[TestResult]):
     t = TestResult("5. Multi-turn conversation context")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             # First message: establish context
@@ -333,7 +333,7 @@ async def test_code_generation(results: list[TestResult]):
     t = TestResult("6. Code generation")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             text, resp, _ = await chat(
@@ -377,7 +377,7 @@ async def test_translation(results: list[TestResult]):
     t = TestResult("7. Language / translation")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             text, resp, _ = await chat(
@@ -425,7 +425,7 @@ async def test_summarization(results: list[TestResult]):
     t = TestResult("8. Text summarization")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             long_text = (
@@ -478,7 +478,7 @@ async def test_math(results: list[TestResult]):
     t = TestResult("9. Math / computation")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             text, resp, _ = await chat(
@@ -513,7 +513,7 @@ async def test_streaming_long(results: list[TestResult]):
     t = TestResult("10. Streaming long response")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             start = time.time()
@@ -614,7 +614,7 @@ async def test_empty_message(results: list[TestResult]):
     t = TestResult("12. Error handling — empty message")
     results.append(t)
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=10)
 
             req = make_request("agent.chat", {"message": "", "stream": False})
@@ -725,3 +725,4 @@ async def main():
 if __name__ == "__main__":
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
+

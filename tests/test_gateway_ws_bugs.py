@@ -1299,6 +1299,45 @@ class TestWSStreamingContent:
             assert len(done_events) >= 1
             assert done_events[0]["data"]["content"] == "fallback done content"
 
+    def test_stream_complete_event_keeps_full_response(self, client):
+        """agent.complete should carry the full response body, not a preview slice."""
+        agent = app_module._agent
+        assert agent is not None
+
+        full_text = "A" * 260
+
+        async def _stream_with_full_done(**kwargs):
+            yield {"type": "done", "delta": "", "metadata": {"content": full_text}}
+
+        agent.stream = _stream_with_full_done
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_complete_full_response",
+                "method": "chat.send",
+                "params": {
+                    "message": "hello stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            complete_events = [
+                e for e in events
+                if e.get("type") == "event" and e.get("event") == "agent.complete"
+            ]
+            assert len(complete_events) == 1
+            assert complete_events[0]["data"]["response"] == full_text
+
 
 # ===================================================================
 # Handler error masking (part of #14)

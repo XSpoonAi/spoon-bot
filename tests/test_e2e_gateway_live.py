@@ -179,7 +179,7 @@ async def _ws_test_basic_ops():
     """WS basic operations: connect, ping, status."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         # connection.established
         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
         if msg.get("event") == "connection.established":
@@ -210,7 +210,7 @@ async def _ws_test_params_validation():
     """#14: WS params validation — non-dict params returns INVALID_MESSAGE."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()  # connection.established
 
         await ws.send(json.dumps({
@@ -232,7 +232,7 @@ async def _ws_test_session_switch_validation():
     """#15: session.switch rejects non-string session_key."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()  # connection.established
 
         # Object session_key — should be rejected
@@ -262,7 +262,7 @@ async def _ws_test_subscribe_validation():
     """#16: subscribe rejects non-list events."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()
 
         # String events — should be rejected
@@ -292,7 +292,7 @@ async def _ws_test_session_import():
     """#12: session.import persists messages."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()
 
         await ws.send(json.dumps({
@@ -320,7 +320,7 @@ async def _ws_test_chat_non_stream():
     """#10/#11: WS non-stream chat with session binding."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()
 
         await ws.send(json.dumps({
@@ -360,7 +360,7 @@ async def _ws_test_chat_stream():
     """WS stream chat must emit chunks and done before final response."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()
 
         await ws.send(json.dumps({
@@ -432,7 +432,7 @@ async def _ws_test_cancel():
     """#13: WS cancel reports task_interrupted."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()
 
         await ws.send(json.dumps({
@@ -453,7 +453,7 @@ async def _ws_test_shell_format_safe():
     """#6: ShellTool does not block 'format' in URL params."""
     import websockets
 
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
         await ws.recv()
 
         # This tests the shell tool's security validator directly via agent
@@ -549,3 +549,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

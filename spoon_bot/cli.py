@@ -16,6 +16,7 @@ from typing import Any, Optional
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -287,6 +288,10 @@ def _truncate(text: str, max_len: int = 200) -> str:
     return first_line
 
 
+def _escape_and_indent(text: str, indent: str = "      ") -> str:
+    return _escape_markup(text).replace("\n", f"\n{indent}")
+
+
 def _format_tool_args(tool_name: str, raw_args: str) -> str:
     """Extract a human-readable summary from raw JSON tool args."""
     import json as _json
@@ -296,34 +301,48 @@ def _format_tool_args(tool_name: str, raw_args: str) -> str:
     try:
         obj = _json.loads(raw_args)
     except (ValueError, TypeError):
-        return f"[dim]{_truncate(raw_args, 100)}[/dim]"
+        if tool_name == "shell":
+            return f"\n      [dim]{_escape_and_indent(raw_args)}[/dim]"
+        return f"[dim]{_escape_and_indent(_truncate(raw_args, 100))}[/dim]"
 
     if not isinstance(obj, dict):
-        return f"[dim]{_truncate(raw_args, 100)}[/dim]"
+        if tool_name == "shell":
+            return f"\n      [dim]{_escape_and_indent(str(obj))}[/dim]"
+        return f"[dim]{_escape_and_indent(_truncate(raw_args, 100))}[/dim]"
 
     if tool_name == "shell":
         cmd = obj.get("command", "")
-        return f"\n      [dim]$ {cmd}[/dim]" if cmd else ""
+        lines = []
+        if cmd:
+            lines.append(f"$ {cmd}")
+        for key, value in obj.items():
+            if key == "command":
+                continue
+            lines.append(f"{key}: {value}")
+        if not lines:
+            return ""
+        return f"\n      [dim]{_escape_and_indent(chr(10).join(lines))}[/dim]"
     if tool_name == "skill_marketplace":
         action = obj.get("action", "")
         url = obj.get("url", obj.get("skill_name", ""))
         if url:
-            return f"[dim]{action} → {url}[/dim]"
-        return f"[dim]{action}[/dim]"
+            return f"[dim]{_escape_and_indent(f'{action} → {url}')}[/dim]"
+        return f"[dim]{_escape_and_indent(action)}[/dim]"
     if tool_name in ("read_file", "read_text_file"):
-        return f"[dim]{obj.get('path', '')}[/dim]"
+        return f"[dim]{_escape_and_indent(obj.get('path', ''))}[/dim]"
     if tool_name == "write_file":
-        return f"[dim]→ {obj.get('path', obj.get('file_path', ''))}[/dim]"
+        path_value = obj.get("path", obj.get("file_path", ""))
+        return f"[dim]{_escape_and_indent(f'→ {path_value}')}[/dim]"
     if tool_name == "edit_file":
-        return f"[dim]{obj.get('path', '')}[/dim]"
+        return f"[dim]{_escape_and_indent(obj.get('path', ''))}[/dim]"
     if tool_name in ("list_dir", "list_directory"):
-        return f"[dim]{obj.get('path', '')}[/dim]"
+        return f"[dim]{_escape_and_indent(obj.get('path', ''))}[/dim]"
     if tool_name == "grep":
         pat = obj.get("pattern", "")
         path = obj.get("path", "")
-        return f"[dim]{pat} in {path}[/dim]"
+        return f"[dim]{_escape_and_indent(f'{pat} in {path}')}[/dim]"
     if tool_name == "self_upgrade":
-        return f"[dim]{obj.get('action', '')}[/dim]"
+        return f"[dim]{_escape_and_indent(obj.get('action', ''))}[/dim]"
 
     parts = []
     for k, v in list(obj.items())[:4]:
@@ -331,7 +350,7 @@ def _format_tool_args(tool_name: str, raw_args: str) -> str:
         if len(sv) > 60:
             sv = sv[:57] + "..."
         parts.append(f"{k}={sv}")
-    return "[dim]" + ", ".join(parts) + "[/dim]"
+    return "[dim]" + _escape_and_indent(", ".join(parts)) + "[/dim]"
 
 
 def _tui_step_sink(message):
@@ -348,7 +367,7 @@ def _tui_step_sink(message):
     if m:
         thought = m.group(1).strip()
         if thought:
-            display = thought[:200] + "…" if len(thought) > 200 else thought
+            display = _escape_and_indent(thought)
             console.print(f"    [dim]💭[/dim] [italic]{display}[/italic]", highlight=False)
         return
 
@@ -376,13 +395,15 @@ def _tui_step_sink(message):
             return
 
         lines = raw.split("\n")
-        max_lines = 5 if tool_name == "shell" else 3
-        display_lines = lines[:max_lines]
-        display = "\n".join(ln.strip() for ln in display_lines)
-        if len(display) > 500:
+        max_lines = None if tool_name == "shell" else 3
+        display_lines = lines if max_lines is None else lines[:max_lines]
+        display = "\n".join(ln.rstrip() for ln in display_lines) if tool_name == "shell" else "\n".join(ln.strip() for ln in display_lines)
+        if tool_name != "shell" and len(display) > 500:
             display = display[:500] + "..."
-        if len(lines) > max_lines:
+        if max_lines is not None and len(lines) > max_lines:
             display += f"\n      ... ({len(lines) - max_lines} more lines)"
+
+        rendered_display = _escape_and_indent(display)
 
         if "Error" in display or "failed" in display.lower() or "Security Error" in display:
             style = "[red]"
@@ -395,9 +416,9 @@ def _tui_step_sink(message):
             end_style = ""
 
         if "\n" in display:
-            console.print(f"    [dim]╰→[/dim] {style}{display}{end_style}", highlight=False)
+            console.print(f"    [dim]╰→[/dim] {style}{rendered_display}{end_style}", highlight=False)
         else:
-            console.print(f"    [dim]╰→[/dim] {style}{display}{end_style}", highlight=False)
+            console.print(f"    [dim]╰→[/dim] {style}{rendered_display}{end_style}", highlight=False)
         return
 
 
@@ -563,10 +584,6 @@ async def _run_agent(
         tool_count = len(agent.tools)
         skill_count = len(agent.skills)
         console.print(f"\r  [green]Ready[/green] — {tool_count} tools · {skill_count} skills")
-        if os.environ.get("SPOON_BOT_WALLET_AUTO_CREATED") == "1":
-            wallet_addr = os.environ.get("WALLET_ADDRESS", "").strip()
-            wallet_note = f" ({wallet_addr})" if wallet_addr else ""
-            console.print(f"  [yellow]Wallet auto-created[/yellow]{wallet_note}")
         console.rule(style="dim")
 
     except ValueError as e:
@@ -729,7 +746,6 @@ def onboard():
     Initializes a git repository for version control.
     """
     from spoon_bot.services.git import GitManager
-    from spoon_bot.skills.builtin import ensure_builtin_skills
 
     workspace = get_workspace()
     config_dir = Path.home() / ".spoon-bot"
@@ -743,11 +759,8 @@ def onboard():
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "memory").mkdir(exist_ok=True)
     (workspace / "skills").mkdir(exist_ok=True)
-    installed_skills = ensure_builtin_skills(workspace)
 
     console.print(f"[green]✓[/green] Created workspace: {workspace}")
-    for skill_dir in installed_skills:
-        console.print(f"[green]✓[/green] Installed built-in skill: {skill_dir.name}")
 
     # Create AGENTS.md
     agents_file = workspace / "AGENTS.md"
@@ -1041,10 +1054,6 @@ async def _run_gateway(
         with console.status("[bold blue]Initializing agent...[/bold blue]"):
             agent = await create_agent(**create_kwargs)
         print_success(f"Agent initialized: {agent.provider}/{agent.model}")
-        if os.environ.get("SPOON_BOT_WALLET_AUTO_CREATED") == "1":
-            wallet_addr = os.environ.get("WALLET_ADDRESS", "").strip()
-            wallet_note = f" ({wallet_addr})" if wallet_addr else ""
-            print_info(f"Wallet auto-created{wallet_note}")
     except ValueError as e:
         print_error(ConfigurationError(
             str(e),

@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import os
 import logging as stdlib_logging
+import re
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator
@@ -94,7 +94,6 @@ from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
-from spoon_bot.skills.builtin import ensure_builtin_skills
 from spoon_bot.wallet import ensure_wallet_runtime
 from spoon_bot.exceptions import (
     SpoonBotError,
@@ -117,6 +116,12 @@ _ATTACHMENT_ONLY_PLACEHOLDER = (
     "The user attached files without extra text. Inspect the files and answer based on their contents."
 )
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
+_WALLET_REQUIRED_TOOLS: frozenset[str] = frozenset({
+    "balance_check",
+    "transfer",
+    "swap",
+    "contract_call",
+})
 
 
 def _workspace_root_path(workspace: Path | str | None) -> Path:
@@ -410,6 +415,8 @@ class AgentLoop:
         self._agent: SpoonReactMCP | SpoonReactSkill | None = None
         self._skill_manager: SkillManager | None = None
         self._mcp_tools: list[MCPTool] = []
+        self._latest_reasoning_excerpt: str | None = None
+        self._pending_reasoning_chunks: list[str] = []
 
         # spoon-bot components
         self.context = ContextBuilder(self.workspace, yolo_mode=self.yolo_mode)
@@ -1159,8 +1166,6 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
-            session_key: Optional session key for multi-user/multi-channel isolation.
-                         When provided, switches to this session before processing.
 
         Returns:
             The agent's response text.
@@ -1175,11 +1180,9 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        # Switch session if a different key is requested
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
-            logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message: {message[:100]}...")
 
@@ -1941,9 +1944,9 @@ class AgentLoop:
                 if not content or not content.strip():
                     break
                 safe_text = mask_secrets(content.strip())
-                if len(safe_text) > 500:
-                    safe_text = safe_text[:500] + "…"
-                logger.info(f"💭 Agent reasoning: {safe_text}")
+                captured = agent_loop._capture_reasoning_text(safe_text)
+                if captured:
+                    logger.info(f"💭 Agent reasoning: {captured}")
                 break
 
         def _log_tool_calls():
@@ -1968,6 +1971,55 @@ class AgentLoop:
         original_think = getattr(agent, "_spoon_bot_base_think", None)
         if original_think is not None:
             agent.think = original_think
+
+    def _reset_reasoning_capture(self) -> None:
+        """Reset request-scoped reasoning captured from tracked think logs."""
+        self._latest_reasoning_excerpt = None
+        self._pending_reasoning_chunks = []
+
+    def _capture_reasoning_text(self, text: str | None) -> str | None:
+        """Store a reasoning excerpt so gateway transports can reuse it."""
+        normalized = str(text or "").strip()
+        if not normalized:
+            return None
+        if normalized == self._latest_reasoning_excerpt:
+            return normalized
+        self._latest_reasoning_excerpt = normalized
+        self._pending_reasoning_chunks.append(normalized)
+        return normalized
+
+    def _drain_reasoning_chunks(self) -> list[str]:
+        """Return pending reasoning excerpts and clear the queue."""
+        pending = [
+            text
+            for text in self._pending_reasoning_chunks
+            if isinstance(text, str) and text.strip()
+        ]
+        self._pending_reasoning_chunks = []
+        return pending
+
+    @staticmethod
+    def _normalize_comparable_text(text: str | None) -> str:
+        """Collapse whitespace so duplicate text can be compared reliably."""
+        return " ".join(str(text or "").split())
+
+    def _looks_like_duplicate_thinking(
+        self,
+        thinking_text: str | None,
+        content_text: str | None,
+    ) -> bool:
+        """Return True when a thinking payload is effectively the final answer."""
+        normalized_thinking = self._normalize_comparable_text(thinking_text)
+        normalized_content = self._normalize_comparable_text(content_text)
+        if not normalized_thinking or not normalized_content:
+            return False
+        if normalized_thinking == normalized_content:
+            return True
+        shorter, longer = sorted(
+            (normalized_thinking, normalized_content),
+            key=len,
+        )
+        return len(shorter) >= 64 and shorter in longer
 
     def _filter_execution_steps(self, content: str) -> str:
         """
@@ -2050,6 +2102,7 @@ class AgentLoop:
             await self.initialize()
 
         logger.info(f"Streaming message: {message[:100]}...")
+        self._reset_reasoning_capture()
 
         # Refresh memory context
         try:
@@ -2063,6 +2116,8 @@ class AgentLoop:
         stream_completed = False
         stream_cancelled = False
         bg_task: asyncio.Task[None] | None = None
+        pending_pre_tool_chunks: list[dict[str, Any]] = []
+        buffering_pre_tool_segment = thinking
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
@@ -2142,7 +2197,13 @@ class AgentLoop:
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
             while not (td.is_set() and oq.empty()):
-                if asyncio.get_event_loop().time() > deadline:
+                # tracked_reasoning is inferred from assistant output logs and is
+                # not a reliable API thinking source. Clear it so it does not leak
+                # duplicated final content into WS/REST responses.
+                self._drain_reasoning_chunks()
+                now_ts = asyncio.get_event_loop().time()
+
+                if now_ts > deadline:
                     logger.warning(
                         f"Streaming deadline reached ({stream_timeout}s), "
                         f"stopping after {chunk_count} chunks"
@@ -2207,6 +2268,15 @@ class AgentLoop:
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
+                        if thinking and pending_pre_tool_chunks:
+                            for pending_chunk in pending_pre_tool_chunks:
+                                yield {
+                                    "type": "thinking",
+                                    "delta": pending_chunk["delta"],
+                                    "metadata": pending_chunk["metadata"],
+                                }
+                            pending_pre_tool_chunks = []
+                        buffering_pre_tool_segment = thinking
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
                             if isinstance(tc, dict):
@@ -2229,24 +2299,55 @@ class AgentLoop:
                                 },
                             }
                         continue
+                    chunk_metadata = chunk.get("metadata")
+                    if isinstance(chunk_metadata, dict):
+                        metadata = dict(chunk_metadata)
+                    dict_type = chunk.get("type")
+                    if dict_type == "thinking":
+                        chunk_type = "thinking"
+                    elif dict_type == "content":
+                        chunk_type = "content"
                     # Support both "content" and "delta" keys (#10)
                     text = chunk.get("content") or chunk.get("delta") or ""
                     if text:
                         delta = text
-                        full_content += delta
 
                 # -- Object chunks with content --
                 elif hasattr(chunk, "content") and chunk.content:
                     delta = chunk.content
-                    full_content += delta
 
                 # -- Plain string chunks --
                 elif isinstance(chunk, str):
                     delta = chunk
-                    full_content += delta
 
                 if delta:
-                    yield {"type": chunk_type, "delta": delta, "metadata": metadata}
+                    metadata_phase = metadata.get("phase") if isinstance(metadata, dict) else None
+                    explicit_pre_tool_phase = (
+                        chunk_type == "content"
+                        and thinking
+                        and metadata_phase == "think"
+                    )
+                    if chunk_type == "content" and explicit_pre_tool_phase:
+                        yield {
+                            "type": "thinking",
+                            "delta": delta,
+                            "metadata": {
+                                **metadata,
+                                "source": metadata.get("source", "phase_think"),
+                            },
+                        }
+                    elif chunk_type == "content" and buffering_pre_tool_segment:
+                        pending_pre_tool_chunks.append(
+                            {
+                                "delta": delta,
+                                "metadata": dict(metadata),
+                            }
+                        )
+                    else:
+                        event = {"type": chunk_type, "delta": delta, "metadata": metadata}
+                        if chunk_type == "content":
+                            full_content += delta
+                        yield event
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
 
@@ -2255,6 +2356,18 @@ class AgentLoop:
                 await asyncio.wait_for(bg_task, timeout=5.0)
             except (asyncio.TimeoutError, Exception):
                 pass
+
+            self._drain_reasoning_chunks()
+
+            if pending_pre_tool_chunks:
+                for pending_chunk in pending_pre_tool_chunks:
+                    full_content += pending_chunk["delta"]
+                    yield {
+                        "type": "content",
+                        "delta": pending_chunk["delta"],
+                        "metadata": pending_chunk["metadata"],
+                    }
+                pending_pre_tool_chunks = []
 
             # Fallback: if run() completed but no stream chunks were emitted,
             # use final run result as one content chunk to avoid empty output.
@@ -2323,7 +2436,6 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
-            session_key: Optional session key for multi-user/multi-channel isolation.
 
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
@@ -2331,13 +2443,12 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
-        # Switch session if a different key is requested
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
-            logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
+        self._reset_reasoning_capture()
 
         # Refresh memory context
         try:
@@ -2383,6 +2494,8 @@ class AgentLoop:
                 thinking_content = result.thinking
             elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
                 thinking_content = result.metadata.get("thinking")
+            if self._looks_like_duplicate_thinking(thinking_content, final_content):
+                thinking_content = None
 
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
@@ -2904,32 +3017,22 @@ async def create_agent(
         >>> # YOLO mode — work in /home/user/project directly
         >>> agent = await create_agent(yolo_mode=True, workspace="/home/user/project")
     """
-    wallet_tool_names = {"balance_check", "transfer", "swap", "contract_call"}
-    wallet_required = False
-    if enabled_tools:
-        wallet_required = bool(wallet_tool_names.intersection(enabled_tools))
-    elif tool_profile in {"web3"}:
-        wallet_required = True
-    if os.environ.get("SPOON_BOT_WALLET_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}:
-        wallet_required = True
-
-    resolved_workspace = Path(workspace).expanduser() if workspace else None
-    if resolved_workspace is not None:
-        ensure_builtin_skills(resolved_workspace)
+    wallet_required = bool(enabled_tools and _WALLET_REQUIRED_TOOLS.intersection(enabled_tools))
     try:
-        ensure_wallet_runtime(resolved_workspace)
-    except Exception as exc:
-        # Wallet bootstrap should not block non-web3 workloads.
-        os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] = "0"
+        ensure_wallet_runtime(workspace)
+    except Exception:
         if wallet_required:
             raise
-        logger.warning(f"Wallet bootstrap skipped: {exc}")
+        logger.warning("Wallet runtime bootstrap failed; continuing because no wallet-required tools are enabled")
+        import os
+
+        os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] = "0"
 
     agent = AgentLoop(
         model=model,
         provider=provider,
         api_key=api_key,
-        workspace=resolved_workspace or workspace,
+        workspace=workspace,
         session_key=session_key,
         base_url=base_url,
         mcp_config=mcp_config,
