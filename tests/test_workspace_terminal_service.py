@@ -121,6 +121,31 @@ async def test_workspace_terminal_service_rejects_cwd_outside_workspace() -> Non
             await service.open(cwd="/etc", shell=shell)
 
 
+def test_workspace_terminal_service_preserves_logical_workspace_path_for_symlink_root() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        real_workspace = temp_path / "real-workspace"
+        real_workspace.mkdir()
+        linked_workspace = temp_path / "workspace"
+        linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+
+        async def emit_stdout(payload: dict[str, object]) -> None:
+            return None
+
+        async def emit_closed(payload: dict[str, object]) -> None:
+            return None
+
+        service = WorkspaceTerminalService(
+            linked_workspace,
+            emit_stdout=emit_stdout,
+            emit_closed=emit_closed,
+        )
+
+        resolved = service._resolve_workspace_path("/workspace")
+        assert resolved == linked_workspace.absolute()
+        assert resolved != real_workspace.resolve()
+
+
 def test_workspace_terminal_service_terminates_process_group_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, int]] = []
 

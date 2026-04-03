@@ -284,7 +284,7 @@ async def _ws_tests():
 
     # Non-stream
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=5)  # connection.established
             await ws.send(json.dumps({
                 "type": "request", "id": "t1",
@@ -308,7 +308,7 @@ async def _ws_tests():
 
     # Stream
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=5)
             await ws.send(json.dumps({
                 "type": "request", "id": "t2",
@@ -371,7 +371,7 @@ async def _ws_session_tests():
         return
 
     try:
-        async with websockets.connect(WS_URL) as ws:
+        async with websockets.connect(WS_URL, ping_interval=3600, ping_timeout=3600) as ws:
             await asyncio.wait_for(ws.recv(), timeout=5)
 
             await ws.send(json.dumps({
@@ -437,3 +437,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
