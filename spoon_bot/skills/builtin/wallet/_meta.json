@@ -1,0 +1,11 @@
+{
+  "owner": "XSpoonAi",
+  "slug": "wallet",
+  "displayName": "Wallet (Built-in)",
+  "latest": {
+    "version": "1.0.0",
+    "publishedAt": 1775001600000,
+    "commit": "builtin"
+  },
+  "history": []
+}

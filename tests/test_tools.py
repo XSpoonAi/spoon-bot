@@ -78,6 +78,51 @@ class TestShellTool:
         # Should be truncated
         assert "truncated" in result.lower() or len(result) <= 100
 
+    def test_windows_shell_uses_user_home_env(self, monkeypatch):
+        """Windows bash execution should preserve the user's home path."""
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        tool = ShellTool(
+            timeout=5,
+            max_output=1000,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(tool, "_find_bash", lambda: "C:/Program Files/Git/bin/bash.exe")
+
+        captured: dict[str, object] = {}
+
+        def fake_run(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+            class _Result:
+                stdout = b"ok"
+                stderr = b""
+                returncode = 0
+
+            return _Result()
+
+        with patch("subprocess.run", side_effect=fake_run):
+            out, err, code = tool._run_sync("echo hello", str(Path.home()))
+
+        assert out == b"ok"
+        assert err == b""
+        assert code == 0
+        assert captured["args"][0][1] == "-c"
+        env = captured["kwargs"]["env"]
+        assert env["USERPROFILE"] == str(Path.home())
+        assert env["HOME"] == tool._windows_home_to_bash(str(Path.home()))
+
+    def test_windows_home_to_bash_path(self):
+        """Windows home paths should be converted to Git Bash POSIX form."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        assert ShellTool._windows_home_to_bash(r"C:\Users\Ricky") == "/c/Users/Ricky"
+        assert ShellTool._windows_home_to_bash("/already/posix") == "/already/posix"
+
 
 class TestCommandValidator:
     """Tests for the CommandValidator."""

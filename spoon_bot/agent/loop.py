@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import logging as stdlib_logging
 from collections import Counter
 from pathlib import Path
@@ -93,6 +94,8 @@ from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
+from spoon_bot.skills.builtin import ensure_builtin_skills
+from spoon_bot.wallet import ensure_wallet_runtime
 from spoon_bot.exceptions import (
     SpoonBotError,
     APIKeyMissingError,
@@ -2901,11 +2904,32 @@ async def create_agent(
         >>> # YOLO mode — work in /home/user/project directly
         >>> agent = await create_agent(yolo_mode=True, workspace="/home/user/project")
     """
+    wallet_tool_names = {"balance_check", "transfer", "swap", "contract_call"}
+    wallet_required = False
+    if enabled_tools:
+        wallet_required = bool(wallet_tool_names.intersection(enabled_tools))
+    elif tool_profile in {"web3"}:
+        wallet_required = True
+    if os.environ.get("SPOON_BOT_WALLET_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        wallet_required = True
+
+    resolved_workspace = Path(workspace).expanduser() if workspace else None
+    if resolved_workspace is not None:
+        ensure_builtin_skills(resolved_workspace)
+    try:
+        ensure_wallet_runtime(resolved_workspace)
+    except Exception as exc:
+        # Wallet bootstrap should not block non-web3 workloads.
+        os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] = "0"
+        if wallet_required:
+            raise
+        logger.warning(f"Wallet bootstrap skipped: {exc}")
+
     agent = AgentLoop(
         model=model,
         provider=provider,
         api_key=api_key,
-        workspace=workspace,
+        workspace=resolved_workspace or workspace,
         session_key=session_key,
         base_url=base_url,
         mcp_config=mcp_config,

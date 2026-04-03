@@ -31,6 +31,7 @@ dependencies = [
     "httpx>=0.25.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "eth-account>=0.13.0",
     "loguru>=0.7.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.0",  # For SKILL.md parsing
@@ -97,6 +98,12 @@ Documentation = "https://github.com/XSpoonAi/spoon-bot#readme"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["spoon_bot*"]
+
+[tool.setuptools.package-data]
+spoon_bot = [
+    "skills/builtin/*/SKILL.md",
+    "skills/builtin/*/_meta.json",
+]
 
 [tool.ruff]
 line-length = 100

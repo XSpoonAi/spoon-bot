@@ -4352,6 +4352,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
+    { name = "eth-account" },
     { name = "httpx" },
     { name = "loguru" },
     { name = "pydantic" },
@@ -4429,6 +4430,7 @@ requires-dist = [
     { name = "aiofiles", specifier = ">=23.0.0" },
     { name = "aiohttp", marker = "extra == 'discord'", specifier = ">=3.9.0" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3.0" },
+    { name = "eth-account", specifier = ">=0.13.0" },
     { name = "fastapi", marker = "extra == 'gateway'", specifier = ">=0.109.0" },
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = ">=1.2.0" },

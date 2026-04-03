@@ -563,6 +563,10 @@ async def _run_agent(
         tool_count = len(agent.tools)
         skill_count = len(agent.skills)
         console.print(f"\r  [green]Ready[/green] — {tool_count} tools · {skill_count} skills")
+        if os.environ.get("SPOON_BOT_WALLET_AUTO_CREATED") == "1":
+            wallet_addr = os.environ.get("WALLET_ADDRESS", "").strip()
+            wallet_note = f" ({wallet_addr})" if wallet_addr else ""
+            console.print(f"  [yellow]Wallet auto-created[/yellow]{wallet_note}")
         console.rule(style="dim")
 
     except ValueError as e:
@@ -725,6 +729,7 @@ def onboard():
     Initializes a git repository for version control.
     """
     from spoon_bot.services.git import GitManager
+    from spoon_bot.skills.builtin import ensure_builtin_skills
 
     workspace = get_workspace()
     config_dir = Path.home() / ".spoon-bot"
@@ -738,8 +743,11 @@ def onboard():
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "memory").mkdir(exist_ok=True)
     (workspace / "skills").mkdir(exist_ok=True)
+    installed_skills = ensure_builtin_skills(workspace)
 
     console.print(f"[green]✓[/green] Created workspace: {workspace}")
+    for skill_dir in installed_skills:
+        console.print(f"[green]✓[/green] Installed built-in skill: {skill_dir.name}")
 
     # Create AGENTS.md
     agents_file = workspace / "AGENTS.md"
@@ -1033,6 +1041,10 @@ async def _run_gateway(
         with console.status("[bold blue]Initializing agent...[/bold blue]"):
             agent = await create_agent(**create_kwargs)
         print_success(f"Agent initialized: {agent.provider}/{agent.model}")
+        if os.environ.get("SPOON_BOT_WALLET_AUTO_CREATED") == "1":
+            wallet_addr = os.environ.get("WALLET_ADDRESS", "").strip()
+            wallet_note = f" ({wallet_addr})" if wallet_addr else ""
+            print_info(f"Wallet auto-created{wallet_note}")
     except ValueError as e:
         print_error(ConfigurationError(
             str(e),
