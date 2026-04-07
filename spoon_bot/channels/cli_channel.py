@@ -10,7 +10,7 @@ from loguru import logger
 from rich.console import Console
 from rich.prompt import Prompt
 
-from spoon_bot.channels.base import BaseChannel
+from spoon_bot.channels.base import BaseChannel, ChannelConfig
 from spoon_bot.bus.events import InboundMessage, OutboundMessage
 
 if TYPE_CHECKING:
@@ -38,7 +38,7 @@ class CLIChannel(BaseChannel):
             prompt: Input prompt string.
             session_key: Session identifier.
         """
-        super().__init__(name)
+        super().__init__(ChannelConfig(name=name))
         self.prompt = prompt
         self.session_key = session_key
         self._console = Console()

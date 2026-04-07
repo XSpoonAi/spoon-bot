@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import textwrap
 from pathlib import Path
@@ -282,13 +283,9 @@ class TestCliEnabledOverride:
         """--cli should add CLI channel even if config didn't enable it."""
         assert "cli:default" not in manager.channel_names
 
-        # Use a mock because CLIChannel() has a pre-existing constructor
-        # issue (passes string where ChannelConfig is expected).
-        cli_ch = MagicMock()
-        cli_ch.full_name = "cli:default"
-        cli_ch.name = "cli"
-        cli_ch.attach_bus = MagicMock()
-        manager.add_channel(cli_ch)
+        from spoon_bot.channels.cli_channel import CLIChannel
+
+        manager.add_channel(CLIChannel())
         assert "cli:default" in manager.channel_names
 
     def test_bootstrap_init_channels_removes_cli_by_default(self):
@@ -300,3 +297,82 @@ class TestCliEnabledOverride:
 
         sig = inspect.signature(init_channels)
         assert sig.parameters["cli_enabled"].default is False
+
+    def test_load_from_config_skips_cli_when_include_cli_false(self):
+        """Runtime bootstrap should skip creating CLI channel entirely."""
+        from spoon_bot.channels.config import ChannelsConfig
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._bus = MagicMock()
+        manager._bus.start = AsyncMock()
+        manager._bus.stop = AsyncMock()
+
+        with patch(
+            "spoon_bot.channels.manager.load_channels_config",
+            return_value=ChannelsConfig({}),
+        ):
+            asyncio.run(manager.load_from_config(include_cli=False))
+
+        assert "cli:default" not in manager.channel_names
+
+
+class TestGatewayReadiness:
+    """Gateway readiness should not depend on optional channel startup."""
+
+    def test_ready_without_channel_manager(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.api.health import readiness_check
+
+        old_agent = app_module._agent
+        old_channel_manager = app_module._channel_manager
+        try:
+            app_module._agent = object()
+            app_module._channel_manager = None
+            data = asyncio.run(readiness_check())
+        finally:
+            app_module._agent = old_agent
+            app_module._channel_manager = old_channel_manager
+
+        assert data["ready"] is True
+        assert data["checks"]["agent"] is True
+
+    def test_ready_with_zero_configured_channels(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.api.health import readiness_check
+
+        old_agent = app_module._agent
+        old_channel_manager = app_module._channel_manager
+        try:
+            app_module._agent = object()
+            app_module._channel_manager = MagicMock(
+                running_channels_count=0,
+                channel_names=[],
+            )
+            data = asyncio.run(readiness_check())
+        finally:
+            app_module._agent = old_agent
+            app_module._channel_manager = old_channel_manager
+
+        assert data["ready"] is True
+        assert data["checks"]["channels"] is True
+
+    def test_not_ready_with_configured_channels_but_none_running(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.api.health import readiness_check
+
+        old_agent = app_module._agent
+        old_channel_manager = app_module._channel_manager
+        try:
+            app_module._agent = object()
+            app_module._channel_manager = MagicMock(
+                running_channels_count=0,
+                channel_names=["telegram:default"],
+            )
+            data = asyncio.run(readiness_check())
+        finally:
+            app_module._agent = old_agent
+            app_module._channel_manager = old_channel_manager
+
+        assert data["ready"] is False
+        assert data["checks"]["channels"] is False

@@ -304,12 +304,17 @@ class ChannelManager:
             f"Install with: uv pip install -e \".[{extras_str}]\""
         )
 
-    async def load_from_config(self, config_path: str | Path | None = None) -> None:
+    async def load_from_config(
+        self,
+        config_path: str | Path | None = None,
+        include_cli: bool = True,
+    ) -> None:
         """
         Load channels from configuration file.
 
         Args:
             config_path: Path to config file (uses default locations if None)
+            include_cli: Whether to create the CLI channel when enabled
 
         Raises:
             ImportError: If required channel dependencies are missing
@@ -341,7 +346,7 @@ class ChannelManager:
                     )
 
         # CLI channel (if enabled) - special case, no external deps
-        if self._config.is_cli_enabled():
+        if include_cli and self._config.is_cli_enabled():
             try:
                 from spoon_bot.channels.cli_channel import CLIChannel
 

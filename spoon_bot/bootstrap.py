@@ -43,7 +43,7 @@ async def init_channels(
 
     manager = ChannelManager()
     manager.set_agent(agent)
-    await manager.load_from_config(config_path)
+    await manager.load_from_config(config_path, include_cli=cli_enabled)
 
     # Remove CLI channel unless explicitly requested — avoids stdin conflicts
     # with the Rich REPL (agent mode) or Docker (no tty).
