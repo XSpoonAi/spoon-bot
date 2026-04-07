@@ -337,7 +337,27 @@ class TestGatewayReadiness:
         assert data["ready"] is True
         assert data["checks"]["agent"] is True
 
-    def test_ready_with_zero_running_channels(self):
+    def test_ready_with_zero_configured_channels(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.api.health import readiness_check
+
+        old_agent = app_module._agent
+        old_channel_manager = app_module._channel_manager
+        try:
+            app_module._agent = object()
+            app_module._channel_manager = MagicMock(
+                running_channels_count=0,
+                channel_names=[],
+            )
+            data = asyncio.run(readiness_check())
+        finally:
+            app_module._agent = old_agent
+            app_module._channel_manager = old_channel_manager
+
+        assert data["ready"] is True
+        assert data["checks"]["channels"] is True
+
+    def test_not_ready_with_configured_channels_but_none_running(self):
         from spoon_bot.gateway import app as app_module
         from spoon_bot.gateway.api.health import readiness_check
 
@@ -354,5 +374,5 @@ class TestGatewayReadiness:
             app_module._agent = old_agent
             app_module._channel_manager = old_channel_manager
 
-        assert data["ready"] is True
-        assert data["checks"]["channels"] is True
+        assert data["ready"] is False
+        assert data["checks"]["channels"] is False
