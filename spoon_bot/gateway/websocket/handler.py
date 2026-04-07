@@ -686,7 +686,7 @@ class WebSocketHandler:
             complete_data: dict[str, Any] = {
                 "task_id": task_id,
                 "status": "done",
-                "response": response[:200] if isinstance(response, str) else str(response)[:200],
+                "response": response if isinstance(response, str) else str(response),
                 "trace_id": trace_id,
                 "timing": timing,
             }

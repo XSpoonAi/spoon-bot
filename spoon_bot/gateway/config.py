@@ -53,9 +53,9 @@ class JWTConfig:
 class BudgetConfig:
     """Execution budget configuration."""
 
-    request_timeout_ms: int = 120_000   # 2 minutes default
-    tool_timeout_ms: int = 60_000       # 1 minute default
-    stream_timeout_ms: int = 300_000    # 5 minutes default
+    request_timeout_ms: int = 3_600_000   # 60 minutes default
+    tool_timeout_ms: int = 3_600_000      # 60 minutes default
+    stream_timeout_ms: int = 3_600_000    # 60 minutes default
 
 
 @dataclass
@@ -133,13 +133,13 @@ class GatewayConfig:
             ),
             budget=BudgetConfig(
                 request_timeout_ms=int(
-                    os.environ.get("GATEWAY_TIMEOUT_REQUEST_MS", "120000")
+                    os.environ.get("GATEWAY_TIMEOUT_REQUEST_MS", "3600000")
                 ),
                 tool_timeout_ms=int(
-                    os.environ.get("GATEWAY_TIMEOUT_TOOL_MS", "60000")
+                    os.environ.get("GATEWAY_TIMEOUT_TOOL_MS", "3600000")
                 ),
                 stream_timeout_ms=int(
-                    os.environ.get("GATEWAY_TIMEOUT_STREAM_MS", "300000")
+                    os.environ.get("GATEWAY_TIMEOUT_STREAM_MS", "3600000")
                 ),
             ),
             audio=AudioConfig(
