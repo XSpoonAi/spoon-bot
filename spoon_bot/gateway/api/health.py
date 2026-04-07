@@ -73,7 +73,10 @@ async def readiness_check() -> dict:
     }
 
     if _channel_manager is not None:
-        checks["channels"] = _channel_manager.running_channels_count > 0
+        # Channels are optional for gateway readiness. When none are configured
+        # (or all are intentionally disabled), the HTTP/WebSocket gateway should
+        # still be considered ready to serve runtime traffic.
+        checks["channels"] = True
 
     all_ready = all(checks.values())
 
