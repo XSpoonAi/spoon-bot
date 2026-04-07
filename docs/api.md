@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-04-03 08:09 UTC.  
+> **Auto-generated** from source code on 2026-04-07 06:38 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -966,9 +966,9 @@ Health check response.
 | `GATEWAY_PORT` | `8080` | config.py |
 | `GATEWAY_DEBUG` | *(none)* | config.py |
 | `JWT_ACCESS_EXPIRE_MINUTES` | `15` | config.py |
-| `GATEWAY_TIMEOUT_REQUEST_MS` | `120000` | config.py |
-| `GATEWAY_TIMEOUT_TOOL_MS` | `60000` | config.py |
-| `GATEWAY_TIMEOUT_STREAM_MS` | `300000` | config.py |
+| `GATEWAY_TIMEOUT_REQUEST_MS` | `3600000` | config.py |
+| `GATEWAY_TIMEOUT_TOOL_MS` | `3600000` | config.py |
+| `GATEWAY_TIMEOUT_STREAM_MS` | `3600000` | config.py |
 | `GATEWAY_AUDIO_ENABLED` | `true` | config.py |
 | `GATEWAY_AUDIO_STT_PROVIDER` | `whisper` | config.py |
 | `GATEWAY_AUDIO_STT_MODEL` | `whisper-1` | config.py |
