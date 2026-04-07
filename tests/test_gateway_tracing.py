@@ -320,7 +320,9 @@ class TestBudgetConfig:
     def test_defaults(self):
         from spoon_bot.gateway.config import BudgetConfig
         b = BudgetConfig()
-        assert b.request_timeout_ms > 0 and b.tool_timeout_ms > 0
+        assert b.request_timeout_ms == 0
+        assert b.tool_timeout_ms > 0
+        assert b.stream_timeout_ms == 0
 
     def test_custom_values(self):
         from spoon_bot.gateway.config import BudgetConfig
@@ -563,6 +565,61 @@ class TestWsCancellationPropagation:
         cancelled = await handler._cancel_current_task_for_cleanup(timeout=0.2)
         assert cancelled is True
         assert handler._current_task is None
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_continues_after_connection_is_gone(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        class _DisconnectedManager(_FakeManager):
+            def get_connection(self, conn_id):
+                return None
+
+            async def send_message(self, conn_id, message):
+                return False
+
+        fm = _DisconnectedManager()
+
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
+            handler = WebSocketHandler("conn_test", "persisted-session")
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                    from spoon_bot.gateway.config import GatewayConfig
+                    mc.return_value = GatewayConfig()
+                    result = await handler._handle_chat({"message": "hi", "stream": True})
+
+        assert result["success"] is True
+        assert result["content"] == "Hello world"
+        assert result["session_key"] == "persisted-session"
+        assert fm.sent_messages == []
+
+    @pytest.mark.asyncio
+    async def test_websocket_disconnect_does_not_cancel_background_chat(self):
+        from fastapi import WebSocketDisconnect
+        from spoon_bot.gateway.config import GatewayConfig
+        from spoon_bot.gateway.websocket import handler as ws_handler_module
+
+        fake_ws = MagicMock()
+        fake_ws.client = None
+        fake_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
+
+        fake_manager = MagicMock()
+        fake_manager.connect = AsyncMock(return_value="conn_test")
+        fake_manager.send_message = AsyncMock(return_value=True)
+        fake_manager.disconnect = AsyncMock()
+
+        fake_handler = MagicMock()
+        fake_handler._cleanup_resources = AsyncMock()
+        fake_handler._cancel_current_task_for_cleanup = AsyncMock(return_value=True)
+
+        with patch.object(ws_handler_module, "get_config", return_value=GatewayConfig()):
+            with patch.object(ws_handler_module, "get_connection_manager", return_value=fake_manager):
+                with patch.object(ws_handler_module, "is_auth_required", return_value=False):
+                    with patch.object(ws_handler_module, "WebSocketHandler", return_value=fake_handler):
+                        await ws_handler_module.websocket_endpoint(fake_ws)
+
+        fake_handler._cancel_current_task_for_cleanup.assert_not_awaited()
+        fake_handler._cleanup_resources.assert_awaited_once()
+        fake_manager.disconnect.assert_awaited_once_with("conn_test")
 
 
 class TestWsTimeoutErrorCodes:
@@ -888,7 +945,7 @@ class TestRestCancellation:
 
 class TestToolkitAdapterTimeout:
     @pytest.mark.asyncio
-    async def test_toolkit_wrapper_enforces_timeout(self):
+    async def test_toolkit_wrapper_moves_to_background_after_timeout(self):
         from spoon_bot.toolkit.adapter import ToolkitToolWrapper
 
         class _SlowAsyncTool:
@@ -900,5 +957,24 @@ class TestToolkitAdapterTimeout:
 
         tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.05)
         result = await tool.execute()
-        assert "timed out" in result.lower()
-        assert "0.05" in result
+        assert "background" in result.lower()
+        assert "job_id:" in result
+
+    @pytest.mark.asyncio
+    async def test_toolkit_background_job_returns_result_when_ready(self):
+        from spoon_bot.toolkit.adapter import ToolkitToolWrapper
+
+        class _SlowAsyncTool:
+            name = "slow_async_result"
+            description = "slow tool"
+
+            async def execute(self, **kwargs):
+                await asyncio.sleep(0.1)
+                return "done"
+
+        tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.01)
+        background = await tool.execute()
+        job_id = background.split("job_id:", 1)[1].splitlines()[0].strip()
+        await asyncio.sleep(0.15)
+        result = await tool.execute(action="job_output", job_id=job_id)
+        assert result == "done"

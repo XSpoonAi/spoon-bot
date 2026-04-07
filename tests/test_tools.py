@@ -78,6 +78,91 @@ class TestShellTool:
         # Should be truncated
         assert "truncated" in result.lower() or len(result) <= 100
 
+    @pytest.mark.asyncio
+    async def test_command_moves_to_background_after_timeout(self, shell_tool):
+        """Timed-out commands should stay alive as background jobs instead of erroring out."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        shell_tool.timeout = 0.01
+
+        class _FakeProcess:
+            returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(1)
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        stdout_task = asyncio.create_task(asyncio.sleep(1))
+        stderr_task = asyncio.create_task(asyncio.sleep(1))
+        job = _BackgroundShellJob(
+            job_id="sh_testjob",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="still running",
+        )
+
+        async def _fake_start_background_job(*args, **kwargs):
+            _SHELL_BACKGROUND_JOBS[job.job_id] = job
+            return job
+
+        with patch.object(shell_tool, "_start_background_job", AsyncMock(side_effect=_fake_start_background_job)):
+            result = await shell_tool.execute("echo hello")
+
+        assert "background" in result.lower()
+        assert "sh_testjob" in result
+        assert _SHELL_BACKGROUND_JOBS["sh_testjob"] is job
+        stdout_task.cancel()
+        stderr_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_background_job_status_and_terminate_actions(self, shell_tool):
+        """Shell background jobs should expose status and terminate actions."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            def __init__(self):
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = -15
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        stdout_task = asyncio.create_task(asyncio.sleep(0))
+        stderr_task = asyncio.create_task(asyncio.sleep(0))
+        job = _BackgroundShellJob(
+            job_id="sh_statusjob",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="line one",
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        status = await shell_tool.execute(action="job_status", job_id=job.job_id)
+        assert "job_id: sh_statusjob" in status
+        assert "line one" in status
+
+        terminated = await shell_tool.execute(action="terminate_job", job_id=job.job_id)
+        assert "Terminated background shell job sh_statusjob" in terminated
+
     def test_windows_shell_uses_user_home_env(self, monkeypatch):
         """Windows bash execution should preserve the user's home path."""
         from spoon_bot.agent.tools.shell import ShellTool

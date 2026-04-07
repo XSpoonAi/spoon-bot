@@ -3,26 +3,41 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
+from uuid import uuid4
 
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
-from spoon_bot.exceptions import ToolExecutionError, ToolTimeoutError
-
 if TYPE_CHECKING:
     pass
+
+
+@dataclass
+class _BackgroundToolkitJob:
+    job_id: str
+    tool_name: str
+    task: asyncio.Task[Any]
+    status: str = "running"
+    result: str | None = None
+    error: str | None = None
+
+
+_TOOLKIT_BACKGROUND_JOBS: dict[str, _BackgroundToolkitJob] = {}
 
 
 class ToolkitToolWrapper(Tool):
     """Wrapper that adapts spoon-toolkit tools to spoon-bot Tool interface."""
 
-    def __init__(self, toolkit_tool: Any, timeout_seconds: float = 30.0):
+    def __init__(self, toolkit_tool: Any, timeout_seconds: float = 3600.0):
         """
         Initialize wrapper.
 
         Args:
             toolkit_tool: Instance from spoon-toolkits.
+            timeout_seconds: Foreground wait budget before the tool is left running
+                in the background.
         """
         self._tool = toolkit_tool
         self._timeout_seconds = timeout_seconds
@@ -33,23 +48,133 @@ class ToolkitToolWrapper(Tool):
 
     @property
     def description(self) -> str:
-        return getattr(self._tool, "description", "No description")
+        base = getattr(self._tool, "description", "No description")
+        return (
+            f"{base} Background actions are also supported: execute, list_jobs, "
+            "job_status, job_output, terminate_job."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
         # Try to get parameters from tool
+        base_schema: dict[str, Any]
         if hasattr(self._tool, "parameters"):
-            return self._tool.parameters
+            base_schema = dict(self._tool.parameters)
         elif hasattr(self._tool, "input_schema"):
-            return self._tool.input_schema
+            base_schema = dict(self._tool.input_schema)
         elif hasattr(self._tool, "args_schema"):
             # Pydantic schema
             schema = self._tool.args_schema
             if hasattr(schema, "model_json_schema"):
-                return schema.model_json_schema()
+                base_schema = schema.model_json_schema()
             elif hasattr(schema, "schema"):
-                return schema.schema()
-        return {"type": "object", "properties": {}}
+                base_schema = schema.schema()
+            else:
+                base_schema = {"type": "object", "properties": {}}
+        else:
+            base_schema = {"type": "object", "properties": {}}
+
+        properties = dict(base_schema.get("properties", {}))
+        properties.update({
+            "action": {
+                "type": "string",
+                "enum": ["execute", "list_jobs", "job_status", "job_output", "terminate_job"],
+                "description": "Tool action. Defaults to execute.",
+                "default": "execute",
+            },
+            "job_id": {
+                "type": "string",
+                "description": "Background toolkit job ID for status/output/terminate actions",
+            },
+        })
+        return {
+            "type": "object",
+            "properties": properties,
+        }
+
+    async def _invoke_tool(self, call_kwargs: dict[str, Any]) -> Any:
+        if hasattr(self._tool, "arun"):
+            return await self._tool.arun(**call_kwargs)
+        if hasattr(self._tool, "execute"):
+            if asyncio.iscoroutinefunction(self._tool.execute):
+                return await self._tool.execute(**call_kwargs)
+            return await asyncio.to_thread(self._tool.execute, **call_kwargs)
+        if hasattr(self._tool, "run"):
+            return await asyncio.to_thread(self._tool.run, **call_kwargs)
+        if callable(self._tool):
+            return await asyncio.to_thread(self._tool, **call_kwargs)
+        raise TypeError(f"Tool '{self.name}' is not callable")
+
+    async def _refresh_job(self, job: _BackgroundToolkitJob) -> _BackgroundToolkitJob:
+        if job.status != "running":
+            return job
+        if not job.task.done():
+            return job
+        try:
+            result = await asyncio.shield(job.task)
+            job.result = str(result) if result is not None else "Success"
+            job.status = "completed"
+        except asyncio.CancelledError:
+            job.error = "Cancellation requested"
+            job.status = "cancelled"
+        except Exception as exc:
+            job.error = str(exc)
+            job.status = "failed"
+        return job
+
+    async def _handle_background_action(self, action: str, job_id: str | None) -> str:
+        if action == "list_jobs":
+            matching_jobs = [job for job in _TOOLKIT_BACKGROUND_JOBS.values() if job.tool_name == self.name]
+            if not matching_jobs:
+                return f"No background jobs for toolkit tool '{self.name}'"
+            lines = [f"Background jobs for toolkit tool '{self.name}':"]
+            for job in matching_jobs:
+                await self._refresh_job(job)
+                lines.append(f"[{job.job_id}] {job.status}")
+            return "\n".join(lines)
+
+        if not job_id:
+            return "Error: 'job_id' is required for this action"
+
+        job = _TOOLKIT_BACKGROUND_JOBS.get(job_id)
+        if job is None or job.tool_name != self.name:
+            return f"Error: Background toolkit job not found: {job_id}"
+
+        await self._refresh_job(job)
+
+        if action == "job_status":
+            details = job.result if job.result is not None else (job.error or "No output yet")
+            return f"job_id: {job.job_id}\nstatus: {job.status}\noutput:\n{details}"
+
+        if action == "job_output":
+            if job.result is not None:
+                return job.result
+            if job.error is not None:
+                return f"Error: {job.error}"
+            return f"Background toolkit job {job.job_id} is still running; no final output yet"
+
+        if action == "terminate_job":
+            if job.task.done():
+                await self._refresh_job(job)
+                return f"Background toolkit job {job.job_id} already finished with status={job.status}"
+            job.task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(job.task), timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Toolkit job {job.job_id} did not stop promptly after cancellation request"
+                )
+            await self._refresh_job(job)
+            if job.status == "running":
+                return (
+                    f"Termination requested for toolkit job {job.job_id}, but the underlying work is still running. "
+                    "This tool type does not expose incremental output or guaranteed hard-kill support."
+                )
+            return f"Background toolkit job {job.job_id} stopped with status={job.status}"
+
+        return f"Error: Unknown action '{action}'"
 
     async def execute(self, **kwargs: Any) -> str:
         """Execute the toolkit tool.
@@ -58,50 +183,35 @@ class ToolkitToolWrapper(Tool):
             Tool execution result as string.
             In case of error, returns a user-friendly error message.
         """
+        action = kwargs.pop("action", "execute")
+        job_id = kwargs.pop("job_id", None)
+
+        if action != "execute":
+            return await self._handle_background_action(action, job_id)
+
         try:
-            # Check if tool has async execute
-            if hasattr(self._tool, "arun"):
-                result = await asyncio.wait_for(
-                    self._tool.arun(**kwargs),
-                    timeout=self._timeout_seconds,
+            bg_task = asyncio.create_task(self._invoke_tool(kwargs))
+            try:
+                result = await asyncio.wait_for(asyncio.shield(bg_task), timeout=self._timeout_seconds)
+                return str(result) if result is not None else "Success"
+            except asyncio.TimeoutError:
+                job = _BackgroundToolkitJob(
+                    job_id=f"tk_{uuid4().hex[:10]}",
+                    tool_name=self.name,
+                    task=bg_task,
                 )
-            elif hasattr(self._tool, "execute"):
-                if asyncio.iscoroutinefunction(self._tool.execute):
-                    result = await asyncio.wait_for(
-                        self._tool.execute(**kwargs),
-                        timeout=self._timeout_seconds,
-                    )
-                else:
-                    # Run sync function in executor to avoid blocking
-                    result = await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, lambda: self._tool.execute(**kwargs)
-                        ),
-                        timeout=self._timeout_seconds,
-                    )
-            elif hasattr(self._tool, "run"):
-                # Run sync function in executor to avoid blocking
-                result = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self._tool.run(**kwargs)
-                    ),
-                    timeout=self._timeout_seconds,
+                _TOOLKIT_BACKGROUND_JOBS[job.job_id] = job
+                logger.warning(
+                    f"Toolkit tool {self.name} exceeded foreground wait budget "
+                    f"({self._timeout_seconds:g}s) and was left running in the background as {job.job_id}"
                 )
-            elif callable(self._tool):
-                result = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self._tool(**kwargs)
-                    ),
-                    timeout=self._timeout_seconds,
+                return (
+                    f"Toolkit tool '{self.name}' exceeded the foreground wait budget "
+                    f"({self._timeout_seconds:g}s) and is still running in the background.\n"
+                    f"job_id: {job.job_id}\n"
+                    "Use action='job_status' to inspect it, action='job_output' to fetch the final result when ready, "
+                    "or action='terminate_job' to request cancellation."
                 )
-            else:
-                return f"Error: Tool '{self.name}' is not callable"
-
-            return str(result) if result is not None else "Success"
-
-        except asyncio.TimeoutError as e:
-            logger.error(f"Toolkit tool {self.name} timed out: {e}")
-            return f"Error: Tool '{self.name}' timed out after {self._timeout_seconds:g} seconds"
         except asyncio.CancelledError:
             logger.warning(f"Toolkit tool {self.name} was cancelled")
             return f"Error: Tool '{self.name}' was cancelled"

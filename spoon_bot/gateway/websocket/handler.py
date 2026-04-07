@@ -333,7 +333,7 @@ async def websocket_endpoint(
 
     # Connect
     conn_id = await manager.connect(websocket, user_id, session_key)
-    handler = WebSocketHandler(conn_id)
+    handler = WebSocketHandler(conn_id, session_key)
 
     try:
         # Send connection success event
@@ -406,9 +406,6 @@ async def websocket_endpoint(
     except Exception as e:
         logger.error(f"WebSocket error for {conn_id}: {e}")
     finally:
-        cancelled = await handler._cancel_current_task_for_cleanup()
-        if cancelled:
-            logger.info(f"Cancelled background WS chat task on disconnect: {conn_id}")
         await handler._cleanup_resources()
         await manager.disconnect(conn_id)
 
@@ -424,6 +421,7 @@ class WebSocketHandler:
     def __init__(self, connection_id: str, session_id: str | None = None):
         self.connection_id = connection_id
         self.session_id = session_id or connection_id
+        self._default_session_key = session_id or "default"
         self._cancel_requested = False
         self._current_task_id: str | None = None
         self._current_task: asyncio.Task | None = None
@@ -549,9 +547,12 @@ class WebSocketHandler:
         manager = get_connection_manager()
         config = get_config()
         conn = manager.get_connection(self.connection_id)
-
+        bound_session_key = conn.session_key if conn else self._default_session_key
         if not conn:
-            raise ValueError("Connection not found")
+            logger.info(
+                f"WS connection {self.connection_id} is no longer live; "
+                "continuing chat task without WebSocket delivery"
+            )
 
         attachments = _validate_attachment_paths(_normalize_attachment_refs(params.get("attachments")))
         media = _string_list_from_any(params.get("media"))
@@ -560,10 +561,11 @@ class WebSocketHandler:
         if not message:
             raise ValueError("Message or attachments are required")
 
-        session_key = params.get("session_key", conn.session_key)
+        session_key = params.get("session_key", bound_session_key)
         # Validate session_key type
         if not isinstance(session_key, str) or not session_key.strip():
-            session_key = conn.session_key
+            session_key = bound_session_key
+        self._default_session_key = session_key
 
         stream = params.get("stream", False)
         thinking = params.get("thinking", False)
@@ -946,6 +948,7 @@ class WebSocketHandler:
             raise ValueError("session_key must be a non-empty string")
 
         conn.session_key = new_session
+        self._default_session_key = new_session
         return {"session_key": new_session, "switched": True}
 
     async def _handle_session_list(self, params: dict[str, Any]) -> dict[str, Any]:

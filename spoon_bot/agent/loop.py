@@ -2191,8 +2191,6 @@ class AgentLoop:
             oq = self._agent.output_queue
             td = self._agent.task_done
             logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
-            stream_timeout = 600.0 if thinking else 300.0
-            deadline = asyncio.get_event_loop().time() + stream_timeout
             chunk_count = 0
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
@@ -2201,26 +2199,9 @@ class AgentLoop:
                 # not a reliable API thinking source. Clear it so it does not leak
                 # duplicated final content into WS/REST responses.
                 self._drain_reasoning_chunks()
-                now_ts = asyncio.get_event_loop().time()
-
-                if now_ts > deadline:
-                    logger.warning(
-                        f"Streaming deadline reached ({stream_timeout}s), "
-                        f"stopping after {chunk_count} chunks"
-                    )
-                    yield {
-                        "type": "error",
-                        "delta": f"Stream timeout after {int(stream_timeout)}s",
-                        "metadata": {
-                            "error": "STREAM_TIMEOUT",
-                            "error_code": "STREAM_TIMEOUT",
-                            "timeout_seconds": stream_timeout,
-                            "chunks_received": chunk_count,
-                        },
-                    }
-                    break
-
                 try:
+                    # Poll without a hard stream deadline so long-running tasks
+                    # only stop when the caller explicitly cancels them.
                     # Use oq.get() without timeout kwarg — works for both
                     # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
                     # handled by the outer asyncio.wait_for.

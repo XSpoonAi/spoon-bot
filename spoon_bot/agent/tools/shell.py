@@ -8,8 +8,10 @@ import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 
@@ -356,6 +358,37 @@ class CommandValidator:
         return command
 
 
+@dataclass
+class _BackgroundShellJob:
+    job_id: str
+    command: str
+    cwd: str
+    process: Any
+    stdout_task: asyncio.Task[None]
+    stderr_task: asyncio.Task[None]
+    buffer_limit: int
+    stdout_text: str = ""
+    stderr_text: str = ""
+    status: str = "running"
+    returncode: int | None = None
+
+    def append_stdout(self, text: str) -> None:
+        self.stdout_text = _append_capped_text(self.stdout_text, text, self.buffer_limit)
+
+    def append_stderr(self, text: str) -> None:
+        self.stderr_text = _append_capped_text(self.stderr_text, text, self.buffer_limit)
+
+
+def _append_capped_text(existing: str, addition: str, limit: int) -> str:
+    combined = existing + addition
+    if len(combined) <= limit:
+        return combined
+    return combined[-limit:]
+
+
+_SHELL_BACKGROUND_JOBS: dict[str, _BackgroundShellJob] = {}
+
+
 class ShellTool(Tool):
     """
     Tool to execute shell commands with comprehensive safety guards.
@@ -436,9 +469,10 @@ class ShellTool(Tool):
     def description(self) -> str:
         mode = "whitelist" if self.validator.whitelist_mode else "blocklist"
         return (
-            f"Execute a shell command and return its output. "
-            f"Commands timeout after {self.timeout}s. "
+            "Execute a shell command or manage a long-running background shell job. "
+            f"Foreground wait budget: {self.timeout}s, then the command stays running in the background. "
             f"Security mode: {mode}. "
+            "Actions: execute, list_jobs, job_status, job_output, terminate_job. "
             "Dangerous commands and injection patterns are blocked."
         )
 
@@ -449,14 +483,30 @@ class ShellTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute (validated for safety)",
+                    "description": "The shell command to execute (required for action=execute)",
                 },
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for the command",
                 },
+                "action": {
+                    "type": "string",
+                    "enum": ["execute", "list_jobs", "job_status", "job_output", "terminate_job"],
+                    "description": "Tool action. Defaults to execute.",
+                    "default": "execute",
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "Background shell job ID for status/output/terminate actions",
+                },
+                "tail_chars": {
+                    "type": "integer",
+                    "description": "How many trailing characters of output to return for background job inspection",
+                    "default": 4000,
+                    "minimum": 200,
+                    "maximum": 50000,
+                },
             },
-            "required": ["command"],
         }
 
     def _parse_command_args(self, command: str) -> list[str]:
@@ -671,10 +721,255 @@ class ShellTool(Tool):
             )
         return result.stdout, result.stderr, result.returncode
 
-    async def execute(
+    def _build_output_result(
+        self,
+        stdout_text: str,
+        stderr_text: str,
+        returncode: int | None,
+        *,
+        max_chars: int | None = None,
+    ) -> str:
+        output_parts = []
+
+        if stdout_text:
+            output_parts.append(stdout_text)
+
+        if stderr_text and stderr_text.strip():
+            output_parts.append(f"STDERR:\n{stderr_text}")
+
+        if returncode not in (None, 0):
+            output_parts.append(f"\nExit code: {returncode}")
+
+        result = "\n".join(output_parts) if output_parts else "(no output)"
+        result = self._mask_secrets(result)
+
+        limit = max_chars or self.max_output
+        if len(result) > limit:
+            truncated = len(result) - limit
+            result = result[:limit] + f"\n... (truncated, {truncated} more chars)"
+
+        return result
+
+    async def _consume_process_stream(
+        self,
+        stream: Any,
+        append: Any,
+    ) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = await asyncio.to_thread(stream.read, 4096)
+            if not chunk:
+                return
+            append(chunk.decode("utf-8", errors="replace"))
+
+    async def _create_process(
         self,
         command: str,
+        cwd: str,
+    ) -> subprocess.Popen[bytes]:
+        env = os.environ.copy()
+        userprofile = env.get("USERPROFILE", "").strip()
+        if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
+            env["HOME"] = userprofile.replace("\\", "/")
+
+        if sys.platform == "win32":
+            home_path = str(Path.home())
+            env["USERPROFILE"] = home_path
+            if len(home_path) >= 2 and home_path[1] == ":":
+                env["HOMEDRIVE"] = home_path[:2]
+                env["HOMEPATH"] = home_path[2:] or "\\"
+            bash = self._find_bash()
+            if bash:
+                env["HOME"] = self._windows_home_to_bash(home_path)
+                command = self._convert_win_paths_to_posix(command)
+                cwd = cwd.replace("\\", "/")
+                return subprocess.Popen(
+                    [bash, "-c", command],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    cwd=cwd,
+                    env=env,
+                )
+            env["HOME"] = home_path.replace("\\", "/")
+            return subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                shell=True,
+                cwd=cwd,
+                env=env,
+            )
+
+        if self.use_shell:
+            return subprocess.Popen(
+                command,
+                shell=True,
+                executable="/bin/sh",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                env=env,
+            )
+
+        args = self._parse_command_args(command)
+        if not args:
+            raise ValueError("Empty command after parsing")
+        return subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            cwd=cwd,
+            env=env,
+        )
+
+    @staticmethod
+    def _get_process_returncode(process: Any) -> int | None:
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            try:
+                return poll()
+            except Exception:
+                pass
+        return getattr(process, "returncode", None)
+
+    async def _wait_for_process(self, process: Any) -> int | None:
+        wait = getattr(process, "wait")
+        if asyncio.iscoroutinefunction(wait):
+            return await wait()
+        return await asyncio.to_thread(wait)
+
+    async def _start_background_job(
+        self,
+        command: str,
+        cwd: str,
+    ) -> _BackgroundShellJob:
+        process = await self._create_process(command, cwd)
+        job = _BackgroundShellJob(
+            job_id=f"sh_{uuid4().hex[:10]}",
+            command=command,
+            cwd=cwd,
+            process=process,
+            stdout_task=asyncio.create_task(asyncio.sleep(0)),
+            stderr_task=asyncio.create_task(asyncio.sleep(0)),
+            buffer_limit=max(self.max_output * 20, 200_000),
+        )
+        job.stdout_task = asyncio.create_task(
+            self._consume_process_stream(process.stdout, job.append_stdout)
+        )
+        job.stderr_task = asyncio.create_task(
+            self._consume_process_stream(process.stderr, job.append_stderr)
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+        return job
+
+    async def _refresh_background_job(self, job: _BackgroundShellJob) -> _BackgroundShellJob:
+        returncode = self._get_process_returncode(job.process)
+        if job.status == "running" and returncode is not None:
+            job.returncode = returncode
+            job.status = "completed" if job.returncode == 0 else "failed"
+        if returncode is not None:
+            await asyncio.gather(job.stdout_task, job.stderr_task, return_exceptions=True)
+        return job
+
+    def _format_background_job_summary(
+        self,
+        job: _BackgroundShellJob,
+        *,
+        timeout_seconds: int,
+        tail_chars: int = 4000,
+    ) -> str:
+        recent_output = self._build_output_result(
+            job.stdout_text,
+            job.stderr_text,
+            job.returncode,
+            max_chars=tail_chars,
+        )
+        return (
+            f"Foreground wait budget ({timeout_seconds}s) expired; command is still running in the background.\n"
+            f"job_id: {job.job_id}\n"
+            f"command: {job.command}\n"
+            f"cwd: {job.cwd}\n"
+            "status: running\n"
+            "Recent output tail:\n"
+            f"{recent_output}\n\n"
+            "Use action='job_status' or action='job_output' with this job_id to inspect it. "
+            "Use action='terminate_job' to stop it."
+        )
+
+    async def _handle_background_action(
+        self,
+        action: str,
+        job_id: str | None,
+        tail_chars: int,
+    ) -> str:
+        if action == "list_jobs":
+            if not _SHELL_BACKGROUND_JOBS:
+                return "No background shell jobs"
+            lines = ["Background shell jobs:"]
+            for job in list(_SHELL_BACKGROUND_JOBS.values()):
+                await self._refresh_background_job(job)
+                lines.append(
+                    f"[{job.job_id}] {job.status} cwd={job.cwd} command={self.validator.sanitize_for_display(job.command)}"
+                )
+            return "\n".join(lines)
+
+        if not job_id:
+            return "Error: 'job_id' is required for this action"
+
+        job = _SHELL_BACKGROUND_JOBS.get(job_id)
+        if not job:
+            return f"Error: Background shell job not found: {job_id}"
+
+        await self._refresh_background_job(job)
+
+        if action == "job_status":
+            return (
+                f"job_id: {job.job_id}\n"
+                f"status: {job.status}\n"
+                f"cwd: {job.cwd}\n"
+                f"command: {job.command}\n"
+                f"returncode: {job.returncode if job.returncode is not None else 'running'}\n"
+                "Recent output tail:\n"
+                f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}"
+            )
+
+        if action == "job_output":
+            return self._build_output_result(
+                job.stdout_text,
+                job.stderr_text,
+                job.returncode,
+                max_chars=tail_chars,
+            )
+
+        if action == "terminate_job":
+            if self._get_process_returncode(job.process) is None:
+                job.process.terminate()
+                try:
+                    await asyncio.wait_for(self._wait_for_process(job.process), timeout=5.0)
+                except asyncio.TimeoutError:
+                    job.process.kill()
+                    await self._wait_for_process(job.process)
+            await self._refresh_background_job(job)
+            job.status = "terminated"
+            return (
+                f"Terminated background shell job {job.job_id}.\n"
+                f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}"
+            )
+
+        return f"Error: Unknown action '{action}'"
+
+    async def execute(
+        self,
+        command: str | None = None,
         working_dir: str | None = None,
+        action: str = "execute",
+        job_id: str | None = None,
+        tail_chars: int = 4000,
         **kwargs: Any,
     ) -> str:
         """
@@ -687,6 +982,12 @@ class ShellTool(Tool):
         Returns:
             Command output or error message.
         """
+        if action != "execute":
+            return await self._handle_background_action(action, job_id, tail_chars)
+
+        if not command or not str(command).strip():
+            return "Error: 'command' is required for action='execute'"
+
         # Apply rate limiting
         if self._rate_limit_config.enabled:
             wait_time = await self._rate_limiter.wait_and_acquire()
@@ -706,39 +1007,18 @@ class ShellTool(Tool):
             return f"Error: Working directory not found: {cwd}"
 
         try:
-            loop = asyncio.get_running_loop()
-            stdout, stderr, returncode = await loop.run_in_executor(
-                None, self._run_sync, command, cwd
-            )
-
-            output_parts = []
-
-            if stdout:
-                stdout_text = stdout.decode("utf-8", errors="replace")
-                output_parts.append(stdout_text)
-
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-
-            if returncode != 0:
-                output_parts.append(f"\nExit code: {returncode}")
-
-            result = "\n".join(output_parts) if output_parts else "(no output)"
-
-            # Mask private keys / secrets so they don't leak into logs or context
-            result = self._mask_secrets(result)
-
-            # Truncate very long output
-            if len(result) > self.max_output:
-                truncated = len(result) - self.max_output
-                result = result[: self.max_output] + f"\n... (truncated, {truncated} more chars)"
-
-            return result
-
-        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-            return f"Error: Command timed out after {self.timeout} seconds"
+            job = await self._start_background_job(command, cwd)
+            try:
+                await asyncio.wait_for(self._wait_for_process(job.process), timeout=self.timeout)
+                await self._refresh_background_job(job)
+                return self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
+            except asyncio.TimeoutError:
+                await self._refresh_background_job(job)
+                return self._format_background_job_summary(
+                    job,
+                    timeout_seconds=self.timeout,
+                    tail_chars=tail_chars,
+                )
         except FileNotFoundError as e:
             return f"Error: Command or file not found: {e}"
         except PermissionError:
@@ -767,7 +1047,7 @@ class SafeShellTool(ShellTool):
 
     def __init__(
         self,
-        timeout: int = 60,
+        timeout: int = 3600,
         max_output: int = 10000,
         working_dir: str | None = None,
         custom_whitelist: set[str] | None = None,
@@ -800,6 +1080,6 @@ class SafeShellTool(ShellTool):
     def description(self) -> str:
         return (
             "Execute a shell command from a whitelist of safe commands. "
-            f"Commands timeout after {self.timeout}s. "
+            f"Foreground wait budget: {self.timeout}s, then the command stays running in the background. "
             "Only predefined commands are allowed for security."
         )
