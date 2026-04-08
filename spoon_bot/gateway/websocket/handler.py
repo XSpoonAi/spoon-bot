@@ -20,12 +20,17 @@ from fastapi import WebSocket, WebSocketDisconnect, Query
 from loguru import logger
 
 from spoon_bot.gateway.app import (
+    cancel_ws_session_chat_task,
+    clear_ws_session_chat_task,
     get_agent,
     get_connection_manager,
     get_config,
     get_agent_execution_lock,
+    get_ws_session_chat_task_id,
     get_session_execution_lock,
+    has_active_ws_session_chat_task,
     is_auth_required,
+    register_ws_session_chat_task,
 )
 from spoon_bot.gateway.auth.jwt import verify_token
 from spoon_bot.gateway.auth.api_key import verify_api_key
@@ -363,8 +368,26 @@ async def websocket_endpoint(
                     # loop stays free to process cancel / status requests.
                     if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
                         _req = message  # capture for closure
+                        session_key = handler._resolve_effective_session_key(_req.params)
 
-                        async def _run_chat(req: WSRequest = _req) -> None:
+                        # New chat for the same session should replace any stale/disconnected run.
+                        had_active_task = has_active_ws_session_chat_task(session_key)
+                        cancelled = await cancel_ws_session_chat_task(session_key)
+                        if had_active_task and not cancelled and has_active_ws_session_chat_task(session_key):
+                            await manager.send_message(
+                                conn_id,
+                                WSError(
+                                    id=_req.id,
+                                    code="TASK_BUSY",
+                                    message=(
+                                        "A previous chat task for this session is still shutting down. "
+                                        "Send chat.cancel and retry shortly."
+                                    ),
+                                ),
+                            )
+                            continue
+
+                        async def _run_chat(req: WSRequest = _req, bound_session_key: str = session_key) -> None:
                             try:
                                 result = await handler._handle_chat(req.params)
                                 await manager.send_message(
@@ -378,8 +401,16 @@ async def websocket_endpoint(
                                 )
                             finally:
                                 handler._current_task = None
+                                clear_ws_session_chat_task(bound_session_key, task=asyncio.current_task())
 
-                        handler._current_task = asyncio.create_task(_run_chat())
+                        chat_task = asyncio.create_task(_run_chat())
+                        handler._current_task = chat_task
+                        register_ws_session_chat_task(
+                            session_key,
+                            chat_task,
+                            cancel_cb=handler._request_current_task_cancel,
+                            task_id_cb=handler._current_task_id_for_cancel,
+                        )
 
                     elif message.method in _CONCURRENT_METHODS:
                         task = asyncio.create_task(
@@ -536,6 +567,33 @@ class WebSocketHandler:
 
     # ========== Chat ==========
 
+    def _resolve_effective_session_key(self, params: dict[str, Any]) -> str:
+        """Resolve the session key for a request using connection binding fallback."""
+        bound_session_key = self._default_session_key
+        try:
+            manager = get_connection_manager()
+            conn = manager.get_connection(self.connection_id)
+        except RuntimeError:
+            conn = None
+
+        if conn:
+            bound_session_key = conn.session_key
+
+        session_key = params.get("session_key", bound_session_key)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = bound_session_key
+        return session_key.strip()
+
+    def _request_current_task_cancel(self) -> None:
+        """Signal cancellation for the current task owned by this handler."""
+        self._cancel_requested = True
+        task = self._current_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _current_task_id_for_cancel(self) -> str | None:
+        return self._current_task_id
+
     async def _handle_chat(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle chat.send / agent.chat — serialized to prevent state races."""
         async with self._chat_lock:
@@ -547,7 +605,6 @@ class WebSocketHandler:
         manager = get_connection_manager()
         config = get_config()
         conn = manager.get_connection(self.connection_id)
-        bound_session_key = conn.session_key if conn else self._default_session_key
         if not conn:
             logger.info(
                 f"WS connection {self.connection_id} is no longer live; "
@@ -561,10 +618,7 @@ class WebSocketHandler:
         if not message:
             raise ValueError("Message or attachments are required")
 
-        session_key = params.get("session_key", bound_session_key)
-        # Validate session_key type
-        if not isinstance(session_key, str) or not session_key.strip():
-            session_key = bound_session_key
+        session_key = self._resolve_effective_session_key(params)
         self._default_session_key = session_key
 
         stream = params.get("stream", False)
@@ -759,10 +813,14 @@ class WebSocketHandler:
     async def _handle_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle cancel request (#13) — cancels both stream and non-stream."""
         self._cancel_requested = True
-        task_id = self._current_task_id
+        target_session_key = self._resolve_effective_session_key(params)
+        task_id = get_ws_session_chat_task_id(target_session_key) or self._current_task_id
 
-        # Also cancel the asyncio task if running (#13)
-        cancelled = await self._cancel_current_task_for_cleanup()
+        # Prefer session-level cancellation so reconnects can stop stale tasks.
+        cancelled = await cancel_ws_session_chat_task(target_session_key)
+        if not cancelled:
+            # Compatibility fallback for direct/unit invocations.
+            cancelled = await self._cancel_current_task_for_cleanup()
 
         return {"cancelled": True, "task_id": task_id, "task_interrupted": cancelled}
 
@@ -776,7 +834,7 @@ class WebSocketHandler:
             self._current_task = None
             return False
 
-        task.cancel()
+        self._request_current_task_cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.CancelledError:
@@ -788,6 +846,7 @@ class WebSocketHandler:
             )
         finally:
             self._current_task = None
+            clear_ws_session_chat_task(self._default_session_key, task=task)
 
         return True
 

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +36,14 @@ _payments: SpoonCorePayments | None = None
 _auth_required: bool = True  # Can be set to False via GATEWAY_AUTH_REQUIRED=false
 _agent_execution_lock: asyncio.Lock | None = None
 _session_execution_locks: dict[str, asyncio.Lock] = {}
+_ws_session_chat_tasks: dict[str, "_WSSessionTaskHandle"] = {}
+
+
+@dataclass
+class _WSSessionTaskHandle:
+    task: asyncio.Task
+    cancel_cb: Callable[[], None] | None = None
+    task_id_cb: Callable[[], str | None] | None = None
 
 
 def is_auth_required() -> bool:
@@ -71,14 +80,94 @@ def get_agent_execution_lock() -> asyncio.Lock:
     return _agent_execution_lock
 
 
+def _normalize_session_key(session_key: str | None) -> str:
+    return session_key.strip() if isinstance(session_key, str) and session_key.strip() else "default"
+
+
 def get_session_execution_lock(session_key: str) -> asyncio.Lock:
     """Get/create a lock for a specific session key."""
-    key = session_key.strip() if isinstance(session_key, str) and session_key.strip() else "default"
+    key = _normalize_session_key(session_key)
     lock = _session_execution_locks.get(key)
     if lock is None:
         lock = asyncio.Lock()
         _session_execution_locks[key] = lock
     return lock
+
+
+def register_ws_session_chat_task(
+    session_key: str,
+    task: asyncio.Task,
+    *,
+    cancel_cb: Callable[[], None] | None = None,
+    task_id_cb: Callable[[], str | None] | None = None,
+) -> None:
+    """Register the active websocket chat task for a session."""
+    _ws_session_chat_tasks[_normalize_session_key(session_key)] = _WSSessionTaskHandle(
+        task=task,
+        cancel_cb=cancel_cb,
+        task_id_cb=task_id_cb,
+    )
+
+
+def get_ws_session_chat_task_id(session_key: str) -> str | None:
+    """Get the current websocket chat task id for a session, if available."""
+    handle = _ws_session_chat_tasks.get(_normalize_session_key(session_key))
+    if handle is None or handle.task_id_cb is None:
+        return None
+    try:
+        return handle.task_id_cb()
+    except Exception:
+        return None
+
+
+def has_active_ws_session_chat_task(session_key: str) -> bool:
+    """Whether a session currently has a running websocket chat task."""
+    handle = _ws_session_chat_tasks.get(_normalize_session_key(session_key))
+    return bool(handle is not None and not handle.task.done())
+
+
+def clear_ws_session_chat_task(session_key: str, *, task: asyncio.Task | None = None) -> bool:
+    """Clear the active websocket chat task for a session."""
+    key = _normalize_session_key(session_key)
+    handle = _ws_session_chat_tasks.get(key)
+    if handle is None:
+        return False
+    if task is not None and handle.task is not task:
+        return False
+    _ws_session_chat_tasks.pop(key, None)
+    return True
+
+
+async def cancel_ws_session_chat_task(session_key: str, timeout: float = 2.0) -> bool:
+    """Cancel and await an active websocket chat task for a session."""
+    key = _normalize_session_key(session_key)
+    handle = _ws_session_chat_tasks.get(key)
+    if handle is None:
+        return False
+
+    task = handle.task
+    if task.done():
+        clear_ws_session_chat_task(key, task=task)
+        return True
+
+    if handle.cancel_cb is not None:
+        try:
+            handle.cancel_cb()
+        except Exception:
+            pass
+    task.cancel()
+    timed_out = False
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        timed_out = True
+        logger.warning(f"Timed out waiting for ws chat task cleanup: session={key}")
+    if task.done():
+        clear_ws_session_chat_task(key, task=task)
+        return True
+    return False if timed_out else task.done()
 
 
 def set_agent(agent: SpoonCoreAgent | AgentLoop) -> None:
@@ -170,11 +259,12 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     Returns:
         Configured FastAPI application.
     """
-    global _config, _agent_execution_lock, _session_execution_locks
+    global _config, _agent_execution_lock, _session_execution_locks, _ws_session_chat_tasks
 
     _config = config or GatewayConfig.from_env()
     _agent_execution_lock = None
     _session_execution_locks = {}
+    _ws_session_chat_tasks = {}
 
     app = FastAPI(
         title="spoon-bot Gateway",

@@ -593,6 +593,84 @@ class TestWsCancellationPropagation:
         assert fm.sent_messages == []
 
     @pytest.mark.asyncio
+    async def test_reconnect_cancel_can_interrupt_previous_session_task(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.app import clear_ws_session_chat_task, register_ws_session_chat_task
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        app_module._ws_session_chat_tasks = {}
+        session_key = "resume-session"
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
+            previous_handler = WebSocketHandler("conn_old", session_key)
+            previous_handler._current_task_id = "task_old_session"
+            previous_handler._current_task = asyncio.create_task(asyncio.sleep(100))
+            register_ws_session_chat_task(
+                session_key,
+                previous_handler._current_task,
+                cancel_cb=previous_handler._request_current_task_cancel,
+                task_id_cb=previous_handler._current_task_id_for_cancel,
+            )
+
+            try:
+                reconnect_handler = WebSocketHandler("conn_new", session_key)
+                result = await reconnect_handler._handle_cancel({"session_key": session_key})
+                assert result["cancelled"] is True
+                assert result["task_interrupted"] is True
+                assert result["task_id"] == "task_old_session"
+                await asyncio.sleep(0)
+                assert previous_handler._cancel_requested is True
+                assert previous_handler._current_task.cancelled()
+            finally:
+                clear_ws_session_chat_task(session_key)
+
+    @pytest.mark.asyncio
+    async def test_chat_send_cancels_existing_session_task_before_start(self):
+        from fastapi import WebSocketDisconnect
+        from spoon_bot.gateway.config import GatewayConfig
+        from spoon_bot.gateway.websocket import handler as ws_handler_module
+
+        fake_ws = MagicMock()
+        fake_ws.client = None
+        fake_ws.receive_json = AsyncMock(side_effect=[
+            {
+                "type": "request",
+                "id": "req_chat",
+                "method": "chat.send",
+                "params": {"message": "hello", "session_key": "active-session"},
+            },
+            WebSocketDisconnect(),
+        ])
+
+        fake_manager = MagicMock()
+        fake_manager.connect = AsyncMock(return_value="conn_test")
+        fake_manager.send_message = AsyncMock(return_value=True)
+        fake_manager.disconnect = AsyncMock()
+
+        fake_handler = MagicMock()
+        fake_handler._cleanup_resources = AsyncMock()
+        fake_handler._dispatch_concurrent_request = AsyncMock()
+        fake_handler.handle_request = AsyncMock()
+        fake_handler._handle_chat = AsyncMock(return_value={"success": True})
+        fake_handler._resolve_effective_session_key = MagicMock(return_value="active-session")
+        fake_handler._request_current_task_cancel = MagicMock()
+        fake_handler._current_task_id_for_cancel = MagicMock(return_value=None)
+        fake_handler._current_task = None
+        fake_handler._concurrent_tasks = set()
+
+        with patch.object(ws_handler_module, "get_config", return_value=GatewayConfig()):
+            with patch.object(ws_handler_module, "get_connection_manager", return_value=fake_manager):
+                with patch.object(ws_handler_module, "is_auth_required", return_value=False):
+                    with patch.object(ws_handler_module, "WebSocketHandler", return_value=fake_handler):
+                        with patch.object(
+                            ws_handler_module,
+                            "cancel_ws_session_chat_task",
+                            new=AsyncMock(return_value=True),
+                        ) as cancel_task:
+                            await ws_handler_module.websocket_endpoint(fake_ws)
+
+        cancel_task.assert_awaited_once_with("active-session")
+
+    @pytest.mark.asyncio
     async def test_websocket_disconnect_does_not_cancel_background_chat(self):
         from fastapi import WebSocketDisconnect
         from spoon_bot.gateway.config import GatewayConfig
