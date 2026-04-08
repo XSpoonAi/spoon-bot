@@ -19,6 +19,24 @@ CORE_TOOLS: frozenset[str] = frozenset({
     "self_config", "memory", "activate_tool", "self_upgrade",
 })
 
+RISKY_LOCAL_TOOLS: frozenset[str] = frozenset({
+    "shell",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "grep",
+    "self_config",
+    "self_upgrade",
+    "activate_tool",
+    "spawn",
+})
+
+GROUP_SAFE_TOOLS: frozenset[str] = frozenset({
+    "web_search",
+    "web_fetch",
+})
+
 # ---------------------------------------------------------------------------
 # Tool profiles: named subsets of tools for different task types.
 # "core" uses CORE_TOOLS above; "all" is implicit (no filter).
@@ -32,6 +50,8 @@ TOOL_PROFILES: dict[str, frozenset[str]] = {
     "research": frozenset({
         "web_search", "web_fetch", "read_file", "list_dir",
     }),
+    "group_safe": GROUP_SAFE_TOOLS,
+    "chat_safe": GROUP_SAFE_TOOLS,
     "full": frozenset({
         "shell", "read_file", "write_file", "edit_file", "list_dir",
         "self_config", "memory", "self_upgrade", "activate_tool", "spawn",

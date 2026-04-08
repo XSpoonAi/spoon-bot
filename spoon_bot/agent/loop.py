@@ -1175,6 +1175,8 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Optional session key for multi-user/multi-channel isolation.
+                         When provided, switches to this session before processing.
 
         Returns:
             The agent's response text.
@@ -1189,9 +1191,11 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
+        # Switch session if a different key is requested
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
+            logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message: {message[:100]}...")
 
@@ -2570,6 +2574,7 @@ class AgentLoop:
         Args:
             message: The user's message.
             media: Optional list of media file paths.
+            session_key: Optional session key for multi-user/multi-channel isolation.
 
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
@@ -2577,9 +2582,11 @@ class AgentLoop:
         if not self._initialized:
             await self.initialize()
 
+        # Switch session if a different key is requested
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
+            logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
         self._reset_reasoning_capture()

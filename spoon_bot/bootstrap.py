@@ -40,9 +40,14 @@ async def init_channels(
         ImportError: If channel dependencies are missing.
     """
     from spoon_bot.channels.manager import ChannelManager
+    from spoon_bot.channels.config import load_agent_config
 
     manager = ChannelManager()
-    manager.set_agent(agent)
+    manager.set_agent(
+        agent,
+        agent_config=load_agent_config(config_path),
+        config_path=config_path,
+    )
     await manager.load_from_config(config_path, include_cli=cli_enabled)
 
     # Remove CLI channel unless explicitly requested — avoids stdin conflicts
