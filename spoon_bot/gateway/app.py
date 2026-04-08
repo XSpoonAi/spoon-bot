@@ -325,6 +325,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
 def _register_routes(app: FastAPI, config: GatewayConfig) -> None:
     """Register all routes."""
     from spoon_bot.gateway.api.health import router as health_router
+    from spoon_bot.gateway.api.webhooks import router as webhook_router
     from spoon_bot.gateway.api.v1.router import router as v1_router
     from spoon_bot.gateway.websocket.handler import websocket_endpoint
 
@@ -340,5 +341,6 @@ def _register_routes(app: FastAPI, config: GatewayConfig) -> None:
         websocket_endpoint,
         name="websocket",
     )
+    app.include_router(webhook_router)
 
     logger.info(f"Registered routes with prefix: {config.api_prefix}")
