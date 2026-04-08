@@ -8,7 +8,8 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,7 @@ from uuid import uuid4
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import get_tool_owner
 from spoon_bot.utils.rate_limit import (
     RateLimitConfig,
     get_rate_limiter,
@@ -367,10 +369,13 @@ class _BackgroundShellJob:
     stdout_task: asyncio.Task[None]
     stderr_task: asyncio.Task[None]
     buffer_limit: int
+    owner_key: str = "default"
     stdout_text: str = ""
     stderr_text: str = ""
     status: str = "running"
     returncode: int | None = None
+    created_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
 
     def append_stdout(self, text: str) -> None:
         self.stdout_text = _append_capped_text(self.stdout_text, text, self.buffer_limit)
@@ -847,10 +852,13 @@ class ShellTool(Tool):
         self,
         command: str,
         cwd: str,
+        owner_key: str | None = None,
     ) -> _BackgroundShellJob:
+        owner = owner_key or get_tool_owner()
         process = await self._create_process(command, cwd)
         job = _BackgroundShellJob(
             job_id=f"sh_{uuid4().hex[:10]}",
+            owner_key=owner,
             command=command,
             cwd=cwd,
             process=process,
@@ -865,6 +873,7 @@ class ShellTool(Tool):
             self._consume_process_stream(process.stderr, job.append_stderr)
         )
         _SHELL_BACKGROUND_JOBS[job.job_id] = job
+        self._prune_background_jobs(owner_key=owner)
         return job
 
     async def _refresh_background_job(self, job: _BackgroundShellJob) -> _BackgroundShellJob:
@@ -872,9 +881,33 @@ class ShellTool(Tool):
         if job.status == "running" and returncode is not None:
             job.returncode = returncode
             job.status = "completed" if job.returncode == 0 else "failed"
+            job.finished_at = time.time()
         if returncode is not None:
             await asyncio.gather(job.stdout_task, job.stderr_task, return_exceptions=True)
         return job
+
+    @staticmethod
+    def _is_terminal_status(status: str) -> bool:
+        return status in {"completed", "failed", "terminated", "cancelled"}
+
+    def _prune_background_jobs(
+        self,
+        *,
+        owner_key: str | None = None,
+        keep_completed_per_owner: int = 20,
+    ) -> None:
+        completed_jobs: dict[str, list[_BackgroundShellJob]] = {}
+        for job in _SHELL_BACKGROUND_JOBS.values():
+            if not self._is_terminal_status(job.status):
+                continue
+            if owner_key is not None and job.owner_key != owner_key:
+                continue
+            completed_jobs.setdefault(job.owner_key, []).append(job)
+
+        for owner, jobs in completed_jobs.items():
+            jobs.sort(key=lambda j: j.finished_at or j.created_at, reverse=True)
+            for stale_job in jobs[keep_completed_per_owner:]:
+                _SHELL_BACKGROUND_JOBS.pop(stale_job.job_id, None)
 
     def _format_background_job_summary(
         self,
@@ -907,11 +940,18 @@ class ShellTool(Tool):
         job_id: str | None,
         tail_chars: int,
     ) -> str:
+        owner_key = get_tool_owner()
+        self._prune_background_jobs(owner_key=owner_key)
+
         if action == "list_jobs":
-            if not _SHELL_BACKGROUND_JOBS:
+            owner_jobs = [
+                job for job in _SHELL_BACKGROUND_JOBS.values()
+                if job.owner_key == owner_key
+            ]
+            if not owner_jobs:
                 return "No background shell jobs"
             lines = ["Background shell jobs:"]
-            for job in list(_SHELL_BACKGROUND_JOBS.values()):
+            for job in owner_jobs:
                 await self._refresh_background_job(job)
                 lines.append(
                     f"[{job.job_id}] {job.status} cwd={job.cwd} command={self.validator.sanitize_for_display(job.command)}"
@@ -922,7 +962,7 @@ class ShellTool(Tool):
             return "Error: 'job_id' is required for this action"
 
         job = _SHELL_BACKGROUND_JOBS.get(job_id)
-        if not job:
+        if not job or job.owner_key != owner_key:
             return f"Error: Background shell job not found: {job_id}"
 
         await self._refresh_background_job(job)
@@ -956,6 +996,7 @@ class ShellTool(Tool):
                     await self._wait_for_process(job.process)
             await self._refresh_background_job(job)
             job.status = "terminated"
+            job.finished_at = time.time()
             return (
                 f"Terminated background shell job {job.job_id}.\n"
                 f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}"
@@ -1007,13 +1048,18 @@ class ShellTool(Tool):
             return f"Error: Working directory not found: {cwd}"
 
         try:
-            job = await self._start_background_job(command, cwd)
+            owner_key = get_tool_owner()
+            job = await self._start_background_job(command, cwd, owner_key=owner_key)
             try:
                 await asyncio.wait_for(self._wait_for_process(job.process), timeout=self.timeout)
                 await self._refresh_background_job(job)
-                return self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
+                result = self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
+                _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
+                self._prune_background_jobs(owner_key=owner_key)
+                return result
             except asyncio.TimeoutError:
                 await self._refresh_background_job(job)
+                self._prune_background_jobs(owner_key=owner_key)
                 return self._format_background_job_summary(
                     job,
                     timeout_seconds=self.timeout,

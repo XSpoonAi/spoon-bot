@@ -978,3 +978,26 @@ class TestToolkitAdapterTimeout:
         await asyncio.sleep(0.15)
         result = await tool.execute(action="job_output", job_id=job_id)
         assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_toolkit_background_jobs_are_scoped_by_owner(self):
+        from spoon_bot.agent.tools.execution_context import bind_tool_owner
+        from spoon_bot.toolkit.adapter import ToolkitToolWrapper
+
+        class _SlowAsyncTool:
+            name = "slow_async_owner"
+            description = "slow tool"
+
+            async def execute(self, **kwargs):
+                await asyncio.sleep(0.15)
+                return "done"
+
+        tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.01)
+        with bind_tool_owner("owner-a"):
+            background = await tool.execute()
+            job_id = background.split("job_id:", 1)[1].splitlines()[0].strip()
+
+        with bind_tool_owner("owner-b"):
+            denied = await tool.execute(action="job_status", job_id=job_id)
+
+        assert "not found" in denied.lower()

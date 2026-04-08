@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from spoon_bot.gateway.app import get_agent
 from spoon_bot.gateway.auth.dependencies import CurrentUser, require_scope
 from spoon_bot.gateway.models.requests import ToolExecuteRequest
+from spoon_bot.agent.tools.execution_context import bind_tool_owner
 from spoon_bot.gateway.models.responses import (
     APIResponse,
     MetaInfo,
@@ -101,7 +102,9 @@ async def execute_tool(
         )
 
     try:
-        result = await agent.tools.execute(tool_name, request.arguments)
+        owner_key = getattr(user, "session_key", None) or getattr(user, "user_id", None) or "admin"
+        with bind_tool_owner(str(owner_key)):
+            result = await agent.tools.execute(tool_name, request.arguments)
         if isinstance(result, str):
             try:
                 parsed = json.loads(result)

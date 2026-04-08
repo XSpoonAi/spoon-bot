@@ -81,6 +81,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.grep import GrepTool
+from spoon_bot.agent.tools.execution_context import bind_tool_owner
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
     SelfConfigTool,
@@ -1244,7 +1245,8 @@ class AgentLoop:
                     ):
                         await self._agent.add_message("user", runtime_message)
                     retry_requires_runtime_message_check = False
-                    result = await self._agent.run()
+                    with bind_tool_owner(getattr(self, "session_key", "default")):
+                        result = await self._agent.run()
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -2161,7 +2163,8 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
-                    result = await self._agent.run(**run_kwargs)
+                    with bind_tool_owner(getattr(self, "session_key", "default")):
+                        result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2182,7 +2185,8 @@ class AgentLoop:
                     self._agent.task_done.set()
 
             logger.debug(f"Creating bg task, agent state={self._agent.state}")
-            bg_task = asyncio.create_task(_run_and_signal())
+            with bind_tool_owner(getattr(self, "session_key", "default")):
+                bg_task = asyncio.create_task(_run_and_signal())
 
             # Force a yield to allow the background task to start
             await asyncio.sleep(0)

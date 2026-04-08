@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import get_tool_owner
 if TYPE_CHECKING:
     pass
 
@@ -19,9 +21,12 @@ class _BackgroundToolkitJob:
     job_id: str
     tool_name: str
     task: asyncio.Task[Any]
+    owner_key: str = "default"
     status: str = "running"
     result: str | None = None
     error: str | None = None
+    created_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
 
 
 _TOOLKIT_BACKGROUND_JOBS: dict[str, _BackgroundToolkitJob] = {}
@@ -114,17 +119,47 @@ class ToolkitToolWrapper(Tool):
             result = await asyncio.shield(job.task)
             job.result = str(result) if result is not None else "Success"
             job.status = "completed"
+            job.finished_at = time.time()
         except asyncio.CancelledError:
             job.error = "Cancellation requested"
             job.status = "cancelled"
+            job.finished_at = time.time()
         except Exception as exc:
             job.error = str(exc)
             job.status = "failed"
+            job.finished_at = time.time()
         return job
 
+    @staticmethod
+    def _is_terminal_status(status: str) -> bool:
+        return status in {"completed", "failed", "cancelled", "terminated"}
+
+    def _prune_completed_jobs(
+        self,
+        *,
+        owner_key: str,
+        keep_completed: int = 20,
+    ) -> None:
+        completed = [
+            job
+            for job in _TOOLKIT_BACKGROUND_JOBS.values()
+            if job.owner_key == owner_key
+            and job.tool_name == self.name
+            and self._is_terminal_status(job.status)
+        ]
+        completed.sort(key=lambda j: j.finished_at or j.created_at, reverse=True)
+        for stale_job in completed[keep_completed:]:
+            _TOOLKIT_BACKGROUND_JOBS.pop(stale_job.job_id, None)
+
     async def _handle_background_action(self, action: str, job_id: str | None) -> str:
+        owner_key = get_tool_owner()
+        self._prune_completed_jobs(owner_key=owner_key)
+
         if action == "list_jobs":
-            matching_jobs = [job for job in _TOOLKIT_BACKGROUND_JOBS.values() if job.tool_name == self.name]
+            matching_jobs = [
+                job for job in _TOOLKIT_BACKGROUND_JOBS.values()
+                if job.tool_name == self.name and job.owner_key == owner_key
+            ]
             if not matching_jobs:
                 return f"No background jobs for toolkit tool '{self.name}'"
             lines = [f"Background jobs for toolkit tool '{self.name}':"]
@@ -137,7 +172,7 @@ class ToolkitToolWrapper(Tool):
             return "Error: 'job_id' is required for this action"
 
         job = _TOOLKIT_BACKGROUND_JOBS.get(job_id)
-        if job is None or job.tool_name != self.name:
+        if job is None or job.tool_name != self.name or job.owner_key != owner_key:
             return f"Error: Background toolkit job not found: {job_id}"
 
         await self._refresh_job(job)
@@ -172,6 +207,9 @@ class ToolkitToolWrapper(Tool):
                     f"Termination requested for toolkit job {job.job_id}, but the underlying work is still running. "
                     "This tool type does not expose incremental output or guaranteed hard-kill support."
                 )
+            if job.status == "cancelled":
+                job.status = "terminated"
+                job.finished_at = time.time()
             return f"Background toolkit job {job.job_id} stopped with status={job.status}"
 
         return f"Error: Unknown action '{action}'"
@@ -190,6 +228,7 @@ class ToolkitToolWrapper(Tool):
             return await self._handle_background_action(action, job_id)
 
         try:
+            owner_key = get_tool_owner()
             bg_task = asyncio.create_task(self._invoke_tool(kwargs))
             try:
                 result = await asyncio.wait_for(asyncio.shield(bg_task), timeout=self._timeout_seconds)
@@ -199,8 +238,10 @@ class ToolkitToolWrapper(Tool):
                     job_id=f"tk_{uuid4().hex[:10]}",
                     tool_name=self.name,
                     task=bg_task,
+                    owner_key=owner_key,
                 )
                 _TOOLKIT_BACKGROUND_JOBS[job.job_id] = job
+                self._prune_completed_jobs(owner_key=owner_key)
                 logger.warning(
                     f"Toolkit tool {self.name} exceeded foreground wait budget "
                     f"({self._timeout_seconds:g}s) and was left running in the background as {job.job_id}"
