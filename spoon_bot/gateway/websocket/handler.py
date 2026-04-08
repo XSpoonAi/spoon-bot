@@ -624,8 +624,9 @@ class WebSocketHandler:
             conn = manager.get_connection(self.connection_id)
         except RuntimeError:
             conn = None
-        if conn and isinstance(conn.user_id, str) and conn.user_id.strip():
-            user_id = conn.user_id.strip()
+        conn_user_id = getattr(conn, "user_id", None) if conn else None
+        if isinstance(conn_user_id, str) and conn_user_id.strip():
+            user_id = conn_user_id.strip()
         return user_id
 
     def _request_current_task_cancel(self) -> None:

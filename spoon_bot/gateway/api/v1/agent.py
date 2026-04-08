@@ -751,6 +751,7 @@ async def voice_chat(
     request_id = f"req_{uuid4().hex[:12]}"
     start_time = time.time()
     trace_id = new_trace_id()
+    owner_user_id = getattr(user, "user_id", "anonymous") if user else "anonymous"
 
     config = get_config()
     if not config.audio.enabled:

@@ -130,6 +130,31 @@ class ToolkitToolWrapper(Tool):
             job.finished_at = time.time()
         return job
 
+    def _attach_background_job_lifecycle(self, job: _BackgroundToolkitJob) -> None:
+        """Keep background job status in sync without requiring polling actions."""
+
+        def _on_done(done_task: asyncio.Task[Any]) -> None:
+            if job.status != "running":
+                return
+            try:
+                result = done_task.result()
+                job.result = str(result) if result is not None else "Success"
+                job.status = "completed"
+            except asyncio.CancelledError:
+                job.error = "Cancellation requested"
+                job.status = "cancelled"
+            except Exception as exc:  # noqa: BLE001
+                job.error = str(exc)
+                job.status = "failed"
+            finally:
+                job.finished_at = time.time()
+                self._prune_completed_jobs(owner_key=job.owner_key)
+
+        if job.task.done():
+            _on_done(job.task)
+            return
+        job.task.add_done_callback(_on_done)
+
     @staticmethod
     def _is_terminal_status(status: str) -> bool:
         return status in {"completed", "failed", "cancelled", "terminated"}
@@ -241,6 +266,7 @@ class ToolkitToolWrapper(Tool):
                     owner_key=owner_key,
                 )
                 _TOOLKIT_BACKGROUND_JOBS[job.job_id] = job
+                self._attach_background_job_lifecycle(job)
                 self._prune_completed_jobs(owner_key=owner_key)
                 logger.warning(
                     f"Toolkit tool {self.name} exceeded foreground wait budget "

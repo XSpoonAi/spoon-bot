@@ -1133,6 +1133,30 @@ class TestToolkitAdapterTimeout:
 
         assert "not found" in denied.lower()
 
+    @pytest.mark.asyncio
+    async def test_toolkit_background_job_auto_marks_terminal_without_polling(self):
+        from spoon_bot.toolkit import adapter as adapter_module
+        from spoon_bot.toolkit.adapter import ToolkitToolWrapper
+
+        class _SlowAsyncTool:
+            name = "slow_auto_terminal"
+            description = "slow tool"
+
+            async def execute(self, **kwargs):
+                await asyncio.sleep(0.05)
+                return "done"
+
+        tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.01)
+        background = await tool.execute()
+        job_id = background.split("job_id:", 1)[1].splitlines()[0].strip()
+
+        await asyncio.sleep(0.12)
+        job = adapter_module._TOOLKIT_BACKGROUND_JOBS.get(job_id)
+        assert job is not None
+        assert job.status == "completed"
+        assert job.finished_at is not None
+        adapter_module._TOOLKIT_BACKGROUND_JOBS.pop(job_id, None)
+
 
 class TestToolOwnerKey:
     def test_owner_key_includes_user_and_session(self):
