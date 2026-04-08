@@ -2472,7 +2472,8 @@ class AgentLoop:
             run_kwargs: dict[str, Any] = {}
             if self._callable_accepts_kwarg(self._agent.run, "thinking"):
                 run_kwargs["thinking"] = True
-            result = await self._agent.run(**run_kwargs)
+            with bind_tool_owner(self._current_tool_owner_key()):
+                result = await self._agent.run(**run_kwargs)
 
             # Extract content and thinking
             if hasattr(result, "content"):

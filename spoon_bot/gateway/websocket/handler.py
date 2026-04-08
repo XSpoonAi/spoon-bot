@@ -26,6 +26,7 @@ from spoon_bot.gateway.app import (
     get_connection_manager,
     get_config,
     get_agent_execution_lock,
+    get_ws_session_chat_lock,
     get_ws_session_chat_task_id,
     get_session_execution_lock,
     has_active_ws_session_chat_task,
@@ -369,67 +370,72 @@ async def websocket_endpoint(
                     if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
                         _req = message  # capture for closure
                         session_key = handler._resolve_effective_session_key(_req.params)
-
-                        # New chat for the same session should replace any stale/disconnected run.
                         registry_user_id = handler._resolve_registry_user_id()
-                        had_active_task = has_active_ws_session_chat_task(
+                        session_chat_lock = get_ws_session_chat_lock(
                             session_key,
                             user_id=registry_user_id,
                         )
-                        cancelled = await cancel_ws_session_chat_task(
-                            session_key,
-                            user_id=registry_user_id,
-                        )
-                        if had_active_task and not cancelled and has_active_ws_session_chat_task(
-                            session_key,
-                            user_id=registry_user_id,
-                        ):
-                            await manager.send_message(
-                                conn_id,
-                                WSError(
-                                    id=_req.id,
-                                    code="TASK_BUSY",
-                                    message=(
-                                        "A previous chat task for this session is still shutting down. "
-                                        "Send chat.cancel and retry shortly."
-                                    ),
-                                ),
-                            )
-                            continue
 
-                        async def _run_chat(
-                            req: WSRequest = _req,
-                            bound_session_key: str = session_key,
-                            bound_user_id: str = registry_user_id,
-                        ) -> None:
-                            try:
-                                result = await handler._handle_chat(req.params)
-                                await manager.send_message(
-                                    conn_id, WSResponse(id=req.id, result=result),
-                                )
-                            except Exception as exc:
-                                logger.error(f"Chat error: {exc}")
+                        async with session_chat_lock:
+                            # New chat for the same session should replace any stale/disconnected run.
+                            had_active_task = has_active_ws_session_chat_task(
+                                session_key,
+                                user_id=registry_user_id,
+                            )
+                            cancelled = await cancel_ws_session_chat_task(
+                                session_key,
+                                user_id=registry_user_id,
+                            )
+                            if had_active_task and not cancelled and has_active_ws_session_chat_task(
+                                session_key,
+                                user_id=registry_user_id,
+                            ):
                                 await manager.send_message(
                                     conn_id,
-                                    WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
+                                    WSError(
+                                        id=_req.id,
+                                        code="TASK_BUSY",
+                                        message=(
+                                            "A previous chat task for this session is still shutting down. "
+                                            "Send chat.cancel and retry shortly."
+                                        ),
+                                    ),
                                 )
-                            finally:
-                                handler._current_task = None
-                                clear_ws_session_chat_task(
-                                    bound_session_key,
-                                    user_id=bound_user_id,
-                                    task=asyncio.current_task(),
-                                )
+                                continue
 
-                        chat_task = asyncio.create_task(_run_chat())
-                        handler._current_task = chat_task
-                        register_ws_session_chat_task(
-                            session_key,
-                            chat_task,
-                            user_id=registry_user_id,
-                            cancel_cb=handler._request_current_task_cancel,
-                            task_id_cb=handler._current_task_id_for_cancel,
-                        )
+                            async def _run_chat(
+                                req: WSRequest = _req,
+                                bound_session_key: str = session_key,
+                                bound_user_id: str = registry_user_id,
+                            ) -> None:
+                                try:
+                                    result = await handler._handle_chat(req.params)
+                                    await manager.send_message(
+                                        conn_id, WSResponse(id=req.id, result=result),
+                                    )
+                                except Exception as exc:
+                                    logger.error(f"Chat error: {exc}")
+                                    await manager.send_message(
+                                        conn_id,
+                                        WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
+                                    )
+                                finally:
+                                    handler._current_task = None
+                                    clear_ws_session_chat_task(
+                                        bound_session_key,
+                                        user_id=bound_user_id,
+                                        task=asyncio.current_task(),
+                                    )
+
+                            chat_task = asyncio.create_task(_run_chat())
+                            handler._current_task = chat_task
+                            register_ws_session_chat_task(
+                                session_key,
+                                chat_task,
+                                user_id=registry_user_id,
+                                cancel_cb=handler._request_current_task_cancel,
+                                task_id_cb=handler._current_task_id_for_cancel,
+                            )
 
                     elif message.method in _CONCURRENT_METHODS:
                         task = asyncio.create_task(
@@ -854,16 +860,21 @@ class WebSocketHandler:
         self._cancel_requested = True
         target_session_key = self._resolve_effective_session_key(params)
         registry_user_id = self._resolve_registry_user_id()
-        task_id = (
-            get_ws_session_chat_task_id(target_session_key, user_id=registry_user_id)
-            or self._current_task_id
-        )
-
-        # Prefer session-level cancellation so reconnects can stop stale tasks.
-        cancelled = await cancel_ws_session_chat_task(
+        session_chat_lock = get_ws_session_chat_lock(
             target_session_key,
             user_id=registry_user_id,
         )
+        async with session_chat_lock:
+            task_id = (
+                get_ws_session_chat_task_id(target_session_key, user_id=registry_user_id)
+                or self._current_task_id
+            )
+
+            # Prefer session-level cancellation so reconnects can stop stale tasks.
+            cancelled = await cancel_ws_session_chat_task(
+                target_session_key,
+                user_id=registry_user_id,
+            )
         if not cancelled:
             # Compatibility fallback for direct/unit invocations.
             cancelled = await self._cancel_current_task_for_cleanup()

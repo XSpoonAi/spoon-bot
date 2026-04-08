@@ -37,6 +37,7 @@ _auth_required: bool = True  # Can be set to False via GATEWAY_AUTH_REQUIRED=fal
 _agent_execution_lock: asyncio.Lock | None = None
 _session_execution_locks: dict[str, asyncio.Lock] = {}
 _ws_session_chat_tasks: dict[str, "_WSSessionTaskHandle"] = {}
+_ws_session_chat_locks: dict[str, asyncio.Lock] = {}
 
 
 @dataclass
@@ -116,6 +117,16 @@ def register_ws_session_chat_task(
         cancel_cb=cancel_cb,
         task_id_cb=task_id_cb,
     )
+
+
+def get_ws_session_chat_lock(session_key: str, user_id: str | None = None) -> asyncio.Lock:
+    """Get/create the serialized replacement lock for a WS user+session key."""
+    key = _ws_session_chat_registry_key(session_key, user_id)
+    lock = _ws_session_chat_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ws_session_chat_locks[key] = lock
+    return lock
 
 
 def get_ws_session_chat_task_id(session_key: str, user_id: str | None = None) -> str | None:
@@ -278,12 +289,13 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     Returns:
         Configured FastAPI application.
     """
-    global _config, _agent_execution_lock, _session_execution_locks, _ws_session_chat_tasks
+    global _config, _agent_execution_lock, _session_execution_locks, _ws_session_chat_tasks, _ws_session_chat_locks
 
     _config = config or GatewayConfig.from_env()
     _agent_execution_lock = None
     _session_execution_locks = {}
     _ws_session_chat_tasks = {}
+    _ws_session_chat_locks = {}
 
     app = FastAPI(
         title="spoon-bot Gateway",

@@ -699,9 +699,15 @@ class TestWsCancellationPropagation:
                             "cancel_ws_session_chat_task",
                             new=AsyncMock(return_value=True),
                         ) as cancel_task:
-                            await ws_handler_module.websocket_endpoint(fake_ws)
+                            with patch.object(
+                                ws_handler_module,
+                                "get_ws_session_chat_lock",
+                                return_value=asyncio.Lock(),
+                            ) as get_replace_lock:
+                                await ws_handler_module.websocket_endpoint(fake_ws)
 
         cancel_task.assert_awaited_once_with("active-session", user_id="anonymous")
+        get_replace_lock.assert_called_once_with("active-session", user_id="anonymous")
 
     @pytest.mark.asyncio
     async def test_websocket_disconnect_does_not_cancel_background_chat(self):
@@ -731,6 +737,20 @@ class TestWsCancellationPropagation:
         fake_handler._cancel_current_task_for_cleanup.assert_not_awaited()
         fake_handler._cleanup_resources.assert_awaited_once()
         fake_manager.disconnect.assert_awaited_once_with("conn_test")
+
+    def test_ws_session_chat_lock_is_scoped_by_user_and_session(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.app import get_ws_session_chat_lock
+
+        app_module._ws_session_chat_locks = {}
+        lock_a = get_ws_session_chat_lock("default", user_id="alice")
+        lock_a_again = get_ws_session_chat_lock("default", user_id="alice")
+        lock_b = get_ws_session_chat_lock("default", user_id="bob")
+        lock_other_session = get_ws_session_chat_lock("other", user_id="alice")
+
+        assert lock_a is lock_a_again
+        assert lock_a is not lock_b
+        assert lock_a is not lock_other_session
 
 
 class TestWsTimeoutErrorCodes:
