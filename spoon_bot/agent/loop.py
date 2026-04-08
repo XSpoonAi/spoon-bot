@@ -2444,6 +2444,14 @@ class AgentLoop:
                 elif isinstance(chunk, str):
                     delta = chunk
 
+                if chunk_type == "tool_result":
+                    yield {
+                        "type": chunk_type,
+                        "delta": delta,
+                        "metadata": metadata,
+                    }
+                    continue
+
                 if delta:
                     metadata_phase = metadata.get("phase") if isinstance(metadata, dict) else None
                     explicit_pre_tool_phase = (
