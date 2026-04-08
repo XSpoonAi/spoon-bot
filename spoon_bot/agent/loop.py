@@ -81,6 +81,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.grep import GrepTool
+from spoon_bot.agent.tools.execution_context import bind_tool_owner, build_tool_owner_key
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
     SelfConfigTool,
@@ -401,6 +402,7 @@ class AgentLoop:
         self.shell_timeout = self._config.shell_timeout
         self.max_output = self._config.max_output
         self.session_key = self._config.session_key
+        self.user_id = "anonymous"
         self._enable_skills = enable_skills
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
@@ -1153,6 +1155,13 @@ class AgentLoop:
             return self.context._build_user_content(text_content, media)
         return text_content
 
+    def _current_tool_owner_key(self, session_key: str | None = None) -> str:
+        """Resolve a user-scoped ownership key for background tool jobs."""
+        return build_tool_owner_key(
+            getattr(self, "user_id", None),
+            session_key if session_key is not None else getattr(self, "session_key", None),
+        )
+
     async def process(
         self,
         message: str,
@@ -1244,7 +1253,8 @@ class AgentLoop:
                     ):
                         await self._agent.add_message("user", runtime_message)
                     retry_requires_runtime_message_check = False
-                    result = await self._agent.run()
+                    with bind_tool_owner(self._current_tool_owner_key()):
+                        result = await self._agent.run()
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -2161,7 +2171,8 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
-                    result = await self._agent.run(**run_kwargs)
+                    with bind_tool_owner(self._current_tool_owner_key()):
+                        result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):
@@ -2182,7 +2193,8 @@ class AgentLoop:
                     self._agent.task_done.set()
 
             logger.debug(f"Creating bg task, agent state={self._agent.state}")
-            bg_task = asyncio.create_task(_run_and_signal())
+            with bind_tool_owner(self._current_tool_owner_key()):
+                bg_task = asyncio.create_task(_run_and_signal())
 
             # Force a yield to allow the background task to start
             await asyncio.sleep(0)
@@ -2191,8 +2203,6 @@ class AgentLoop:
             oq = self._agent.output_queue
             td = self._agent.task_done
             logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
-            stream_timeout = 600.0 if thinking else 300.0
-            deadline = asyncio.get_event_loop().time() + stream_timeout
             chunk_count = 0
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
@@ -2201,26 +2211,9 @@ class AgentLoop:
                 # not a reliable API thinking source. Clear it so it does not leak
                 # duplicated final content into WS/REST responses.
                 self._drain_reasoning_chunks()
-                now_ts = asyncio.get_event_loop().time()
-
-                if now_ts > deadline:
-                    logger.warning(
-                        f"Streaming deadline reached ({stream_timeout}s), "
-                        f"stopping after {chunk_count} chunks"
-                    )
-                    yield {
-                        "type": "error",
-                        "delta": f"Stream timeout after {int(stream_timeout)}s",
-                        "metadata": {
-                            "error": "STREAM_TIMEOUT",
-                            "error_code": "STREAM_TIMEOUT",
-                            "timeout_seconds": stream_timeout,
-                            "chunks_received": chunk_count,
-                        },
-                    }
-                    break
-
                 try:
+                    # Poll without a hard stream deadline so long-running tasks
+                    # only stop when the caller explicitly cancels them.
                     # Use oq.get() without timeout kwarg — works for both
                     # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
                     # handled by the outer asyncio.wait_for.
@@ -2479,7 +2472,8 @@ class AgentLoop:
             run_kwargs: dict[str, Any] = {}
             if self._callable_accepts_kwarg(self._agent.run, "thinking"):
                 run_kwargs["thinking"] = True
-            result = await self._agent.run(**run_kwargs)
+            with bind_tool_owner(self._current_tool_owner_key()):
+                result = await self._agent.run(**run_kwargs)
 
             # Extract content and thinking
             if hasattr(result, "content"):

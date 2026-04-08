@@ -1151,6 +1151,57 @@ class TestAgentLoopProcessWithThinking:
         assert thinking == "I need to think about this..."
 
     @pytest.mark.asyncio
+    async def test_process_with_thinking_binds_tool_owner(self):
+        """process_with_thinking() should bind tool owner context for run()."""
+        from contextlib import contextmanager
+        from spoon_bot.agent.loop import AgentLoop
+
+        result = MagicMock()
+        result.content = "ok"
+        result.thinking_content = None
+
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.run = AsyncMock(return_value=result)
+        mock_inner_agent.add_message = AsyncMock()
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = mock_inner_agent
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._auto_commit = False
+        agent._git = None
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._looks_like_duplicate_thinking = AgentLoop._looks_like_duplicate_thinking.__get__(agent, AgentLoop)
+        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
+        agent._latest_reasoning_excerpt = None
+        agent._current_tool_owner_key = MagicMock(return_value="user:alice|session:default")
+
+        owners: list[str] = []
+
+        @contextmanager
+        def _capture_owner(owner):
+            owners.append(str(owner))
+            yield owner
+
+        with patch("spoon_bot.agent.loop.bind_tool_owner", side_effect=_capture_owner):
+            response, thinking = await AgentLoop.process_with_thinking(agent, message="test")
+
+        assert response == "ok"
+        assert thinking is None
+        assert owners == ["user:alice|session:default"]
+
+    @pytest.mark.asyncio
     async def test_thinking_fallback_attributes(self):
         """Should try multiple attributes for thinking content."""
         from spoon_bot.agent.loop import AgentLoop

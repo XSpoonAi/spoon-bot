@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-04-07 08:14 UTC.  
+> **Auto-generated** from source code on 2026-04-08 03:40 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -57,7 +57,7 @@ Authenticate and get tokens.
 
 **Response Model:** `TokenResponse`
 
-*Source: `spoon_bot/gateway/api/v1/auth.py:22`*
+*Source: `spoon_bot\gateway\api\v1\auth.py:22`*
 
 ### `POST /v1/auth/refresh`
 
@@ -67,7 +67,7 @@ Refresh access token using refresh token.
 
 **Response Model:** `TokenResponse`
 
-*Source: `spoon_bot/gateway/api/v1/auth.py:68`*
+*Source: `spoon_bot\gateway\api\v1\auth.py:68`*
 
 ### `POST /v1/auth/logout`
 
@@ -75,13 +75,13 @@ Logout and invalidate refresh token.
 
 **Request Body:** `RefreshRequest`
 
-*Source: `spoon_bot/gateway/api/v1/auth.py:103`*
+*Source: `spoon_bot\gateway\api\v1\auth.py:103`*
 
 ### `GET /v1/auth/verify`
 
 Verify current authentication.
 
-*Source: `spoon_bot/gateway/api/v1/auth.py:114`*
+*Source: `spoon_bot\gateway\api\v1\auth.py:114`*
 
 ---
 
@@ -95,21 +95,21 @@ Health check endpoint.
 
 **Response Model:** `HealthResponse`
 
-*Source: `spoon_bot/gateway/api/health.py:19`*
+*Source: `spoon_bot\gateway\api\health.py:19`*
 
 ### `GET /ready`
 
 Readiness check endpoint.
 
 
-*Source: `spoon_bot/gateway/api/health.py:62`*
+*Source: `spoon_bot\gateway\api\health.py:62`*
 
 ### `GET /`
 
 Root endpoint with API information.
 
 
-*Source: `spoon_bot/gateway/api/health.py:94`*
+*Source: `spoon_bot\gateway\api\health.py:94`*
 
 ---
 
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:293`*
+*Source: `spoon_bot\gateway\api\v1\agent.py:293`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:722`*
+*Source: `spoon_bot\gateway\api\v1\agent.py:722`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:597`*
+*Source: `spoon_bot\gateway\api\v1\agent.py:597`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:497`*
+*Source: `spoon_bot\gateway\api\v1\agent.py:497`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:533`*
+*Source: `spoon_bot\gateway\api\v1\agent.py:533`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:566`*
+*Source: `spoon_bot\gateway\api\v1\agent.py:566`*
 
 ---
 
@@ -315,7 +315,7 @@ List all sessions.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:26`*
+*Source: `spoon_bot\gateway\api\v1\sessions.py:26`*
 
 ### `POST /v1/sessions`
 
@@ -325,7 +325,7 @@ Create a new session.
 
 **Request Body:** `SessionCreateRequest`
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:63`*
+*Source: `spoon_bot\gateway\api\v1\sessions.py:63`*
 
 ### `GET /v1/sessions/{session_key}`
 
@@ -334,7 +334,7 @@ Get session details.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:103`*
+*Source: `spoon_bot\gateway\api\v1\sessions.py:103`*
 
 ### `DELETE /v1/sessions/{session_key}`
 
@@ -343,7 +343,7 @@ Delete a session.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:138`*
+*Source: `spoon_bot\gateway\api\v1\sessions.py:138`*
 
 ### `POST /v1/sessions/{session_key}/clear`
 
@@ -352,7 +352,7 @@ Clear session history.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:157`*
+*Source: `spoon_bot\gateway\api\v1\sessions.py:157`*
 
 ---
 
@@ -365,7 +365,7 @@ List all available tools.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/tools.py:25`*
+*Source: `spoon_bot\gateway\api\v1\tools.py:26`*
 
 ### `GET /v1/tools/{tool_name}/schema`
 
@@ -374,7 +374,7 @@ Get the schema for a specific tool.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/tools.py:52`*
+*Source: `spoon_bot\gateway\api\v1\tools.py:53`*
 
 ### `POST /v1/tools/{tool_name}/execute`
 
@@ -384,7 +384,7 @@ Execute a tool directly.
 
 **Request Body:** `ToolExecuteRequest`
 
-*Source: `spoon_bot/gateway/api/v1/tools.py:83`*
+*Source: `spoon_bot\gateway\api\v1\tools.py:84`*
 
 ---
 
@@ -397,7 +397,7 @@ List all available skills.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:51`*
+*Source: `spoon_bot\gateway\api\v1\skills.py:51`*
 
 ### `POST /v1/skills/{skill_name}/activate`
 
@@ -407,7 +407,7 @@ Activate a skill.
 
 **Request Body:** `SkillActivateRequest`
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:86`*
+*Source: `spoon_bot\gateway\api\v1\skills.py:86`*
 
 ### `POST /v1/skills/{skill_name}/deactivate`
 
@@ -416,7 +416,7 @@ Deactivate a skill.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/skills.py:144`*
+*Source: `spoon_bot\gateway\api\v1\skills.py:144`*
 
 ---
 
@@ -525,7 +525,7 @@ Handle audio.stream.end
 
 ### Request Models
 
-*Source: `spoon_bot/gateway/models/requests.py`*
+*Source: `spoon_bot\gateway\models\requests.py`*
 
 #### `ChatOptions`
 
@@ -628,7 +628,7 @@ Configuration update request model.
 
 ### Response Models
 
-*Source: `spoon_bot/gateway/models/responses.py`*
+*Source: `spoon_bot\gateway\models\responses.py`*
 
 #### `MetaInfo`
 
@@ -966,9 +966,9 @@ Health check response.
 | `GATEWAY_PORT` | `8080` | config.py |
 | `GATEWAY_DEBUG` | *(none)* | config.py |
 | `JWT_ACCESS_EXPIRE_MINUTES` | `15` | config.py |
-| `GATEWAY_TIMEOUT_REQUEST_MS` | `3600000` | config.py |
+| `GATEWAY_TIMEOUT_REQUEST_MS` | `0` | config.py |
 | `GATEWAY_TIMEOUT_TOOL_MS` | `3600000` | config.py |
-| `GATEWAY_TIMEOUT_STREAM_MS` | `3600000` | config.py |
+| `GATEWAY_TIMEOUT_STREAM_MS` | `0` | config.py |
 | `GATEWAY_AUDIO_ENABLED` | `true` | config.py |
 | `GATEWAY_AUDIO_STT_PROVIDER` | `whisper` | config.py |
 | `GATEWAY_AUDIO_STT_MODEL` | `whisper-1` | config.py |

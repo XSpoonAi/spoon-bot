@@ -1,21 +1,49 @@
 """
-Tests for streaming thinking fix and stream timeout improvements.
+Tests for streaming thinking behavior and resilient long-running streams.
 
 Covers:
   - thinking parameter forwarded to _run_and_signal() in stream mode
-  - stream timeout uses 600s for thinking, 300s otherwise
-  - stream timeout emits error event instead of silent break
+  - stream loop no longer enforces a local deadline
+  - delayed chunks still arrive without tripping a local stream timeout
   - ConnectionManager.send_message retries before disconnecting
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+def _make_mock_stream_agent(run_impl) -> tuple[object, asyncio.Queue, asyncio.Event]:
+    from spoon_bot.agent.loop import AgentLoop
+
+    oq: asyncio.Queue = asyncio.Queue()
+    td = asyncio.Event()
+
+    agent = MagicMock(spec=AgentLoop)
+    agent._initialized = True
+    agent._agent = MagicMock()
+    agent._agent.output_queue = oq
+    agent._agent.task_done = td
+    agent._agent.run = run_impl
+    agent._agent.state = "idle"
+    agent._agent.add_message = AsyncMock()
+    agent._session = MagicMock()
+    agent._session.add_message = MagicMock()
+    agent.sessions = MagicMock()
+    agent.sessions.save = MagicMock()
+    agent.memory = MagicMock()
+    agent.memory.get_memory_context = MagicMock(return_value=None)
+    agent.context = MagicMock()
+    agent._prepare_request_context = AsyncMock()
+    agent._build_runtime_message_content = MagicMock(return_value="test")
+    agent._build_step_prompt = MagicMock(return_value="prompt")
+    agent._install_anti_loop_tracker = MagicMock()
+    agent._restore_agent_think = MagicMock()
+    agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
+    return agent, oq, td
 
 
 # ============================================================
@@ -39,30 +67,7 @@ class TestStreamThinkingParam:
             result.content = "done"
             return result
 
-        oq: asyncio.Queue = asyncio.Queue()
-        td = asyncio.Event()
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = oq
-        agent._agent.task_done = td
-        agent._agent.run = mock_run
-        agent._agent.state = "idle"
-        agent._agent.add_message = AsyncMock()
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(return_value="test")
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
+        agent, _, _ = _make_mock_stream_agent(mock_run)
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test", thinking=True):
@@ -84,30 +89,7 @@ class TestStreamThinkingParam:
             result.content = "done"
             return result
 
-        oq: asyncio.Queue = asyncio.Queue()
-        td = asyncio.Event()
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = oq
-        agent._agent.task_done = td
-        agent._agent.run = mock_run
-        agent._agent.state = "idle"
-        agent._agent.add_message = AsyncMock()
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(return_value="test")
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
+        agent, _, _ = _make_mock_stream_agent(mock_run)
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test", thinking=False):
@@ -118,169 +100,38 @@ class TestStreamThinkingParam:
 
 
 # ============================================================
-# Stream timeout configuration
+# Stream wait behavior
 # ============================================================
 
 
-class TestStreamTimeoutConfig:
-    """Verify that stream timeout is properly configured based on thinking flag."""
+class TestStreamWaitBehavior:
+    """Verify that stream() waits for completion instead of timing out locally."""
 
     @pytest.mark.asyncio
-    async def test_thinking_mode_uses_longer_timeout(self):
-        """With thinking=True, stream_timeout should be 600s."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        timeout_captured: list[float] = []
-
-        orig_time = asyncio.get_event_loop().time
-
-        async def mock_run(**kwargs):
-            result = MagicMock()
-            result.content = "done"
-            return result
-
-        oq: asyncio.Queue = asyncio.Queue()
-        td = asyncio.Event()
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = oq
-        agent._agent.task_done = td
-        agent._agent.run = mock_run
-        agent._agent.state = "idle"
-        agent._agent.add_message = AsyncMock()
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(return_value="test")
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
-
-        chunks = []
-        async for chunk in AgentLoop.stream(agent, message="test", thinking=True):
-            chunks.append(chunk)
-
-        done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert len(done_chunks) == 1
-
-    @pytest.mark.asyncio
-    async def test_non_thinking_mode_uses_default_timeout(self):
-        """With thinking=False, stream_timeout should be 300s (not the old 120s)."""
+    async def test_stream_waits_for_delayed_chunk_without_timeout(self):
+        """A delayed chunk should still be delivered without a synthetic timeout error."""
         from spoon_bot.agent.loop import AgentLoop
 
         async def mock_run(**kwargs):
+            await asyncio.sleep(0.05)
+            await oq.put({"type": "content", "delta": "late chunk", "metadata": {}})
             result = MagicMock()
-            result.content = "done"
+            result.content = "late chunk"
             return result
 
-        oq: asyncio.Queue = asyncio.Queue()
-        td = asyncio.Event()
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = oq
-        agent._agent.task_done = td
-        agent._agent.run = mock_run
-        agent._agent.state = "idle"
-        agent._agent.add_message = AsyncMock()
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(return_value="test")
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
+        agent, oq, _ = _make_mock_stream_agent(mock_run)
 
         chunks = []
-        async for chunk in AgentLoop.stream(agent, message="test", thinking=False):
+        async for chunk in AgentLoop.stream(agent, message="test"):
             chunks.append(chunk)
 
+        assert [c for c in chunks if c["type"] == "error"] == []
+        content_chunks = [c for c in chunks if c["type"] == "content"]
         done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert len(content_chunks) == 1
+        assert content_chunks[0]["delta"] == "late chunk"
         assert len(done_chunks) == 1
-
-
-# ============================================================
-# Stream timeout emits error (not silent break)
-# ============================================================
-
-
-class TestStreamTimeoutError:
-    """Verify that stream timeout emits an error event."""
-
-    @pytest.mark.asyncio
-    async def test_timeout_emits_error_chunk(self):
-        """When stream deadline is reached, an error chunk should be emitted."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        oq: asyncio.Queue = asyncio.Queue()
-        td = asyncio.Event()
-
-        async def slow_run(**kwargs):
-            await asyncio.sleep(100)
-            result = MagicMock()
-            result.content = "never"
-            return result
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = oq
-        agent._agent.task_done = td
-        agent._agent.run = slow_run
-        agent._agent.state = "idle"
-        agent._agent.add_message = AsyncMock()
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(return_value="test")
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
-
-        with patch("spoon_bot.agent.loop.asyncio.get_event_loop") as mock_loop:
-            call_count = 0
-
-            def fake_time():
-                nonlocal call_count
-                call_count += 1
-                if call_count <= 2:
-                    return 1000.0
-                return 2000.0
-
-            mock_event_loop = MagicMock()
-            mock_event_loop.time = fake_time
-            mock_loop.return_value = mock_event_loop
-
-            chunks = []
-            async for chunk in AgentLoop.stream(agent, message="test"):
-                chunks.append(chunk)
-                if chunk.get("type") == "error":
-                    break
-
-            error_chunks = [c for c in chunks if c["type"] == "error"]
-            assert len(error_chunks) >= 1
-            assert "STREAM_TIMEOUT" in error_chunks[0]["metadata"].get("error_code", "")
+        assert done_chunks[0]["metadata"]["content"] == "late chunk"
 
 
 # ============================================================

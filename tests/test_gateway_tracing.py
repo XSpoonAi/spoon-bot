@@ -320,7 +320,9 @@ class TestBudgetConfig:
     def test_defaults(self):
         from spoon_bot.gateway.config import BudgetConfig
         b = BudgetConfig()
-        assert b.request_timeout_ms > 0 and b.tool_timeout_ms > 0
+        assert b.request_timeout_ms == 0
+        assert b.tool_timeout_ms > 0
+        assert b.stream_timeout_ms == 0
 
     def test_custom_values(self):
         from spoon_bot.gateway.config import BudgetConfig
@@ -563,6 +565,192 @@ class TestWsCancellationPropagation:
         cancelled = await handler._cancel_current_task_for_cleanup(timeout=0.2)
         assert cancelled is True
         assert handler._current_task is None
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_continues_after_connection_is_gone(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        class _DisconnectedManager(_FakeManager):
+            def get_connection(self, conn_id):
+                return None
+
+            async def send_message(self, conn_id, message):
+                return False
+
+        fm = _DisconnectedManager()
+
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
+            handler = WebSocketHandler("conn_test", "persisted-session")
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                    from spoon_bot.gateway.config import GatewayConfig
+                    mc.return_value = GatewayConfig()
+                    result = await handler._handle_chat({"message": "hi", "stream": True})
+
+        assert result["success"] is True
+        assert result["content"] == "Hello world"
+        assert result["session_key"] == "persisted-session"
+        assert fm.sent_messages == []
+
+    @pytest.mark.asyncio
+    async def test_reconnect_cancel_can_interrupt_previous_session_task(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.app import clear_ws_session_chat_task, register_ws_session_chat_task
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        app_module._ws_session_chat_tasks = {}
+        session_key = "resume-session"
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
+            previous_handler = WebSocketHandler("conn_old", session_key, user_id="user-a")
+            previous_handler._current_task_id = "task_old_session"
+            previous_handler._current_task = asyncio.create_task(asyncio.sleep(100))
+            register_ws_session_chat_task(
+                session_key,
+                previous_handler._current_task,
+                user_id="user-a",
+                cancel_cb=previous_handler._request_current_task_cancel,
+                task_id_cb=previous_handler._current_task_id_for_cancel,
+            )
+
+            try:
+                reconnect_handler = WebSocketHandler("conn_new", session_key, user_id="user-a")
+                result = await reconnect_handler._handle_cancel({"session_key": session_key})
+                assert result["cancelled"] is True
+                assert result["task_interrupted"] is True
+                assert result["task_id"] == "task_old_session"
+                await asyncio.sleep(0)
+                assert previous_handler._cancel_requested is True
+                assert previous_handler._current_task.cancelled()
+            finally:
+                clear_ws_session_chat_task(session_key, user_id="user-a")
+
+    @pytest.mark.asyncio
+    async def test_reconnect_cancel_does_not_interrupt_other_user_task(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.app import clear_ws_session_chat_task, register_ws_session_chat_task
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        app_module._ws_session_chat_tasks = {}
+        session_key = "default"
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
+            owner_handler = WebSocketHandler("conn_owner", session_key, user_id="user-a")
+            owner_handler._current_task_id = "task_user_a"
+            owner_handler._current_task = asyncio.create_task(asyncio.sleep(100))
+            register_ws_session_chat_task(
+                session_key,
+                owner_handler._current_task,
+                user_id="user-a",
+                cancel_cb=owner_handler._request_current_task_cancel,
+                task_id_cb=owner_handler._current_task_id_for_cancel,
+            )
+
+            attacker_handler = WebSocketHandler("conn_other", session_key, user_id="user-b")
+            result = await attacker_handler._handle_cancel({"session_key": session_key})
+            assert result["cancelled"] is True
+            assert result["task_interrupted"] is False
+            await asyncio.sleep(0)
+            assert owner_handler._current_task.cancelled() is False
+
+            owner_handler._current_task.cancel()
+            await asyncio.gather(owner_handler._current_task, return_exceptions=True)
+            clear_ws_session_chat_task(session_key, user_id="user-a")
+
+    @pytest.mark.asyncio
+    async def test_chat_send_cancels_existing_session_task_before_start(self):
+        from fastapi import WebSocketDisconnect
+        from spoon_bot.gateway.config import GatewayConfig
+        from spoon_bot.gateway.websocket import handler as ws_handler_module
+
+        fake_ws = MagicMock()
+        fake_ws.client = None
+        fake_ws.receive_json = AsyncMock(side_effect=[
+            {
+                "type": "request",
+                "id": "req_chat",
+                "method": "chat.send",
+                "params": {"message": "hello", "session_key": "active-session"},
+            },
+            WebSocketDisconnect(),
+        ])
+
+        fake_manager = MagicMock()
+        fake_manager.connect = AsyncMock(return_value="conn_test")
+        fake_manager.send_message = AsyncMock(return_value=True)
+        fake_manager.disconnect = AsyncMock()
+
+        fake_handler = MagicMock()
+        fake_handler._cleanup_resources = AsyncMock()
+        fake_handler._dispatch_concurrent_request = AsyncMock()
+        fake_handler.handle_request = AsyncMock()
+        fake_handler._handle_chat = AsyncMock(return_value={"success": True})
+        fake_handler._resolve_effective_session_key = MagicMock(return_value="active-session")
+        fake_handler._resolve_registry_user_id = MagicMock(return_value="anonymous")
+        fake_handler._request_current_task_cancel = MagicMock()
+        fake_handler._current_task_id_for_cancel = MagicMock(return_value=None)
+        fake_handler._current_task = None
+        fake_handler._concurrent_tasks = set()
+
+        with patch.object(ws_handler_module, "get_config", return_value=GatewayConfig()):
+            with patch.object(ws_handler_module, "get_connection_manager", return_value=fake_manager):
+                with patch.object(ws_handler_module, "is_auth_required", return_value=False):
+                    with patch.object(ws_handler_module, "WebSocketHandler", return_value=fake_handler):
+                        with patch.object(
+                            ws_handler_module,
+                            "cancel_ws_session_chat_task",
+                            new=AsyncMock(return_value=True),
+                        ) as cancel_task:
+                            with patch.object(
+                                ws_handler_module,
+                                "get_ws_session_chat_lock",
+                                return_value=asyncio.Lock(),
+                            ) as get_replace_lock:
+                                await ws_handler_module.websocket_endpoint(fake_ws)
+
+        cancel_task.assert_awaited_once_with("active-session", user_id="anonymous")
+        get_replace_lock.assert_called_once_with("active-session", user_id="anonymous")
+
+    @pytest.mark.asyncio
+    async def test_websocket_disconnect_does_not_cancel_background_chat(self):
+        from fastapi import WebSocketDisconnect
+        from spoon_bot.gateway.config import GatewayConfig
+        from spoon_bot.gateway.websocket import handler as ws_handler_module
+
+        fake_ws = MagicMock()
+        fake_ws.client = None
+        fake_ws.receive_json = AsyncMock(side_effect=WebSocketDisconnect())
+
+        fake_manager = MagicMock()
+        fake_manager.connect = AsyncMock(return_value="conn_test")
+        fake_manager.send_message = AsyncMock(return_value=True)
+        fake_manager.disconnect = AsyncMock()
+
+        fake_handler = MagicMock()
+        fake_handler._cleanup_resources = AsyncMock()
+        fake_handler._cancel_current_task_for_cleanup = AsyncMock(return_value=True)
+
+        with patch.object(ws_handler_module, "get_config", return_value=GatewayConfig()):
+            with patch.object(ws_handler_module, "get_connection_manager", return_value=fake_manager):
+                with patch.object(ws_handler_module, "is_auth_required", return_value=False):
+                    with patch.object(ws_handler_module, "WebSocketHandler", return_value=fake_handler):
+                        await ws_handler_module.websocket_endpoint(fake_ws)
+
+        fake_handler._cancel_current_task_for_cleanup.assert_not_awaited()
+        fake_handler._cleanup_resources.assert_awaited_once()
+        fake_manager.disconnect.assert_awaited_once_with("conn_test")
+
+    def test_ws_session_chat_lock_is_scoped_by_user_and_session(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.app import get_ws_session_chat_lock
+
+        app_module._ws_session_chat_locks = {}
+        lock_a = get_ws_session_chat_lock("default", user_id="alice")
+        lock_a_again = get_ws_session_chat_lock("default", user_id="alice")
+        lock_b = get_ws_session_chat_lock("default", user_id="bob")
+        lock_other_session = get_ws_session_chat_lock("other", user_id="alice")
+
+        assert lock_a is lock_a_again
+        assert lock_a is not lock_b
+        assert lock_a is not lock_other_session
 
 
 class TestWsTimeoutErrorCodes:
@@ -888,7 +1076,7 @@ class TestRestCancellation:
 
 class TestToolkitAdapterTimeout:
     @pytest.mark.asyncio
-    async def test_toolkit_wrapper_enforces_timeout(self):
+    async def test_toolkit_wrapper_moves_to_background_after_timeout(self):
         from spoon_bot.toolkit.adapter import ToolkitToolWrapper
 
         class _SlowAsyncTool:
@@ -900,5 +1088,90 @@ class TestToolkitAdapterTimeout:
 
         tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.05)
         result = await tool.execute()
-        assert "timed out" in result.lower()
-        assert "0.05" in result
+        assert "background" in result.lower()
+        assert "job_id:" in result
+
+    @pytest.mark.asyncio
+    async def test_toolkit_background_job_returns_result_when_ready(self):
+        from spoon_bot.toolkit.adapter import ToolkitToolWrapper
+
+        class _SlowAsyncTool:
+            name = "slow_async_result"
+            description = "slow tool"
+
+            async def execute(self, **kwargs):
+                await asyncio.sleep(0.1)
+                return "done"
+
+        tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.01)
+        background = await tool.execute()
+        job_id = background.split("job_id:", 1)[1].splitlines()[0].strip()
+        await asyncio.sleep(0.15)
+        result = await tool.execute(action="job_output", job_id=job_id)
+        assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_toolkit_background_jobs_are_scoped_by_owner(self):
+        from spoon_bot.agent.tools.execution_context import bind_tool_owner
+        from spoon_bot.toolkit.adapter import ToolkitToolWrapper
+
+        class _SlowAsyncTool:
+            name = "slow_async_owner"
+            description = "slow tool"
+
+            async def execute(self, **kwargs):
+                await asyncio.sleep(0.15)
+                return "done"
+
+        tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.01)
+        with bind_tool_owner("owner-a"):
+            background = await tool.execute()
+            job_id = background.split("job_id:", 1)[1].splitlines()[0].strip()
+
+        with bind_tool_owner("owner-b"):
+            denied = await tool.execute(action="job_status", job_id=job_id)
+
+        assert "not found" in denied.lower()
+
+    @pytest.mark.asyncio
+    async def test_toolkit_background_job_auto_marks_terminal_without_polling(self):
+        from spoon_bot.toolkit import adapter as adapter_module
+        from spoon_bot.toolkit.adapter import ToolkitToolWrapper
+
+        class _SlowAsyncTool:
+            name = "slow_auto_terminal"
+            description = "slow tool"
+
+            async def execute(self, **kwargs):
+                await asyncio.sleep(0.05)
+                return "done"
+
+        tool = ToolkitToolWrapper(_SlowAsyncTool(), timeout_seconds=0.01)
+        background = await tool.execute()
+        job_id = background.split("job_id:", 1)[1].splitlines()[0].strip()
+
+        await asyncio.sleep(0.12)
+        job = adapter_module._TOOLKIT_BACKGROUND_JOBS.get(job_id)
+        assert job is not None
+        assert job.status == "completed"
+        assert job.finished_at is not None
+        adapter_module._TOOLKIT_BACKGROUND_JOBS.pop(job_id, None)
+
+
+class TestToolOwnerKey:
+    def test_owner_key_includes_user_and_session(self):
+        from spoon_bot.agent.tools.execution_context import build_tool_owner_key
+
+        a = build_tool_owner_key("alice", "default")
+        b = build_tool_owner_key("bob", "default")
+        assert a == "user:alice|session:default"
+        assert b == "user:bob|session:default"
+        assert a != b
+
+    def test_agent_loop_owner_key_is_user_scoped(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.user_id = "alice"
+        loop.session_key = "default"
+        assert loop._current_tool_owner_key() == "user:alice|session:default"
