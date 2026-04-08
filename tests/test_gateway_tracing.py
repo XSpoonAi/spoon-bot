@@ -601,18 +601,19 @@ class TestWsCancellationPropagation:
         app_module._ws_session_chat_tasks = {}
         session_key = "resume-session"
         with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
-            previous_handler = WebSocketHandler("conn_old", session_key)
+            previous_handler = WebSocketHandler("conn_old", session_key, user_id="user-a")
             previous_handler._current_task_id = "task_old_session"
             previous_handler._current_task = asyncio.create_task(asyncio.sleep(100))
             register_ws_session_chat_task(
                 session_key,
                 previous_handler._current_task,
+                user_id="user-a",
                 cancel_cb=previous_handler._request_current_task_cancel,
                 task_id_cb=previous_handler._current_task_id_for_cancel,
             )
 
             try:
-                reconnect_handler = WebSocketHandler("conn_new", session_key)
+                reconnect_handler = WebSocketHandler("conn_new", session_key, user_id="user-a")
                 result = await reconnect_handler._handle_cancel({"session_key": session_key})
                 assert result["cancelled"] is True
                 assert result["task_interrupted"] is True
@@ -621,7 +622,38 @@ class TestWsCancellationPropagation:
                 assert previous_handler._cancel_requested is True
                 assert previous_handler._current_task.cancelled()
             finally:
-                clear_ws_session_chat_task(session_key)
+                clear_ws_session_chat_task(session_key, user_id="user-a")
+
+    @pytest.mark.asyncio
+    async def test_reconnect_cancel_does_not_interrupt_other_user_task(self):
+        from spoon_bot.gateway import app as app_module
+        from spoon_bot.gateway.app import clear_ws_session_chat_task, register_ws_session_chat_task
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        app_module._ws_session_chat_tasks = {}
+        session_key = "default"
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=_make_mock_agent()):
+            owner_handler = WebSocketHandler("conn_owner", session_key, user_id="user-a")
+            owner_handler._current_task_id = "task_user_a"
+            owner_handler._current_task = asyncio.create_task(asyncio.sleep(100))
+            register_ws_session_chat_task(
+                session_key,
+                owner_handler._current_task,
+                user_id="user-a",
+                cancel_cb=owner_handler._request_current_task_cancel,
+                task_id_cb=owner_handler._current_task_id_for_cancel,
+            )
+
+            attacker_handler = WebSocketHandler("conn_other", session_key, user_id="user-b")
+            result = await attacker_handler._handle_cancel({"session_key": session_key})
+            assert result["cancelled"] is True
+            assert result["task_interrupted"] is False
+            await asyncio.sleep(0)
+            assert owner_handler._current_task.cancelled() is False
+
+            owner_handler._current_task.cancel()
+            await asyncio.gather(owner_handler._current_task, return_exceptions=True)
+            clear_ws_session_chat_task(session_key, user_id="user-a")
 
     @pytest.mark.asyncio
     async def test_chat_send_cancels_existing_session_task_before_start(self):
@@ -652,6 +684,7 @@ class TestWsCancellationPropagation:
         fake_handler.handle_request = AsyncMock()
         fake_handler._handle_chat = AsyncMock(return_value={"success": True})
         fake_handler._resolve_effective_session_key = MagicMock(return_value="active-session")
+        fake_handler._resolve_registry_user_id = MagicMock(return_value="anonymous")
         fake_handler._request_current_task_cancel = MagicMock()
         fake_handler._current_task_id_for_cancel = MagicMock(return_value=None)
         fake_handler._current_task = None
@@ -668,7 +701,7 @@ class TestWsCancellationPropagation:
                         ) as cancel_task:
                             await ws_handler_module.websocket_endpoint(fake_ws)
 
-        cancel_task.assert_awaited_once_with("active-session")
+        cancel_task.assert_awaited_once_with("active-session", user_id="anonymous")
 
     @pytest.mark.asyncio
     async def test_websocket_disconnect_does_not_cancel_background_chat(self):
@@ -1079,3 +1112,22 @@ class TestToolkitAdapterTimeout:
             denied = await tool.execute(action="job_status", job_id=job_id)
 
         assert "not found" in denied.lower()
+
+
+class TestToolOwnerKey:
+    def test_owner_key_includes_user_and_session(self):
+        from spoon_bot.agent.tools.execution_context import build_tool_owner_key
+
+        a = build_tool_owner_key("alice", "default")
+        b = build_tool_owner_key("bob", "default")
+        assert a == "user:alice|session:default"
+        assert b == "user:bob|session:default"
+        assert a != b
+
+    def test_agent_loop_owner_key_is_user_scoped(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.user_id = "alice"
+        loop.session_key = "default"
+        assert loop._current_tool_owner_key() == "user:alice|session:default"

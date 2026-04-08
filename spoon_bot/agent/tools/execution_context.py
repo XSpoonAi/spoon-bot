@@ -10,6 +10,28 @@ from typing import Iterator
 _TOOL_OWNER: ContextVar[str] = ContextVar("tool_owner", default="default")
 
 
+def normalize_tool_owner_user(user_id: str | None) -> str:
+    """Normalize user identity component for tool ownership."""
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    return "anonymous"
+
+
+def normalize_tool_owner_session(session_key: str | None) -> str:
+    """Normalize session component for tool ownership."""
+    if isinstance(session_key, str) and session_key.strip():
+        return session_key.strip()
+    return "default"
+
+
+def build_tool_owner_key(user_id: str | None, session_key: str | None) -> str:
+    """Build a stable user+session ownership key."""
+    return (
+        f"user:{normalize_tool_owner_user(user_id)}"
+        f"|session:{normalize_tool_owner_session(session_key)}"
+    )
+
+
 def get_tool_owner() -> str:
     """Return current task-local tool owner key."""
     owner = _TOOL_OWNER.get()

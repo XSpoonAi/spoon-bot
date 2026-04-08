@@ -81,7 +81,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.grep import GrepTool
-from spoon_bot.agent.tools.execution_context import bind_tool_owner
+from spoon_bot.agent.tools.execution_context import bind_tool_owner, build_tool_owner_key
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
     SelfConfigTool,
@@ -402,6 +402,7 @@ class AgentLoop:
         self.shell_timeout = self._config.shell_timeout
         self.max_output = self._config.max_output
         self.session_key = self._config.session_key
+        self.user_id = "anonymous"
         self._enable_skills = enable_skills
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
@@ -1154,6 +1155,13 @@ class AgentLoop:
             return self.context._build_user_content(text_content, media)
         return text_content
 
+    def _current_tool_owner_key(self, session_key: str | None = None) -> str:
+        """Resolve a user-scoped ownership key for background tool jobs."""
+        return build_tool_owner_key(
+            getattr(self, "user_id", None),
+            session_key if session_key is not None else getattr(self, "session_key", None),
+        )
+
     async def process(
         self,
         message: str,
@@ -1245,7 +1253,7 @@ class AgentLoop:
                     ):
                         await self._agent.add_message("user", runtime_message)
                     retry_requires_runtime_message_check = False
-                    with bind_tool_owner(getattr(self, "session_key", "default")):
+                    with bind_tool_owner(self._current_tool_owner_key()):
                         result = await self._agent.run()
 
                     logger.debug(f"Agent result type: {type(result)}")
@@ -2163,7 +2171,7 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
-                    with bind_tool_owner(getattr(self, "session_key", "default")):
+                    with bind_tool_owner(self._current_tool_owner_key()):
                         result = await self._agent.run(**run_kwargs)
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
@@ -2185,7 +2193,7 @@ class AgentLoop:
                     self._agent.task_done.set()
 
             logger.debug(f"Creating bg task, agent state={self._agent.state}")
-            with bind_tool_owner(getattr(self, "session_key", "default")):
+            with bind_tool_owner(self._current_tool_owner_key()):
                 bg_task = asyncio.create_task(_run_and_signal())
 
             # Force a yield to allow the background task to start

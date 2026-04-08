@@ -193,6 +193,7 @@ async def _stream_sse(
     thinking: bool,
     *,
     session_key: str | None = None,
+    user_id: str | None = None,
     trace_id: str | None = None,
     request_id: str | None = None,
     cancel_event: asyncio.Event | None = None,
@@ -217,6 +218,7 @@ async def _stream_sse(
     async with session_lock:
         async with agent_lock:
             _switch_session(agent, resolved_session_key)
+            setattr(agent, "user_id", user_id or "anonymous")
 
             kwargs = {"message": message, "thinking": thinking}
             if media:
@@ -311,6 +313,7 @@ async def chat(
 
     try:
         agent = get_agent()
+        owner_user_id = getattr(user, "user_id", "anonymous")
 
         # Session key: request body takes priority over user token.
         session_key = _resolve_session_key(request.session_key, user)
@@ -343,6 +346,7 @@ async def chat(
                     attachments or None,
                     thinking,
                     session_key=session_key,
+                    user_id=owner_user_id,
                     trace_id=trace_id,
                     request_id=request_id,
                 ),
@@ -361,6 +365,7 @@ async def chat(
             async with agent_lock:
                 # Non-streaming mode — switch session before processing
                 _switch_session(agent, session_key)
+                setattr(agent, "user_id", owner_user_id)
 
                 kwargs = {"message": message}
                 if media:
@@ -465,7 +470,13 @@ class AsyncTask:
 _task_store: dict[str, AsyncTask] = {}
 
 
-async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str | None = None):
+async def _run_async_task(
+    task: AsyncTask,
+    agent,
+    message: str,
+    session_key: str | None = None,
+    user_id: str | None = None,
+):
     """Background coroutine that drives agent processing for an async task."""
     task.status = TaskStatus.RUNNING
     try:
@@ -475,6 +486,7 @@ async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str
         async with session_lock:
             async with agent_lock:
                 _switch_session(agent, resolved_session_key)
+                setattr(agent, "user_id", user_id or "anonymous")
                 if task._cancel_event.is_set():
                     task.status = TaskStatus.CANCELLED
                     return
@@ -519,7 +531,15 @@ async def chat_async(
     task = AsyncTask(task_id=task_id, owner_user_id=owner_user_id)
     _task_store[task_id] = task
 
-    bg = asyncio.create_task(_run_async_task(task, agent, request.message, session_key=session_key))
+    bg = asyncio.create_task(
+        _run_async_task(
+            task,
+            agent,
+            request.message,
+            session_key=session_key,
+            user_id=owner_user_id,
+        )
+    )
     task._bg_task = bg
 
     return {
@@ -776,6 +796,7 @@ async def voice_chat(
                 None,
                 False,
                 session_key=session_key,
+                user_id=owner_user_id,
                 trace_id=trace_id,
                 request_id=request_id,
             ),
@@ -789,6 +810,7 @@ async def voice_chat(
         )
 
     _switch_session(agent, session_key)
+    setattr(agent, "user_id", owner_user_id)
     response_text = await agent.process(message=processed_message)
     duration_ms = int((time.time() - start_time) * 1000)
 

@@ -84,6 +84,14 @@ def _normalize_session_key(session_key: str | None) -> str:
     return session_key.strip() if isinstance(session_key, str) and session_key.strip() else "default"
 
 
+def _normalize_user_id(user_id: str | None) -> str:
+    return user_id.strip() if isinstance(user_id, str) and user_id.strip() else "anonymous"
+
+
+def _ws_session_chat_registry_key(session_key: str | None, user_id: str | None) -> str:
+    return f"user:{_normalize_user_id(user_id)}|session:{_normalize_session_key(session_key)}"
+
+
 def get_session_execution_lock(session_key: str) -> asyncio.Lock:
     """Get/create a lock for a specific session key."""
     key = _normalize_session_key(session_key)
@@ -98,20 +106,21 @@ def register_ws_session_chat_task(
     session_key: str,
     task: asyncio.Task,
     *,
+    user_id: str | None = None,
     cancel_cb: Callable[[], None] | None = None,
     task_id_cb: Callable[[], str | None] | None = None,
 ) -> None:
     """Register the active websocket chat task for a session."""
-    _ws_session_chat_tasks[_normalize_session_key(session_key)] = _WSSessionTaskHandle(
+    _ws_session_chat_tasks[_ws_session_chat_registry_key(session_key, user_id)] = _WSSessionTaskHandle(
         task=task,
         cancel_cb=cancel_cb,
         task_id_cb=task_id_cb,
     )
 
 
-def get_ws_session_chat_task_id(session_key: str) -> str | None:
+def get_ws_session_chat_task_id(session_key: str, user_id: str | None = None) -> str | None:
     """Get the current websocket chat task id for a session, if available."""
-    handle = _ws_session_chat_tasks.get(_normalize_session_key(session_key))
+    handle = _ws_session_chat_tasks.get(_ws_session_chat_registry_key(session_key, user_id))
     if handle is None or handle.task_id_cb is None:
         return None
     try:
@@ -120,15 +129,20 @@ def get_ws_session_chat_task_id(session_key: str) -> str | None:
         return None
 
 
-def has_active_ws_session_chat_task(session_key: str) -> bool:
+def has_active_ws_session_chat_task(session_key: str, user_id: str | None = None) -> bool:
     """Whether a session currently has a running websocket chat task."""
-    handle = _ws_session_chat_tasks.get(_normalize_session_key(session_key))
+    handle = _ws_session_chat_tasks.get(_ws_session_chat_registry_key(session_key, user_id))
     return bool(handle is not None and not handle.task.done())
 
 
-def clear_ws_session_chat_task(session_key: str, *, task: asyncio.Task | None = None) -> bool:
+def clear_ws_session_chat_task(
+    session_key: str,
+    *,
+    user_id: str | None = None,
+    task: asyncio.Task | None = None,
+) -> bool:
     """Clear the active websocket chat task for a session."""
-    key = _normalize_session_key(session_key)
+    key = _ws_session_chat_registry_key(session_key, user_id)
     handle = _ws_session_chat_tasks.get(key)
     if handle is None:
         return False
@@ -138,16 +152,21 @@ def clear_ws_session_chat_task(session_key: str, *, task: asyncio.Task | None = 
     return True
 
 
-async def cancel_ws_session_chat_task(session_key: str, timeout: float = 2.0) -> bool:
+async def cancel_ws_session_chat_task(
+    session_key: str,
+    timeout: float = 2.0,
+    *,
+    user_id: str | None = None,
+) -> bool:
     """Cancel and await an active websocket chat task for a session."""
-    key = _normalize_session_key(session_key)
+    key = _ws_session_chat_registry_key(session_key, user_id)
     handle = _ws_session_chat_tasks.get(key)
     if handle is None:
         return False
 
     task = handle.task
     if task.done():
-        clear_ws_session_chat_task(key, task=task)
+        clear_ws_session_chat_task(session_key, user_id=user_id, task=task)
         return True
 
     if handle.cancel_cb is not None:
@@ -165,7 +184,7 @@ async def cancel_ws_session_chat_task(session_key: str, timeout: float = 2.0) ->
         timed_out = True
         logger.warning(f"Timed out waiting for ws chat task cleanup: session={key}")
     if task.done():
-        clear_ws_session_chat_task(key, task=task)
+        clear_ws_session_chat_task(session_key, user_id=user_id, task=task)
         return True
     return False if timed_out else task.done()
 
