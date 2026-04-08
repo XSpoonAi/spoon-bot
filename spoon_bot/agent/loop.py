@@ -2086,6 +2086,96 @@ class AgentLoop:
         result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
         return result.strip()
 
+    @staticmethod
+    def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
+        """Read a message field from either dict or object runtime payloads."""
+        if isinstance(message, dict):
+            return message.get(key, default)
+        return getattr(message, key, default)
+
+    @staticmethod
+    def _stream_message_role(message: Any) -> str:
+        """Normalize runtime message roles to plain strings."""
+        role = AgentLoop._stream_message_attr(message, "role", "")
+        return role.value if hasattr(role, "value") else str(role or "")
+
+    @staticmethod
+    def _stringify_stream_payload(payload: Any) -> str:
+        """Serialize structured tool payloads for websocket metadata."""
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, (dict, list)):
+            try:
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                return str(payload)
+        return str(payload)
+
+    def _get_runtime_memory_messages(self) -> list[Any]:
+        """Return runtime memory messages exposed by the active inner agent."""
+        if not hasattr(self._agent, "memory") or self._agent.memory is None:
+            return []
+
+        memory = self._agent.memory
+        if hasattr(memory, "get_messages"):
+            try:
+                messages = memory.get_messages()
+                if isinstance(messages, list):
+                    return messages
+            except Exception as exc:
+                logger.debug(f"Failed to read runtime memory via get_messages(): {exc}")
+
+        messages = getattr(memory, "messages", None)
+        return messages if isinstance(messages, list) else []
+
+    def _collect_stream_tool_result_events(
+        self,
+        start_index: int,
+        emitted_tool_result_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Collect newly-added tool result messages from runtime memory."""
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if start_index < 0 or start_index > len(messages):
+            start_index = 0
+
+        events: list[dict[str, Any]] = []
+        for msg in messages[start_index:]:
+            if AgentLoop._stream_message_role(msg) != "tool":
+                continue
+
+            tool_call_id = (
+                AgentLoop._stream_message_attr(msg, "tool_call_id", "")
+                or AgentLoop._stream_message_attr(msg, "id", "")
+            )
+            if tool_call_id and tool_call_id in emitted_tool_result_ids:
+                continue
+
+            result_payload = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if result_payload in (None, ""):
+                result_payload = AgentLoop._stream_message_attr(msg, "content", "")
+            serialized_result = AgentLoop._stringify_stream_payload(result_payload)
+            tool_name = AgentLoop._stream_message_attr(msg, "name", "")
+
+            metadata: dict[str, Any] = {
+                "name": tool_name,
+                "result": serialized_result,
+                "content": serialized_result,
+            }
+            if tool_call_id:
+                metadata["id"] = tool_call_id
+                metadata["tool_call_id"] = tool_call_id
+                emitted_tool_result_ids.add(tool_call_id)
+
+            events.append({
+                "type": "tool_result",
+                "delta": "",
+                "metadata": metadata,
+            })
+
+        return events, len(messages)
+
 
     async def stream(
         self,
@@ -2161,6 +2251,8 @@ class AgentLoop:
                     break
 
             await self._agent.add_message("user", runtime_message)
+            stream_tool_result_index = len(AgentLoop._get_runtime_memory_messages(self))
+            emitted_tool_result_ids: set[str] = set()
 
             # 2. Start run() in background
             run_result_text = ""
@@ -2207,6 +2299,16 @@ class AgentLoop:
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
             while not (td.is_set() and oq.empty()):
+                tool_result_events, stream_tool_result_index = (
+                    AgentLoop._collect_stream_tool_result_events(
+                        self,
+                        stream_tool_result_index,
+                        emitted_tool_result_ids,
+                    )
+                )
+                for event in tool_result_events:
+                    yield event
+
                 # tracked_reasoning is inferred from assistant output logs and is
                 # not a reliable API thinking source. Clear it so it does not leak
                 # duplicated final content into WS/REST responses.
@@ -2298,6 +2400,28 @@ class AgentLoop:
                     dict_type = chunk.get("type")
                     if dict_type == "thinking":
                         chunk_type = "thinking"
+                    elif dict_type == "tool_result":
+                        chunk_type = "tool_result"
+                        tool_result = (
+                            chunk.get("result")
+                            or chunk.get("content")
+                            or chunk.get("response")
+                            or chunk.get("output")
+                        )
+                        serialized_result = AgentLoop._stringify_stream_payload(tool_result)
+                        if serialized_result:
+                            metadata.setdefault("result", serialized_result)
+                            metadata.setdefault("content", serialized_result)
+                        tool_call_id = (
+                            chunk.get("tool_call_id")
+                            or chunk.get("id")
+                            or metadata.get("tool_call_id")
+                            or metadata.get("id")
+                        )
+                        if tool_call_id:
+                            metadata.setdefault("tool_call_id", tool_call_id)
+                            metadata.setdefault("id", tool_call_id)
+                            emitted_tool_result_ids.add(tool_call_id)
                     elif dict_type == "content":
                         chunk_type = "content"
                     # Support both "content" and "delta" keys (#10)
@@ -2312,6 +2436,14 @@ class AgentLoop:
                 # -- Plain string chunks --
                 elif isinstance(chunk, str):
                     delta = chunk
+
+                if chunk_type == "tool_result":
+                    yield {
+                        "type": chunk_type,
+                        "delta": delta,
+                        "metadata": metadata,
+                    }
+                    continue
 
                 if delta:
                     metadata_phase = metadata.get("phase") if isinstance(metadata, dict) else None
@@ -2351,6 +2483,15 @@ class AgentLoop:
                 pass
 
             self._drain_reasoning_chunks()
+            tool_result_events, stream_tool_result_index = (
+                AgentLoop._collect_stream_tool_result_events(
+                    self,
+                    stream_tool_result_index,
+                    emitted_tool_result_ids,
+                )
+            )
+            for event in tool_result_events:
+                yield event
 
             if pending_pre_tool_chunks:
                 for pending_chunk in pending_pre_tool_chunks:

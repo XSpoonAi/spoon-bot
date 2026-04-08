@@ -684,6 +684,128 @@ class TestAgentLoopStream:
         assert done_chunks[0]["metadata"]["content"] == "Done."
 
     @pytest.mark.asyncio
+    async def test_stream_passes_through_structured_tool_result_chunks(self):
+        """Explicit tool_result chunks should be preserved for downstream UIs."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"pwd"}'
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {
+                        "id": "call_1",
+                        "name": "shell",
+                    },
+                    "result": {
+                        "stdout": "/workspace",
+                    },
+                }
+            )
+            await agent._agent.output_queue.put({"content": "Done."})
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(return_value="placeholder")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        emitted = [c for c in chunks if c["type"] in {"tool_call", "tool_result", "content"}]
+        assert [c["type"] for c in emitted] == ["tool_call", "tool_result", "content"]
+        assert emitted[1]["metadata"]["id"] == "call_1"
+        assert emitted[1]["metadata"]["name"] == "shell"
+        assert emitted[1]["metadata"]["result"] == '{"stdout": "/workspace"}'
+
+    @pytest.mark.asyncio
+    async def test_stream_backfills_tool_result_from_runtime_memory(self):
+        """Tool results stored only in runtime memory should still be emitted."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"pwd"}'
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            agent._agent.memory.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "shell",
+                    "content": "/workspace",
+                }
+            )
+            await agent._agent.output_queue.put({"content": "Done."})
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(return_value="placeholder")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        emitted = [c for c in chunks if c["type"] in {"tool_call", "tool_result", "content"}]
+        assert [c["type"] for c in emitted] == ["tool_call", "tool_result", "content"]
+        assert emitted[1]["metadata"]["id"] == "call_1"
+        assert emitted[1]["metadata"]["name"] == "shell"
+        assert emitted[1]["metadata"]["result"] == "/workspace"
+
+    @pytest.mark.asyncio
     async def test_stream_uses_explicit_thinking_chunk_without_prompt_heuristic(self):
         """Explicit thinking chunks from core should drive pre-tool thinking display."""
         from spoon_bot.agent.loop import AgentLoop
