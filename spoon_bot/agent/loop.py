@@ -1607,6 +1607,79 @@ class AgentLoop:
         )
 
     @staticmethod
+    def _message_role_value(msg: Any) -> str | None:
+        """Return the normalized string role value for a runtime message."""
+        role = getattr(msg, "role", None)
+        return role.value if hasattr(role, "value") else role
+
+    @classmethod
+    def _reorder_tool_messages(cls, messages: list) -> int:
+        """Move tool results to immediately follow the issuing assistant turn."""
+        if not messages:
+            return 0
+
+        claimed_tool_indices: set[int] = set()
+        tool_messages_by_assistant_index: dict[int, list] = {}
+
+        for index, message in enumerate(messages):
+            if cls._message_role_value(message) != "tool":
+                continue
+
+            tool_call_id = getattr(message, "tool_call_id", None)
+            if not tool_call_id:
+                continue
+
+            for candidate_index in range(index - 1, -1, -1):
+                candidate = messages[candidate_index]
+                if cls._message_role_value(candidate) != "assistant":
+                    continue
+                tool_calls = getattr(candidate, "tool_calls", None) or []
+                if any(getattr(tool_call, "id", None) == tool_call_id for tool_call in tool_calls):
+                    tool_messages_by_assistant_index.setdefault(candidate_index, []).append(message)
+                    claimed_tool_indices.add(index)
+                    break
+
+        if not claimed_tool_indices:
+            return 0
+
+        original_ids = [id(message) for message in messages]
+        reordered_messages: list = []
+        for index, message in enumerate(messages):
+            if index in claimed_tool_indices:
+                continue
+
+            reordered_messages.append(message)
+            if cls._message_role_value(message) != "assistant":
+                continue
+
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls:
+                continue
+
+            tool_order = {
+                getattr(tool_call, "id", None): position
+                for position, tool_call in enumerate(tool_calls)
+            }
+            matched_tool_messages = tool_messages_by_assistant_index.get(index, [])
+            matched_tool_messages.sort(
+                key=lambda item: tool_order.get(getattr(item, "tool_call_id", None), len(tool_order))
+            )
+            reordered_messages.extend(matched_tool_messages)
+
+        reordered_ids = [id(message) for message in reordered_messages]
+        if reordered_ids == original_ids:
+            return 0
+
+        moved = sum(
+            1
+            for original_id, reordered_id in zip(original_ids, reordered_ids)
+            if original_id != reordered_id
+        )
+        messages[:] = reordered_messages
+        logger.info(f"Reordered {moved} runtime message positions to restore tool adjacency")
+        return moved
+
+    @staticmethod
     def _repair_tool_pairing(messages: list) -> int:
         """Remove orphaned tool results and tool calls after message deletion.
 
@@ -1662,6 +1735,47 @@ class AgentLoop:
             logger.info(f"Repaired tool pairing: removed {removed} orphaned messages/calls")
         return removed
 
+    @classmethod
+    def _normalize_runtime_tool_context(cls, messages: list) -> int:
+        """Repair runtime tool-call sequencing before sending history back to the LLM."""
+        normalized = cls._reorder_tool_messages(messages)
+        normalized += cls._repair_tool_pairing(messages)
+        return normalized
+
+    def _uses_strict_tool_turn_order(self) -> bool:
+        """True for providers/models that reject non-adjacent function call turns."""
+        provider_raw = getattr(self, "provider", None)
+        model_raw = getattr(self, "model", None)
+        base_url_raw = getattr(self, "base_url", None)
+
+        provider = provider_raw.strip().lower() if isinstance(provider_raw, str) else ""
+        model = model_raw.strip().lower() if isinstance(model_raw, str) else ""
+        base_url = base_url_raw.strip().lower() if isinstance(base_url_raw, str) else ""
+
+        if provider in {"gemini", "google", "google_ai_studio", "google-ai-studio"}:
+            return True
+        if "gemini" in model or model.startswith("google/"):
+            return True
+        return "generativelanguage.googleapis.com" in base_url
+
+    def _should_skip_runtime_next_step_prompt(self) -> bool:
+        """Avoid synthetic user turns after tool responses for strict function-turn providers."""
+        if not self._uses_strict_tool_turn_order():
+            return False
+        if not self._agent or not hasattr(self._agent, "memory"):
+            return False
+
+        messages = getattr(self._agent.memory, "messages", None)
+        if not isinstance(messages, list):
+            return False
+
+        for message in reversed(messages):
+            role = self._message_role_value(message)
+            if role == "system":
+                continue
+            return role == "tool"
+        return False
+
     def _compress_runtime_context(self) -> int:
         """Proactively compress the agent's runtime context.
 
@@ -1676,14 +1790,15 @@ class AgentLoop:
             return 0
 
         messages = self._agent.memory.messages
+        normalized = self._normalize_runtime_tool_context(messages)
         if len(messages) <= 6:
-            return 0
+            return normalized
 
         estimated = self._estimate_runtime_tokens()
         budget = int(self.context_window * 0.50)
 
         if estimated <= budget:
-            return 0
+            return normalized
 
         logger.warning(
             f"Context compression triggered: ~{estimated:,} tokens "
@@ -1691,7 +1806,7 @@ class AgentLoop:
             f"Messages: {len(messages)}"
         )
 
-        compressed = 0
+        compressed = normalized
 
         # Phase 1: Remove all but the LAST next_step_prompt user message.
         last_nsp_idx = -1
@@ -1753,10 +1868,9 @@ class AgentLoop:
             return 0
 
         messages = self._agent.memory.messages
+        compressed = self._normalize_runtime_tool_context(messages)
         if len(messages) <= 4:
-            return 0
-
-        compressed = 0
+            return compressed
 
         # Truncate ALL messages to 150 chars
         for msg in messages:
@@ -1898,6 +2012,7 @@ class AgentLoop:
             _evict_duplicate_tool_results()
             agent_loop._compress_runtime_context()
 
+            desired_next_step_prompt = agent.next_step_prompt or base_prompt
             if call_tracker:
                 completed_parts = []
                 for key, count in detail_tracker.most_common(8):
@@ -1921,9 +2036,21 @@ class AgentLoop:
                 if len(anti_loop) > 1000:
                     anti_loop = anti_loop[:1000] + "..."
 
-                agent.next_step_prompt = base_prompt + anti_loop
+                desired_next_step_prompt = base_prompt + anti_loop
 
-            result = await original_think()
+            suppress_runtime_prompt = AgentLoop._should_skip_runtime_next_step_prompt(agent_loop)
+            if suppress_runtime_prompt:
+                logger.info(
+                    "Suppressing synthetic next_step_prompt user turn for strict tool-call provider"
+                )
+                agent.next_step_prompt = None
+            else:
+                agent.next_step_prompt = desired_next_step_prompt
+
+            try:
+                result = await original_think()
+            finally:
+                agent.next_step_prompt = desired_next_step_prompt
 
             _log_agent_reasoning()
             _log_tool_calls()
