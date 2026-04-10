@@ -98,6 +98,36 @@ class TestStreamThinkingParam:
         assert len(run_kwargs_captured) == 1
         assert "thinking" not in run_kwargs_captured[0]
 
+    @pytest.mark.asyncio
+    async def test_anti_loop_tracker_forwards_thinking_kwargs(self):
+        """The anti-loop think() wrapper must preserve provider-specific kwargs."""
+        from pathlib import Path
+
+        from spoon_bot.agent.loop import AgentLoop
+
+        captured_kwargs: list[dict] = []
+
+        async def base_think(**kwargs):
+            captured_kwargs.append(kwargs)
+            return True
+
+        loop = object.__new__(AgentLoop)
+        loop.workspace = Path(".")
+        loop._agent = type("FakeAgent", (), {})()
+        loop._agent.think = base_think
+        loop._agent.next_step_prompt = None
+        loop._agent.tool_calls = []
+        loop._agent.memory = MagicMock(messages=[])
+        loop._compress_runtime_context = MagicMock()
+        loop._capture_reasoning_text = MagicMock(return_value=None)
+
+        AgentLoop._install_anti_loop_tracker(loop, "prompt")
+
+        result = await loop._agent.think(thinking=True)
+
+        assert result is True
+        assert captured_kwargs == [{"thinking": True}]
+
 
 # ============================================================
 # Stream wait behavior

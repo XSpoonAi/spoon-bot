@@ -2008,7 +2008,7 @@ class AgentLoop:
             if evicted:
                 logger.info(f"Evicted {evicted} duplicate tool results from context")
 
-        async def _tracked_think() -> bool:
+        async def _tracked_think(*args: Any, **kwargs: Any) -> bool:
             _evict_duplicate_tool_results()
             agent_loop._compress_runtime_context()
 
@@ -2048,7 +2048,7 @@ class AgentLoop:
                 agent.next_step_prompt = desired_next_step_prompt
 
             try:
-                result = await original_think()
+                result = await original_think(*args, **kwargs)
             finally:
                 agent.next_step_prompt = desired_next_step_prompt
 
@@ -2347,8 +2347,6 @@ class AgentLoop:
         stream_completed = False
         stream_cancelled = False
         bg_task: asyncio.Task[None] | None = None
-        pending_pre_tool_chunks: list[dict[str, Any]] = []
-        buffering_pre_tool_segment = thinking
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
@@ -2494,15 +2492,6 @@ class AgentLoop:
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
-                        if thinking and pending_pre_tool_chunks:
-                            for pending_chunk in pending_pre_tool_chunks:
-                                yield {
-                                    "type": "thinking",
-                                    "delta": pending_chunk["delta"],
-                                    "metadata": pending_chunk["metadata"],
-                                }
-                            pending_pre_tool_chunks = []
-                        buffering_pre_tool_segment = thinking
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
                             if isinstance(tc, dict):
@@ -2592,13 +2581,6 @@ class AgentLoop:
                                 "source": metadata.get("source", "phase_think"),
                             },
                         }
-                    elif chunk_type == "content" and buffering_pre_tool_segment:
-                        pending_pre_tool_chunks.append(
-                            {
-                                "delta": delta,
-                                "metadata": dict(metadata),
-                            }
-                        )
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
@@ -2623,16 +2605,6 @@ class AgentLoop:
             )
             for event in tool_result_events:
                 yield event
-
-            if pending_pre_tool_chunks:
-                for pending_chunk in pending_pre_tool_chunks:
-                    full_content += pending_chunk["delta"]
-                    yield {
-                        "type": "content",
-                        "delta": pending_chunk["delta"],
-                        "metadata": pending_chunk["metadata"],
-                    }
-                pending_pre_tool_chunks = []
 
             # Fallback: if run() completed but no stream chunks were emitted,
             # use final run result as one content chunk to avoid empty output.

@@ -632,8 +632,8 @@ class TestAgentLoopStream:
         assert done_chunks[0]["metadata"]["content"] == "Answer"
 
     @pytest.mark.asyncio
-    async def test_stream_buffers_leading_content_until_tool_call_then_emits_thinking(self):
-        """Leading streamed content should become thinking only after a real tool call arrives."""
+    async def test_stream_keeps_leading_content_streaming_when_tool_call_follows(self):
+        """Plain content should stay streamable even if a tool call appears later."""
         from spoon_bot.agent.loop import AgentLoop
 
         tool_call = MagicMock()
@@ -643,9 +643,9 @@ class TestAgentLoopStream:
         tool_call.function.arguments = '{"command":"pwd"}'
 
         async def mock_run(**kwargs):
-            await agent._agent.output_queue.put({"content": "Let me inspect the workspace first."})
+            await agent._agent.output_queue.put({"content": "Part A. "})
             await agent._agent.output_queue.put({"tool_calls": [tool_call]})
-            await agent._agent.output_queue.put({"content": "Done."})
+            await agent._agent.output_queue.put({"content": "Part B."})
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
@@ -675,13 +675,13 @@ class TestAgentLoopStream:
         async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
             chunks.append(chunk)
 
-        emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
-        assert emitted[0]["delta"] == "Let me inspect the workspace first."
+        emitted = [c for c in chunks if c["type"] in {"content", "tool_call"}]
+        assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
+        assert emitted[0]["delta"] == "Part A. "
         assert emitted[1]["metadata"]["name"] == "shell"
-        assert emitted[2]["delta"] == "Done."
+        assert emitted[2]["delta"] == "Part B."
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert done_chunks[0]["metadata"]["content"] == "Done."
+        assert done_chunks[0]["metadata"]["content"] == "Part A. Part B."
 
     @pytest.mark.asyncio
     async def test_stream_passes_through_structured_tool_result_chunks(self):
@@ -1020,6 +1020,56 @@ class TestAgentLoopStream:
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "直接给答案"
+
+    @pytest.mark.asyncio
+    async def test_stream_without_tool_call_emits_first_content_before_run_finishes(self):
+        """thinking=true should not buffer normal content until the very end."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        release_run = asyncio.Event()
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"content": "chunk-1 "})
+            await asyncio.wait_for(release_run.wait(), timeout=0.2)
+            await agent._agent.output_queue.put({"content": "chunk-2"})
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+
+        stream_iter = AgentLoop.stream(agent, message="test", thinking=True)
+
+        first_chunk = await asyncio.wait_for(anext(stream_iter), timeout=0.2)
+        assert first_chunk == {"type": "content", "delta": "chunk-1 ", "metadata": {}}
+
+        release_run.set()
+        remaining_chunks = [chunk async for chunk in stream_iter]
+        content_chunks = [first_chunk, *[c for c in remaining_chunks if c["type"] == "content"]]
+        done_chunks = [c for c in remaining_chunks if c["type"] == "done"]
+
+        assert [c["delta"] for c in content_chunks] == ["chunk-1 ", "chunk-2"]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "chunk-1 chunk-2"
 
     @pytest.mark.asyncio
     async def test_stream_error_handling(self):
