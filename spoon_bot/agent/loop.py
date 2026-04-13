@@ -2144,6 +2144,28 @@ class AgentLoop:
         """Collapse whitespace so duplicate text can be compared reliably."""
         return " ".join(str(text or "").split())
 
+    @staticmethod
+    def _resolve_stream_fallback_delta(
+        streamed_text: str | None,
+        final_text: str | None,
+    ) -> tuple[str, str]:
+        """Return merged final content plus the missing delta to emit."""
+        streamed = str(streamed_text or "")
+        final = str(final_text or "")
+        if not streamed or not final:
+            return final, final
+
+        prefix_candidates = [streamed]
+        trimmed_streamed = streamed.rstrip()
+        if trimmed_streamed and trimmed_streamed != streamed:
+            prefix_candidates.append(trimmed_streamed)
+
+        for prefix in prefix_candidates:
+            if prefix and final.startswith(prefix):
+                return final, final[len(prefix):]
+
+        return streamed + final, final
+
     def _looks_like_duplicate_thinking(
         self,
         thinking_text: str | None,
@@ -2627,17 +2649,22 @@ class AgentLoop:
                     "Stream produced no content chunks; "
                     "falling back to run() result text."
                 )
+                fallback_delta = run_result_text
                 if full_content and fallback_after_tool_only_preamble:
-                    full_content += run_result_text
+                    full_content, fallback_delta = AgentLoop._resolve_stream_fallback_delta(
+                        full_content,
+                        run_result_text,
+                    )
                     fallback_reason = "run_result_after_tool_preamble"
                 else:
                     full_content = run_result_text
                     fallback_reason = "run_result_no_chunks"
-                yield {
-                    "type": "content",
-                    "delta": run_result_text,
-                    "metadata": {"fallback": fallback_reason},
-                }
+                if fallback_delta:
+                    yield {
+                        "type": "content",
+                        "delta": fallback_delta,
+                        "metadata": {"fallback": fallback_reason},
+                    }
 
             # Emit done
             stream_completed = True
@@ -2888,15 +2915,29 @@ class AgentLoop:
             prompt += env_section
         return prompt
 
+    def _current_llm_provider(self) -> str:
+        """Return the active provider name for prompt-selection decisions."""
+        provider = getattr(self, "provider", None)
+        if isinstance(provider, str) and provider.strip():
+            return provider.strip().lower()
+        chatbot_provider = getattr(getattr(self, "_chatbot", None), "llm_provider", None)
+        if isinstance(chatbot_provider, str) and chatbot_provider.strip():
+            return chatbot_provider.strip().lower()
+        return ""
+
+    def _should_use_lightweight_thinking_prompt(self) -> bool:
+        """Only OpenRouter reasoning runs need the lightweight prompt workaround."""
+        return self._current_llm_provider() == "openrouter"
+
     def _select_next_step_prompt(self, message: str, *, thinking: bool) -> str:
         """Choose the per-step prompt shape for the current request.
 
         OpenRouter-backed reasoning models stop emitting streaming reasoning
         tokens when we inject the heavier runtime step prompt as an extra user
-        turn. When thinking is enabled, prefer the lightweight default prompt
-        so visible reasoning remains available while preserving normal tool use.
+        turn. Keep that workaround scoped to OpenRouter so other providers
+        retain the contextual user/workspace/env sections from _build_step_prompt().
         """
-        if thinking:
+        if thinking and self._should_use_lightweight_thinking_prompt():
             return self.DEFAULT_NEXT_STEP_PROMPT
         return self._build_step_prompt(message)
 
