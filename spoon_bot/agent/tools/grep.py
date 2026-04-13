@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import capture_tool_output
 
 
 class GrepTool(Tool):
@@ -129,9 +130,11 @@ class GrepTool(Tool):
             ws_str = str(self._workspace)
             output = output.replace(ws_str + os.sep, "").replace(ws_str + "/", "")
 
+        full_output = output
         if len(output) > self._max_output:
             output = output[: self._max_output] + f"\n... [truncated, {len(output) - self._max_output} more chars]"
 
+        capture_tool_output(output, full_output)
         return output
 
     @staticmethod

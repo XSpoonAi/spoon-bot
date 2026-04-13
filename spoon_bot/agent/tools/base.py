@@ -5,6 +5,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, TypedDict
 
+from spoon_bot.agent.tools.execution_context import bind_tool_invocation, finalize_tool_invocation
+
 try:
     from typing import NotRequired
 except ImportError:
@@ -132,7 +134,12 @@ class Tool(ABC):
 
         This allows the tool to be used as: `result = await tool(arg=value)`
         """
-        return await self.execute(**kwargs)
+        with bind_tool_invocation(self.name, kwargs):
+            try:
+                result = await self.execute(**kwargs)
+            finally:
+                finalize_tool_invocation(locals().get("result"))
+        return result
 
     @abstractmethod
     async def execute(self, **kwargs: Any) -> str:

@@ -11,6 +11,7 @@ import aiofiles
 import aiofiles.os
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import capture_tool_output
 from spoon_bot.agent.tools.path_validator import (
     PathValidator,
     validate_read_path,
@@ -128,12 +129,15 @@ class ReadFileTool(Tool):
             else:
                 range_note = ""
 
-            total_size = len(content)
+            full_content = content
+            total_size = len(full_content)
             parts = file_path.parts
             is_skill_file = "skills" in parts
 
             if self._max_output and total_size > self._max_output:
-                content = content[:self._max_output] + f"\n... (truncated, {total_size - self._max_output} more chars)"
+                content = full_content[:self._max_output] + f"\n... (truncated, {total_size - self._max_output} more chars)"
+            else:
+                content = full_content
 
             # Use relative path to workspace for dedup, fallback to name
             try:
@@ -145,12 +149,18 @@ class ReadFileTool(Tool):
             except ValueError:
                 display_path = file_path.name
 
-            actual_size = len(content)
-            header = f"[file: {display_path} | {actual_size} chars{range_note}"
-            if is_skill_file:
-                header += " | skill-ref"
-            header += "]\n"
-            return header + content
+            def _build_result(body: str) -> str:
+                body_size = len(body)
+                header = f"[file: {display_path} | {body_size} chars{range_note}"
+                if is_skill_file:
+                    header += " | skill-ref"
+                header += "]\n"
+                return header + body
+
+            summary_result = _build_result(content)
+            full_result = _build_result(full_content)
+            capture_tool_output(summary_result, full_result)
+            return summary_result
 
         except PermissionError:
             return f"Error: Permission denied: {path}"

@@ -81,7 +81,13 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.grep import GrepTool
-from spoon_bot.agent.tools.execution_context import bind_tool_owner, build_tool_owner_key
+from spoon_bot.agent.tools.execution_context import (
+    bind_tool_owner,
+    build_tool_owner_key,
+    capture_tool_outputs,
+    consume_captured_tool_output,
+    normalize_tool_arguments,
+)
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
     SelfConfigTool,
@@ -2267,6 +2273,41 @@ class AgentLoop:
                 return str(payload)
         return str(payload)
 
+    @staticmethod
+    def _tool_call_arguments_key(arguments: Any) -> str:
+        """Normalize tool-call arguments for captured-output matching."""
+        return normalize_tool_arguments(arguments)
+
+    @staticmethod
+    def _merge_stream_tool_result_metadata(
+        metadata: dict[str, Any],
+        *,
+        streamed_result: str,
+        captured_output: Any | None,
+    ) -> dict[str, Any]:
+        """Prefer captured full tool output while retaining model-visible summary."""
+        merged = dict(metadata)
+        summary_result = streamed_result
+        full_result = streamed_result
+
+        if captured_output is not None:
+            captured_summary = getattr(captured_output, "summary_output", "") or summary_result
+            captured_full = getattr(captured_output, "full_output", "") or captured_summary
+            summary_result = captured_summary
+            full_result = captured_full
+
+        if full_result:
+            merged["result"] = full_result
+            merged["content"] = full_result
+            merged["full_result"] = full_result
+            merged["full_content"] = full_result
+        if summary_result:
+            merged.setdefault("model_result", summary_result)
+            merged.setdefault("model_content", summary_result)
+        if full_result and summary_result and full_result != summary_result:
+            merged["result_truncated_for_model"] = True
+        return merged
+
     def _get_runtime_memory_messages(self) -> list[Any]:
         """Return runtime memory messages exposed by the active inner agent."""
         if not hasattr(self._agent, "memory") or self._agent.memory is None:
@@ -2288,6 +2329,9 @@ class AgentLoop:
         self,
         start_index: int,
         emitted_tool_result_ids: set[str],
+        *,
+        tool_output_capture_scope: str | None,
+        tool_call_arguments_by_id: dict[str, str],
     ) -> tuple[list[dict[str, Any]], int]:
         """Collect newly-added tool result messages from runtime memory."""
         messages = AgentLoop._get_runtime_memory_messages(self)
@@ -2295,15 +2339,20 @@ class AgentLoop:
             start_index = 0
 
         events: list[dict[str, Any]] = []
-        for msg in messages[start_index:]:
+        next_index = start_index
+        for index, msg in enumerate(messages[start_index:], start=start_index):
             if AgentLoop._stream_message_role(msg) != "tool":
+                next_index = index + 1
                 continue
 
             tool_call_id = (
                 AgentLoop._stream_message_attr(msg, "tool_call_id", "")
                 or AgentLoop._stream_message_attr(msg, "id", "")
             )
+            if tool_call_id and tool_call_id not in tool_call_arguments_by_id:
+                break
             if tool_call_id and tool_call_id in emitted_tool_result_ids:
+                next_index = index + 1
                 continue
 
             result_payload = AgentLoop._stream_message_attr(msg, "text_content", None)
@@ -2311,24 +2360,31 @@ class AgentLoop:
                 result_payload = AgentLoop._stream_message_attr(msg, "content", "")
             serialized_result = AgentLoop._stringify_stream_payload(result_payload)
             tool_name = AgentLoop._stream_message_attr(msg, "name", "")
+            captured_output = consume_captured_tool_output(
+                tool_output_capture_scope,
+                tool_name=tool_name,
+                arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+            )
 
-            metadata: dict[str, Any] = {
-                "name": tool_name,
-                "result": serialized_result,
-                "content": serialized_result,
-            }
+            metadata: dict[str, Any] = {"name": tool_name}
             if tool_call_id:
                 metadata["id"] = tool_call_id
                 metadata["tool_call_id"] = tool_call_id
                 emitted_tool_result_ids.add(tool_call_id)
+            metadata = AgentLoop._merge_stream_tool_result_metadata(
+                metadata,
+                streamed_result=serialized_result,
+                captured_output=captured_output,
+            )
 
             events.append({
                 "type": "tool_result",
                 "delta": "",
                 "metadata": metadata,
             })
+            next_index = index + 1
 
-        return events, len(messages)
+        return events, next_index
 
 
     async def stream(
@@ -2374,6 +2430,8 @@ class AgentLoop:
         bg_task: asyncio.Task[None] | None = None
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
+        tool_output_capture_scope: str | None = None
+        capture_manager = None
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
@@ -2387,6 +2445,8 @@ class AgentLoop:
             message = runtime_message
 
         try:
+            capture_manager = capture_tool_outputs()
+            tool_output_capture_scope = capture_manager.__enter__()
             _base_prompt = self._select_next_step_prompt(message, thinking=thinking)
             original_system_prompt, original_base_system_prompt = (
                 AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=thinking)
@@ -2412,6 +2472,7 @@ class AgentLoop:
             await self._agent.add_message("user", runtime_message)
             stream_tool_result_index = len(AgentLoop._get_runtime_memory_messages(self))
             emitted_tool_result_ids: set[str] = set()
+            tool_call_arguments_by_id: dict[str, str] = {}
 
             # 2. Start run() in background
             run_result_text = ""
@@ -2493,6 +2554,8 @@ class AgentLoop:
                         self,
                         stream_tool_result_index,
                         emitted_tool_result_ids,
+                        tool_output_capture_scope=tool_output_capture_scope,
+                        tool_call_arguments_by_id=tool_call_arguments_by_id,
                     )
                 )
                 for event in tool_result_events:
@@ -2565,6 +2628,8 @@ class AgentLoop:
                                 fn_obj = getattr(tc, "function", None)
                                 fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
                                 fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                            if tc_id:
+                                tool_call_arguments_by_id[tc_id] = AgentLoop._tool_call_arguments_key(fn_args)
                             yield _decorate_stream_event({
                                 "type": "tool_call",
                                 "delta": "",
@@ -2583,6 +2648,11 @@ class AgentLoop:
                         chunk_type = "thinking"
                     elif dict_type == "tool_result":
                         chunk_type = "tool_result"
+                        tool_name = (
+                            chunk.get("name")
+                            or metadata.get("name")
+                            or ""
+                        )
                         tool_result = (
                             chunk.get("result")
                             or chunk.get("content")
@@ -2590,19 +2660,28 @@ class AgentLoop:
                             or chunk.get("output")
                         )
                         serialized_result = AgentLoop._stringify_stream_payload(tool_result)
-                        if serialized_result:
-                            metadata.setdefault("result", serialized_result)
-                            metadata.setdefault("content", serialized_result)
                         tool_call_id = (
                             chunk.get("tool_call_id")
                             or chunk.get("id")
                             or metadata.get("tool_call_id")
                             or metadata.get("id")
                         )
+                        captured_output = consume_captured_tool_output(
+                            tool_output_capture_scope,
+                            tool_name=tool_name,
+                            arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                        )
+                        if tool_name:
+                            metadata.setdefault("name", tool_name)
                         if tool_call_id:
                             metadata.setdefault("tool_call_id", tool_call_id)
                             metadata.setdefault("id", tool_call_id)
                             emitted_tool_result_ids.add(tool_call_id)
+                        metadata = AgentLoop._merge_stream_tool_result_metadata(
+                            metadata,
+                            streamed_result=serialized_result,
+                            captured_output=captured_output,
+                        )
                     elif dict_type == "content":
                         chunk_type = "content"
                     # Support both "content" and "delta" keys (#10)
@@ -2664,6 +2743,8 @@ class AgentLoop:
                     self,
                     stream_tool_result_index,
                     emitted_tool_result_ids,
+                    tool_output_capture_scope=tool_output_capture_scope,
+                    tool_call_arguments_by_id=tool_call_arguments_by_id,
                 )
             )
             for event in tool_result_events:
@@ -2716,6 +2797,8 @@ class AgentLoop:
             yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
         finally:
+            if capture_manager is not None:
+                capture_manager.__exit__(None, None, None)
             self._restore_agent_think()
             AgentLoop._restore_request_context_system_prompt(
                 self,
