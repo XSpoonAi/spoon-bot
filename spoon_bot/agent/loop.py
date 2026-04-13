@@ -117,6 +117,7 @@ _ATTACHMENT_ONLY_PLACEHOLDER = (
     "The user attached files without extra text. Inspect the files and answer based on their contents."
 )
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
+_MISSING = object()
 _WALLET_REQUIRED_TOOLS: frozenset[str] = frozenset({
     "balance_check",
     "transfer",
@@ -2371,6 +2372,8 @@ class AgentLoop:
         stream_completed = False
         stream_cancelled = False
         bg_task: asyncio.Task[None] | None = None
+        original_system_prompt: str | None = None
+        original_base_system_prompt: object = _MISSING
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
@@ -2384,6 +2387,9 @@ class AgentLoop:
             message = runtime_message
 
         _base_prompt = self._select_next_step_prompt(message, thinking=thinking)
+        original_system_prompt, original_base_system_prompt = (
+            AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=thinking)
+        )
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
 
@@ -2681,6 +2687,11 @@ class AgentLoop:
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
         finally:
             self._restore_agent_think()
+            AgentLoop._restore_request_context_system_prompt(
+                self,
+                original_system_prompt,
+                original_base_system_prompt,
+            )
             if bg_task is not None and not bg_task.done():
                 bg_task.cancel()
                 try:
@@ -2735,6 +2746,8 @@ class AgentLoop:
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
         self._reset_reasoning_capture()
+        original_system_prompt: str | None = None
+        original_base_system_prompt: object = _MISSING
 
         # Refresh memory context
         try:
@@ -2756,6 +2769,9 @@ class AgentLoop:
             message = runtime_message
 
         _base_prompt = self._select_next_step_prompt(message, thinking=True)
+        original_system_prompt, original_base_system_prompt = (
+            AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=True)
+        )
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
         await self._agent.add_message("user", runtime_message)
@@ -2789,6 +2805,11 @@ class AgentLoop:
             raise
         finally:
             self._restore_agent_think()
+            AgentLoop._restore_request_context_system_prompt(
+                self,
+                original_system_prompt,
+                original_base_system_prompt,
+            )
 
         # Save to session
         try:
@@ -2915,29 +2936,76 @@ class AgentLoop:
             prompt += env_section
         return prompt
 
-    def _current_llm_provider(self) -> str:
-        """Return the active provider name for prompt-selection decisions."""
-        provider = getattr(self, "provider", None)
-        if isinstance(provider, str) and provider.strip():
-            return provider.strip().lower()
-        chatbot_provider = getattr(getattr(self, "_chatbot", None), "llm_provider", None)
-        if isinstance(chatbot_provider, str) and chatbot_provider.strip():
-            return chatbot_provider.strip().lower()
-        return ""
+    def _build_request_context_prompt(self, message: str) -> str:
+        """Build the compact request context block used for thinking runs."""
+        _truncated = message[:300] + ("…" if len(message) > 300 else "")
+        _ws = self._workspace_posix_path()
+        prompt = (
+            f"[USER REQUEST]: {_truncated}\n"
+            f"[WORKSPACE]: {_ws}/\n"
+        )
+        env_section = self._extract_env_for_prompt()
+        if env_section:
+            prompt += env_section
+        return prompt
 
-    def _should_use_lightweight_thinking_prompt(self) -> bool:
-        """Only OpenRouter reasoning runs need the lightweight prompt workaround."""
-        return self._current_llm_provider() == "openrouter"
+    def _apply_request_context_to_system_prompt(
+        self,
+        message: str,
+        *,
+        thinking: bool,
+    ) -> tuple[str | None, object]:
+        """Temporarily append active request context to the agent system prompt."""
+        if not thinking or not getattr(self, "_agent", None):
+            return None, _MISSING
+
+        current_prompt = getattr(self._agent, "system_prompt", None)
+        if not isinstance(current_prompt, str) or not current_prompt:
+            return None, _MISSING
+
+        request_context = self._build_request_context_prompt(message)
+        augmented_prompt = (
+            f"{current_prompt}\n\n"
+            f"## Active Request Context\n"
+            f"{request_context}"
+        )
+        self._agent.system_prompt = augmented_prompt
+
+        original_base_prompt = _MISSING
+        if hasattr(self._agent, "_original_system_prompt"):
+            original_base_prompt = getattr(self._agent, "_original_system_prompt")
+            if isinstance(original_base_prompt, str) and original_base_prompt:
+                self._agent._original_system_prompt = (
+                    f"{original_base_prompt}\n\n"
+                    f"## Active Request Context\n"
+                    f"{request_context}"
+                )
+
+        return current_prompt, original_base_prompt
+
+    def _restore_request_context_system_prompt(
+        self,
+        original_prompt: str | None,
+        original_base_prompt: object,
+    ) -> None:
+        """Restore the agent system prompt after a thinking run completes."""
+        if not getattr(self, "_agent", None):
+            return
+        if original_prompt is not None:
+            self._agent.system_prompt = original_prompt
+        if original_base_prompt is not _MISSING and hasattr(self._agent, "_original_system_prompt"):
+            self._agent._original_system_prompt = original_base_prompt
 
     def _select_next_step_prompt(self, message: str, *, thinking: bool) -> str:
         """Choose the per-step prompt shape for the current request.
 
-        OpenRouter-backed reasoning models stop emitting streaming reasoning
-        tokens when we inject the heavier runtime step prompt as an extra user
-        turn. Keep that workaround scoped to OpenRouter so other providers
-        retain the contextual user/workspace/env sections from _build_step_prompt().
+        Thinking runs keep a lightweight per-step prompt across all providers.
+        The active request context is injected into the system prompt instead,
+        so runtime pruning still preserves user/workspace/env guidance without
+        reintroducing the heavier synthetic user-turn prompt that suppresses
+        streamed reasoning on some providers.
         """
-        if thinking and self._should_use_lightweight_thinking_prompt():
+        if thinking:
             return self.DEFAULT_NEXT_STEP_PROMPT
         return self._build_step_prompt(message)
 

@@ -379,8 +379,8 @@ class TestAgentLoopStream:
         loop.sessions.save = MagicMock()
         return loop
 
-    def test_select_next_step_prompt_uses_lightweight_prompt_for_openrouter_thinking(self):
-        """OpenRouter thinking runs should keep the lightweight prompt workaround."""
+    def test_select_next_step_prompt_keeps_context_for_openrouter_thinking(self):
+        """Thinking mode should use the same lightweight next-step prompt on OpenRouter."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
@@ -394,7 +394,7 @@ class TestAgentLoopStream:
         loop._build_step_prompt.assert_not_called()
 
     def test_select_next_step_prompt_keeps_context_for_other_providers(self):
-        """Non-OpenRouter thinking runs should retain the contextual step prompt."""
+        """Thinking mode should use the same lightweight next-step prompt for every provider."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
@@ -404,8 +404,39 @@ class TestAgentLoopStream:
 
         prompt = AgentLoop._select_next_step_prompt(loop, "inspect workspace", thinking=True)
 
-        assert prompt == "context prompt"
-        loop._build_step_prompt.assert_called_once_with("inspect workspace")
+        assert prompt == AgentLoop.DEFAULT_NEXT_STEP_PROMPT
+        loop._build_step_prompt.assert_not_called()
+
+    def test_apply_request_context_to_system_prompt_augments_and_restores_prompts(self):
+        """Thinking runs should preserve request context via temporary system prompt augmentation."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = MagicMock()
+        loop._agent.system_prompt = "base system"
+        loop._agent._original_system_prompt = "base original"
+        loop._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: inspect workspace")
+
+        original_prompt, original_base_prompt = AgentLoop._apply_request_context_to_system_prompt(
+            loop,
+            "inspect workspace",
+            thinking=True,
+        )
+
+        assert original_prompt == "base system"
+        assert original_base_prompt == "base original"
+        assert "## Active Request Context" in loop._agent.system_prompt
+        assert "[USER REQUEST]: inspect workspace" in loop._agent.system_prompt
+        assert "## Active Request Context" in loop._agent._original_system_prompt
+
+        AgentLoop._restore_request_context_system_prompt(
+            loop,
+            original_prompt,
+            original_base_prompt,
+        )
+
+        assert loop._agent.system_prompt == "base system"
+        assert loop._agent._original_system_prompt == "base original"
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
