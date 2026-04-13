@@ -105,17 +105,18 @@ async def test_install_root_skill_repo_writes_into_workspace_skills_directory(
 
 
 def test_git_clone_command_uses_full_clone_for_root_skill_repo(skill_manager_module):
+    destination = Path("C:/tmp/repo")
     cmd = skill_manager_module._build_git_clone_command(
         "https://github.com/Agent-Cypher-Lab/joker-game-agent.git",
         "main",
-        Path("C:/tmp/repo"),
+        destination,
         "",
     )
 
     assert "--sparse" not in cmd
     assert cmd[-2:] == [
         "https://github.com/Agent-Cypher-Lab/joker-game-agent.git",
-        "C:\\tmp\\repo",
+        str(destination),
     ]
 
 
