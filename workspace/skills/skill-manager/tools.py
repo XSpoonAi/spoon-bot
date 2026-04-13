@@ -33,6 +33,33 @@ def _get_workspace() -> Path:
     return Path.home() / ".spoon-bot" / "workspace"
 
 
+def _normalize_subpath(raw: str) -> str:
+    """Normalize a remote skill path into a stable POSIX-like form."""
+    subpath = raw.strip().replace("\\", "/").strip("/")
+    while "//" in subpath:
+        subpath = subpath.replace("//", "/")
+    return subpath
+
+
+def _validate_subpath(raw: str, *, allow_empty: bool = False) -> str:
+    """Validate a remote skill path and optionally allow repo root installs."""
+    subpath = _normalize_subpath(raw)
+    if not subpath:
+        if allow_empty:
+            return ""
+        raise ValueError("Invalid skill path")
+
+    parts = [p for p in subpath.split("/") if p]
+    if not parts:
+        raise ValueError("Invalid skill path")
+    if any(p in {".", ".."} for p in parts):
+        raise ValueError("Invalid skill path: path traversal is not allowed")
+    if any(p.startswith(".") for p in parts):
+        raise ValueError("Invalid skill path: hidden segments are not allowed")
+
+    return "/".join(parts)
+
+
 def _parse_github_url(url: str) -> tuple[str, str, str, str]:
     """Parse a GitHub URL -> (owner, repo, branch, subpath)."""
     m = _GITHUB_URL_RE.match(url.strip())
@@ -55,6 +82,22 @@ def _github_headers() -> dict[str, str]:
     return headers
 
 
+def _build_git_clone_command(clone_url: str, branch: str, destination: Path, subpath: str) -> list[str]:
+    """Build the git clone command for either repo-root or nested skill installs."""
+    cmd = [
+        "git",
+        "clone",
+        "--depth=1",
+        "--filter=blob:none",
+        "--branch",
+        branch,
+    ]
+    if subpath:
+        cmd.append("--sparse")
+    cmd.extend([clone_url, str(destination)])
+    return cmd
+
+
 async def _download_via_git(
     owner: str, repo: str, branch: str, subpath: str, target: Path
 ) -> int:
@@ -66,11 +109,15 @@ async def _download_via_git(
     tmp_dir = Path(tempfile.mkdtemp(prefix="spoon_skill_"))
 
     try:
-        # git clone with sparse checkout — only download the subpath we need
+        # Nested skills use sparse checkout; repo-root skills clone fully.
+        clone_cmd = _build_git_clone_command(
+            clone_url,
+            branch,
+            tmp_dir / "repo",
+            subpath,
+        )
         proc = await asyncio.create_subprocess_exec(
-            "git", "clone", "--depth=1", "--filter=blob:none",
-            "--sparse", "--branch", branch,
-            clone_url, str(tmp_dir / "repo"),
+            *clone_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -80,7 +127,6 @@ async def _download_via_git(
 
         repo_dir = tmp_dir / "repo"
 
-        # Set sparse-checkout to only include the skill subpath
         if subpath:
             proc = await asyncio.create_subprocess_exec(
                 "git", "sparse-checkout", "set", subpath,
@@ -88,7 +134,11 @@ async def _download_via_git(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(proc.communicate(), timeout=30)
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"git sparse-checkout failed: {stderr.decode().strip()}"
+                )
 
         # Copy skill files to target
         source = repo_dir / subpath if subpath else repo_dir
@@ -126,7 +176,7 @@ async def _download_via_api(
         api_path: str, dest_dir: Path, client: httpx.AsyncClient
     ) -> None:
         nonlocal total_files
-        url = f"{base_api}/{api_path}?ref={branch}"
+        url = f"{base_api}/{api_path}?ref={branch}" if api_path else f"{base_api}?ref={branch}"
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         items: list[dict[str, Any]] = resp.json()
@@ -230,7 +280,7 @@ class SkillMarketplaceTool(BaseTool):
                 "description": (
                     "GitHub URL to install from. Pass the EXACT URL the user gave you, "
                     "e.g. 'https://github.com/openclaw/skills/tree/main/skills/tezatezaz/clawcast-wallet'. "
-                    "Also accepts 'owner/repo/skillId' shorthand."
+                    "Also accepts 'owner/repo/<skill_path>' shorthand."
                 ),
             },
             "skill_name": {
@@ -301,25 +351,28 @@ class SkillMarketplaceTool(BaseTool):
 
                 if _url.startswith(("http://", "https://")):
                     owner, repo, branch, subpath = _parse_github_url(_url)
-                    skill_name_derived = (
-                        subpath.rsplit("/", 1)[-1] if subpath else repo
-                    )
+                    subpath = _validate_subpath(subpath, allow_empty=True)
+                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
                 else:
                     parts = [p for p in url.split("/") if p]
                     if len(parts) < 2:
                         return (
                             "Error: provide a full GitHub URL or "
-                            "'owner/repo/skillId' shorthand"
+                            "'owner/repo[/<skill_path>]' shorthand"
                         )
                     owner, repo = parts[0], parts[1]
                     branch = "main"
                     rest = parts[2:]
                     if rest and rest[0] == "tree":
+                        if len(rest) < 2:
+                            return (
+                                "Error: provide a full GitHub tree URL, e.g. "
+                                "owner/repo/tree/main[/skills/foo]"
+                            )
                         branch = rest[1] if len(rest) > 1 else "main"
                         rest = rest[2:]
-                    skill_id = rest[-1] if rest else ""
-                    subpath = "/".join(rest) if rest else ""
-                    skill_name_derived = skill_id or repo
+                    subpath = _validate_subpath("/".join(rest), allow_empty=True)
+                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
 
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
@@ -382,22 +435,28 @@ class SkillMarketplaceTool(BaseTool):
 
                 if _url.startswith(("http://", "https://")):
                     owner, repo, branch, subpath = _parse_github_url(_url)
-                    skill_name_derived = (
-                        subpath.rsplit("/", 1)[-1] if subpath else repo
-                    )
+                    subpath = _validate_subpath(subpath, allow_empty=True)
+                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
                 else:
                     parts = [p for p in url.split("/") if p]
                     if len(parts) < 2:
-                        return "Error: provide a full GitHub URL or 'owner/repo/skillId' shorthand"
+                        return (
+                            "Error: provide a full GitHub URL or "
+                            "'owner/repo[/<skill_path>]' shorthand"
+                        )
                     owner, repo = parts[0], parts[1]
                     branch = "main"
                     rest = parts[2:]
                     if rest and rest[0] == "tree":
+                        if len(rest) < 2:
+                            return (
+                                "Error: provide a full GitHub tree URL, e.g. "
+                                "owner/repo/tree/main[/skills/foo]"
+                            )
                         branch = rest[1] if len(rest) > 1 else "main"
                         rest = rest[2:]
-                    skill_id = rest[-1] if rest else ""
-                    subpath = "/".join(rest) if rest else ""
-                    skill_name_derived = skill_id or repo
+                    subpath = _validate_subpath("/".join(rest), allow_empty=True)
+                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
 
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
