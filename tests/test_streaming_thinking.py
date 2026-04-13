@@ -684,6 +684,61 @@ class TestAgentLoopStream:
         assert done_chunks[0]["metadata"]["content"] == "Part A. Part B."
 
     @pytest.mark.asyncio
+    async def test_stream_falls_back_to_run_result_after_pre_tool_content_without_final_chunk(self):
+        """A tool preamble should not suppress the final run() answer fallback."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"pwd"}'
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"content": "Need tool first. "})
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            result = MagicMock()
+            result.content = "Final answer."
+            return result
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(return_value="placeholder")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted = [c for c in chunks if c["type"] in {"content", "tool_call"}]
+        assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
+        assert emitted[0]["delta"] == "Need tool first. "
+        assert emitted[2]["delta"] == "Final answer."
+        assert emitted[2]["metadata"]["fallback"] == "run_result_after_tool_preamble"
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Need tool first. Final answer."
+
+    @pytest.mark.asyncio
     async def test_stream_passes_through_structured_tool_result_chunks(self):
         """Explicit tool_result chunks should be preserved for downstream UIs."""
         from spoon_bot.agent.loop import AgentLoop

@@ -2344,6 +2344,8 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+        saw_tool_call = False
+        saw_content_after_tool_call = False
         stream_completed = False
         stream_cancelled = False
         bg_task: asyncio.Task[None] | None = None
@@ -2492,6 +2494,7 @@ class AgentLoop:
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
+                        saw_tool_call = True
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
                             if isinstance(tc, dict):
@@ -2584,6 +2587,8 @@ class AgentLoop:
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
+                            if saw_tool_call:
+                                saw_content_after_tool_call = True
                             full_content += delta
                         yield event
 
@@ -2606,18 +2611,32 @@ class AgentLoop:
             for event in tool_result_events:
                 yield event
 
+            fallback_after_tool_only_preamble = (
+                saw_tool_call
+                and not saw_content_after_tool_call
+                and bool(run_result_text)
+                and self._normalize_comparable_text(full_content)
+                != self._normalize_comparable_text(run_result_text)
+            )
+
             # Fallback: if run() completed but no stream chunks were emitted,
-            # use final run result as one content chunk to avoid empty output.
-            if not full_content and run_result_text:
+            # or only a pre-tool preamble was emitted, use the final run result
+            # to avoid ending the stream without the actual answer text.
+            if run_result_text and (not full_content or fallback_after_tool_only_preamble):
                 logger.warning(
                     "Stream produced no content chunks; "
                     "falling back to run() result text."
                 )
-                full_content = run_result_text
+                if full_content and fallback_after_tool_only_preamble:
+                    full_content += run_result_text
+                    fallback_reason = "run_result_after_tool_preamble"
+                else:
+                    full_content = run_result_text
+                    fallback_reason = "run_result_no_chunks"
                 yield {
                     "type": "content",
                     "delta": run_result_text,
-                    "metadata": {"fallback": "run_result_no_chunks"},
+                    "metadata": {"fallback": fallback_reason},
                 }
 
             # Emit done
