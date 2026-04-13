@@ -117,6 +117,7 @@ _ATTACHMENT_ONLY_PLACEHOLDER = (
     "The user attached files without extra text. Inspect the files and answer based on their contents."
 )
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
+_MISSING = object()
 _WALLET_REQUIRED_TOOLS: frozenset[str] = frozenset({
     "balance_check",
     "transfer",
@@ -2008,7 +2009,7 @@ class AgentLoop:
             if evicted:
                 logger.info(f"Evicted {evicted} duplicate tool results from context")
 
-        async def _tracked_think() -> bool:
+        async def _tracked_think(*args: Any, **kwargs: Any) -> bool:
             _evict_duplicate_tool_results()
             agent_loop._compress_runtime_context()
 
@@ -2048,7 +2049,7 @@ class AgentLoop:
                 agent.next_step_prompt = desired_next_step_prompt
 
             try:
-                result = await original_think()
+                result = await original_think(*args, **kwargs)
             finally:
                 agent.next_step_prompt = desired_next_step_prompt
 
@@ -2143,6 +2144,28 @@ class AgentLoop:
     def _normalize_comparable_text(text: str | None) -> str:
         """Collapse whitespace so duplicate text can be compared reliably."""
         return " ".join(str(text or "").split())
+
+    @staticmethod
+    def _resolve_stream_fallback_delta(
+        streamed_text: str | None,
+        final_text: str | None,
+    ) -> tuple[str, str]:
+        """Return merged final content plus the missing delta to emit."""
+        streamed = str(streamed_text or "")
+        final = str(final_text or "")
+        if not streamed or not final:
+            return final, final
+
+        prefix_candidates = [streamed]
+        trimmed_streamed = streamed.rstrip()
+        if trimmed_streamed and trimmed_streamed != streamed:
+            prefix_candidates.append(trimmed_streamed)
+
+        for prefix in prefix_candidates:
+            if prefix and final.startswith(prefix):
+                return final, final[len(prefix):]
+
+        return streamed + final, final
 
     def _looks_like_duplicate_thinking(
         self,
@@ -2344,11 +2367,13 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+        saw_tool_call = False
+        saw_content_after_tool_call = False
         stream_completed = False
         stream_cancelled = False
         bg_task: asyncio.Task[None] | None = None
-        pending_pre_tool_chunks: list[dict[str, Any]] = []
-        buffering_pre_tool_segment = thinking
+        original_system_prompt: str | None = None
+        original_base_system_prompt: object = _MISSING
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context()
@@ -2361,18 +2386,21 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
-        _base_prompt = self._build_step_prompt(message)
-        self._agent.next_step_prompt = _base_prompt
-        self._install_anti_loop_tracker(_base_prompt)
-
-        # ------------------------------------------------------------------
-        # Streaming uses the spoon-core run+stream pattern:
-        #   1. Clear task_done + drain output_queue
-        #   2. Start run(message) in background — sets task_done on finish
-        #   3. Read chunks from output_queue until task_done AND queue empty
-        # ------------------------------------------------------------------
-
         try:
+            _base_prompt = self._select_next_step_prompt(message, thinking=thinking)
+            original_system_prompt, original_base_system_prompt = (
+                AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=thinking)
+            )
+            self._agent.next_step_prompt = _base_prompt
+            self._install_anti_loop_tracker(_base_prompt)
+
+            # ------------------------------------------------------------------
+            # Streaming uses the spoon-core run+stream pattern:
+            #   1. Clear task_done + drain output_queue
+            #   2. Start run(message) in background — sets task_done on finish
+            #   3. Read chunks from output_queue until task_done AND queue empty
+            # ------------------------------------------------------------------
+
             # 1. Reset streaming state
             self._agent.task_done.clear()
             while not self._agent.output_queue.empty():
@@ -2494,15 +2522,7 @@ class AgentLoop:
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
-                        if thinking and pending_pre_tool_chunks:
-                            for pending_chunk in pending_pre_tool_chunks:
-                                yield {
-                                    "type": "thinking",
-                                    "delta": pending_chunk["delta"],
-                                    "metadata": pending_chunk["metadata"],
-                                }
-                            pending_pre_tool_chunks = []
-                        buffering_pre_tool_segment = thinking
+                        saw_tool_call = True
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
                             if isinstance(tc, dict):
@@ -2592,16 +2612,11 @@ class AgentLoop:
                                 "source": metadata.get("source", "phase_think"),
                             },
                         }
-                    elif chunk_type == "content" and buffering_pre_tool_segment:
-                        pending_pre_tool_chunks.append(
-                            {
-                                "delta": delta,
-                                "metadata": dict(metadata),
-                            }
-                        )
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
+                            if saw_tool_call:
+                                saw_content_after_tool_call = True
                             full_content += delta
                         yield event
 
@@ -2624,29 +2639,38 @@ class AgentLoop:
             for event in tool_result_events:
                 yield event
 
-            if pending_pre_tool_chunks:
-                for pending_chunk in pending_pre_tool_chunks:
-                    full_content += pending_chunk["delta"]
-                    yield {
-                        "type": "content",
-                        "delta": pending_chunk["delta"],
-                        "metadata": pending_chunk["metadata"],
-                    }
-                pending_pre_tool_chunks = []
+            fallback_after_tool_only_preamble = (
+                saw_tool_call
+                and not saw_content_after_tool_call
+                and bool(run_result_text)
+                and self._normalize_comparable_text(full_content)
+                != self._normalize_comparable_text(run_result_text)
+            )
 
             # Fallback: if run() completed but no stream chunks were emitted,
-            # use final run result as one content chunk to avoid empty output.
-            if not full_content and run_result_text:
+            # or only a pre-tool preamble was emitted, use the final run result
+            # to avoid ending the stream without the actual answer text.
+            if run_result_text and (not full_content or fallback_after_tool_only_preamble):
                 logger.warning(
                     "Stream produced no content chunks; "
                     "falling back to run() result text."
                 )
-                full_content = run_result_text
-                yield {
-                    "type": "content",
-                    "delta": run_result_text,
-                    "metadata": {"fallback": "run_result_no_chunks"},
-                }
+                fallback_delta = run_result_text
+                if full_content and fallback_after_tool_only_preamble:
+                    full_content, fallback_delta = AgentLoop._resolve_stream_fallback_delta(
+                        full_content,
+                        run_result_text,
+                    )
+                    fallback_reason = "run_result_after_tool_preamble"
+                else:
+                    full_content = run_result_text
+                    fallback_reason = "run_result_no_chunks"
+                if fallback_delta:
+                    yield {
+                        "type": "content",
+                        "delta": fallback_delta,
+                        "metadata": {"fallback": fallback_reason},
+                    }
 
             # Emit done
             stream_completed = True
@@ -2663,6 +2687,11 @@ class AgentLoop:
             yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
         finally:
             self._restore_agent_think()
+            AgentLoop._restore_request_context_system_prompt(
+                self,
+                original_system_prompt,
+                original_base_system_prompt,
+            )
             if bg_task is not None and not bg_task.done():
                 bg_task.cancel()
                 try:
@@ -2717,6 +2746,8 @@ class AgentLoop:
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
         self._reset_reasoning_capture()
+        original_system_prompt: str | None = None
+        original_base_system_prompt: object = _MISSING
 
         # Refresh memory context
         try:
@@ -2737,13 +2768,16 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
-        _base_prompt = self._build_step_prompt(message)
-        self._agent.next_step_prompt = _base_prompt
-        self._install_anti_loop_tracker(_base_prompt)
-        await self._agent.add_message("user", runtime_message)
-
-        # Run agent with thinking enabled
         try:
+            _base_prompt = self._select_next_step_prompt(message, thinking=True)
+            original_system_prompt, original_base_system_prompt = (
+                AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=True)
+            )
+            self._agent.next_step_prompt = _base_prompt
+            self._install_anti_loop_tracker(_base_prompt)
+            await self._agent.add_message("user", runtime_message)
+
+            # Run agent with thinking enabled
             run_kwargs: dict[str, Any] = {}
             if self._callable_accepts_kwarg(self._agent.run, "thinking"):
                 run_kwargs["thinking"] = True
@@ -2771,6 +2805,11 @@ class AgentLoop:
             raise
         finally:
             self._restore_agent_think()
+            AgentLoop._restore_request_context_system_prompt(
+                self,
+                original_system_prompt,
+                original_base_system_prompt,
+            )
 
         # Save to session
         try:
@@ -2896,6 +2935,79 @@ class AgentLoop:
         if env_section:
             prompt += env_section
         return prompt
+
+    def _build_request_context_prompt(self, message: str) -> str:
+        """Build the compact request context block used for thinking runs."""
+        _truncated = message[:300] + ("…" if len(message) > 300 else "")
+        _ws = self._workspace_posix_path()
+        prompt = (
+            f"[USER REQUEST]: {_truncated}\n"
+            f"[WORKSPACE]: {_ws}/\n"
+        )
+        env_section = self._extract_env_for_prompt()
+        if env_section:
+            prompt += env_section
+        return prompt
+
+    def _apply_request_context_to_system_prompt(
+        self,
+        message: str,
+        *,
+        thinking: bool,
+    ) -> tuple[str | None, object]:
+        """Temporarily append active request context to the agent system prompt."""
+        if not thinking or not getattr(self, "_agent", None):
+            return None, _MISSING
+
+        current_prompt = getattr(self._agent, "system_prompt", None)
+        if not isinstance(current_prompt, str) or not current_prompt:
+            return None, _MISSING
+
+        request_context = self._build_request_context_prompt(message)
+        augmented_prompt = (
+            f"{current_prompt}\n\n"
+            f"## Active Request Context\n"
+            f"{request_context}"
+        )
+        self._agent.system_prompt = augmented_prompt
+
+        original_base_prompt = _MISSING
+        if hasattr(self._agent, "_original_system_prompt"):
+            original_base_prompt = getattr(self._agent, "_original_system_prompt")
+            if isinstance(original_base_prompt, str) and original_base_prompt:
+                self._agent._original_system_prompt = (
+                    f"{original_base_prompt}\n\n"
+                    f"## Active Request Context\n"
+                    f"{request_context}"
+                )
+
+        return current_prompt, original_base_prompt
+
+    def _restore_request_context_system_prompt(
+        self,
+        original_prompt: str | None,
+        original_base_prompt: object,
+    ) -> None:
+        """Restore the agent system prompt after a thinking run completes."""
+        if not getattr(self, "_agent", None):
+            return
+        if original_prompt is not None:
+            self._agent.system_prompt = original_prompt
+        if original_base_prompt is not _MISSING and hasattr(self._agent, "_original_system_prompt"):
+            self._agent._original_system_prompt = original_base_prompt
+
+    def _select_next_step_prompt(self, message: str, *, thinking: bool) -> str:
+        """Choose the per-step prompt shape for the current request.
+
+        Thinking runs keep a lightweight per-step prompt across all providers.
+        The active request context is injected into the system prompt instead,
+        so runtime pruning still preserves user/workspace/env guidance without
+        reintroducing the heavier synthetic user-turn prompt that suppresses
+        streamed reasoning on some providers.
+        """
+        if thinking:
+            return self.DEFAULT_NEXT_STEP_PROMPT
+        return self._build_step_prompt(message)
 
     def _extract_env_for_prompt(self) -> str:
         """Extract env vars from .env.local for the step prompt.
