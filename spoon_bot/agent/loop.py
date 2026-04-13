@@ -2361,7 +2361,7 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
-        _base_prompt = self._build_step_prompt(message)
+        _base_prompt = self._select_next_step_prompt(message, thinking=thinking)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
 
@@ -2728,7 +2728,7 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
-        _base_prompt = self._build_step_prompt(message)
+        _base_prompt = self._select_next_step_prompt(message, thinking=True)
         self._agent.next_step_prompt = _base_prompt
         self._install_anti_loop_tracker(_base_prompt)
         await self._agent.add_message("user", runtime_message)
@@ -2887,6 +2887,18 @@ class AgentLoop:
         if env_section:
             prompt += env_section
         return prompt
+
+    def _select_next_step_prompt(self, message: str, *, thinking: bool) -> str:
+        """Choose the per-step prompt shape for the current request.
+
+        OpenRouter-backed reasoning models stop emitting streaming reasoning
+        tokens when we inject the heavier runtime step prompt as an extra user
+        turn. When thinking is enabled, prefer the lightweight default prompt
+        so visible reasoning remains available while preserving normal tool use.
+        """
+        if thinking:
+            return self.DEFAULT_NEXT_STEP_PROMPT
+        return self._build_step_prompt(message)
 
     def _extract_env_for_prompt(self) -> str:
         """Extract env vars from .env.local for the step prompt.
