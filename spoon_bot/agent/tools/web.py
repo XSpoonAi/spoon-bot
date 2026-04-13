@@ -11,6 +11,7 @@ import httpx
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import capture_tool_output
 
 
 # Shared httpx client for connection pooling across web tools.
@@ -384,26 +385,32 @@ class WebFetchTool(Tool):
             resp.raise_for_status()
 
             content_type = resp.headers.get("content-type", "")
-            raw = resp.text
-
-            # Truncate very large responses
-            if len(raw) > self._max_content_size:
-                raw = raw[: self._max_content_size] + "\n\n[Content truncated]"
+            full_raw = resp.text
+            summary_raw = full_raw
+            if len(summary_raw) > self._max_content_size:
+                summary_raw = summary_raw[: self._max_content_size] + "\n\n[Content truncated]"
 
             # JSON response — return formatted
             if "json" in content_type:
                 try:
                     data = resp.json()
-                    return _json.dumps(data, ensure_ascii=False, indent=2)
+                    result = _json.dumps(data, ensure_ascii=False, indent=2)
+                    capture_tool_output(result, result)
+                    return result
                 except Exception:
-                    return raw
+                    capture_tool_output(summary_raw, full_raw)
+                    return summary_raw
 
             # HTML — try to extract readable text
             if "html" in content_type and extract_text:
-                return self._extract_text_from_html(raw, selector)
+                summary_result = self._extract_text_from_html(summary_raw, selector)
+                full_result = self._extract_text_from_html(full_raw, selector)
+                capture_tool_output(summary_result, full_result)
+                return summary_result
 
             # Plain text / other
-            return raw
+            capture_tool_output(summary_raw, full_raw)
+            return summary_raw
 
         except httpx.HTTPStatusError as exc:
             return f"Error: HTTP {exc.response.status_code} for {url}"

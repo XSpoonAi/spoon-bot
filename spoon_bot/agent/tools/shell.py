@@ -17,7 +17,7 @@ from uuid import uuid4
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
-from spoon_bot.agent.tools.execution_context import get_tool_owner
+from spoon_bot.agent.tools.execution_context import capture_tool_output, get_tool_owner
 from spoon_bot.utils.rate_limit import (
     RateLimitConfig,
     get_rate_limiter,
@@ -733,6 +733,7 @@ class ShellTool(Tool):
         returncode: int | None,
         *,
         max_chars: int | None = None,
+        truncate: bool = True,
     ) -> str:
         output_parts = []
 
@@ -749,7 +750,7 @@ class ShellTool(Tool):
         result = self._mask_secrets(result)
 
         limit = max_chars or self.max_output
-        if len(result) > limit:
+        if truncate and limit and len(result) > limit:
             truncated = len(result) - limit
             result = result[:limit] + f"\n... (truncated, {truncated} more chars)"
 
@@ -979,12 +980,21 @@ class ShellTool(Tool):
             )
 
         if action == "job_output":
-            return self._build_output_result(
+            full_result = self._build_output_result(
+                job.stdout_text,
+                job.stderr_text,
+                job.returncode,
+                max_chars=tail_chars,
+                truncate=False,
+            )
+            result = self._build_output_result(
                 job.stdout_text,
                 job.stderr_text,
                 job.returncode,
                 max_chars=tail_chars,
             )
+            capture_tool_output(result, full_result)
+            return result
 
         if action == "terminate_job":
             if self._get_process_returncode(job.process) is None:
@@ -997,10 +1007,26 @@ class ShellTool(Tool):
             await self._refresh_background_job(job)
             job.status = "terminated"
             job.finished_at = time.time()
-            return (
-                f"Terminated background shell job {job.job_id}.\n"
-                f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}"
+            full_body = self._build_output_result(
+                job.stdout_text,
+                job.stderr_text,
+                job.returncode,
+                max_chars=tail_chars,
+                truncate=False,
             )
+            summary_body = self._build_output_result(
+                job.stdout_text,
+                job.stderr_text,
+                job.returncode,
+                max_chars=tail_chars,
+            )
+            result = (
+                f"Terminated background shell job {job.job_id}.\n"
+                f"{summary_body}"
+            )
+            full_result = f"Terminated background shell job {job.job_id}.\n{full_body}"
+            capture_tool_output(result, full_result)
+            return result
 
         return f"Error: Unknown action '{action}'"
 
@@ -1053,7 +1079,14 @@ class ShellTool(Tool):
             try:
                 await asyncio.wait_for(self._wait_for_process(job.process), timeout=self.timeout)
                 await self._refresh_background_job(job)
+                full_result = self._build_output_result(
+                    job.stdout_text,
+                    job.stderr_text,
+                    job.returncode,
+                    truncate=False,
+                )
                 result = self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
+                capture_tool_output(result, full_result)
                 _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
                 self._prune_background_jobs(owner_key=owner_key)
                 return result

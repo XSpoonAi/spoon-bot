@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from spoon_bot.agent.tools.base import Tool, ToolParameterSchema
+from spoon_bot.agent.tools.execution_context import capture_tool_output
 
 
 class DocumentParseTool(Tool):
@@ -179,8 +180,10 @@ class DocumentParseTool(Tool):
             ]
             result_parts.extend(warnings)
 
+            full_text_result = None
             if extract_text:
-                joined_text = "\n\n".join(text_blocks)
+                full_text_result = "\n\n".join(text_blocks)
+                joined_text = full_text_result
                 if len(joined_text) > 50_000:
                     joined_text = joined_text[:50_000] + "\n\n[Truncated at 50KB]"
                 result_parts.append("\n# Text\n" + (joined_text or "No text extracted"))
@@ -193,6 +196,25 @@ class DocumentParseTool(Tool):
                 images_text = "\n".join(image_paths) if image_paths else "No images extracted"
                 result_parts.append("\n# Images\n" + images_text)
 
-            return "\n".join(result_parts)
+            summary_result = "\n".join(result_parts)
+            if full_text_result is None:
+                capture_tool_output(summary_result, summary_result)
+                return summary_result
+
+            full_parts = [
+                f"Parsed: {pdf_path.name}",
+                f"Pages processed: {len(selected_pages)}/{page_count}",
+            ]
+            full_parts.extend(warnings)
+            full_parts.append("\n# Text\n" + (full_text_result or "No text extracted"))
+            if extract_tables:
+                joined_tables = "\n\n".join(table_blocks)
+                full_parts.append("\n# Tables\n" + (joined_tables or "No tables found"))
+            if extract_images:
+                images_text = "\n".join(image_paths) if image_paths else "No images extracted"
+                full_parts.append("\n# Images\n" + images_text)
+            full_result = "\n".join(full_parts)
+            capture_tool_output(summary_result, full_result)
+            return summary_result
         finally:
             doc.close()
