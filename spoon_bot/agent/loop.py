@@ -2386,21 +2386,21 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
-        _base_prompt = self._select_next_step_prompt(message, thinking=thinking)
-        original_system_prompt, original_base_system_prompt = (
-            AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=thinking)
-        )
-        self._agent.next_step_prompt = _base_prompt
-        self._install_anti_loop_tracker(_base_prompt)
-
-        # ------------------------------------------------------------------
-        # Streaming uses the spoon-core run+stream pattern:
-        #   1. Clear task_done + drain output_queue
-        #   2. Start run(message) in background — sets task_done on finish
-        #   3. Read chunks from output_queue until task_done AND queue empty
-        # ------------------------------------------------------------------
-
         try:
+            _base_prompt = self._select_next_step_prompt(message, thinking=thinking)
+            original_system_prompt, original_base_system_prompt = (
+                AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=thinking)
+            )
+            self._agent.next_step_prompt = _base_prompt
+            self._install_anti_loop_tracker(_base_prompt)
+
+            # ------------------------------------------------------------------
+            # Streaming uses the spoon-core run+stream pattern:
+            #   1. Clear task_done + drain output_queue
+            #   2. Start run(message) in background — sets task_done on finish
+            #   3. Read chunks from output_queue until task_done AND queue empty
+            # ------------------------------------------------------------------
+
             # 1. Reset streaming state
             self._agent.task_done.clear()
             while not self._agent.output_queue.empty():
@@ -2768,16 +2768,16 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
-        _base_prompt = self._select_next_step_prompt(message, thinking=True)
-        original_system_prompt, original_base_system_prompt = (
-            AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=True)
-        )
-        self._agent.next_step_prompt = _base_prompt
-        self._install_anti_loop_tracker(_base_prompt)
-        await self._agent.add_message("user", runtime_message)
-
-        # Run agent with thinking enabled
         try:
+            _base_prompt = self._select_next_step_prompt(message, thinking=True)
+            original_system_prompt, original_base_system_prompt = (
+                AgentLoop._apply_request_context_to_system_prompt(self, message, thinking=True)
+            )
+            self._agent.next_step_prompt = _base_prompt
+            self._install_anti_loop_tracker(_base_prompt)
+            await self._agent.add_message("user", runtime_message)
+
+            # Run agent with thinking enabled
             run_kwargs: dict[str, Any] = {}
             if self._callable_accepts_kwarg(self._agent.run, "thinking"):
                 run_kwargs["thinking"] = True

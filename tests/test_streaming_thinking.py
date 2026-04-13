@@ -1734,6 +1734,42 @@ class TestAgentLoopProcessWithThinking:
         with pytest.raises(RuntimeError, match="LLM unavailable"):
             await AgentLoop.process_with_thinking(agent, message="test")
 
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_restores_system_prompt_when_add_message_fails(self):
+        """Temporary request context must be rolled back if setup fails before run()."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.system_prompt = "base system"
+        mock_inner_agent._original_system_prompt = "base original"
+        mock_inner_agent.run = AsyncMock()
+        mock_inner_agent.add_message = AsyncMock(side_effect=RuntimeError("setup failed"))
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = mock_inner_agent
+        agent._session = MagicMock()
+        agent.sessions = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._auto_commit = False
+        agent._git = None
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+
+        with pytest.raises(RuntimeError, match="setup failed"):
+            await AgentLoop.process_with_thinking(agent, message="test")
+
+        assert mock_inner_agent.system_prompt == "base system"
+        assert mock_inner_agent._original_system_prompt == "base original"
+
 
 # ============================================================
 # REST API endpoint tests

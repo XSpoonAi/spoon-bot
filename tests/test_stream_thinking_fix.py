@@ -163,6 +163,35 @@ class TestStreamWaitBehavior:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "late chunk"
 
+    @pytest.mark.asyncio
+    async def test_stream_restores_system_prompt_when_add_message_fails(self):
+        """Temporary request context must be rolled back if stream setup fails."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        async def mock_run(**kwargs):
+            result = MagicMock()
+            result.content = "unused"
+            return result
+
+        agent, _, _ = _make_mock_stream_agent(mock_run)
+        agent._agent.system_prompt = "base system"
+        agent._agent._original_system_prompt = "base original"
+        agent._agent.add_message = AsyncMock(side_effect=RuntimeError("setup failed"))
+        agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="test", thinking=True):
+            chunks.append(chunk)
+
+        error_chunks = [c for c in chunks if c["type"] == "error"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert len(error_chunks) == 1
+        assert error_chunks[0]["metadata"]["error"] == "setup failed"
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["error"] == "setup failed"
+        assert agent._agent.system_prompt == "base system"
+        assert agent._agent._original_system_prompt == "base original"
+
 
 # ============================================================
 # ConnectionManager send_message retry
