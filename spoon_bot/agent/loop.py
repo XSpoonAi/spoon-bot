@@ -2455,6 +2455,36 @@ class AgentLoop:
             td = self._agent.task_done
             logger.debug(f"output_queue type={type(oq).__name__}, task_done type={type(td).__name__}")
             chunk_count = 0
+            stream_segment_index = -1
+            current_stream_segment_type: str | None = None
+
+            def _decorate_stream_event(event: dict[str, Any]) -> dict[str, Any]:
+                nonlocal stream_segment_index, current_stream_segment_type
+
+                event_type = str(event.get("type") or "")
+                if event_type not in {"thinking", "content", "tool_call", "tool_result"}:
+                    return event
+
+                metadata = dict(event.get("metadata") or {})
+                starts_new_segment = (
+                    event_type in {"tool_call", "tool_result"}
+                    or current_stream_segment_type != event_type
+                )
+                if starts_new_segment:
+                    stream_segment_index += 1
+                metadata.setdefault("segment_index", stream_segment_index)
+                metadata.setdefault("segment_start", starts_new_segment)
+                metadata.setdefault("segment_type", event_type)
+
+                if event_type in {"tool_call", "tool_result"}:
+                    current_stream_segment_type = None
+                else:
+                    current_stream_segment_type = event_type
+
+                return {
+                    **event,
+                    "metadata": metadata,
+                }
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
             while not (td.is_set() and oq.empty()):
@@ -2466,7 +2496,7 @@ class AgentLoop:
                     )
                 )
                 for event in tool_result_events:
-                    yield event
+                    yield _decorate_stream_event(event)
 
                 # tracked_reasoning is inferred from assistant output logs and is
                 # not a reliable API thinking source. Clear it so it does not leak
@@ -2535,7 +2565,7 @@ class AgentLoop:
                                 fn_obj = getattr(tc, "function", None)
                                 fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
                                 fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
-                            yield {
+                            yield _decorate_stream_event({
                                 "type": "tool_call",
                                 "delta": "",
                                 "metadata": {
@@ -2543,7 +2573,7 @@ class AgentLoop:
                                     "name": fn_name,
                                     "arguments": fn_args,
                                 },
-                            }
+                            })
                         continue
                     chunk_metadata = chunk.get("metadata")
                     if isinstance(chunk_metadata, dict):
@@ -2589,11 +2619,11 @@ class AgentLoop:
                     delta = chunk
 
                 if chunk_type == "tool_result":
-                    yield {
+                    yield _decorate_stream_event({
                         "type": chunk_type,
                         "delta": delta,
                         "metadata": metadata,
-                    }
+                    })
                     continue
 
                 if delta:
@@ -2604,21 +2634,21 @@ class AgentLoop:
                         and metadata_phase == "think"
                     )
                     if chunk_type == "content" and explicit_pre_tool_phase:
-                        yield {
+                        yield _decorate_stream_event({
                             "type": "thinking",
                             "delta": delta,
                             "metadata": {
                                 **metadata,
                                 "source": metadata.get("source", "phase_think"),
                             },
-                        }
+                        })
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
                             if saw_tool_call:
                                 saw_content_after_tool_call = True
                             full_content += delta
-                        yield event
+                        yield _decorate_stream_event(event)
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
 
@@ -2637,7 +2667,7 @@ class AgentLoop:
                 )
             )
             for event in tool_result_events:
-                yield event
+                yield _decorate_stream_event(event)
 
             fallback_after_tool_only_preamble = (
                 saw_tool_call
@@ -2666,11 +2696,11 @@ class AgentLoop:
                     full_content = run_result_text
                     fallback_reason = "run_result_no_chunks"
                 if fallback_delta:
-                    yield {
+                    yield _decorate_stream_event({
                         "type": "content",
                         "delta": fallback_delta,
                         "metadata": {"fallback": fallback_reason},
-                    }
+                    })
 
             # Emit done
             stream_completed = True
