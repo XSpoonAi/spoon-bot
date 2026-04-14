@@ -273,39 +273,129 @@ class SpoonCoreIdentity:
     """
     Wrapper around spoon-core's ERC8004 identity system.
 
-    Provides Web3-based authentication when spoon-core identity module is available.
+    Uses the built-in wallet (keystore-based) to resolve the agent's on-chain
+    identity on startup.  No private key is needed for read-only lookups.
     """
+
+    # NeoX Mainnet (chain ID 47763) — default deployment
+    _DEFAULT_RPC_URL = "https://mainnet-6.rpc.banelabs.org"
+    _DEFAULT_IDENTITY_REGISTRY = "0xfE8dD9bB5fd274b9749ECCE9C97d69fE0e6fE5Aa"
+    _DEFAULT_REPUTATION_REGISTRY = "0x690A42f68A0CC5EfDBB24CaC39b9ce45219173E4"
+    _DEFAULT_VALIDATION_REGISTRY = "0x8964708CaaCb4f5F5e9FB06DAE49EFaEc866728E"
 
     def __init__(
         self,
         rpc_url: str | None = None,
-        private_key: str | None = None,
+        identity_registry_address: str | None = None,
+        reputation_registry_address: str | None = None,
+        validation_registry_address: str | None = None,
     ):
-        """
-        Initialize identity client.
-
-        Args:
-            rpc_url: Ethereum RPC URL.
-            private_key: Private key for signing (optional).
-        """
-        self._rpc_url = rpc_url or os.environ.get("ETH_RPC_URL")
-        self._private_key = private_key or os.environ.get("PRIVATE_KEY")
+        self._rpc_url = rpc_url or os.environ.get("ETH_RPC_URL") or self._DEFAULT_RPC_URL
         self._client: Any = None
+        self._agent_id: int = 0
+        self._wallet_address: str | None = os.environ.get("WALLET_ADDRESS")
+
+        _identity = (
+            identity_registry_address
+            or os.environ.get("IDENTITY_REGISTRY_ADDRESS")
+            or self._DEFAULT_IDENTITY_REGISTRY
+        )
+        _reputation = (
+            reputation_registry_address
+            or os.environ.get("REPUTATION_REGISTRY_ADDRESS")
+            or self._DEFAULT_REPUTATION_REGISTRY
+        )
+        _validation = (
+            validation_registry_address
+            or os.environ.get("VALIDATION_REGISTRY_ADDRESS")
+            or self._DEFAULT_VALIDATION_REGISTRY
+        )
 
         if _IDENTITY_AVAILABLE and ERC8004Client:
             try:
                 self._client = ERC8004Client(
                     rpc_url=self._rpc_url,
-                    private_key=self._private_key,
+                    identity_registry_address=_identity,
+                    reputation_registry_address=_reputation,
+                    validation_registry_address=_validation,
                 )
-                logger.info("ERC8004 identity client initialized")
             except Exception as e:
-                logger.warning(f"Failed to initialize ERC8004 client: {e}")
+                logger.info(f"ERC8004 identity client not available: {e}")
+                return
+
+            if self._wallet_address:
+                try:
+                    self._agent_id = self._client.get_agent_id_for_address(
+                        self._wallet_address
+                    )
+                except Exception:
+                    self._agent_id = 0
+
+                if self._agent_id:
+                    logger.info(
+                        f"On-chain identity: AgentID={self._agent_id}  "
+                        f"wallet={self._wallet_address}  "
+                        f"registry={_identity}"
+                    )
+                else:
+                    logger.info(
+                        f"No on-chain agent identity for wallet {self._wallet_address} "
+                        f"(register via `joker-game-agent register`)"
+                    )
+            else:
+                logger.info("ERC8004 client ready (no wallet address set yet)")
+
+    @property
+    def agent_id(self) -> int:
+        """On-chain agent ID (0 if not registered)."""
+        return self._agent_id
+
+    @property
+    def wallet_address(self) -> str | None:
+        return self._wallet_address
 
     @property
     def available(self) -> bool:
         """Check if identity system is available."""
         return self._client is not None
+
+    @classmethod
+    def query_identity(cls, wallet_address: str) -> dict[str, Any]:
+        """One-shot on-chain identity lookup (no persistent state needed).
+
+        This is the single source of truth for identity queries — used by the
+        REST endpoint, CLI banner, and ``/myid`` channel commands.
+        """
+        rpc = os.environ.get("ETH_RPC_URL") or cls._DEFAULT_RPC_URL
+        identity_reg = os.environ.get("IDENTITY_REGISTRY_ADDRESS") or cls._DEFAULT_IDENTITY_REGISTRY
+        reputation_reg = os.environ.get("REPUTATION_REGISTRY_ADDRESS") or cls._DEFAULT_REPUTATION_REGISTRY
+        validation_reg = os.environ.get("VALIDATION_REGISTRY_ADDRESS") or cls._DEFAULT_VALIDATION_REGISTRY
+
+        try:
+            if not (_IDENTITY_AVAILABLE and ERC8004Client):
+                raise RuntimeError("spoon-core identity module not installed")
+
+            client = ERC8004Client(
+                rpc_url=rpc,
+                identity_registry_address=identity_reg,
+                reputation_registry_address=reputation_reg,
+                validation_registry_address=validation_reg,
+            )
+            agent_id = client.get_agent_id_for_address(wallet_address)
+            return {
+                "wallet_address": wallet_address,
+                "agent_id": agent_id,
+                "registered": agent_id > 0,
+                "chain": "NeoX Mainnet",
+                "chain_id": 47763,
+            }
+        except Exception as exc:
+            return {
+                "wallet_address": wallet_address,
+                "agent_id": 0,
+                "registered": False,
+                "error": str(exc),
+            }
 
     async def resolve_did(self, did: str) -> dict[str, Any] | None:
         """

@@ -65,6 +65,7 @@ class TelegramChannel(BaseChannel):
         # Add handlers
         self._app.add_handler(CommandHandler("start", self._handle_start))
         self._app.add_handler(CommandHandler("help", self._handle_help))
+        self._app.add_handler(CommandHandler("myid", self._handle_myid))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
         )
@@ -151,10 +152,24 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             "**spoon-bot Commands**\n\n"
             "/start - Start the bot\n"
-            "/help - Show this help\n\n"
+            "/help - Show this help\n"
+            "/myid - Show agent on-chain identity\n\n"
             "Just type any message to chat with the agent.",
             parse_mode="Markdown",
         )
+
+    async def _handle_myid(self, update: Any, context: Any) -> None:
+        """Handle /myid command — show agent on-chain identity."""
+        if not self._check_user_allowed(update.effective_user.id):
+            return
+
+        try:
+            from spoon_bot.gateway.api.v1.identity import format_identity_text
+
+            text = format_identity_text()
+        except Exception as e:
+            text = f"Identity lookup failed: {e}"
+        await update.message.reply_text(text)
 
     async def _handle_message(self, update: Any, context: Any) -> None:
         """Handle incoming messages."""

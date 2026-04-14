@@ -145,6 +145,17 @@ def get_workspace() -> Path:
     return Path.home() / ".spoon-bot" / "workspace"
 
 
+def _lookup_onchain_identity(wallet_address: str) -> int:
+    """Return the on-chain AgentID for *wallet_address*, or 0."""
+    try:
+        from spoon_bot.gateway.api.v1.identity import _query_identity
+
+        info = _query_identity(wallet_address)
+        return info.get("agent_id", 0)
+    except Exception:
+        return 0
+
+
 @app.command()
 def agent(
     message: Optional[str] = typer.Option(
@@ -584,6 +595,21 @@ async def _run_agent(
         tool_count = len(agent.tools)
         skill_count = len(agent.skills)
         console.print(f"\r  [green]Ready[/green] — {tool_count} tools · {skill_count} skills")
+
+        _wallet_addr = os.environ.get("WALLET_ADDRESS")
+        if _wallet_addr:
+            _agent_id = _lookup_onchain_identity(_wallet_addr)
+            if _agent_id:
+                console.print(
+                    f"  [bold cyan]⬡[/bold cyan] AgentID={_agent_id}  "
+                    f"[dim]{_wallet_addr[:8]}…{_wallet_addr[-6:]}[/dim]",
+                    highlight=False,
+                )
+            else:
+                console.print(
+                    f"  [dim]wallet {_wallet_addr[:8]}…{_wallet_addr[-6:]} (no on-chain identity)[/dim]",
+                    highlight=False,
+                )
         console.rule(style="dim")
 
     except ValueError as e:

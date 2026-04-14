@@ -920,6 +920,29 @@ class ChannelManager:
             except Exception as e:
                 logger.error(f"Health check loop error: {e}")
 
+    @staticmethod
+    def _try_builtin_command(message: InboundMessage) -> OutboundMessage | None:
+        """Handle built-in slash commands that don't need the agent.
+
+        Returns an ``OutboundMessage`` if the message was a recognised
+        built-in command, or ``None`` to fall through to agent processing.
+        """
+        text = (message.content or "").strip()
+        if text.lower() in ("/myid", "/myid@bot"):
+            try:
+                from spoon_bot.gateway.api.v1.identity import format_identity_text
+
+                reply = format_identity_text()
+            except Exception as exc:
+                reply = f"Identity lookup failed: {exc}"
+            return OutboundMessage(
+                content=reply,
+                channel=message.channel,
+                reply_to=message.message_id,
+                metadata=message.metadata.copy(),
+            )
+        return None
+
     async def _handle_message(self, message: InboundMessage) -> OutboundMessage | None:
         """
         Handle incoming message by routing to agent.
@@ -930,6 +953,10 @@ class ChannelManager:
         Returns:
             Agent's response as OutboundMessage.
         """
+        builtin_response = self._try_builtin_command(message)
+        if builtin_response is not None:
+            return builtin_response
+
         channel = self._channels.get(message.channel)
         agent = await self._resolve_agent_for_message(channel, message)
         if not agent:
