@@ -18,6 +18,7 @@ from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import capture_tool_output, get_tool_owner
+from spoon_bot.config import DEFAULT_MAX_OUTPUT, DEFAULT_SHELL_MAX_TIMEOUT, DEFAULT_SHELL_TIMEOUT
 from spoon_bot.utils.rate_limit import (
     RateLimitConfig,
     get_rate_limiter,
@@ -411,8 +412,9 @@ class ShellTool(Tool):
 
     def __init__(
         self,
-        timeout: int = 3600,
-        max_output: int = 10000,
+        timeout: int = DEFAULT_SHELL_TIMEOUT,
+        max_timeout: int = DEFAULT_SHELL_MAX_TIMEOUT,
+        max_output: int = DEFAULT_MAX_OUTPUT,
         working_dir: str | None = None,
         whitelist_mode: bool = False,
         custom_whitelist: set[str] | None = None,
@@ -428,7 +430,9 @@ class ShellTool(Tool):
         Initialize shell tool.
 
         Args:
-            timeout: Command timeout in seconds (default 3600).
+            timeout: Default foreground timeout in seconds (default 600).
+                     Commands exceeding this are moved to background.
+            max_timeout: Maximum allowed per-command timeout override (default 7200).
             max_output: Maximum output characters (default 10000).
             working_dir: Default working directory.
             whitelist_mode: If True, only allow whitelisted commands.
@@ -442,6 +446,7 @@ class ShellTool(Tool):
             rate_limit_config: Configuration for rate limiting shell commands.
         """
         self.timeout = timeout
+        self.max_timeout = max(timeout, max_timeout)
         self.max_output = max_output
         self.working_dir = working_dir
         self.use_shell = use_shell
@@ -473,9 +478,14 @@ class ShellTool(Tool):
     @property
     def description(self) -> str:
         mode = "whitelist" if self.validator.whitelist_mode else "blocklist"
+        timeout_min = self.timeout // 60
+        max_min = self.max_timeout // 60
         return (
             "Execute a shell command or manage a long-running background shell job. "
-            f"Foreground wait budget: {self.timeout}s, then the command stays running in the background. "
+            f"Default foreground budget: {timeout_min}min ({self.timeout}s). "
+            f"You may override with timeout (max {max_min}min). "
+            "Commands exceeding the budget keep running in the background — "
+            "use job_status to monitor and terminate_job to stop if stuck. "
             f"Security mode: {mode}. "
             "Actions: execute, list_jobs, job_status, job_output, terminate_job. "
             "Dangerous commands and injection patterns are blocked."
@@ -493,6 +503,16 @@ class ShellTool(Tool):
                 "working_dir": {
                     "type": "string",
                     "description": "Optional working directory for the command",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": (
+                        f"Optional foreground timeout in seconds (max {self.max_timeout}). "
+                        f"Defaults to {self.timeout}s. Use a higher value for known "
+                        "long-running operations like builds or installations."
+                    ),
+                    "minimum": 1,
+                    "maximum": self.max_timeout,
                 },
                 "action": {
                     "type": "string",
@@ -923,16 +943,21 @@ class ShellTool(Tool):
             job.returncode,
             max_chars=tail_chars,
         )
+        elapsed = time.time() - job.created_at
         return (
-            f"Foreground wait budget ({timeout_seconds}s) expired; command is still running in the background.\n"
+            f"Foreground timeout ({timeout_seconds}s) exceeded — command moved to background.\n"
             f"job_id: {job.job_id}\n"
             f"command: {job.command}\n"
             f"cwd: {job.cwd}\n"
-            "status: running\n"
+            f"status: running (elapsed {elapsed:.0f}s)\n"
             "Recent output tail:\n"
             f"{recent_output}\n\n"
-            "Use action='job_status' or action='job_output' with this job_id to inspect it. "
-            "Use action='terminate_job' to stop it."
+            "NEXT STEPS — you SHOULD monitor this job:\n"
+            f"  1. Check progress: action='job_status', job_id='{job.job_id}'\n"
+            f"  2. Read full output: action='job_output', job_id='{job.job_id}'\n"
+            f"  3. Stop if stuck:   action='terminate_job', job_id='{job.job_id}'\n"
+            "Decide whether the command is making progress or is hung. "
+            "If no new output appears after two checks, terminate it."
         )
 
     async def _handle_background_action(
@@ -1034,6 +1059,7 @@ class ShellTool(Tool):
         self,
         command: str | None = None,
         working_dir: str | None = None,
+        timeout: int | None = None,
         action: str = "execute",
         job_id: str | None = None,
         tail_chars: int = 4000,
@@ -1045,6 +1071,7 @@ class ShellTool(Tool):
         Args:
             command: The command to execute.
             working_dir: Optional working directory.
+            timeout: Per-command foreground timeout override in seconds.
 
         Returns:
             Command output or error message.
@@ -1054,6 +1081,11 @@ class ShellTool(Tool):
 
         if not command or not str(command).strip():
             return "Error: 'command' is required for action='execute'"
+
+        # Resolve effective timeout: per-command override capped by max_timeout
+        effective_timeout = self.timeout
+        if timeout is not None:
+            effective_timeout = max(1, min(int(timeout), self.max_timeout))
 
         # Apply rate limiting
         if self._rate_limit_config.enabled:
@@ -1077,7 +1109,7 @@ class ShellTool(Tool):
             owner_key = get_tool_owner()
             job = await self._start_background_job(command, cwd, owner_key=owner_key)
             try:
-                await asyncio.wait_for(self._wait_for_process(job.process), timeout=self.timeout)
+                await asyncio.wait_for(self._wait_for_process(job.process), timeout=effective_timeout)
                 await self._refresh_background_job(job)
                 full_result = self._build_output_result(
                     job.stdout_text,
@@ -1095,7 +1127,7 @@ class ShellTool(Tool):
                 self._prune_background_jobs(owner_key=owner_key)
                 return self._format_background_job_summary(
                     job,
-                    timeout_seconds=self.timeout,
+                    timeout_seconds=effective_timeout,
                     tail_chars=tail_chars,
                 )
         except FileNotFoundError as e:
@@ -1126,8 +1158,9 @@ class SafeShellTool(ShellTool):
 
     def __init__(
         self,
-        timeout: int = 3600,
-        max_output: int = 10000,
+        timeout: int = DEFAULT_SHELL_TIMEOUT,
+        max_timeout: int = DEFAULT_SHELL_MAX_TIMEOUT,
+        max_output: int = DEFAULT_MAX_OUTPUT,
         working_dir: str | None = None,
         custom_whitelist: set[str] | None = None,
     ):
@@ -1135,19 +1168,21 @@ class SafeShellTool(ShellTool):
         Initialize safe shell tool with whitelist mode.
 
         Args:
-            timeout: Command timeout in seconds.
+            timeout: Default foreground timeout in seconds.
+            max_timeout: Maximum per-command timeout override.
             max_output: Maximum output characters.
             working_dir: Default working directory.
             custom_whitelist: Additional commands to whitelist.
         """
         super().__init__(
             timeout=timeout,
+            max_timeout=max_timeout,
             max_output=max_output,
             working_dir=working_dir,
             whitelist_mode=True,
             custom_whitelist=custom_whitelist,
-            allow_pipes=True,  # Allow pipes for common operations
-            strict_mode=True,  # Enable strict path checking
+            allow_pipes=True,
+            strict_mode=True,
             use_shell=True,
         )
 
@@ -1157,8 +1192,10 @@ class SafeShellTool(ShellTool):
 
     @property
     def description(self) -> str:
+        timeout_min = self.timeout // 60
         return (
             "Execute a shell command from a whitelist of safe commands. "
-            f"Foreground wait budget: {self.timeout}s, then the command stays running in the background. "
+            f"Foreground budget: {timeout_min}min ({self.timeout}s), "
+            "then the command stays running in the background. "
             "Only predefined commands are allowed for security."
         )
