@@ -44,7 +44,7 @@ def test_ensure_wallet_runtime_creates_wallet_and_exports_env(monkeypatch, tmp_p
     state_env = runtime.state_file.read_text(encoding="utf-8")
     assert "KEYSTORE_FILE=" in state_env
     assert "PASSWORD_FILE=" in state_env
-    assert "PRIVATE_KEY_FILE=" in state_env
+    assert "PRIVATE_KEY_FILE=" not in state_env
     assert "ADDRESS=" in state_env
     assert runtime.address == os.environ["WALLET_ADDRESS"]
     assert runtime.private_key == os.environ["PRIVATE_KEY"]

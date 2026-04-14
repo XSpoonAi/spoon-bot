@@ -30,6 +30,21 @@ class ShellSecurityError(Exception):
     pass
 
 
+from spoon_bot.utils.privacy import SCRUBBED_ENV_VARS
+
+
+def _scrub_env(env: dict[str, str]) -> dict[str, str]:
+    """Remove secret env vars that the agent must never see in output.
+
+    Skills needing the private key should read from the keystore or
+    the on-disk file; leaking it through the subprocess environment
+    lets any ``env``/``printenv`` expose it into the conversation.
+    """
+    for key in SCRUBBED_ENV_VARS:
+        env.pop(key, None)
+    return env
+
+
 class CommandValidator:
     """
     Validates shell commands for security risks.
@@ -663,7 +678,7 @@ class ShellTool(Tool):
         cwd: str,
     ) -> tuple[bytes, bytes, int]:
         """Synchronous subprocess execution (called via run_in_executor)."""
-        env = os.environ.copy()
+        env = _scrub_env(os.environ.copy())
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
             env["HOME"] = userprofile.replace("\\", "/")
@@ -774,7 +789,7 @@ class ShellTool(Tool):
         command: str,
         cwd: str,
     ) -> subprocess.Popen[bytes]:
-        env = os.environ.copy()
+        env = _scrub_env(os.environ.copy())
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
             env["HOME"] = userprofile.replace("\\", "/")

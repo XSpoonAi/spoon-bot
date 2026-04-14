@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import re
 
+# Env vars that must be scrubbed from subprocess environments to prevent
+# leaking secrets into the LLM conversation via `env` / `printenv` output.
+# Shared between privacy.py and shell.py so sensitive-var definitions are
+# co-located.
+SCRUBBED_ENV_VARS: frozenset[str] = frozenset({
+    "PRIVATE_KEY",
+    "SECRET_KEY",
+    "MNEMONIC",
+})
+
 _SENSITIVE_VAR_RE = re.compile(
     r'^(\s*(?:export\s+)?'
     r'(?:\w*(?:PRIVATE_KEY|SECRET_KEY|SECRET|API_KEY|ACCESS_KEY|AUTH_TOKEN'
@@ -27,17 +37,66 @@ _INLINE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Bare hex private keys: 0x + exactly 64 hex chars.
+# EVM addresses are 0x + 40 hex, tx hashes are 0x + 64 hex.
+# To distinguish private keys from tx hashes we mask 0x+64 hex only when NOT
+# preceded by labels that indicate a hash/address context (tx, hash, receipt,
+# transaction, block).  This is intentionally aggressive — a leaked private key
+# in the LLM context is far worse than a masked tx hash (the agent can always
+# re-fetch a hash).
+_BARE_HEX_PRIVATE_KEY_RE = re.compile(
+    r'(?<!\w)'           # not preceded by word char
+    r'(?<!tx[:\s])'      # not preceded by "tx:" / "tx "
+    r'(?<!hash[:\s])'    # not preceded by "hash:" / "hash "
+    r'(0x[0-9a-fA-F]{64})'
+    r'(?![0-9a-fA-F])',  # not followed by more hex (longer hash)
+)
+
+# Explicit allowlist of field names that indicate a tx/block hash, not a key.
+# Uses word boundary (\b) so substrings like "myhash" don't bypass masking.
+# Handles:
+#   plain text  — "transaction hash: 0x..", "tx hash= 0x.."
+#   env assign  — "TX_HASH=0x.."
+#   JSON output — {"transactionHash":"0x.."}, {"blockHash":"0x.."}
+_HASH_CONTEXT_FIELDS = (
+    r'transactionHash'       # JSON receipt
+    r'|transaction[_\s]*hash'  # transaction_hash, transaction hash
+    r'|tx[_\s]*hash'          # tx_hash, tx hash
+    r'|block[_\s]*hash'       # blockHash, block_hash
+    r'|receipt[_\s]*hash'     # receiptHash
+    r'|parent[_\s]*hash'      # parentHash
+    r'|uncles[_\s]*hash'      # unclesHash
+)
+_HASH_CONTEXT_RE = re.compile(
+    r'(?:^|["\'{(\s,])'                                           # word start or JSON/struct boundary
+    r'(?:' + _HASH_CONTEXT_FIELDS + r')'
+    r'[\s"\']*[=:]+[\s"\']*$',                                    # delimiter: =  :  ":"  = " etc.
+    re.IGNORECASE,
+)
+
+
+def _mask_bare_hex_keys(text: str) -> str:
+    """Replace bare 0x+64-hex strings that look like private keys."""
+    def _replace(m: re.Match[str]) -> str:
+        start = m.start(1)
+        # Look back up to 40 chars for a hash-context label
+        prefix = text[max(0, start - 40):start]
+        if _HASH_CONTEXT_RE.search(prefix):
+            return m.group(0)
+        return "0x***masked_private_key***"
+    return _BARE_HEX_PRIVATE_KEY_RE.sub(_replace, text)
+
 
 def mask_secrets(text: str) -> str:
     """Mask sensitive values in text output.
 
     Targets: env var assignments with sensitive names, Bearer tokens,
-    Authorization headers, inline key=value patterns.
-    Does NOT mask general hex strings (addresses, tx hashes) as agents
-    need those for on-chain interaction.
+    Authorization headers, inline key=value patterns, and bare hex strings
+    that look like EVM private keys (0x + 64 hex chars).
     """
     text = _SENSITIVE_VAR_RE.sub(lambda m: f"{m.group(1)}***masked***", text)
     text = _BEARER_RE.sub(r'\1***masked***', text)
     text = _AUTHORIZATION_HEADER_RE.sub(r'\1***masked***', text)
     text = _INLINE_KEY_RE.sub(r'\1***masked***', text)
+    text = _mask_bare_hex_keys(text)
     return text

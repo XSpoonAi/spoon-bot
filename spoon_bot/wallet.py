@@ -166,7 +166,6 @@ def _write_state_env(
         "ADDRESS": address,
         "KEYSTORE_FILE": str(keystore_path),
         "PASSWORD_FILE": str(password_path),
-        "PRIVATE_KEY_FILE": str(_private_key_file(wallet_root)),
         "NETWORK": network.name,
         "NETWORK_KEY": network.key,
         "CHAIN_ID": str(network.chain_id),
