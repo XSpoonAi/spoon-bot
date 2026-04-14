@@ -14,7 +14,7 @@ import logging as stdlib_logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
 
 from loguru import logger
 
@@ -108,11 +108,13 @@ from spoon_bot.exceptions import (
     ContextOverflowError,
     LLMError,
     LLMConnectionError,
+    LLMRateLimitError,
     LLMTimeoutError,
     SkillActivationError,
     user_friendly_error,
 )
 from spoon_bot.services.git import GitManager
+from spoon_bot.utils.retry import RetryConfig, with_provider_retry, is_retryable
 
 if TYPE_CHECKING:
     from spoon_bot.session.manager import Session
@@ -354,6 +356,10 @@ class AgentLoop:
         auto_reload_interval: float = 5.0,
         config_path: Path | str | None = None,
         yolo_mode: bool = False,
+        provider_max_retries: int = 5,
+        provider_retry_base_delay: float = 1.0,
+        provider_retry_max_delay: float = 60.0,
+        provider_retry_backoff_factor: float = 2.0,
     ) -> None:
         """
         Initialize the agent loop.
@@ -393,6 +399,10 @@ class AgentLoop:
                 skill_paths=skill_paths,
                 mcp_config=mcp_config,
                 yolo_mode=yolo_mode,
+                provider_max_retries=provider_max_retries,
+                provider_retry_base_delay=provider_retry_base_delay,
+                provider_retry_max_delay=provider_retry_max_delay,
+                provider_retry_backoff_factor=provider_retry_backoff_factor,
             )
         except Exception as e:
             logger.error(f"Configuration validation failed: {e}")
@@ -526,6 +536,14 @@ class AgentLoop:
 
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
+
+        # Provider retry config (exponential backoff for transient LLM errors)
+        self._retry_config = RetryConfig(
+            max_retries=self._config.provider_max_retries,
+            base_delay=self._config.provider_retry_base_delay,
+            max_delay=self._config.provider_retry_max_delay,
+            backoff_factor=self._config.provider_retry_backoff_factor,
+        )
 
         active_count = len(self.tools)
         total_count = len(self.tools._tools)
@@ -1169,6 +1187,45 @@ class AgentLoop:
             session_key if session_key is not None else getattr(self, "session_key", None),
         )
 
+    async def _run_agent_with_retry(
+        self,
+        label: str = "agent",
+        pre_retry_cleanup: Callable[[], Any] | None = None,
+        **run_kwargs: Any,
+    ) -> Any:
+        """Run ``self._agent.run()`` wrapped with provider-level retry.
+
+        Centralises the retry pattern used by both ``process()`` and
+        ``process_with_thinking()`` so the logic isn't duplicated.
+
+        Args:
+            label: Descriptive label used in log messages (e.g. "stream").
+            pre_retry_cleanup: Optional sync callable invoked before each retry
+                (e.g. to drain the output queue for streaming).
+            **run_kwargs: Forwarded to ``self._agent.run()``.
+        """
+        async def _do_run() -> Any:
+            with bind_tool_owner(self._current_tool_owner_key()):
+                return await self._agent.run(**run_kwargs)
+
+        def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
+            logger.warning(
+                f"[{label}] Provider transient error (attempt {attempt + 1}/"
+                f"{self._retry_config.max_retries + 1}), "
+                f"retrying in {delay:.1f}s: {type(exc).__name__}: {exc}"
+            )
+            if pre_retry_cleanup:
+                try:
+                    pre_retry_cleanup()
+                except Exception:
+                    pass
+
+        return await with_provider_retry(
+            _do_run,
+            config=self._retry_config,
+            on_retry=_on_retry,
+        )
+
     async def process(
         self,
         message: str,
@@ -1251,12 +1308,16 @@ class AgentLoop:
         self._install_anti_loop_tracker(_base_prompt)
         await self._agent.add_message("user", runtime_message)
 
-        # Run agent — with recovery for LLM API errors (context overflow, etc.)
-        # Retry up to 2 times on ANY error, with increasingly aggressive compression.
-        _max_retries = 2
+        # Run agent — two layers of retry:
+        #   1. Provider retry (inner): exponential backoff for transient LLM errors
+        #      (rate limits, timeouts, 5xx) — up to provider_max_retries (default 5).
+        #   2. Context-compression retry (outer): up to 2 attempts with increasingly
+        #      aggressive context trimming for non-transient errors.
+        _max_context_retries = 2
         retry_requires_runtime_message_check = False
+
         try:
-            for _attempt in range(_max_retries + 1):
+            for _attempt in range(_max_context_retries + 1):
                 try:
                     if (
                         retry_requires_runtime_message_check
@@ -1264,14 +1325,12 @@ class AgentLoop:
                     ):
                         await self._agent.add_message("user", runtime_message)
                     retry_requires_runtime_message_check = False
-                    with bind_tool_owner(self._current_tool_owner_key()):
-                        result = await self._agent.run()
+                    result = await self._run_agent_with_retry(label="process")
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
                         logger.info(f"Agent result.content (first 300): {str(result.content)[:300]}")
 
-                    # Extract content — guard against result.content being None
                     if hasattr(result, "content") and result.content is not None:
                         final_content = result.content
                     elif hasattr(result, "content"):
@@ -1279,7 +1338,6 @@ class AgentLoop:
                     else:
                         final_content = str(result)
 
-                    # Fallback: when toolcall.run() returns "No results"
                     if final_content.strip() in ("No results", ""):
                         logger.warning(
                             "Agent returned empty/no-results — attempting to extract "
@@ -1289,20 +1347,22 @@ class AgentLoop:
                         if _extracted:
                             final_content = _extracted
 
-                    # Filter out technical execution steps
                     final_content = self._filter_execution_steps(final_content)
                     break
 
                 except Exception as e:
-                    # Log the FULL error (before cli.py sanitizes it)
                     import traceback
                     logger.error(
-                        f"Agent run error (attempt {_attempt + 1}/{_max_retries + 1}): "
+                        f"Agent run error (context-retry {_attempt + 1}/{_max_context_retries + 1}): "
                         f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                     )
-                    if _attempt < _max_retries:
+
+                    if is_retryable(e):
+                        logger.error("Transient provider error exhausted retry budget — not compressing context")
+                        raise
+
+                    if _attempt < _max_context_retries:
                         logger.warning("Compressing context and retrying...")
-                        # First retry: normal compression. Second: force-compress.
                         compression_actions = 0
                         if _attempt == 0:
                             compression_actions = self._compress_runtime_context()
@@ -1311,7 +1371,6 @@ class AgentLoop:
                         else:
                             compression_actions = self._force_compress_runtime_context()
                         retry_requires_runtime_message_check = True
-                        # Reset agent state so it can re-enter run()
                         if hasattr(self._agent, 'state'):
                             self._agent.state = AgentState.IDLE
                             self._agent.current_step = 0
@@ -2483,8 +2542,16 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
-                    with bind_tool_owner(self._current_tool_owner_key()):
-                        result = await self._agent.run(**run_kwargs)
+
+                    def _drain_queue() -> None:
+                        while not self._agent.output_queue.empty():
+                            self._agent.output_queue.get_nowait()
+
+                    result = await self._run_agent_with_retry(
+                        label="stream",
+                        pre_retry_cleanup=_drain_queue,
+                        **run_kwargs,
+                    )
                     if hasattr(result, "content"):
                         run_result_text = result.content or ""
                     elif isinstance(result, str):

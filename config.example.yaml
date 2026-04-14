@@ -34,6 +34,13 @@ agent:
   # auto_reload: false          # Watch skill paths & config for changes, auto-reload
   # auto_reload_interval: 5     # Poll interval in seconds (1-300)
 
+  # Provider retry — exponential backoff for transient LLM errors
+  # (rate limits, timeouts, 5xx). Delays: ~1s, ~2s, ~4s, ~8s, ~16s
+  # provider_max_retries: 5       # Max retry attempts (0 disables)
+  # provider_retry_base_delay: 1  # Base delay in seconds
+  # provider_retry_max_delay: 60  # Max delay cap in seconds
+  # provider_retry_backoff_factor: 2  # Exponential multiplier
+
 # Session Configuration
 sessions:
   default_timeout: 3600  # Session timeout in seconds (1 hour)

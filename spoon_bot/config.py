@@ -22,6 +22,15 @@ from pydantic_settings import BaseSettings
 
 
 # ---------------------------------------------------------------------------
+# Shared default constants (single source of truth)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROVIDER_MAX_RETRIES: int = 5
+DEFAULT_PROVIDER_RETRY_BASE_DELAY: float = 1.0
+DEFAULT_PROVIDER_RETRY_MAX_DELAY: float = 60.0
+DEFAULT_PROVIDER_RETRY_BACKOFF_FACTOR: float = 2.0
+
+# ---------------------------------------------------------------------------
 # Model context-window lookup (tokens)
 # Used to auto-configure context budget when the user doesn't specify one.
 # ---------------------------------------------------------------------------
@@ -448,6 +457,32 @@ class AgentLoopConfig(BaseModel):
         description="Semantic memory search configuration"
     )
 
+    # Provider retry (exponential backoff for transient LLM errors)
+    provider_max_retries: int = Field(
+        default=DEFAULT_PROVIDER_MAX_RETRIES,
+        ge=0,
+        le=10,
+        description="Max provider-level retries for transient errors (rate limit, timeout, 5xx). 0 disables."
+    )
+    provider_retry_base_delay: float = Field(
+        default=DEFAULT_PROVIDER_RETRY_BASE_DELAY,
+        ge=0.1,
+        le=30.0,
+        description="Base delay in seconds for the first retry attempt (1-30)"
+    )
+    provider_retry_max_delay: float = Field(
+        default=DEFAULT_PROVIDER_RETRY_MAX_DELAY,
+        ge=1.0,
+        le=300.0,
+        description="Maximum delay cap in seconds between retry attempts (1-300)"
+    )
+    provider_retry_backoff_factor: float = Field(
+        default=DEFAULT_PROVIDER_RETRY_BACKOFF_FACTOR,
+        ge=1.0,
+        le=5.0,
+        description="Multiplier for exponential backoff (1-5)"
+    )
+
     # Hot-reload
     auto_reload: bool = Field(
         default=False,
@@ -695,6 +730,10 @@ def validate_agent_loop_params(
     skill_paths: list[Path | str] | None = None,
     mcp_config: dict[str, dict[str, Any]] | None = None,
     yolo_mode: bool = False,
+    provider_max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
+    provider_retry_base_delay: float = DEFAULT_PROVIDER_RETRY_BASE_DELAY,
+    provider_retry_max_delay: float = DEFAULT_PROVIDER_RETRY_MAX_DELAY,
+    provider_retry_backoff_factor: float = DEFAULT_PROVIDER_RETRY_BACKOFF_FACTOR,
 ) -> AgentLoopConfig:
     """
     Validate AgentLoop initialization parameters.
@@ -709,6 +748,10 @@ def validate_agent_loop_params(
         skill_paths: Additional skill search paths.
         mcp_config: MCP server configurations.
         yolo_mode: If True, operate directly in the user path without sandbox.
+        provider_max_retries: Max retry attempts for transient LLM errors.
+        provider_retry_base_delay: Base delay in seconds between retries.
+        provider_retry_max_delay: Max delay cap in seconds.
+        provider_retry_backoff_factor: Exponential backoff multiplier.
 
     Returns:
         Validated AgentLoopConfig.
@@ -735,4 +778,8 @@ def validate_agent_loop_params(
         skill_paths=skill_paths,  # type: ignore
         mcp_servers=mcp_servers,
         yolo_mode=yolo_mode,
+        provider_max_retries=provider_max_retries,
+        provider_retry_base_delay=provider_retry_base_delay,
+        provider_retry_max_delay=provider_retry_max_delay,
+        provider_retry_backoff_factor=provider_retry_backoff_factor,
     )

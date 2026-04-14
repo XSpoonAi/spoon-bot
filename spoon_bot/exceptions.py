@@ -149,6 +149,36 @@ class LLMTimeoutError(LLMError):
         return "The request took too long to complete. Please try again."
 
 
+class LLMRateLimitError(LLMError):
+    """LLM provider rate limit exceeded (HTTP 429)."""
+
+    def __init__(
+        self,
+        provider: str,
+        retry_after: float | None = None,
+        status_code: int = 429,
+    ):
+        self.provider = provider
+        self.retry_after = retry_after
+        self.status_code = status_code
+        msg = f"Rate limit exceeded for {provider}"
+        if retry_after:
+            msg += f" (retry after {retry_after:.1f}s)"
+        super().__init__(msg, {
+            "provider": provider,
+            "retry_after": retry_after,
+            "status_code": status_code,
+        })
+
+    def user_message(self) -> str:
+        if self.retry_after:
+            return (
+                f"Rate limit exceeded for {self.provider}. "
+                f"Retrying in {self.retry_after:.0f}s..."
+            )
+        return f"Rate limit exceeded for {self.provider}. Please try again later."
+
+
 class ContextOverflowError(LLMError):
     """Context window exceeded and cannot be recovered by trimming."""
 
