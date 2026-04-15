@@ -93,6 +93,7 @@ class PathValidator:
         "secrets",
         "password",
         "private_key",
+        "privatekey",
         "secret_key",
         "api_key",
         "token",
