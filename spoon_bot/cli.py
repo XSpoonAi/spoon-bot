@@ -588,6 +588,10 @@ async def _run_agent(
         create_kwargs["auto_reload"] = True
         if agent_cfg.get("auto_reload_interval") is not None:
             create_kwargs["auto_reload_interval"] = float(agent_cfg["auto_reload_interval"])
+    for _retry_key in ("provider_max_retries", "provider_retry_base_delay",
+                        "provider_retry_max_delay", "provider_retry_backoff_factor"):
+        if agent_cfg.get(_retry_key) is not None:
+            create_kwargs[_retry_key] = agent_cfg[_retry_key]
 
     try:
         console.print("  [dim]Initializing...[/dim]", end="")
@@ -1075,6 +1079,10 @@ async def _run_gateway(
         create_kwargs["auto_reload"] = True
         if agent_cfg.get("auto_reload_interval") is not None:
             create_kwargs["auto_reload_interval"] = float(agent_cfg["auto_reload_interval"])
+    for _retry_key in ("provider_max_retries", "provider_retry_base_delay",
+                        "provider_retry_max_delay", "provider_retry_backoff_factor"):
+        if agent_cfg.get(_retry_key) is not None:
+            create_kwargs[_retry_key] = agent_cfg[_retry_key]
 
     try:
         with console.status("[bold blue]Initializing agent...[/bold blue]"):

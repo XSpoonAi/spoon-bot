@@ -762,16 +762,23 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         "shell_timeout":  ["SPOON_BOT_SHELL_TIMEOUT"],
         "max_output":     ["SPOON_BOT_MAX_OUTPUT"],
         "context_window": ["CONTEXT_WINDOW"],
+        "provider_max_retries":        ["SPOON_BOT_PROVIDER_MAX_RETRIES"],
+        "provider_retry_base_delay":   ["SPOON_BOT_PROVIDER_RETRY_BASE_DELAY"],
+        "provider_retry_max_delay":    ["SPOON_BOT_PROVIDER_RETRY_MAX_DELAY"],
+        "provider_retry_backoff_factor": ["SPOON_BOT_PROVIDER_RETRY_BACKOFF_FACTOR"],
     }
     _bool_fields = {"enable_skills", "yolo_mode"}
-    _int_fields = {"max_iterations", "shell_timeout", "max_output", "context_window"}
+    _int_fields = {"max_iterations", "shell_timeout", "max_output", "context_window", "provider_max_retries"}
+    _float_fields = {"provider_retry_base_delay", "provider_retry_max_delay", "provider_retry_backoff_factor"}
     for field, env_vars in agent_env_map.items():
-        if not resolved.get(field):
+        if resolved.get(field) is None:
             for var in env_vars:
                 val = os.environ.get(var)
                 if val:
                     if field in _int_fields:
                         resolved[field] = int(val)
+                    elif field in _float_fields:
+                        resolved[field] = float(val)
                     elif field in _bool_fields:
                         resolved[field] = val.lower() in ("true", "1", "yes")
                     else:
