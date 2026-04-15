@@ -1158,6 +1158,16 @@ class AgentLoop:
         """Prepare request context by trimming and injecting session history."""
         trimmed_count = self._trim_context_if_needed()
         injected_count = await self._sync_runtime_history_from_session()
+
+        # Repair tool-call ordering after history injection — session storage
+        # may not preserve tool_call_id metadata, producing orphaned tool
+        # messages that providers (OpenAI, Gemini, etc.) reject.
+        repaired = 0
+        if self._agent and hasattr(self._agent, "memory"):
+            messages = getattr(self._agent.memory, "messages", None)
+            if isinstance(messages, list):
+                repaired = self._normalize_runtime_tool_context(messages)
+
         estimated_tokens = self._estimate_token_count()
 
         logger.info(
@@ -1165,6 +1175,7 @@ class AgentLoop:
             f"injected_messages={injected_count}, "
             f"estimated_tokens~{estimated_tokens}, "
             f"trimmed_messages={trimmed_count}"
+            + (f", repaired_tool_order={repaired}" if repaired else "")
         )
 
     def _build_runtime_message_content(
@@ -1745,39 +1756,55 @@ class AgentLoop:
         logger.info(f"Reordered {moved} runtime message positions to restore tool adjacency")
         return moved
 
-    @staticmethod
-    def _repair_tool_pairing(messages: list) -> int:
+    @classmethod
+    def _repair_tool_pairing(cls, messages: list) -> int:
         """Remove orphaned tool results and tool calls after message deletion.
 
         Ensures every tool_call_id in a tool-result message has a matching
         tool_calls entry in a preceding assistant message, and vice-versa.
+        Also removes tool-role messages with no tool_call_id at all (e.g.
+        injected from session history without metadata).
         Without this, the LLM API rejects the conversation.
 
         Returns the number of messages removed.
         """
         removed = 0
 
-        # Collect all tool_call IDs from assistant messages
-        offered_ids: set[str] = set()
-        for msg in messages:
-            if getattr(msg, 'tool_calls', None):
-                for tc in msg.tool_calls:
-                    tc_id = getattr(tc, 'id', None)
-                    if tc_id:
-                        offered_ids.add(tc_id)
+        # Phase 1: remove orphaned tool messages — delegate to spoon-core's
+        # shared utility when available so detection logic isn't duplicated.
+        try:
+            from spoon_ai.llm.message_utils import drop_orphaned_tool_messages
 
-        # Remove tool-result messages whose tool_call_id is not in offered_ids
-        i = 0
-        while i < len(messages):
-            msg = messages[i]
-            tc_id = getattr(msg, 'tool_call_id', None)
-            if tc_id and tc_id not in offered_ids:
-                del messages[i]
-                removed += 1
-                continue
-            i += 1
+            before = len(messages)
+            cleaned = drop_orphaned_tool_messages(messages)
+            messages[:] = cleaned
+            removed += before - len(messages)
+        except ImportError:
+            offered_ids: set[str] = set()
+            for msg in messages:
+                if getattr(msg, 'tool_calls', None):
+                    for tc in msg.tool_calls:
+                        tc_id = getattr(tc, 'id', None)
+                        if tc_id:
+                            offered_ids.add(tc_id)
 
-        # Collect all answered tool_call IDs
+            i = 0
+            while i < len(messages):
+                msg = messages[i]
+                role = cls._message_role_value(msg)
+                tc_id = getattr(msg, 'tool_call_id', None)
+
+                if role == "tool" and not tc_id:
+                    del messages[i]
+                    removed += 1
+                    continue
+                if tc_id and tc_id not in offered_ids:
+                    del messages[i]
+                    removed += 1
+                    continue
+                i += 1
+
+        # Phase 2: collect all answered tool_call IDs
         answered_ids: set[str] = set()
         for msg in messages:
             tc_id = getattr(msg, 'tool_call_id', None)
@@ -1809,7 +1836,11 @@ class AgentLoop:
         return normalized
 
     def _uses_strict_tool_turn_order(self) -> bool:
-        """True for providers/models that reject non-adjacent function call turns."""
+        """True for providers/models that reject non-adjacent function call turns.
+
+        Both OpenAI and Gemini require tool-result messages to immediately
+        follow the assistant message that issued the tool_calls.
+        """
         provider_raw = getattr(self, "provider", None)
         model_raw = getattr(self, "model", None)
         base_url_raw = getattr(self, "base_url", None)
@@ -1818,9 +1849,15 @@ class AgentLoop:
         model = model_raw.strip().lower() if isinstance(model_raw, str) else ""
         base_url = base_url_raw.strip().lower() if isinstance(base_url_raw, str) else ""
 
+        if provider in {"openai", "openrouter"}:
+            return True
         if provider in {"gemini", "google", "google_ai_studio", "google-ai-studio"}:
             return True
+        if any(prefix in model for prefix in ("gpt-", "o3", "o4", "openai/")):
+            return True
         if "gemini" in model or model.startswith("google/"):
+            return True
+        if "api.openai.com" in base_url:
             return True
         return "generativelanguage.googleapis.com" in base_url
 
