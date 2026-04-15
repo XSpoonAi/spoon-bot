@@ -25,6 +25,10 @@ from pydantic_settings import BaseSettings
 # Shared default constants (single source of truth)
 # ---------------------------------------------------------------------------
 
+DEFAULT_SHELL_TIMEOUT: int = 600       # 10 min foreground budget
+DEFAULT_SHELL_MAX_TIMEOUT: int = 7200  # 2 hour per-command cap
+DEFAULT_MAX_OUTPUT: int = 10_000
+DEFAULT_MAX_ITERATIONS: int = 20
 DEFAULT_PROVIDER_MAX_RETRIES: int = 5
 DEFAULT_PROVIDER_RETRY_BASE_DELAY: float = 1.0
 DEFAULT_PROVIDER_RETRY_MAX_DELAY: float = 60.0
@@ -386,19 +390,26 @@ class AgentLoopConfig(BaseModel):
         description="LLM model name (uses provider default if not specified)"
     )
     max_iterations: int = Field(
-        default=20,
+        default=DEFAULT_MAX_ITERATIONS,
         ge=1,
         le=100,
         description="Maximum tool call iterations (1-100)"
     )
     shell_timeout: int = Field(
-        default=3600,
+        default=DEFAULT_SHELL_TIMEOUT,
         ge=1,
-        le=3600,
-        description="Shell command timeout in seconds (1-3600)"
+        le=7200,
+        description="Default shell command foreground timeout in seconds (1-7200). "
+                    "Commands exceeding this are moved to background."
+    )
+    shell_max_timeout: int = Field(
+        default=DEFAULT_SHELL_MAX_TIMEOUT,
+        ge=60,
+        le=7200,
+        description="Maximum allowed per-command timeout override in seconds (60-7200)"
     )
     max_output: int = Field(
-        default=10000,
+        default=DEFAULT_MAX_OUTPUT,
         ge=100,
         le=1000000,
         description="Maximum output characters for shell (100-1000000)"
@@ -630,19 +641,25 @@ class SpoonBotSettings(BaseSettings):
 
     # Agent settings
     max_iterations: int = Field(
-        default=20,
+        default=DEFAULT_MAX_ITERATIONS,
         ge=1,
         le=100,
         description="Default max iterations"
     )
     shell_timeout: int = Field(
-        default=3600,
+        default=DEFAULT_SHELL_TIMEOUT,
         ge=1,
-        le=3600,
-        description="Default shell timeout"
+        le=7200,
+        description="Default shell foreground timeout in seconds"
+    )
+    shell_max_timeout: int = Field(
+        default=DEFAULT_SHELL_MAX_TIMEOUT,
+        ge=60,
+        le=7200,
+        description="Maximum allowed per-command timeout override in seconds"
     )
     max_output: int = Field(
-        default=10000,
+        default=DEFAULT_MAX_OUTPUT,
         ge=100,
         le=1000000,
         description="Default max output"
@@ -723,13 +740,14 @@ def validate_mcp_configs(configs: dict[str, dict[str, Any]]) -> dict[str, MCPSer
 def validate_agent_loop_params(
     workspace: Path | str | None = None,
     model: str | None = None,
-    max_iterations: int = 20,
-    shell_timeout: int = 3600,
-    max_output: int = 10000,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
+    max_output: int = DEFAULT_MAX_OUTPUT,
     session_key: str = "default",
     skill_paths: list[Path | str] | None = None,
     mcp_config: dict[str, dict[str, Any]] | None = None,
     yolo_mode: bool = False,
+    shell_max_timeout: int = DEFAULT_SHELL_MAX_TIMEOUT,
     provider_max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
     provider_retry_base_delay: float = DEFAULT_PROVIDER_RETRY_BASE_DELAY,
     provider_retry_max_delay: float = DEFAULT_PROVIDER_RETRY_MAX_DELAY,
@@ -742,12 +760,13 @@ def validate_agent_loop_params(
         workspace: Workspace directory path.
         model: LLM model name.
         max_iterations: Maximum tool call iterations.
-        shell_timeout: Shell command timeout.
+        shell_timeout: Default shell foreground timeout in seconds.
         max_output: Maximum output characters.
         session_key: Session identifier.
         skill_paths: Additional skill search paths.
         mcp_config: MCP server configurations.
         yolo_mode: If True, operate directly in the user path without sandbox.
+        shell_max_timeout: Maximum per-command timeout override in seconds.
         provider_max_retries: Max retry attempts for transient LLM errors.
         provider_retry_base_delay: Base delay in seconds between retries.
         provider_retry_max_delay: Max delay cap in seconds.
@@ -773,6 +792,7 @@ def validate_agent_loop_params(
         model=model,
         max_iterations=max_iterations,
         shell_timeout=shell_timeout,
+        shell_max_timeout=shell_max_timeout,
         max_output=max_output,
         session_key=session_key,
         skill_paths=skill_paths,  # type: ignore

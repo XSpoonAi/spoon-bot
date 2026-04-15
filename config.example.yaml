@@ -28,7 +28,10 @@ agent:
   #   filesystem:
   #     command: "npx"
   #     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
-  # shell_timeout: 3600
+  # shell_timeout: 600         # Default foreground timeout in seconds (10 min).
+                                # Commands exceeding this are moved to background.
+  # shell_max_timeout: 7200    # Max allowed per-command timeout override (2 hours).
+                                # The agent can request longer timeouts up to this cap.
   # max_output: 10000
   # context_window: 200000
   # auto_reload: false          # Watch skill paths & config for changes, auto-reload

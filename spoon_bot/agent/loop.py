@@ -95,7 +95,15 @@ from spoon_bot.agent.tools.self_config import (
     SelfUpgradeTool,
 )
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
-from spoon_bot.config import AgentLoopConfig, MemSearchConfig, validate_agent_loop_params, resolve_context_window
+from spoon_bot.config import (
+    AgentLoopConfig,
+    DEFAULT_MAX_OUTPUT,
+    DEFAULT_SHELL_MAX_TIMEOUT,
+    DEFAULT_SHELL_TIMEOUT,
+    MemSearchConfig,
+    resolve_context_window,
+    validate_agent_loop_params,
+)
 from spoon_bot.services.hotreload import HotReloadService
 from spoon_bot.services.spawn import SpawnTool
 from spoon_bot.session.manager import SessionManager
@@ -337,8 +345,9 @@ class AgentLoop:
         api_key: str | None = None,
         base_url: str | None = None,
         max_iterations: int = 50,
-        shell_timeout: int = 3600,
-        max_output: int = 10000,
+        shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
+        shell_max_timeout: int = DEFAULT_SHELL_MAX_TIMEOUT,
+        max_output: int = DEFAULT_MAX_OUTPUT,
         session_key: str = "default",
         skill_paths: list[Path | str] | None = None,
         mcp_config: dict[str, dict[str, Any]] | None = None,
@@ -371,7 +380,8 @@ class AgentLoop:
             api_key: API key for the LLM provider.
             base_url: Custom base URL for the provider.
             max_iterations: Maximum tool call iterations.
-            shell_timeout: Shell command timeout in seconds.
+            shell_timeout: Default shell foreground timeout in seconds.
+            shell_max_timeout: Maximum per-command timeout override in seconds.
             max_output: Maximum output characters for shell.
             session_key: Session identifier for persistence.
             skill_paths: Additional paths to search for skills.
@@ -394,6 +404,7 @@ class AgentLoop:
                 model=model,
                 max_iterations=max_iterations,
                 shell_timeout=shell_timeout,
+                shell_max_timeout=shell_max_timeout,
                 max_output=max_output,
                 session_key=session_key,
                 skill_paths=skill_paths,
@@ -417,6 +428,7 @@ class AgentLoop:
         self.base_url = base_url
         self.max_iterations = self._config.max_iterations
         self.shell_timeout = self._config.shell_timeout
+        self.shell_max_timeout = self._config.shell_max_timeout
         self.max_output = self._config.max_output
         self.session_key = self._config.session_key
         self.user_id = "anonymous"
@@ -716,9 +728,10 @@ class AgentLoop:
         # Initialize agent
         await self._agent.initialize()
 
-        # Keep the agent's per-step timeout aligned with the configured shell timeout
+        # Keep the agent's per-step timeout aligned with the effective shell ceiling
         # so long-running commands are not cancelled prematurely by the outer loop.
-        self._agent._default_timeout = max(300.0, float(self.shell_timeout))
+        effective_ceiling = max(self.shell_timeout, self.shell_max_timeout)
+        self._agent._default_timeout = max(300.0, float(effective_ceiling))
 
         self._initialized = True
         active_count = len(self.tools.get_active_tools())
@@ -746,6 +759,7 @@ class AgentLoop:
         # compose multi-step ops and use $(), ${}, and backtick expressions.
         self.tools.register(ShellTool(
             timeout=self.shell_timeout,
+            max_timeout=self.shell_max_timeout,
             max_output=self.max_output,
             working_dir=str(self.workspace),
             allow_chaining=True,

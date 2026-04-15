@@ -719,7 +719,7 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
         model, provider, api_key, base_url, workspace, yolo_mode,
         max_iterations, tool_profile, enabled_tools, enable_skills,
-        shell_timeout, max_output, context_window,
+        shell_timeout, shell_max_timeout, max_output, context_window,
         session_store_backend, session_store_dsn, session_store_db_path,
         mcp_config (alias: mcp_servers)
 
@@ -753,14 +753,15 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
     # 2. Overlay env vars for fields NOT already set by YAML
     # ------------------------------------------------------------------
     agent_env_map: dict[str, list[str]] = {
-        "provider":       ["SPOON_BOT_DEFAULT_PROVIDER", "SPOON_PROVIDER"],
-        "model":          ["SPOON_BOT_DEFAULT_MODEL", "SPOON_MODEL"],
-        "workspace":      ["SPOON_BOT_WORKSPACE_PATH"],
+        "provider": ["SPOON_BOT_DEFAULT_PROVIDER", "SPOON_PROVIDER"],
+        "model": ["SPOON_BOT_DEFAULT_MODEL", "SPOON_MODEL"],
+        "workspace": ["SPOON_BOT_WORKSPACE_PATH"],
         "max_iterations": ["SPOON_BOT_MAX_ITERATIONS", "SPOON_MAX_STEPS"],
-        "enable_skills":  ["SPOON_BOT_ENABLE_SKILLS"],
-        "yolo_mode":      ["SPOON_BOT_YOLO_MODE"],
-        "shell_timeout":  ["SPOON_BOT_SHELL_TIMEOUT"],
-        "max_output":     ["SPOON_BOT_MAX_OUTPUT"],
+        "enable_skills": ["SPOON_BOT_ENABLE_SKILLS"],
+        "yolo_mode": ["SPOON_BOT_YOLO_MODE"],
+        "shell_timeout": ["SPOON_BOT_SHELL_TIMEOUT"],
+        "shell_max_timeout": ["SPOON_BOT_SHELL_MAX_TIMEOUT"],
+        "max_output": ["SPOON_BOT_MAX_OUTPUT"],
         "context_window": ["CONTEXT_WINDOW"],
         "provider_max_retries":        ["SPOON_BOT_PROVIDER_MAX_RETRIES"],
         "provider_retry_base_delay":   ["SPOON_BOT_PROVIDER_RETRY_BASE_DELAY"],
@@ -768,7 +769,14 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         "provider_retry_backoff_factor": ["SPOON_BOT_PROVIDER_RETRY_BACKOFF_FACTOR"],
     }
     _bool_fields = {"enable_skills", "yolo_mode"}
-    _int_fields = {"max_iterations", "shell_timeout", "max_output", "context_window", "provider_max_retries"}
+    _int_fields = {
+        "max_iterations",
+        "shell_timeout",
+        "shell_max_timeout",
+        "max_output",
+        "context_window",
+        "provider_max_retries",
+    }
     _float_fields = {"provider_retry_base_delay", "provider_retry_max_delay", "provider_retry_backoff_factor"}
     for field, env_vars in agent_env_map.items():
         if resolved.get(field) is None:

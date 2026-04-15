@@ -1,0 +1,15 @@
+agent:
+  model: "google/gemini-3-flash-preview"
+  provider: "openrouter"
+  workspace: "~/.spoon-bot/workspace"
+  max_iterations: 20
+  tool_profile: "core"
+channels:
+  telegram:
+    enabled: false
+  discord:
+    enabled: false
+  feishu:
+    enabled: false
+  cli:
+    enabled: false
