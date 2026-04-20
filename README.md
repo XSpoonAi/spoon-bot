@@ -97,6 +97,7 @@ To enable Telegram or other channel integrations, create a `config.yaml` in the 
 agent:
   provider: anthropic
   model: claude-sonnet-4-20250514
+  reasoning_effort: high          # Optional: low/medium/high/xhigh
   # api_key: sk-xxx  # Or use environment variable
 
 channels:
@@ -111,6 +112,20 @@ channels:
         groups:
           enabled: false
           require_mention: true
+```
+
+`reasoning_effort` is provider-neutral. spoon-bot maps it to each provider's current API shape:
+
+- OpenAI: `reasoning_effort`
+- Anthropic: `thinking: {type: "adaptive"}` plus `output_config.effort` on supported models
+- Gemini 3: `thinkingLevel`
+- Gemini 2.5: `thinkingBudget`
+- OpenRouter: `extra_body.reasoning.effort`
+
+Environment override:
+
+```bash
+export SPOON_BOT_REASONING_EFFORT=medium
 ```
 
 **Telegram setup:**
@@ -145,7 +160,7 @@ spoon-bot agent -m "List files in the current directory"
 ```bash
 # OpenAI GPT-5.2
 export OPENAI_API_KEY=your-key
-spoon-bot agent --provider openai --model gpt-5.2
+spoon-bot agent --provider openai --model gpt-5.2 --reasoning-effort xhigh
 
 # DeepSeek V3.2
 export DEEPSEEK_API_KEY=your-key
@@ -153,12 +168,30 @@ spoon-bot agent --provider deepseek --model deepseek-v3.2
 
 # Google Gemini 3
 export GEMINI_API_KEY=your-key
-spoon-bot agent --provider gemini --model gemini-3-flash-preview
+spoon-bot agent --provider gemini --model gemini-3-flash-preview --reasoning-effort high
 
 # OpenRouter (access 400+ models with one key)
 export OPENROUTER_API_KEY=sk-or-xxx
-spoon-bot agent --provider openrouter --model anthropic/claude-sonnet-4.5
+spoon-bot agent --provider openrouter --model anthropic/claude-sonnet-4.5 --reasoning-effort high
 ```
+
+### Reasoning Effort
+
+You can set the default reasoning intensity in YAML, env, CLI, or Telegram `/think`.
+
+```yaml
+agent:
+  provider: openai
+  model: gpt-5.2
+  reasoning_effort: xhigh
+```
+
+```bash
+spoon-bot agent --reasoning-effort medium
+spoon-bot gateway --reasoning-effort high
+```
+
+Telegram `/think` now exposes `Off`, `Low`, `Medium`, `High`, and `X-High`. Older saved values like `basic` and `extended` are still accepted and mapped to `low` and `high`.
 
 ## LLM Providers
 

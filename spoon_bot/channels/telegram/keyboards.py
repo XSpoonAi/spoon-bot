@@ -15,6 +15,7 @@ from spoon_bot.channels.telegram.constants import (
     MODELS_PER_PROVIDER_PAGE,
     REASONING_LEVELS,
     THINK_LEVELS,
+    normalize_think_level,
 )
 
 
@@ -95,16 +96,27 @@ def build_think_keyboard(current_level: str = "off") -> InlineKeyboardMarkup:
     Returns:
         InlineKeyboardMarkup with think level buttons.
     """
-    buttons: list[InlineKeyboardButton] = []
-    for level, label in THINK_LEVELS.items():
-        text = f"✓ {label}" if level == current_level else label
-        buttons.append(
-            InlineKeyboardButton(
-                text=text,
-                callback_data=f"{CALLBACK_PREFIX['think']}{level}",
+    normalized_current = normalize_think_level(current_level)
+    ordered_levels = list(THINK_LEVELS.items())
+    row_sizes = (2, 2, 1)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    index = 0
+    for size in row_sizes:
+        row: list[InlineKeyboardButton] = []
+        for level, label in ordered_levels[index:index + size]:
+            text = f"✓ {label}" if level == normalized_current else label
+            row.append(
+                InlineKeyboardButton(
+                    text=text,
+                    callback_data=f"{CALLBACK_PREFIX['think']}{level}",
+                )
             )
-        )
-    return InlineKeyboardMarkup([buttons])
+        if row:
+            rows.append(row)
+        index += size
+
+    return InlineKeyboardMarkup(rows)
 
 
 def build_verbose_keyboard(current_state: bool = False) -> InlineKeyboardMarkup:

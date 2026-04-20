@@ -32,6 +32,7 @@ class TestChatOptionsModel:
         opts = ChatOptions()
         assert opts.stream is False
         assert opts.thinking is False
+        assert opts.reasoning_effort is None
         assert opts.max_iterations == 20
         assert opts.model is None
 
@@ -74,6 +75,14 @@ class TestChatOptionsModel:
         parsed = json.loads(json_str)
         assert parsed["stream"] is True
         assert parsed["thinking"] is True
+
+    def test_reasoning_effort_roundtrip(self):
+        from spoon_bot.gateway.models.requests import ChatOptions
+
+        opts = ChatOptions(stream=True, thinking=True, reasoning_effort="high")
+        data = opts.model_dump()
+        restored = ChatOptions(**data)
+        assert restored.reasoning_effort == "high"
 
 
 class TestStreamChunkModel:

@@ -13,6 +13,12 @@
 agent:
   model: "anthropic/claude-sonnet-4.6"  # or "other-model-name"
   provider: "openrouter" # openai, openrouter, anthropic, google, etc.
+  reasoning_effort: "high"  # Optional: low/medium/high/xhigh (provider-dependent)
+                             # OpenAI: Chat Completions -> reasoning_effort
+                             # Anthropic: adaptive thinking + output_config.effort
+                             # Gemini 3: thinkingLevel, Gemini 2.5: thinkingBudget
+                             # OpenRouter: extra_body.reasoning.effort
+                             # Env override: SPOON_BOT_REASONING_EFFORT=medium
   workspace: "~/.spoon-bot/workspace"
   max_iterations: 20
   tool_profile: "core"  # Options: core, coding, web3, research, full
@@ -83,6 +89,7 @@ channels:
         # Agent configuration for this bot
         agent_config:
           tool_profile: "full"  # This bot uses all tools
+          # reasoning_effort: "medium"  # Optional per-channel override
           # Or specify individual tools:
           # enabled_tools:
           #   - shell

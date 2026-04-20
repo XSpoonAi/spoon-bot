@@ -668,6 +668,7 @@ class WebSocketHandler:
 
         stream = params.get("stream", False)
         thinking = params.get("thinking", False)
+        reasoning_effort = params.get("reasoning_effort")
         task_id = f"task_{uuid4().hex[:8]}"
         trace_id = new_trace_id()
         span = TimerSpan("ws_chat")
@@ -699,7 +700,13 @@ class WebSocketHandler:
                     if stream:
                         # Streaming mode: emit chunks via WSEvent
                         full_content = ""
-                        async for chunk_data in agent.stream(message=message, media=media, attachments=attachments, thinking=thinking):
+                        async for chunk_data in agent.stream(
+                            message=message,
+                            media=media,
+                            attachments=attachments,
+                            thinking=thinking,
+                            reasoning_effort=reasoning_effort,
+                        ):
                             check_budget("stream", config.budget.stream_timeout_ms, span.elapsed_ms)
                             if self._cancel_requested:
                                 break
@@ -776,9 +783,19 @@ class WebSocketHandler:
                     else:
                         # Non-streaming mode
                         if thinking:
-                            response, thinking_content = await agent.process_with_thinking(message=message, media=media, attachments=attachments)
+                            response, thinking_content = await agent.process_with_thinking(
+                                message=message,
+                                media=media,
+                                attachments=attachments,
+                                reasoning_effort=reasoning_effort,
+                            )
                         else:
-                            response = await agent.process(message=message, media=media, attachments=attachments)
+                            response = await agent.process(
+                                message=message,
+                                media=media,
+                                attachments=attachments,
+                                reasoning_effort=reasoning_effort,
+                            )
                             thinking_content = None
                         check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
