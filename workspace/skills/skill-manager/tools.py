@@ -243,14 +243,16 @@ async def _download_skill_files(
 
 
 class SkillMarketplaceTool(BaseTool):
-    """Search, install, and remove skills from skills.sh / GitHub."""
+    """Search, install, and remove skills from skills.sh / GitHub / local paths."""
 
     name: str = "skill_marketplace"
     description: str = (
         "Install, update, remove, or search skills. "
         "WHEN THE USER GIVES A GITHUB URL, call this tool with action='install_skill' and url=<the URL>. "
+        "WHEN THE USER GIVES A LOCAL PATH, call this tool with action='install_local' and url=<the path>. "
         "Actions: "
         "install_skill (url required) — install a skill from GitHub URL; "
+        "install_local (url required) — install/link a skill from a local directory path; "
         "update_skill (url required) — re-download and update an already-installed skill; "
         "search_skills (query required) — search skills.sh; "
         "remove_skill (skill_name required) — remove installed skill; "
@@ -265,6 +267,7 @@ class SkillMarketplaceTool(BaseTool):
                 "enum": [
                     "search_skills",
                     "install_skill",
+                    "install_local",
                     "update_skill",
                     "remove_skill",
                     "skill_info",
@@ -278,9 +281,9 @@ class SkillMarketplaceTool(BaseTool):
             "url": {
                 "type": "string",
                 "description": (
-                    "GitHub URL to install from. Pass the EXACT URL the user gave you, "
-                    "e.g. 'https://github.com/openclaw/skills/tree/main/skills/tezatezaz/clawcast-wallet'. "
-                    "Also accepts 'owner/repo/<skill_path>' shorthand."
+                    "GitHub URL to install from, or a local filesystem path for install_local. "
+                    "e.g. 'https://github.com/openclaw/skills/tree/main/skills/tezatezaz/clawcast-wallet' "
+                    "or '/home/user/my-skills/my-skill' or 'C:\\Projects\\my-skill'."
                 ),
             },
             "skill_name": {
@@ -418,6 +421,60 @@ class SkillMarketplaceTool(BaseTool):
                 except NameError:
                     pass
                 return f"Error installing skill: {e}"
+
+        # ----------------------------------------------------------
+        # install_local — copy/link a skill from a local directory
+        # ----------------------------------------------------------
+        elif action == "install_local":
+            if not url:
+                return "Error: 'url' (local path) is required for install_local"
+            try:
+                source = Path(url.strip()).expanduser().resolve()
+                if not source.is_dir():
+                    return f"Error: '{url}' is not a valid directory"
+                if not (source / "SKILL.md").exists():
+                    return f"Error: '{url}' does not contain SKILL.md — not a valid skill"
+
+                skill_name_derived = source.name
+                target = workspace / "skills" / skill_name_derived
+                _rel_path = f"skills/{skill_name_derived}"
+
+                if target.exists() and (target / "SKILL.md").exists():
+                    return (
+                        f"Skill '{skill_name_derived}' is already installed at {_rel_path}.\n"
+                        "Use action='update_skill' or remove it first.\n"
+                        f"To use: read_file(path='{_rel_path}/SKILL.md')"
+                    )
+                elif target.exists():
+                    shutil.rmtree(str(target), ignore_errors=True)
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(
+                    str(source), str(target),
+                    ignore=shutil.ignore_patterns(
+                        ".git", "node_modules", ".pnpm-store",
+                        "__pycache__", ".venv", "*.pyc",
+                    ),
+                )
+
+                installed_files = []
+                for f in sorted(target.rglob("*")):
+                    if f.is_file():
+                        installed_files.append(str(f.relative_to(target)))
+
+                return (
+                    f"SUCCESS: Skill '{skill_name_derived}' installed from local path "
+                    f"({len(installed_files)} files).\n"
+                    f"Source: {source}\n"
+                    f"Files: {', '.join(installed_files[:15])}\n\n"
+                    "NEXT STEPS:\n"
+                    "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
+                    f"2) read_file(path='{_rel_path}/SKILL.md') for instructions.\n"
+                    "3) Execute CLI commands from SKILL.md."
+                )
+            except Exception as e:
+                logger.error(f"install_local failed: {e}")
+                return f"Error installing local skill: {e}"
 
         # ----------------------------------------------------------
         # update_skill — re-download an already-installed skill

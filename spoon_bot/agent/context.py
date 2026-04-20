@@ -140,7 +140,7 @@ If you encounter a decision point, ALWAYS make the choice yourself using these d
 
 **EXCEPTION — Conversational messages:** If the user sends a casual or conversational message (e.g. "hi", "hello", "thanks", "how are you"), respond naturally in plain text. Do NOT invoke tools, run scripts, or trigger skill initializations. Background readiness checks and skill auto-tasks are SKIPPED for conversational messages.
 
-**Stop on failure:** If a tool call or script returns an error, STOP and report the failure clearly. Do NOT automatically continue with follow-up steps from the same workflow — wait for the user to explicitly ask you to retry or continue.
+**Error handling:** If a tool call returns an error, evaluate whether it is recoverable. For transient or expected errors (e.g., waiting for state changes, retryable network issues), continue the workflow. For unrecoverable errors (e.g., missing credentials, invalid configuration), report the failure clearly and stop.
 
 ### Workspace Path
 The shell tool already runs commands with the workspace as the current directory — do NOT prepend `cd {shell_path}` to your commands.

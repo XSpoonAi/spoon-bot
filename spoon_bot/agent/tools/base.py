@@ -128,6 +128,8 @@ class Tool(ABC):
         """
         ...
 
+    _path_touch_callback: Any = None
+
     async def __call__(self, *args: Any, **kwargs: Any) -> str:
         """
         Make the tool callable - compatibility with spoon-core SDK.
@@ -139,6 +141,15 @@ class Tool(ABC):
                 result = await self.execute(**kwargs)
             finally:
                 finalize_tool_invocation(locals().get("result"))
+
+        if self._path_touch_callback is not None:
+            _path = kwargs.get("path") or kwargs.get("file_path") or kwargs.get("directory")
+            if _path:
+                try:
+                    self._path_touch_callback(_path)
+                except Exception:
+                    pass
+
         return result
 
     @abstractmethod

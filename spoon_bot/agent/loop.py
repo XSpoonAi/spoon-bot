@@ -503,6 +503,18 @@ class AgentLoop:
 
         self._git = GitManager(self.workspace) if auto_commit else None
 
+        # Deploy built-in skills to the runtime workspace (idempotent)
+        try:
+            from spoon_bot.skills.builtin import ensure_builtin_skills
+            _newly_installed = ensure_builtin_skills(self.workspace)
+            if _newly_installed:
+                logger.info(
+                    f"Installed {len(_newly_installed)} built-in skill(s): "
+                    f"{[p.name for p in _newly_installed]}"
+                )
+        except Exception as exc:
+            logger.debug(f"Built-in skill deployment skipped: {exc}")
+
         # Skill paths: runtime workspace + bundled skills shipped with spoon-bot
         self._skill_paths = [self.workspace / "skills"]
         _bundled_skills = Path(__file__).resolve().parent.parent.parent / "workspace" / "skills"
@@ -549,6 +561,14 @@ class AgentLoop:
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
 
+        # Tracks the skill name injected by _pre_inject_matched_skill()
+        self._pre_injected_skill_name: str | None = None
+
+        # Conditional activation — file paths touched during this session.
+        # Skills declaring ``paths`` frontmatter are dormant until a touched
+        # file matches one of their patterns (mirrors Claude Code behaviour).
+        self._touched_paths: set[str] = set()
+
         # Provider retry config (exponential backoff for transient LLM errors)
         self._retry_config = RetryConfig(
             max_retries=self._config.provider_max_retries,
@@ -594,31 +614,27 @@ class AgentLoop:
         skills_xml = self._build_skills_for_prompt()
         if skills_xml:
             system_prompt += f"\n## Installed Skills\n{skills_xml}\n"
-
-        if skills_xml:
             system_prompt += (
-                "\n> **FIRST ACTION**: Match the user's request to a skill above "
-                "by name/description, then `read_file` its `<location>` path. "
-                "Do NOT call skill_marketplace, web_search, or filesystem search first.\n"
+                "\nWhen a user request matches a skill by name, description, or "
+                "`when_to_use`, read its SKILL.md first (unless already pre-loaded "
+                "in the message). Follow the skill's own procedures directly.\n"
             )
 
         system_prompt += (
             "\n## Workflow\n"
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
-            "1. **Read SKILL.md**: If a skill above matches, `read_file` its path. "
-            "Extract config, addresses, commands.\n"
-            "2. **Execute**: Run commands from SKILL.md directly via shell "
-            "(`cast`, `curl`, etc.). Do NOT write script files.\n"
-            "3. **Done**: Summarize result. Save key state to `soul.md`.\n\n"
-            "Only use `web_search` if NO installed skill matches the task.\n\n"
+            "1. If a [PRE-LOADED SKILL] block is present in the user message, "
+            "execute its instructions immediately — do NOT re-read it.\n"
+            "2. Otherwise, if a skill matches, `read_file` its SKILL.md path, "
+            "then execute.\n"
+            "3. Run commands from SKILL.md directly via shell. Do NOT write script files.\n"
+            "4. Summarize result when done.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
             "- `source .env.local` before commands that need env vars.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
             "- Follow user instructions exactly — respect specific IDs, names, actions.\n"
-            "\n## Agent Memory (soul.md)\n"
-            "After completing significant actions, append a timestamped entry to `soul.md`.\n"
-            "Format: `## YYYY-MM-DD HH:MM — <topic>` followed by bullet points.\n"
+            "- Only use `web_search` if NO installed skill matches the task.\n"
         )
 
         # Inject soul.md content if it exists
@@ -776,11 +792,17 @@ class AgentLoop:
         _extra_read: list[Path] = [Path.home()]
         if self.yolo_mode:
             _extra_read.extend(p for p in self.workspace.parents if p != Path.home())
-        self.tools.register(ReadFileTool(workspace=self.workspace, additional_read_paths=_extra_read, max_output=15000))
-        self.tools.register(WriteFileTool(workspace=self.workspace))
-        self.tools.register(EditFileTool(workspace=self.workspace))
-        self.tools.register(ListDirTool(workspace=self.workspace, additional_read_paths=_extra_read))
-        self.tools.register(GrepTool(workspace=self.workspace))
+
+        _file_tools = [
+            ReadFileTool(workspace=self.workspace, additional_read_paths=_extra_read, max_output=15000),
+            WriteFileTool(workspace=self.workspace),
+            EditFileTool(workspace=self.workspace),
+            ListDirTool(workspace=self.workspace, additional_read_paths=_extra_read),
+            GrepTool(workspace=self.workspace),
+        ]
+        for ft in _file_tools:
+            ft._path_touch_callback = lambda p: self.record_touched_paths(p)
+            self.tools.register(ft)
 
         # Self-management tools
         self.tools.register(SelfConfigTool())
@@ -1287,6 +1309,9 @@ class AgentLoop:
             logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message: {message[:100]}...")
+
+        # Reset per-request state
+        self._pre_injected_skill_name = None
 
         # Refresh memory context
         try:
@@ -3078,72 +3103,405 @@ class AgentLoop:
             raw = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', raw)
         return raw
 
-    def _pre_inject_matched_skill(self, message: str) -> str:
-        """Match user message to an installed skill and prepend SKILL.md content.
+    # Directories in the workspace root that are never skills
+    _WORKSPACE_INFRA_DIRS = frozenset({
+        "skills", "logs", "sessions", "memory",
+        "channels", "wallet", ".git",
+    })
 
-        Saves 2-5 agent steps by providing skill content upfront so the
-        agent can start executing immediately without calling read_file.
+    # Common stop words filtered out during skill-matching token comparison
+    _SKILL_MATCH_STOP_WORDS = frozenset({
+        "when", "use", "this", "the", "for", "and", "with",
+        "that", "from", "needs", "need", "should", "also",
+        "through", "using", "codex", "claude", "agent",
+        "local", "based", "first", "only", "needed", "prefer", "logic",
+    })
+
+    # Scoring weights for _pre_inject_matched_skill (tune here, not inline)
+    _SCORE_NAME_TOKEN = 2
+    _SCORE_TRIGGER = 3
+    _SCORE_WHEN_TO_USE = 4
+    _SCORE_DESCRIPTION = 1
+    _SCORE_THRESHOLD = 2
+
+    # ------------------------------------------------------------------
+    # Conditional activation helpers
+    # ------------------------------------------------------------------
+
+    def record_touched_paths(self, *paths: str | Path) -> None:
+        """Register file paths the agent has interacted with.
+
+        Called by file-oriented tools (read_file, write_file, edit_file, etc.)
+        so that path-conditional skills can be activated dynamically.
+
+        Also performs **dynamic discovery**: walks up from the touched path
+        looking for directories containing ``SKILL.md`` and adds them to
+        ``_skill_paths`` if not already known (inspired by Claude Code's
+        ``discoverSkillDirsForPaths``).
+        """
+        for p in paths:
+            resolved = Path(p)
+            if not resolved.is_absolute():
+                resolved = self.workspace / resolved
+            try:
+                resolved = resolved.resolve()
+            except OSError:
+                pass
+
+            try:
+                rel = str(resolved.relative_to(self.workspace))
+            except (ValueError, OSError):
+                rel = str(p)
+            self._touched_paths.add(rel.replace("\\", "/"))
+
+            self._discover_skills_near(resolved)
+
+    def _discover_skills_near(self, file_path: Path) -> None:
+        """Walk up from *file_path* looking for ``skills/`` directories.
+
+        When a directory containing ``SKILL.md`` files is found and is not
+        already in ``_skill_paths``, it is added dynamically.  This mirrors
+        Claude Code's ``discoverSkillDirsForPaths`` which walks up from every
+        file operation to find project-level ``.claude/skills/`` directories.
+
+        Only walks up to ``self.workspace`` (never above).
+        """
+        known = {str(Path(sp).resolve()) for sp in self._skill_paths}
+        current = file_path.parent if file_path.is_file() else file_path
+
+        try:
+            ws_resolved = self.workspace.resolve()
+        except OSError:
+            return
+
+        while True:
+            try:
+                if not current.is_relative_to(ws_resolved):
+                    break
+            except (TypeError, ValueError):
+                break
+
+            skills_dir = current / "skills"
+            if skills_dir.is_dir() and str(skills_dir.resolve()) not in known:
+                has_skill = any(
+                    (child / "SKILL.md").exists()
+                    for child in skills_dir.iterdir()
+                    if child.is_dir()
+                )
+                if has_skill:
+                    self._skill_paths.append(skills_dir)
+                    known.add(str(skills_dir.resolve()))
+                    logger.info(f"Dynamic skill discovery: found {skills_dir}")
+
+            if current == ws_resolved:
+                break
+            current = current.parent
+
+    @staticmethod
+    def _skill_paths_match(
+        patterns: list[str], touched: set[str], workspace: Path | None = None,
+    ) -> bool:
+        """Return True if any *touched* file matches at least one *pattern*.
+
+        Patterns use gitignore-style globs (``fnmatch``).  A leading ``!``
+        negates (exclude) the pattern — same semantics as ``.gitignore``.
+        An empty *patterns* list means "always active" (unconditional).
+        """
+        from fnmatch import fnmatch
+
+        if not patterns:
+            return True
+        if not touched:
+            return False
+
+        for fp in touched:
+            included = False
+            for pat in patterns:
+                negate = pat.startswith("!")
+                glob = pat.lstrip("!")
+                if fnmatch(fp, glob) or fnmatch(fp, f"**/{glob}"):
+                    included = not negate
+            if included:
+                return True
+        return False
+
+    @staticmethod
+    def _parse_skill_frontmatter(skill_md: Path) -> dict[str, str | list[str]]:
+        """Extract description, when_to_use, triggers, and paths from SKILL.md YAML frontmatter.
+
+        The ``paths`` field (list of gitignore-style glob patterns) enables
+        conditional activation: skills declaring ``paths`` are only active when
+        recently-touched files match at least one pattern.  Skills without
+        ``paths`` are unconditionally active.
         """
         import re as _re
 
+        result: dict[str, str | list[str]] = {
+            "description": "", "when_to_use": "", "triggers": "", "paths": [],
+        }
+        try:
+            raw = skill_md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return result
+
+        fm = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
+        if not fm:
+            for line in raw.split("\n")[1:20]:
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("#", "---", "```")):
+                    result["description"] = stripped[:300]
+                    break
+            return result
+
+        fm_text = fm.group(1)
+        in_multiline = ""
+        in_paths_list = False
+        trigger_fragments: list[str] = []
+        paths_list: list[str] = []
+
+        for line in fm_text.split("\n"):
+            stripped = line.strip()
+
+            if in_paths_list:
+                if stripped.startswith("- "):
+                    paths_list.append(stripped[2:].strip().strip("'\""))
+                    continue
+                elif line.startswith("  ") or line.startswith("\t"):
+                    if stripped.startswith("- "):
+                        paths_list.append(stripped[2:].strip().strip("'\""))
+                    continue
+                else:
+                    in_paths_list = False
+
+            if in_multiline:
+                if line.startswith("  ") or line.startswith("\t"):
+                    if in_multiline == "description":
+                        result["description"] += " " + stripped
+                    elif in_multiline == "when_to_use":
+                        result["when_to_use"] += " " + stripped
+                    continue
+                else:
+                    in_multiline = ""
+
+            if stripped.startswith("description:"):
+                val = stripped.split(":", 1)[1].strip().strip("'\"")
+                if val and val not in (">", "|"):
+                    result["description"] = val
+                elif val in (">", "|"):
+                    in_multiline = "description"
+
+            elif stripped.startswith(("when_to_use:", "whenToUse:")):
+                val = stripped.split(":", 1)[1].strip().strip("'\"")
+                if val and val not in (">", "|"):
+                    result["when_to_use"] = val
+                elif val in (">", "|"):
+                    in_multiline = "when_to_use"
+
+            elif stripped.startswith("paths:"):
+                inline = stripped.split(":", 1)[1].strip()
+                if inline.startswith("[") and inline.endswith("]"):
+                    for p in inline[1:-1].split(","):
+                        p = p.strip().strip("'\"")
+                        if p:
+                            paths_list.append(p)
+                else:
+                    in_paths_list = True
+
+            elif "triggers" in stripped.lower() or "trigger" in stripped.lower():
+                trigger_fragments.extend(_re.findall(r'"([^"]+)"', stripped))
+
+        if not result["description"]:
+            for line in raw.split("\n")[1:20]:
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("#", "---", "```")):
+                    result["description"] = stripped[:300]
+                    break
+
+        result["description"] = str(result["description"]).strip()[:300]
+        result["when_to_use"] = str(result["when_to_use"]).strip()[:200]
+        result["triggers"] = "|".join(trigger_fragments)
+        result["paths"] = paths_list
+        return result
+
+    def _iter_skill_candidates(
+        self, *, include_dormant: bool = False,
+    ) -> list[tuple[str, Path, Path, bool]]:
+        """Return (name, dir, skill_md_path, is_organized) for all discoverable skills.
+
+        Scans in priority order:
+        1. ``workspace/skills/`` — primary organized location
+        2. All entries in ``_skill_paths`` (includes bundled/dev skills)
+        3. Workspace root — unorganized skills the user may have dropped in
+
+        Deduplicates by both name AND resolved (realpath) canonical path so
+        symlinks pointing to the same physical directory are counted once.
+        Earlier entries take priority (matches Claude Code's first-wins logic).
+
+        **Conditional activation (``paths`` frontmatter)**:
+        Skills declaring ``paths`` patterns are dormant until a touched file
+        matches.  Set *include_dormant* to ``True`` to include them anyway
+        (useful for listing all skills in the prompt with a "dormant" tag).
+        """
         skills_dir = self.workspace / "skills"
-        if not skills_dir.is_dir():
+
+        # (parent_dir, is_organized)
+        scan_dirs: list[tuple[Path, bool]] = []
+        if skills_dir.is_dir():
+            scan_dirs.append((skills_dir, True))
+        for sp in getattr(self, "_skill_paths", []):
+            resolved = Path(sp).resolve()
+            if resolved.is_dir() and resolved != skills_dir.resolve():
+                scan_dirs.append((resolved, True))
+        if self.workspace.is_dir():
+            scan_dirs.append((self.workspace, False))
+
+        candidates: list[tuple[str, Path, Path, bool]] = []
+        seen_names: set[str] = set()
+        seen_realpaths: set[str] = set()
+
+        for parent_dir, is_organized in scan_dirs:
+            for child in sorted(parent_dir.iterdir()):
+                if not (child.is_dir() or child.is_symlink()):
+                    continue
+                if not is_organized and child.name in self._WORKSPACE_INFRA_DIRS:
+                    continue
+                skill_md = child / "SKILL.md"
+                if not skill_md.exists():
+                    continue
+                name = child.name
+                if name in seen_names:
+                    continue
+
+                try:
+                    canonical = str(skill_md.resolve())
+                except OSError:
+                    canonical = str(skill_md)
+                if canonical in seen_realpaths:
+                    logger.debug(
+                        f"Skipping duplicate skill '{name}' "
+                        f"(same file already loaded via another path)"
+                    )
+                    continue
+
+                if not include_dormant:
+                    fm = self._parse_skill_frontmatter(skill_md)
+                    skill_paths = fm.get("paths", [])
+                    if isinstance(skill_paths, list) and skill_paths:
+                        if not self._skill_paths_match(
+                            skill_paths, self._touched_paths, self.workspace,
+                        ):
+                            logger.debug(
+                                f"Skill '{name}' dormant (paths not matched)"
+                            )
+                            continue
+
+                seen_names.add(name)
+                seen_realpaths.add(canonical)
+                candidates.append((name, child, skill_md, is_organized))
+
+        return candidates
+
+    def _pre_inject_matched_skill(self, message: str) -> str:
+        """Match user message to an installed skill and prepend SKILL.md content.
+
+        Scoring uses multiple signals inspired by Claude Code's skill matching:
+        - Skill name tokens (split on ``-`` / ``_``)
+        - YAML frontmatter ``description`` keywords
+        - ``when_to_use`` / ``whenToUse`` field (highest weight)
+        - ``triggers`` keyword list
+
+        Scans both ``workspace/skills/`` (organized) and the workspace root
+        (unorganized).  When an unorganized skill matches, the injection
+        includes a note asking the agent to move it into ``skills/`` first.
+        """
+        import re as _re, sys as _sys
+
+        candidates = self._iter_skill_candidates()
+        if not candidates:
             return message
 
         msg_lower = message.lower()
         best_skill = None
         best_score = 0
 
-        for child in sorted(skills_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            skill_md = child / "SKILL.md"
-            if not skill_md.exists():
-                continue
-
-            name = child.name
+        for name, skill_dir, skill_md, is_organized in candidates:
             score = 0
 
-            # Match skill name tokens against user message
             name_tokens = _re.split(r'[-_]', name)
             for token in name_tokens:
                 if len(token) >= 3 and token.lower() in msg_lower:
-                    score += 2
+                    score += self._SCORE_NAME_TOKEN
 
-            # Match trigger words from frontmatter
-            try:
-                raw = skill_md.read_text(encoding="utf-8", errors="replace")
-                fm = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
-                if fm:
-                    for line in fm.group(1).split("\n"):
-                        if "triggers" in line.lower() or "trigger" in line.lower():
-                            triggers = _re.findall(r'"([^"]+)"', line)
-                            for t in triggers:
-                                if t.lower() in msg_lower:
-                                    score += 3
-            except Exception:
-                pass
+            fm = self._parse_skill_frontmatter(skill_md)
+
+            for t in fm["triggers"].split("|"):
+                if t and t.lower() in msg_lower:
+                    score += self._SCORE_TRIGGER
+
+            if fm["when_to_use"]:
+                wtu_tokens = _re.findall(r'[A-Za-z\u4e00-\u9fff]{2,}', fm["when_to_use"].lower())
+                for token in wtu_tokens:
+                    if token not in self._SKILL_MATCH_STOP_WORDS and token in msg_lower:
+                        score += self._SCORE_WHEN_TO_USE
+
+            if fm["description"]:
+                desc_tokens = _re.findall(r'[A-Za-z\u4e00-\u9fff]{3,}', fm["description"].lower())
+                for token in desc_tokens:
+                    if token not in self._SKILL_MATCH_STOP_WORDS and token in msg_lower:
+                        score += self._SCORE_DESCRIPTION
 
             if score > best_score:
                 best_score = score
-                best_skill = (name, skill_md)
+                best_skill = (name, skill_dir, skill_md, is_organized)
 
-        if not best_skill or best_score < 2:
+        if not best_skill or best_score < self._SCORE_THRESHOLD:
             return message
 
-        skill_name, skill_path = best_skill
+        skill_name, skill_dir, skill_path, is_organized = best_skill
         try:
             content = skill_path.read_text(encoding="utf-8", errors="replace").strip()
         except Exception:
             return message
 
-        logger.info(f"Pre-injected skill '{skill_name}' (score={best_score}) into message")
+        base_dir = str(skill_dir).replace("\\", "/")
+        if _sys.platform == "win32":
+            base_dir = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', base_dir)
+
+        ws_posix = self._workspace_posix_path()
+
+        if is_organized:
+            skill_rel = f"skills/{skill_name}"
+        else:
+            skill_rel = skill_name
+
+        content = content.replace("${SKILL_DIR}", f"{ws_posix}/{skill_rel}")
+        content = content.replace("$SKILL_DIR", f"{ws_posix}/{skill_rel}")
+
+        self._pre_injected_skill_name = skill_name
+
+        organize_note = ""
+        if not is_organized:
+            organize_note = (
+                f"\n⚠️ ORGANIZE FIRST: This skill is at the workspace root, not in skills/.\n"
+                f"Before executing, move it:\n"
+                f"  mv {skill_name} skills/{skill_name}\n"
+                f"Then update your working paths to use skills/{skill_name}/ as the base.\n"
+            )
+
+        logger.info(
+            f"Pre-injected skill '{skill_name}' (score={best_score}, "
+            f"organized={is_organized}) into message"
+        )
         return (
             f"{message}\n\n"
             f"---\n"
-            f"[PRE-LOADED SKILL: {skill_name}] "
-            f"The following SKILL.md is already loaded — execute its steps directly. "
-            f"Do NOT call read_file on this skill again.\n\n"
+            f"[PRE-LOADED SKILL: {skill_name}]\n"
+            f"Base directory: {base_dir}\n"
+            f"Workspace-relative path: {skill_rel}/\n"
+            f"{organize_note}\n"
+            f"The SKILL.md below is already loaded — follow its procedures directly. "
+            f"Do NOT call read_file on this skill. Do NOT search for alternatives. "
+            f"Start executing the skill's instructions immediately.\n\n"
             f"{content}\n"
             f"---"
         )
@@ -3285,75 +3643,50 @@ class AgentLoop:
     def _build_skills_for_prompt(self) -> str:
         """Build Openclaw-style XML metadata for installed skills.
 
-        Scans skill directories, extracts name + description from SKILL.md
-        frontmatter, and returns an <available_skills> XML block for the
-        system prompt. The agent reads SKILL.md lazily when needed.
+        Uses ``_iter_skill_candidates`` and ``_parse_skill_frontmatter`` to
+        build an ``<available_skills>`` XML block.  Unorganized skills (in the
+        workspace root) are flagged so the agent knows to move them first.
+
+        Path-conditional skills are included with ``include_dormant=True``
+        so the agent is *aware* of them, but they carry a ``<status>dormant``
+        tag indicating they will activate when matching files are touched.
         """
-        import re as _re, os as _os, sys as _sys
-
-        skills_dir = self.workspace / "skills"
-        if not skills_dir.is_dir():
+        candidates = self._iter_skill_candidates(include_dormant=True)
+        if not candidates:
             return ""
 
-        ws_str = str(self.workspace).replace("\\", "/")
-        if _sys.platform == "win32":
-            ws_str = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', ws_str)
+        entries: list[str] = []
+        for name, _dir, skill_md, is_organized in candidates:
+            fm = self._parse_skill_frontmatter(skill_md)
+            description = fm["description"] or name
+            when_to_use = fm["when_to_use"]
+            skill_paths = fm.get("paths", [])
 
-        entries = []
-        for child in sorted(skills_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            skill_md = child / "SKILL.md"
-            if not skill_md.exists():
-                continue
+            location = f"skills/{name}/SKILL.md" if is_organized else f"{name}/SKILL.md"
 
-            name = child.name
-            description = ""
-            try:
-                raw = skill_md.read_text(encoding="utf-8", errors="replace")
-                fm_match = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
-                if fm_match:
-                    for line in fm_match.group(1).split("\n"):
-                        stripped = line.strip()
-                        if stripped.startswith("description:"):
-                            val = stripped.split(":", 1)[1].strip().strip("'\"")
-                            if val and val != ">":
-                                description = val[:200]
-                                break
-                    if not description:
-                        in_desc = False
-                        desc_lines = []
-                        for line in fm_match.group(1).split("\n"):
-                            if line.strip().startswith("description:"):
-                                in_desc = True
-                                val = line.split(":", 1)[1].strip()
-                                if val and val not in (">", "|"):
-                                    desc_lines.append(val)
-                                continue
-                            if in_desc:
-                                if line.startswith("  ") or line.startswith("\t"):
-                                    desc_lines.append(line.strip())
-                                else:
-                                    break
-                        description = " ".join(desc_lines)[:200]
-                if not description:
-                    for line in raw.split("\n")[1:20]:
-                        stripped = line.strip()
-                        if stripped and not stripped.startswith(("#", "---", "```")):
-                            description = stripped[:200]
-                            break
-            except Exception:
-                description = name
+            parts = [
+                f'<skill name="{name}">',
+                f'  <description>{description}</description>',
+            ]
+            if when_to_use:
+                parts.append(f'  <when_to_use>{when_to_use}</when_to_use>')
+            parts.append(f'  <location>{location}</location>')
+            if not is_organized:
+                parts.append(
+                    f'  <status>unorganized — move to skills/{name}/ before use</status>'
+                )
+            elif isinstance(skill_paths, list) and skill_paths:
+                is_active = self._skill_paths_match(
+                    skill_paths, self._touched_paths, self.workspace,
+                )
+                if not is_active:
+                    parts.append(
+                        f'  <status>dormant — activates when files matching '
+                        f'{", ".join(skill_paths[:3])} are touched</status>'
+                    )
+            parts.append('</skill>')
+            entries.append("\n".join(parts))
 
-            entries.append(
-                f'<skill name="{name}">\n'
-                f'  <description>{description}</description>\n'
-                f'  <location>skills/{name}/SKILL.md</location>\n'
-                f'</skill>'
-            )
-
-        if not entries:
-            return ""
         return "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
 
     @staticmethod
