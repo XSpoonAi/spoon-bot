@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -120,3 +120,39 @@ async def test_install_anti_loop_tracker_keeps_prompt_for_non_strict_providers()
 
     assert seen_prompts == ["prompt"]
     assert agent._agent.next_step_prompt == "prompt"
+
+
+@pytest.mark.requires_spoon_core
+@pytest.mark.asyncio
+async def test_install_anti_loop_tracker_logs_provider_reasoning_summary():
+    from spoon_bot.agent.loop import AgentLoop
+
+    async def base_think() -> bool:
+        agent._agent.last_reasoning_summary = "Plan from provider summary"
+        return True
+
+    agent = AgentLoop.__new__(AgentLoop)
+    agent.workspace = Path("/workspace")
+    agent.provider = "openai"
+    agent.model = "gpt-5.2"
+    agent.base_url = None
+    agent._agent = MagicMock()
+    agent._agent.think = base_think
+    agent._agent._spoon_bot_base_think = base_think
+    agent._agent.next_step_prompt = "prompt"
+    agent._agent.tool_calls = []
+    agent._agent.memory = MagicMock()
+    agent._agent.memory.messages = []
+    agent._agent.last_reasoning_summary = None
+    agent._compress_runtime_context = MagicMock(return_value=0)
+    agent._latest_reasoning_excerpt = None
+    agent._pending_reasoning_chunks = []
+
+    with patch("spoon_bot.agent.loop.logger.info") as log_info:
+        AgentLoop._install_anti_loop_tracker(agent, "prompt")
+        await agent._agent.think()
+
+    assert any(
+        call.args and call.args[0] == "💭 Agent reasoning: Plan from provider summary"
+        for call in log_info.call_args_list
+    )

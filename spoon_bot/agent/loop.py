@@ -2203,6 +2203,13 @@ class AgentLoop:
         def _log_agent_reasoning():
             """Extract and log the agent's reasoning text from its last response."""
             from spoon_bot.utils.privacy import mask_secrets
+            provider_reasoning = getattr(agent, "last_reasoning_summary", None)
+            if isinstance(provider_reasoning, str) and provider_reasoning.strip():
+                safe_reasoning = mask_secrets(provider_reasoning.strip())
+                captured = agent_loop._capture_reasoning_text(safe_reasoning)
+                if captured:
+                    logger.info(f"💭 Agent reasoning: {captured}")
+                return
             if not hasattr(agent, 'memory') or not agent.memory.messages:
                 return
             for msg in reversed(agent.memory.messages[-3:]):
@@ -3052,7 +3059,10 @@ class AgentLoop:
             elif hasattr(result, "thinking"):
                 thinking_content = result.thinking
             elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
-                thinking_content = result.metadata.get("thinking")
+                thinking_content = (
+                    result.metadata.get("thinking")
+                    or result.metadata.get("reasoning")
+                )
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
 
