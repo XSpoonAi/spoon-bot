@@ -9,7 +9,12 @@ from loguru import logger
 from telegram import Update
 from telegram.ext import CommandHandler
 
-from spoon_bot.channels.telegram.constants import BOT_COMMANDS, REASONING_LEVELS, THINK_LEVELS
+from spoon_bot.channels.telegram.constants import (
+    BOT_COMMANDS,
+    REASONING_LEVELS,
+    THINK_LEVELS,
+    normalize_think_level,
+)
 from spoon_bot.channels.telegram.keyboards import (
     build_commands_keyboard,
     build_confirm_keyboard,
@@ -160,13 +165,13 @@ class CommandHandlers:
 
         try:
             state = self._get_state(update)
-            current = state.get("think_level", "off")
+            current = normalize_think_level(state.get("think_level", "off"))
             keyboard = build_think_keyboard(current)
 
             level_label = THINK_LEVELS.get(current, current)
             await self._reply(
                 update,
-                f"Think mode: {level_label}\n\nSelect thinking level:",
+                f"Think mode: {level_label}\n\nSelect reasoning intensity:",
                 reply_markup=keyboard,
             )
         except Exception as e:
@@ -272,7 +277,7 @@ class CommandHandlers:
                 f"*Provider:* `{self._agent.provider}`",
                 f"*Tools:* {active_count}/{total_count} active",
                 f"*Skills:* {len(skill_list)}",
-                f"*Think:* {THINK_LEVELS.get(state.get('think_level', 'off'), 'off')}",
+                f"*Think:* {THINK_LEVELS.get(normalize_think_level(state.get('think_level', 'off')), 'off')}",
                 f"*Verbose:* {'ON' if state.get('verbose') else 'OFF'}",
             ]
 

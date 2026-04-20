@@ -908,6 +908,37 @@ class TestAgentLoopThinkingMode:
         assert thinking == "reasoning trace"
         assert loop._agent.run_calls == [((), {"thinking": True})]
 
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_passes_reasoning_effort_when_runtime_accepts_it(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop.workspace = tmp_dir
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._agent = _ThinkingRuntimeAgent("answer", "reasoning trace")
+        loop._session = Session(session_key="thinking_mode")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._auto_commit = False
+        loop._git = None
+
+        response, thinking = await AgentLoop.process_with_thinking(
+            loop,
+            message="Explain the answer.",
+            reasoning_effort="high",
+        )
+
+        assert response == "answer"
+        assert thinking == "reasoning trace"
+        assert loop._agent.run_calls == [((), {"thinking": True, "reasoning_effort": "high"})]
+
 
 # ============================================================================
 # §5  create_session_store factory

@@ -14,7 +14,9 @@ from spoon_bot.channels.telegram.constants import (
     CALLBACK_PREFIX,
     MODEL_PROVIDERS,
     REASONING_LEVELS,
+    THINK_LEVEL_ALIASES,
     THINK_LEVELS,
+    normalize_think_level,
 )
 from spoon_bot.channels.telegram.keyboards import (
     build_commands_keyboard,
@@ -134,7 +136,10 @@ class CallbackRouter:
     # ------------------------------------------------------------------
 
     async def _on_think_select(self, query: Any, data: str, user_id: int) -> None:
-        level = data[len(CALLBACK_PREFIX["think"]):]
+        raw_level = data[len(CALLBACK_PREFIX["think"]):].strip().lower()
+        if raw_level not in THINK_LEVELS and raw_level not in THINK_LEVEL_ALIASES:
+            return
+        level = normalize_think_level(raw_level)
         if level not in THINK_LEVELS:
             return
 
@@ -144,7 +149,7 @@ class CallbackRouter:
         keyboard = build_think_keyboard(level)
         label = THINK_LEVELS[level]
         await query.edit_message_text(
-            f"*Think mode:* {label}\n\nSelect thinking level:",
+            f"*Think mode:* {label}\n\nSelect reasoning intensity:",
             reply_markup=keyboard,
             parse_mode="Markdown",
         )

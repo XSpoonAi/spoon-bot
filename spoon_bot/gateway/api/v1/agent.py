@@ -191,6 +191,7 @@ async def _stream_sse(
     media: list[str] | None,
     attachments: list[dict[str, Any]] | None,
     thinking: bool,
+    reasoning_effort: str | None = None,
     *,
     session_key: str | None = None,
     user_id: str | None = None,
@@ -221,6 +222,8 @@ async def _stream_sse(
             setattr(agent, "user_id", user_id or "anonymous")
 
             kwargs = {"message": message, "thinking": thinking}
+            if reasoning_effort:
+                kwargs["reasoning_effort"] = reasoning_effort
             if media:
                 kwargs["media"] = media
             if attachments:
@@ -310,6 +313,7 @@ async def chat(
     # Determine options
     stream = request.options.stream if request.options else False
     thinking = request.options.thinking if request.options else False
+    reasoning_effort = request.options.reasoning_effort if request.options else None
 
     try:
         agent = get_agent()
@@ -345,6 +349,7 @@ async def chat(
                     media or None,
                     attachments or None,
                     thinking,
+                    reasoning_effort,
                     session_key=session_key,
                     user_id=owner_user_id,
                     trace_id=trace_id,
@@ -368,6 +373,8 @@ async def chat(
                 setattr(agent, "user_id", owner_user_id)
 
                 kwargs = {"message": message}
+                if reasoning_effort:
+                    kwargs["reasoning_effort"] = reasoning_effort
                 if media:
                     kwargs["media"] = media
                 if attachments:

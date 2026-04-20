@@ -93,6 +93,7 @@ class SpoonBotConfig:
     provider: str = ""
     api_key: str | None = None
     base_url: str | None = None
+    reasoning_effort: str | None = None
 
     # Agent settings
     max_steps: int = 15
@@ -127,6 +128,7 @@ class SpoonBotConfig:
             provider=cfg.get("provider", ""),
             api_key=cfg.get("api_key"),
             base_url=cfg.get("base_url"),
+            reasoning_effort=cfg.get("reasoning_effort"),
             max_steps=cfg.get("max_iterations", 15),
             mcp_servers=cfg.get("mcp_config", {}) or {},
             enable_skills=cfg.get("enable_skills", True),
@@ -156,6 +158,13 @@ class SpoonBot:
         self._skill_manager: SkillManager | None = None
         self._mcp_tools: list[MCPTool] = []
         self._initialized = False
+
+    def _apply_default_reasoning_effort(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if self.config.reasoning_effort and kwargs.get("reasoning_effort") is None:
+            updated = dict(kwargs)
+            updated["reasoning_effort"] = self.config.reasoning_effort
+            return updated
+        return kwargs
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -295,6 +304,7 @@ class SpoonBot:
         if not self._initialized:
             await self.initialize()
 
+        kwargs = self._apply_default_reasoning_effort(kwargs)
         result = await self._agent.run(message, **kwargs)
 
         if hasattr(result, "content"):
@@ -318,6 +328,7 @@ class SpoonBot:
         if not self._initialized:
             await self.initialize()
 
+        kwargs = self._apply_default_reasoning_effort(kwargs)
         messages = [{"role": "user", "content": message}]
         async for chunk in self._chatbot.astream(messages, **kwargs):
             if hasattr(chunk, "delta") and chunk.delta:
@@ -343,6 +354,7 @@ class SpoonBot:
         if not self._initialized:
             await self.initialize()
 
+        kwargs = self._apply_default_reasoning_effort(kwargs)
         response = await self._chatbot.ask_tool(
             messages=[{"role": "user", "content": message}],
             tools=tools,
@@ -472,11 +484,14 @@ async def create_agent(
         ... )
     """
     # If model/provider not explicitly passed, resolve from YAML/env
-    if not model or not provider:
+    cfg: dict[str, Any] = {}
+    if not model or not provider or kwargs.get("reasoning_effort") is None:
         from spoon_bot.channels.config import load_agent_config
         cfg = load_agent_config()
         model = model or cfg.get("model", "")
         provider = provider or cfg.get("provider", "")
+        if kwargs.get("reasoning_effort") is None and cfg.get("reasoning_effort") is not None:
+            kwargs["reasoning_effort"] = cfg.get("reasoning_effort")
 
     config = SpoonBotConfig(
         model=model,

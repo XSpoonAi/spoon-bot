@@ -389,6 +389,10 @@ class AgentLoopConfig(BaseModel):
         default=None,
         description="LLM model name (uses provider default if not specified)"
     )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Provider-neutral reasoning effort hint (mapped per provider)"
+    )
     max_iterations: int = Field(
         default=DEFAULT_MAX_ITERATIONS,
         ge=1,
@@ -638,6 +642,10 @@ class SpoonBotSettings(BaseSettings):
         default=None,
         description="Default model name"
     )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Default provider-neutral reasoning effort hint"
+    )
 
     # Agent settings
     max_iterations: int = Field(
@@ -740,6 +748,7 @@ def validate_mcp_configs(configs: dict[str, dict[str, Any]]) -> dict[str, MCPSer
 def validate_agent_loop_params(
     workspace: Path | str | None = None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     shell_timeout: int = DEFAULT_SHELL_TIMEOUT,
     max_output: int = DEFAULT_MAX_OUTPUT,
@@ -759,6 +768,7 @@ def validate_agent_loop_params(
     Args:
         workspace: Workspace directory path.
         model: LLM model name.
+        reasoning_effort: Provider-neutral reasoning effort hint.
         max_iterations: Maximum tool call iterations.
         shell_timeout: Default shell foreground timeout in seconds.
         max_output: Maximum output characters.
@@ -790,6 +800,7 @@ def validate_agent_loop_params(
     return AgentLoopConfig(
         workspace=workspace,  # type: ignore
         model=model,
+        reasoning_effort=reasoning_effort,
         max_iterations=max_iterations,
         shell_timeout=shell_timeout,
         shell_max_timeout=shell_max_timeout,
