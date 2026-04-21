@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,21 @@ from loguru import logger
 from starlette.websockets import WebSocketState
 
 from spoon_bot.gateway.websocket.protocol import WSEvent, WSMessage
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
+    """Read a float env var, falling back to ``default`` on missing/invalid values."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Invalid value for {name}={raw!r}; falling back to default {default}"
+        )
+        return default
+    return max(value, minimum)
 
 
 def _is_disconnect_error(exc: BaseException) -> bool:
@@ -78,6 +94,21 @@ class ConnectionManager:
         self._user_connections: dict[str, set[str]] = {}  # user_id -> connection_ids
         self._running = False
         self._ping_task: asyncio.Task | None = None
+
+        # Keep-alive tuning. Defaults are deliberately lower than common proxy
+        # idle timeouts (nginx/ingress/cloudflare ~60s) so half-open connections
+        # are detected before they bite the next user send.
+        self._ping_interval = _env_float(
+            "SPOON_BOT_WS_PING_INTERVAL_SECONDS", default=20.0, minimum=1.0
+        )
+        # Anything that has seen no traffic for this long is considered dead
+        # and evicted proactively (belt-and-suspenders in case the OS hasn't
+        # surfaced a FIN yet). Defaults to 3x the ping interval.
+        self._stale_threshold = _env_float(
+            "SPOON_BOT_WS_STALE_SECONDS",
+            default=self._ping_interval * 3.0,
+            minimum=self._ping_interval + 1.0,
+        )
 
     async def start(self) -> None:
         """Start the connection manager."""
@@ -169,6 +200,18 @@ class ConnectionManager:
     def get_connection(self, connection_id: str) -> Connection | None:
         """Get a connection by ID."""
         return self._connections.get(connection_id)
+
+    def touch(self, connection_id: str) -> None:
+        """Record inbound activity for ``connection_id``.
+
+        Used by the WebSocket handler to refresh the liveness timestamp every
+        time a client frame is received (including pings/pongs), so the ping
+        loop's staleness check reflects full-duplex activity, not just server
+        sends.
+        """
+        conn = self._connections.get(connection_id)
+        if conn is not None:
+            conn.update_activity()
 
     async def send_message(
         self,
@@ -317,20 +360,44 @@ class ConnectionManager:
             logger.debug(f"Connection {connection_id} unsubscribed from: {events}")
 
     async def _ping_loop(self) -> None:
-        """Send periodic pings to keep connections alive.
+        """Send periodic pings and evict half-open connections.
 
-        ``send_message`` now performs its own disconnect detection and
-        cleanup, so this loop just needs to trigger sends and let the manager
-        evict stale connections.
+        Two complementary mechanisms keep the connection table honest:
+
+        1. Every ``self._ping_interval`` seconds we send a ``ping`` frame.
+           ``send_message`` performs its own disconnect detection and will
+           drop the connection on any transport-level error.
+        2. Before sending each ping we also check ``last_activity``. If no
+           frame has flowed in either direction within ``self._stale_threshold``
+           seconds, the connection is evicted proactively - this catches the
+           "half-open" case where a middlebox silently dropped the socket but
+           no FIN ever reached us.
         """
         while self._running:
-            await asyncio.sleep(30)  # Ping every 30 seconds
+            try:
+                await asyncio.sleep(self._ping_interval)
+            except asyncio.CancelledError:
+                raise
 
+            now = datetime.utcnow()
             for conn_id in list(self._connections.keys()):
+                conn = self._connections.get(conn_id)
+                if conn is None:
+                    continue
+
+                idle_seconds = (now - conn.last_activity).total_seconds()
+                if idle_seconds > self._stale_threshold:
+                    logger.debug(
+                        f"Evicting stale WebSocket {conn_id}: "
+                        f"idle={idle_seconds:.1f}s > threshold={self._stale_threshold:.1f}s"
+                    )
+                    await self.disconnect(conn_id)
+                    continue
+
                 try:
                     await self.send_message(
                         conn_id,
-                        {"type": "ping", "timestamp": datetime.utcnow().isoformat()},
+                        {"type": "ping", "timestamp": now.isoformat()},
                     )
                 except asyncio.CancelledError:
                     raise

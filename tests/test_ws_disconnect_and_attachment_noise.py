@@ -1,6 +1,7 @@
 """Regression tests for the WS disconnect / history-warning noise fix.
 
-These tests lock in the behaviour introduced by commit 2e45e6d:
+These tests lock in the behaviour introduced by commit 2e45e6d and its
+follow-ups:
 
 1. ``ConnectionManager.send_message`` must short-circuit on a client-side
    WebSocket disconnect (no retry, no WARNING, connection auto-cleaned).
@@ -9,12 +10,17 @@ These tests lock in the behaviour introduced by commit 2e45e6d:
 3. A pre-closed ``client_state`` must be detected before the first send.
 4. ``AgentLoop._warn_dropped_refs`` must dedupe per session and include the
    dropped paths the first time they are observed.
+5. ``ConnectionManager._ping_loop`` must proactively evict connections that
+   have been idle past the configured stale threshold (half-open detection).
+6. Ping interval and stale threshold must be env-configurable with sane
+   fallbacks for invalid values.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,6 +32,7 @@ from starlette.websockets import WebSocketState
 from spoon_bot.agent.loop import AgentLoop
 from spoon_bot.gateway.websocket.manager import (
     ConnectionManager,
+    _env_float,
     _is_disconnect_error,
 )
 
@@ -285,3 +292,151 @@ class TestWarnDroppedRefsDedup:
 
         assert not cap.messages(level="WARNING")
         assert not cap.messages(level="DEBUG")
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive / half-open detection
+# ---------------------------------------------------------------------------
+
+
+class TestEnvFloat:
+    def test_returns_default_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SPOON_BOT_TEST_FLOAT", raising=False)
+        assert _env_float("SPOON_BOT_TEST_FLOAT", default=7.5) == pytest.approx(7.5)
+
+    def test_parses_valid_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SPOON_BOT_TEST_FLOAT", "12.25")
+        assert _env_float("SPOON_BOT_TEST_FLOAT", default=0.0) == pytest.approx(12.25)
+
+    def test_clamps_to_minimum(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SPOON_BOT_TEST_FLOAT", "0.01")
+        assert _env_float("SPOON_BOT_TEST_FLOAT", default=10.0, minimum=1.0) == 1.0
+
+    def test_falls_back_on_garbage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SPOON_BOT_TEST_FLOAT", "not-a-number")
+        with _LoguruCapture() as cap:
+            value = _env_float("SPOON_BOT_TEST_FLOAT", default=4.0)
+        assert value == pytest.approx(4.0)
+        assert any("Invalid value" in m for m in cap.messages(level="WARNING"))
+
+    def test_falls_back_on_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SPOON_BOT_TEST_FLOAT", "   ")
+        assert _env_float("SPOON_BOT_TEST_FLOAT", default=2.5) == pytest.approx(2.5)
+
+
+class TestManagerKeepAliveConfig:
+    def test_defaults_are_sub_proxy_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SPOON_BOT_WS_PING_INTERVAL_SECONDS", raising=False)
+        monkeypatch.delenv("SPOON_BOT_WS_STALE_SECONDS", raising=False)
+        mgr = ConnectionManager()
+        # Default ping interval must stay well below typical 60s idle timeouts.
+        assert mgr._ping_interval <= 30.0
+        # Stale threshold is at least one full interval bigger than the ping
+        # cadence so a single missed ping doesn't nuke the connection.
+        assert mgr._stale_threshold > mgr._ping_interval
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SPOON_BOT_WS_PING_INTERVAL_SECONDS", "5")
+        monkeypatch.setenv("SPOON_BOT_WS_STALE_SECONDS", "40")
+        mgr = ConnectionManager()
+        assert mgr._ping_interval == pytest.approx(5.0)
+        assert mgr._stale_threshold == pytest.approx(40.0)
+
+    def test_stale_threshold_must_exceed_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SPOON_BOT_WS_PING_INTERVAL_SECONDS", "10")
+        monkeypatch.setenv("SPOON_BOT_WS_STALE_SECONDS", "5")  # too low
+        mgr = ConnectionManager()
+        # Minimum clamp in _env_float keeps the threshold strictly larger
+        # than the ping interval so one late tick can't evict a live peer.
+        assert mgr._stale_threshold > mgr._ping_interval
+
+
+class TestTouch:
+    @pytest.mark.asyncio
+    async def test_touch_refreshes_last_activity(self) -> None:
+        manager = ConnectionManager()
+        ws = _make_fake_ws(send_side_effect=None)
+        conn_id = await manager.connect(ws, user_id="u", session_key="s")
+        conn = manager.get_connection(conn_id)
+        assert conn is not None
+
+        # Artificially backdate last_activity to something clearly stale.
+        conn.last_activity = datetime.utcnow() - timedelta(minutes=5)
+
+        manager.touch(conn_id)
+
+        refreshed = (datetime.utcnow() - conn.last_activity).total_seconds()
+        assert refreshed < 1.0
+
+    def test_touch_unknown_connection_is_a_no_op(self) -> None:
+        manager = ConnectionManager()
+        # Must not raise even if the connection id is unknown.
+        manager.touch("does-not-exist")
+
+
+@pytest.mark.asyncio
+class TestPingLoopHalfOpenEviction:
+    async def test_stale_connection_is_evicted_without_send(self) -> None:
+        manager = ConnectionManager()
+        manager._ping_interval = 0.01
+        manager._stale_threshold = 0.05
+
+        ws = _make_fake_ws(send_side_effect=None)
+        conn_id = await manager.connect(ws, user_id="u", session_key="s")
+        conn = manager.get_connection(conn_id)
+        assert conn is not None
+
+        # Simulate a connection that went quiet long before the loop ticks.
+        conn.last_activity = datetime.utcnow() - timedelta(seconds=10)
+
+        await manager.start()
+        try:
+            # Give the loop enough time to tick at least once.
+            for _ in range(50):
+                if manager.connection_count == 0:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await manager.stop()
+
+        assert manager.connection_count == 0
+        # Because we evicted before the send path, send_json must not have
+        # been exercised by the ping loop.
+        assert ws.send_json.await_count == 0
+
+    async def test_fresh_connection_is_pinged_not_evicted(self) -> None:
+        manager = ConnectionManager()
+        manager._ping_interval = 0.01
+        manager._stale_threshold = 1.0  # plenty of headroom
+
+        ws = _make_fake_ws(send_side_effect=None)
+        conn_id = await manager.connect(ws, user_id="u", session_key="s")
+
+        await manager.start()
+        try:
+            # Wait for at least one ping to be dispatched.
+            for _ in range(50):
+                if ws.send_json.await_count > 0:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await manager.stop()
+
+        assert manager.connection_count == 0  # stop() clears the table
+        assert ws.send_json.await_count >= 1
+        # Every ping payload must look like a ping frame.
+        for call in ws.send_json.await_args_list:
+            payload = call.args[0]
+            assert payload.get("type") == "ping"
+
+    async def test_ping_loop_cancels_cleanly_on_stop(self) -> None:
+        manager = ConnectionManager()
+        manager._ping_interval = 10.0  # long enough that we'd block if buggy
+        await manager.start()
+        # stop() must return promptly even with no connections.
+        await asyncio.wait_for(manager.stop(), timeout=1.0)
+        assert manager._ping_task is None or manager._ping_task.done()
