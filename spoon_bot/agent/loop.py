@@ -448,6 +448,11 @@ class AgentLoop:
         self._mcp_tools: list[MCPTool] = []
         self._latest_reasoning_excerpt: str | None = None
         self._pending_reasoning_chunks: list[str] = []
+        # Track which invalid persisted attachment/media refs we've already
+        # warned about per session, so history sync doesn't spam identical
+        # warnings on every user turn. Keyed by session_key -> set of refs.
+        self._warned_invalid_attachment_refs: dict[str, set[str]] = {}
+        self._warned_invalid_media_refs: dict[str, set[str]] = {}
 
         # spoon-bot components
         self.context = ContextBuilder(self.workspace, yolo_mode=self.yolo_mode)
@@ -1130,6 +1135,43 @@ class AgentLoop:
 
         return trimmed_count
 
+    def _warn_dropped_refs(self, *, kind: str, dropped: list[str]) -> None:
+        """Log dropped persisted refs once per (session, ref) pair.
+
+        The previous implementation emitted a generic warning on *every*
+        history sync — producing a large volume of duplicate log lines for
+        sessions that carried stale references (e.g. attachments uploaded in
+        a prior container lifetime whose workspace paths no longer resolve).
+        We now deduplicate per session and include the offending paths the
+        first time we see them so operators can diagnose the root cause.
+        """
+        unique_refs = [ref for ref in dict.fromkeys(filter(None, dropped))]
+        if not unique_refs:
+            return
+
+        cache_map = (
+            self._warned_invalid_attachment_refs
+            if kind == "attachment"
+            else self._warned_invalid_media_refs
+        )
+        seen = cache_map.setdefault(self.session_key, set())
+
+        new_refs = [ref for ref in unique_refs if ref not in seen]
+        if new_refs:
+            seen.update(new_refs)
+            preview = ", ".join(new_refs[:5])
+            suffix = f" (+{len(new_refs) - 5} more)" if len(new_refs) > 5 else ""
+            logger.warning(
+                f"Dropped invalid persisted {kind} refs outside workspace during "
+                f"history sync (session={self.session_key}): {preview}{suffix}"
+            )
+        else:
+            logger.debug(
+                f"Dropped invalid persisted {kind} refs outside workspace during "
+                f"history sync (session={self.session_key}): "
+                f"{len(unique_refs)} already-known ref(s)"
+            )
+
     async def _sync_runtime_history_from_session(self) -> int:
         """Sync persisted session history into spoon-core runtime memory."""
         if not self._agent:
@@ -1166,12 +1208,24 @@ class AgentLoop:
             raw_media = _normalize_media_list(msg.get("media"))
             media = _sanitize_media_list(raw_media, self.workspace)
             if raw_media and len(media) != len(raw_media):
-                logger.warning("Dropped invalid persisted media refs outside workspace during history sync")
+                self._warn_dropped_refs(
+                    kind="media",
+                    dropped=[ref for ref in raw_media if ref not in media],
+                )
 
             raw_attachments = _normalize_attachment_refs(msg.get("attachments"))
             attachments = _sanitize_attachment_refs(raw_attachments, self.workspace)
             if raw_attachments and len(attachments) != len(raw_attachments):
-                logger.warning("Dropped invalid persisted attachment refs outside workspace during history sync")
+                kept = {
+                    str(item.get("workspace_path") or item.get("uri") or "").strip()
+                    for item in attachments
+                }
+                dropped = [
+                    str(item.get("workspace_path") or item.get("uri") or "").strip()
+                    for item in raw_attachments
+                    if str(item.get("workspace_path") or item.get("uri") or "").strip() not in kept
+                ]
+                self._warn_dropped_refs(kind="attachment", dropped=dropped)
             content = self._build_runtime_message_content(
                 role,
                 content,

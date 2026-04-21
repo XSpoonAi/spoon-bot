@@ -8,10 +8,40 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 from loguru import logger
+from starlette.websockets import WebSocketState
 
 from spoon_bot.gateway.websocket.protocol import WSEvent, WSMessage
+
+
+def _is_disconnect_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` indicates the WebSocket is no longer usable.
+
+    Covers:
+    - ``starlette.websockets.WebSocketDisconnect`` (client closed cleanly)
+    - ``websockets.exceptions.ConnectionClosed`` and subclasses
+    - ``RuntimeError`` raised by Starlette when the send-side is already closed
+      (e.g. "Cannot call 'send' once a close message has been sent.")
+    """
+    if isinstance(exc, WebSocketDisconnect):
+        return True
+
+    # ``websockets`` is an optional transitive dep of uvicorn; import lazily.
+    try:
+        from websockets.exceptions import ConnectionClosed as _WSConnectionClosed  # type: ignore
+    except Exception:  # pragma: no cover - defensive
+        _WSConnectionClosed = ()  # type: ignore[assignment]
+
+    if _WSConnectionClosed and isinstance(exc, _WSConnectionClosed):
+        return True
+
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if "close message" in msg or "websocket is disconnected" in msg or "after sending" in msg:
+            return True
+
+    return False
 
 
 @dataclass
@@ -159,6 +189,18 @@ class ConnectionManager:
         if not conn:
             return False
 
+        # Bail out early if the transport has already been torn down. This
+        # avoids noisy retries when the client closed the WebSocket while the
+        # server was mid-stream (the common cause of the spurious
+        # ``send_message ... failed (attempt 1/3)`` warnings seen in the wild).
+        ws_state = getattr(conn.websocket, "client_state", None)
+        if ws_state is not None and ws_state != WebSocketState.CONNECTED:
+            logger.debug(
+                f"send_message to {connection_id} skipped: connection state={ws_state.name if hasattr(ws_state, 'name') else ws_state}"
+            )
+            await self.disconnect(connection_id)
+            return False
+
         data = message.to_dict() if isinstance(message, WSMessage) else message
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -170,10 +212,20 @@ class ConnectionManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                # Client-side disconnect: don't retry, don't spam logs, and
+                # make sure the connection is cleaned up so future sends fast-fail.
+                if _is_disconnect_error(e):
+                    logger.debug(
+                        f"send_message to {connection_id} aborted: peer disconnected "
+                        f"({type(e).__name__}: {e})"
+                    )
+                    await self.disconnect(connection_id)
+                    return False
+
                 if attempt < max_retries:
                     logger.warning(
                         f"send_message to {connection_id} failed (attempt "
-                        f"{attempt + 1}/{max_retries + 1}): {e}"
+                        f"{attempt + 1}/{max_retries + 1}): {type(e).__name__}: {e}"
                     )
                     await asyncio.sleep(0.1 * (attempt + 1))
                     if connection_id not in self._connections:
@@ -181,7 +233,7 @@ class ConnectionManager:
                     continue
                 logger.error(
                     f"Failed to send message to {connection_id} after "
-                    f"{max_retries + 1} attempts: {e}"
+                    f"{max_retries + 1} attempts: {type(e).__name__}: {e}"
                 )
                 await self.disconnect(connection_id)
                 return False
@@ -265,7 +317,12 @@ class ConnectionManager:
             logger.debug(f"Connection {connection_id} unsubscribed from: {events}")
 
     async def _ping_loop(self) -> None:
-        """Send periodic pings to keep connections alive."""
+        """Send periodic pings to keep connections alive.
+
+        ``send_message`` now performs its own disconnect detection and
+        cleanup, so this loop just needs to trigger sends and let the manager
+        evict stale connections.
+        """
         while self._running:
             await asyncio.sleep(30)  # Ping every 30 seconds
 
@@ -275,8 +332,10 @@ class ConnectionManager:
                         conn_id,
                         {"type": "ping", "timestamp": datetime.utcnow().isoformat()},
                     )
-                except Exception:
-                    pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pragma: no cover - belt & suspenders
+                    logger.debug(f"ping to {conn_id} failed: {exc!r}")
 
     @property
     def connection_count(self) -> int:
