@@ -48,6 +48,7 @@ class ClientMethod(str, Enum):
     SESSION_CLEAR = "session.clear"
     SESSION_EXPORT = "session.export"
     SESSION_IMPORT = "session.import"
+    SESSION_SEARCH = "session.search"
 
     # Agent methods
     AGENT_STATUS = "agent.status"

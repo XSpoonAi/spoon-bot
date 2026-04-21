@@ -12,12 +12,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from threading import RLock
 from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Iterable, Optional, TYPE_CHECKING
 
 from loguru import logger
 
 if TYPE_CHECKING:
-    from spoon_bot.session.store import SessionStore
+    from spoon_bot.session.store import SearchHit, SessionStore
 
 
 # ============================================================================
@@ -210,6 +210,61 @@ class SessionManager:
         """Release backend resources."""
         with self._lock:
             self._store.close()
+
+    def search_messages(
+        self,
+        query: str,
+        *,
+        session_key: Optional[str] = None,
+        regex: bool = False,
+        case_sensitive: bool = False,
+        roles: Optional[Iterable[str]] = None,
+        include_extras: bool = True,
+        limit: int = 50,
+        offset: int = 0,
+        max_content_length: Optional[int] = 2000,
+    ) -> list["SearchHit"]:
+        """Search persisted messages (grep / SQL fallback for compacted context).
+
+        Results reflect whatever is currently *persisted* by the store; in-memory
+        mutations that haven't been ``save()``'d will not be visible.  Agent
+        loops save after every user turn, so in practice this returns the
+        current state minus any partial stream in flight.
+
+        Args / Returns: see :meth:`SessionStore.search_messages`.
+        """
+        with self._lock:
+            # Flush any dirty hot sessions that match the search scope so that
+            # search reflects the latest in-memory state.  We only flush the
+            # specific session if ``session_key`` is given; otherwise we
+            # flush everything cached (small dict, bounded by LRU).
+            to_flush: list[Session] = []
+            if session_key is not None:
+                sess = self._sessions.get(session_key)
+                if sess is not None:
+                    to_flush.append(sess)
+            else:
+                to_flush.extend(self._sessions.values())
+            for sess in to_flush:
+                try:
+                    self._store.save_session(sess)
+                except Exception as exc:
+                    logger.debug(
+                        f"search_messages: best-effort flush failed for "
+                        f"{sess.session_key}: {exc}"
+                    )
+
+        return self._store.search_messages(
+            query,
+            session_key=session_key,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            roles=roles,
+            include_extras=include_extras,
+            limit=limit,
+            offset=offset,
+            max_content_length=max_content_length,
+        )
 
     def _evict_if_needed(self) -> None:
         """Bound in-memory cache size by evicting oldest inserted sessions."""

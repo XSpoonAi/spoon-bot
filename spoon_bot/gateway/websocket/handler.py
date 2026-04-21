@@ -524,6 +524,7 @@ class WebSocketHandler:
             "session.clear": self._handle_session_clear,
             ClientMethod.SESSION_EXPORT.value: self._handle_session_export,
             ClientMethod.SESSION_IMPORT.value: self._handle_session_import,
+            ClientMethod.SESSION_SEARCH.value: self._handle_session_search,
             # Subscription
             "subscribe": self._handle_subscribe,
             "unsubscribe": self._handle_unsubscribe,
@@ -1088,6 +1089,133 @@ class WebSocketHandler:
             }
         except Exception:
             return {"sessions": []}
+
+    async def _handle_session_search(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle ``session.search``.
+
+        Runs a persisted-history search across one or all sessions so the
+        client / model can recover earlier tool calls, tool results, or
+        message bodies that have fallen out of the runtime context due to
+        compaction.
+
+        Params:
+          q (str, required): search query.
+          session_key (str, optional): restrict to a single session.
+          regex (bool, default False): interpret ``q`` as a regex.
+          case_sensitive (bool, default False).
+          roles (list[str], optional): restrict to these message roles
+              (e.g. ``["tool", "assistant"]``).
+          include_extras (bool, default True): also match serialized
+              ``tool_call_id`` / ``tool_calls`` / ``attachments`` metadata.
+          limit (int, default 50, max 500).
+          offset (int, default 0).
+          max_content_length (int, default 2000): truncate returned
+              ``content`` to at most N characters.
+        """
+        import re as _re
+
+        query = params.get("q") or params.get("query")
+        if not isinstance(query, str) or not query:
+            return {"error": "INVALID_QUERY", "message": "q is required"}
+
+        # Wait for any pending chat task so the freshest turn is persisted
+        # before we search.
+        if self._current_task and not self._current_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._current_task), timeout=30.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
+        agent = get_agent()
+        sessions_manager = getattr(agent, "sessions", None)
+        if sessions_manager is None:
+            return {"error": "INTERNAL_ERROR", "message": "Session manager unavailable"}
+
+        session_key = params.get("session_key")
+        if session_key is not None and not isinstance(session_key, str):
+            return {"error": "INVALID_QUERY", "message": "session_key must be a string"}
+
+        roles_raw = params.get("roles")
+        roles: list[str] | None
+        if roles_raw is None:
+            roles = None
+        elif isinstance(roles_raw, (list, tuple)):
+            roles = [str(r) for r in roles_raw if r]
+            if not roles:
+                roles = None
+        else:
+            return {"error": "INVALID_QUERY", "message": "roles must be a list"}
+
+        def _as_bool(value: Any, default: bool) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(value)
+
+        def _as_int(value: Any, default: int, *, low: int, high: int) -> int:
+            if value is None:
+                return default
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                return default
+            return max(low, min(high, n))
+
+        regex = _as_bool(params.get("regex"), False)
+        case_sensitive = _as_bool(params.get("case_sensitive"), False)
+        include_extras = _as_bool(params.get("include_extras"), True)
+        limit = _as_int(params.get("limit"), 50, low=1, high=500)
+        offset = _as_int(params.get("offset"), 0, low=0, high=1_000_000)
+        max_content_length_raw = params.get("max_content_length", 2000)
+        if max_content_length_raw is None:
+            max_content_length: int | None = None
+        else:
+            max_content_length = _as_int(
+                max_content_length_raw, 2000, low=1, high=100_000
+            )
+
+        try:
+            hits = sessions_manager.search_messages(
+                query,
+                session_key=session_key,
+                regex=regex,
+                case_sensitive=case_sensitive,
+                roles=roles,
+                include_extras=include_extras,
+                limit=limit,
+                offset=offset,
+                max_content_length=max_content_length,
+            )
+        except _re.error as exc:
+            return {"error": "INVALID_REGEX", "message": str(exc)}
+        except ValueError as exc:
+            return {"error": "INVALID_QUERY", "message": str(exc)}
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"session.search failed: {exc}")
+            return {"error": "INTERNAL_ERROR", "message": "Search failed"}
+
+        return {
+            "query": query,
+            "total": len(hits),
+            "limit": limit,
+            "offset": offset,
+            "hits": [
+                {
+                    "session_key": h.session_key,
+                    "seq": h.seq,
+                    "role": h.role,
+                    "content": h.content,
+                    "timestamp": h.timestamp,
+                    "matched_in": h.matched_in,
+                    "snippet": h.snippet,
+                    "extras": dict(h.extras) if h.extras else {},
+                }
+                for h in hits
+            ],
+        }
 
     async def _handle_session_clear(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle session clear."""

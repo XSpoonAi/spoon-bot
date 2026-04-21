@@ -81,6 +81,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.grep import GrepTool
+from spoon_bot.agent.tools.history_search import SearchHistoryTool
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_owner,
     build_tool_owner_key,
@@ -503,6 +504,18 @@ class AgentLoop:
 
         self._git = GitManager(self.workspace) if auto_commit else None
 
+        # Deploy built-in skills to the runtime workspace (idempotent)
+        try:
+            from spoon_bot.skills.builtin import ensure_builtin_skills
+            _newly_installed = ensure_builtin_skills(self.workspace)
+            if _newly_installed:
+                logger.info(
+                    f"Installed {len(_newly_installed)} built-in skill(s): "
+                    f"{[p.name for p in _newly_installed]}"
+                )
+        except Exception as exc:
+            logger.debug(f"Built-in skill deployment skipped: {exc}")
+
         # Skill paths: runtime workspace + bundled skills shipped with spoon-bot
         self._skill_paths = [self.workspace / "skills"]
         _bundled_skills = Path(__file__).resolve().parent.parent.parent / "workspace" / "skills"
@@ -549,6 +562,14 @@ class AgentLoop:
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
 
+        # Tracks the skill name injected by _pre_inject_matched_skill()
+        self._pre_injected_skill_name: str | None = None
+
+        # Conditional activation — file paths touched during this session.
+        # Skills declaring ``paths`` frontmatter are dormant until a touched
+        # file matches one of their patterns (mirrors Claude Code behaviour).
+        self._touched_paths: set[str] = set()
+
         # Provider retry config (exponential backoff for transient LLM errors)
         self._retry_config = RetryConfig(
             max_retries=self._config.provider_max_retries,
@@ -594,31 +615,27 @@ class AgentLoop:
         skills_xml = self._build_skills_for_prompt()
         if skills_xml:
             system_prompt += f"\n## Installed Skills\n{skills_xml}\n"
-
-        if skills_xml:
             system_prompt += (
-                "\n> **FIRST ACTION**: Match the user's request to a skill above "
-                "by name/description, then `read_file` its `<location>` path. "
-                "Do NOT call skill_marketplace, web_search, or filesystem search first.\n"
+                "\nWhen a user request matches a skill by name, description, or "
+                "`when_to_use`, read its SKILL.md first (unless already pre-loaded "
+                "in the message). Follow the skill's own procedures directly.\n"
             )
 
         system_prompt += (
             "\n## Workflow\n"
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
-            "1. **Read SKILL.md**: If a skill above matches, `read_file` its path. "
-            "Extract config, addresses, commands.\n"
-            "2. **Execute**: Run commands from SKILL.md directly via shell "
-            "(`cast`, `curl`, etc.). Do NOT write script files.\n"
-            "3. **Done**: Summarize result. Save key state to `soul.md`.\n\n"
-            "Only use `web_search` if NO installed skill matches the task.\n\n"
+            "1. If a [PRE-LOADED SKILL] block is present in the user message, "
+            "execute its instructions immediately — do NOT re-read it.\n"
+            "2. Otherwise, if a skill matches, `read_file` its SKILL.md path, "
+            "then execute.\n"
+            "3. Run commands from SKILL.md directly via shell. Do NOT write script files.\n"
+            "4. Summarize result when done.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
             "- `source .env.local` before commands that need env vars.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
             "- Follow user instructions exactly — respect specific IDs, names, actions.\n"
-            "\n## Agent Memory (soul.md)\n"
-            "After completing significant actions, append a timestamped entry to `soul.md`.\n"
-            "Format: `## YYYY-MM-DD HH:MM — <topic>` followed by bullet points.\n"
+            "- Only use `web_search` if NO installed skill matches the task.\n"
         )
 
         # Inject soul.md content if it exists
@@ -776,11 +793,17 @@ class AgentLoop:
         _extra_read: list[Path] = [Path.home()]
         if self.yolo_mode:
             _extra_read.extend(p for p in self.workspace.parents if p != Path.home())
-        self.tools.register(ReadFileTool(workspace=self.workspace, additional_read_paths=_extra_read, max_output=15000))
-        self.tools.register(WriteFileTool(workspace=self.workspace))
-        self.tools.register(EditFileTool(workspace=self.workspace))
-        self.tools.register(ListDirTool(workspace=self.workspace, additional_read_paths=_extra_read))
-        self.tools.register(GrepTool(workspace=self.workspace))
+
+        _file_tools = [
+            ReadFileTool(workspace=self.workspace, additional_read_paths=_extra_read, max_output=15000),
+            WriteFileTool(workspace=self.workspace),
+            EditFileTool(workspace=self.workspace),
+            ListDirTool(workspace=self.workspace, additional_read_paths=_extra_read),
+            GrepTool(workspace=self.workspace),
+        ]
+        for ft in _file_tools:
+            ft._path_touch_callback = lambda p: self.record_touched_paths(p)
+            self.tools.register(ft)
 
         # Self-management tools
         self.tools.register(SelfConfigTool())
@@ -804,6 +827,29 @@ class AgentLoop:
 
         # Background task tool
         self.tools.register(SpawnTool())
+
+        # Conversation history search — fallback for post-compaction
+        # recovery of earlier tool calls / results / user messages.
+        #
+        # Pass a resolver callable instead of relying on
+        # ``set_default_session_key`` being invoked on every session
+        # switch.  Session switches can happen from multiple call
+        # sites (gateway WS handler, channel code, REST routes) and
+        # not all of them go through AgentLoop's explicit switch
+        # hooks, so a pull-based lookup is safer than push-based
+        # synchronisation.
+        def _current_session_key() -> str | None:
+            sess = self._session
+            return sess.session_key if sess is not None else None
+
+        self._history_search_tool = SearchHistoryTool(
+            self.sessions,
+            default_session_key=(
+                self._session.session_key if self._session is not None else None
+            ),
+            session_key_resolver=_current_session_key,
+        )
+        self.tools.register(self._history_search_tool)
 
         # Web tools
         self.tools.register(WebSearchTool())
@@ -1071,40 +1117,33 @@ class AgentLoop:
         return sum(len(m.get("content", "")) for m in self._session.messages) // 4
 
     def _trim_context_if_needed(self) -> int:
-        """Auto-trim oldest messages if context budget approaches the limit.
+        """No-op placeholder.
 
-        Keeps at minimum the two most recent messages (last user + assistant pair).
-        Raises ContextOverflowError if even after trimming the context is too large.
+        History compaction is deliberately **runtime-only** now
+        (``_compress_runtime_context`` / ``_force_compress_runtime_context``):
+
+        * The persisted session store remains the authoritative, *complete*
+          transcript — tool-call inputs/outputs included.
+        * Runtime memory (what the LLM sees) is compacted in place with
+          full tool-pair atomicity (see :meth:`_compress_runtime_context`).
+        * Anything that falls out of runtime memory is still reachable via
+          the :class:`SearchHistoryTool` because the store was never
+          mutated.
+
+        Earlier versions of this method would call
+        ``self._session.messages.pop(0)`` whenever the *session-side*
+        estimate exceeded the window.  That permanently destroyed
+        persisted history (breaking ``search_history`` / cross-session
+        recall), and could leave orphan tool results behind because the
+        pop was not tool-segment-aware.  Both problems are now fixed by
+        simply refusing to touch the session store here.
+
+        A future bounded-history policy (e.g. "cap each JSONL at N
+        messages") should be implemented as a dedicated, opt-in pruner
+        that *also* updates any search index — NOT inside the per-turn
+        context-budget path.
         """
-        if not self._session.messages:
-            return 0
-
-        budget = int(self.context_window * 0.75)
-        estimated = self._estimate_token_count()
-
-        if estimated <= budget:
-            return 0
-
-        logger.warning(
-            f"Context approaching limit: ~{estimated:,} tokens "
-            f"(budget: {budget:,}, window: {self.context_window:,}). "
-            f"Trimming oldest messages."
-        )
-
-        messages = self._session.messages
-        trimmed_count = 0
-        while len(messages) > 2 and self._estimate_token_count() > budget:
-            removed = messages.pop(0)
-            trimmed_count += 1
-            logger.debug(
-                f"Trimmed message: role={removed.get('role')}, "
-                f"len={len(removed.get('content', ''))}"
-            )
-
-        # If still over the hard limit after trimming, raise
-        final_estimate = self._estimate_token_count()
-        if final_estimate > self.context_window:
-            raise ContextOverflowError(final_estimate, self.context_window)
+        return 0
 
         return trimmed_count
 
@@ -1129,6 +1168,65 @@ class AgentLoop:
             if hasattr(self._session, "get_messages")
             else self._session.get_history()
         )
+
+        # Lazy import — these are only needed when re-hydrating tool-call
+        # metadata persisted by _capture_turn_tool_trace.
+        try:
+            from spoon_ai.schema import Function as _CoreFunction  # noqa: F401
+        except Exception:  # pragma: no cover - defensive
+            _CoreFunction = None  # type: ignore[assignment]
+
+        def _rehydrate_tool_calls(raw: Any) -> list | None:
+            """Convert persisted ``tool_calls`` extras back into ToolCall objects.
+
+            The tool-trace capture path stores ``tool_calls`` as a list of
+            plain dicts (``{"id", "type", "function": {"name", "arguments"}}``).
+            spoon-core's ``agent.add_message`` expects ``ToolCall`` models so
+            it can normalise / serialise them for the LLM provider.  Without
+            this rehydration the tool_call <-> tool-result pairing is lost on
+            every history sync and ``drop_orphaned_tool_messages`` will prune
+            every tool result before the next API call.
+            """
+            if not raw or _CoreFunction is None:
+                return None
+            if not isinstance(raw, list):
+                return None
+            out: list = []
+            for item in raw:
+                if isinstance(item, CoreToolCall):
+                    out.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                tc_id = item.get("id")
+                if not tc_id:
+                    continue
+                fn = item.get("function") or {}
+                if isinstance(fn, dict):
+                    name = fn.get("name") or ""
+                    arguments = fn.get("arguments") or ""
+                else:
+                    name = getattr(fn, "name", "") or ""
+                    arguments = getattr(fn, "arguments", "") or ""
+                if arguments is not None and not isinstance(arguments, str):
+                    try:
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    except Exception:
+                        arguments = str(arguments)
+                try:
+                    out.append(
+                        CoreToolCall(
+                            id=str(tc_id),
+                            type=str(item.get("type") or "function"),
+                            function=_CoreFunction(
+                                name=str(name), arguments=str(arguments or "")
+                            ),
+                        )
+                    )
+                except Exception:
+                    continue
+            return out or None
+
         for msg in history_messages:
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
@@ -1157,8 +1255,26 @@ class AgentLoop:
                 attachments=attachments,
             )
 
+            # Forward tool metadata so runtime memory stays a faithful
+            # replay of what the LLM originally saw.  Without these
+            # fields, ``drop_orphaned_tool_messages`` will strip every
+            # persisted tool result before the next provider call
+            # because its ``tool_call_id`` will be ``None``.
+            extra_kwargs: dict[str, Any] = {}
+            if role == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id:
+                    extra_kwargs["tool_call_id"] = str(tc_id)
+                tool_name = msg.get("name") or msg.get("tool_name")
+                if tool_name:
+                    extra_kwargs["tool_name"] = str(tool_name)
+            elif role == "assistant":
+                rehydrated = _rehydrate_tool_calls(msg.get("tool_calls"))
+                if rehydrated:
+                    extra_kwargs["tool_calls"] = rehydrated
+
             try:
-                await self._agent.add_message(role, content)
+                await self._agent.add_message(role, content, **extra_kwargs)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -1169,28 +1285,206 @@ class AgentLoop:
         return injected_count
 
     async def _prepare_request_context(self) -> None:
-        """Prepare request context by trimming and injecting session history."""
-        trimmed_count = self._trim_context_if_needed()
+        """Prepare request context by injecting session history and, if
+        needed, compacting runtime memory *before* the LLM sees it.
+
+        Persisted history (``self._session.messages``) is the authoritative
+        store and is never trimmed here — see
+        :meth:`_trim_context_if_needed` for the reasoning.  Runtime memory
+        is what goes into the next provider request, so that is the only
+        thing compacted by this method.
+        """
+        trimmed_count = self._trim_context_if_needed()  # always 0 now
         injected_count = await self._sync_runtime_history_from_session()
 
         # Repair tool-call ordering after history injection — session storage
         # may not preserve tool_call_id metadata, producing orphaned tool
         # messages that providers (OpenAI, Gemini, etc.) reject.
         repaired = 0
+        messages_ref: list | None = None
         if self._agent and hasattr(self._agent, "memory"):
-            messages = getattr(self._agent.memory, "messages", None)
-            if isinstance(messages, list):
-                repaired = self._normalize_runtime_tool_context(messages)
+            messages_ref = getattr(self._agent.memory, "messages", None)
+            if isinstance(messages_ref, list):
+                repaired = self._normalize_runtime_tool_context(messages_ref)
 
-        estimated_tokens = self._estimate_token_count()
+        # Proactively compact runtime memory before the turn so we don't
+        # have to rely on a provider token-overflow error to trigger
+        # compaction.  ``_compress_runtime_context`` is a no-op when we're
+        # under the 50 % budget.  It preserves tool-pair atomicity and
+        # (if a drop happens) injects a ``[history-compacted]`` marker
+        # message pointing the model at ``search_history``.
+        compressed = 0
+        if isinstance(messages_ref, list) and messages_ref:
+            try:
+                compressed = self._compress_runtime_context()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Proactive runtime compression skipped: {exc}")
+
+        runtime_tokens = self._estimate_runtime_tokens()
+        session_tokens = self._estimate_token_count()
 
         logger.info(
             f"Session context prepared: session={self.session_key}, "
             f"injected_messages={injected_count}, "
-            f"estimated_tokens~{estimated_tokens}, "
+            f"runtime_tokens~{runtime_tokens}, session_tokens~{session_tokens}, "
             f"trimmed_messages={trimmed_count}"
             + (f", repaired_tool_order={repaired}" if repaired else "")
+            + (f", compressed_actions={compressed}" if compressed else "")
         )
+
+    def _runtime_memory_snapshot_index(self) -> int:
+        """Return the current length of runtime memory.
+
+        Callers snapshot this *before* a turn begins so they can later
+        iterate only the messages that were produced during that turn —
+        typically tool-call and intermediate assistant messages that we
+        want to persist for post-hoc search/recovery.
+        """
+        try:
+            return len(AgentLoop._get_runtime_memory_messages(self))
+        except Exception:
+            return 0
+
+    def _capture_turn_tool_trace(self, start_index: int) -> list[dict[str, Any]]:
+        """Capture tool-call artifacts added since ``start_index``.
+
+        We persist three kinds of messages so a later ``search_history``
+        query can surface them after context compaction:
+
+        * ``role=tool`` — the full tool result the model actually saw.
+          We keep ``tool_call_id`` and ``name`` as extras so they can be
+          correlated with the originating assistant call and filtered by
+          tool name.
+        * ``role=assistant`` messages that carry non-empty ``tool_calls``
+          but no final user-visible content (the "I'm about to call X"
+          turns).  These are normally squashed into the final assistant
+          reply; without them, future history sync can't pair tool
+          results with their call-site.  We serialize ``tool_calls`` in
+          the same shape the OpenAI function-calling spec uses.
+
+        The final assistant reply is persisted separately by the caller.
+        ``role=user`` messages are untouched — the caller handles those
+        with their own media / attachment kwargs.
+        """
+        if not isinstance(start_index, int) or start_index < 0:
+            return []
+
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if not messages or start_index >= len(messages):
+            return []
+
+        captured: list[dict[str, Any]] = []
+        for msg in messages[start_index:]:
+            role = AgentLoop._stream_message_role(msg).lower()
+            if role not in ("tool", "assistant"):
+                continue
+
+            content = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if not isinstance(content, str) or not content:
+                content = AgentLoop._stream_message_attr(msg, "content", "") or ""
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content = str(content)
+
+            extras: dict[str, Any] = {}
+
+            if role == "tool":
+                tool_call_id = AgentLoop._stream_message_attr(msg, "tool_call_id", None) \
+                    or AgentLoop._stream_message_attr(msg, "id", None)
+                if tool_call_id:
+                    extras["tool_call_id"] = str(tool_call_id)
+                name = AgentLoop._stream_message_attr(msg, "name", None)
+                if name:
+                    extras["name"] = str(name)
+            else:  # assistant
+                tool_calls = AgentLoop._stream_message_attr(msg, "tool_calls", None) or []
+                serialized: list[dict[str, Any]] = []
+                for tc in tool_calls:
+                    tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+                    tc_type = (
+                        getattr(tc, "type", None)
+                        or (tc.get("type") if isinstance(tc, dict) else None)
+                        or "function"
+                    )
+                    fn = getattr(tc, "function", None) or (
+                        tc.get("function") if isinstance(tc, dict) else None
+                    )
+                    if fn is not None:
+                        tc_name = getattr(fn, "name", None) or (
+                            fn.get("name") if isinstance(fn, dict) else None
+                        )
+                        tc_args = getattr(fn, "arguments", None) or (
+                            fn.get("arguments") if isinstance(fn, dict) else None
+                        )
+                    else:
+                        tc_name = getattr(tc, "name", None)
+                        tc_args = getattr(tc, "arguments", None)
+
+                    if tc_args is not None and not isinstance(tc_args, str):
+                        try:
+                            tc_args = json.dumps(tc_args, ensure_ascii=False)
+                        except Exception:
+                            tc_args = str(tc_args)
+
+                    if tc_name or tc_id:
+                        serialized.append(
+                            {
+                                "id": tc_id,
+                                "type": tc_type,
+                                "function": {
+                                    "name": tc_name,
+                                    "arguments": tc_args or "",
+                                },
+                            }
+                        )
+                if not serialized:
+                    # Nothing tool-related to preserve; the final assistant
+                    # reply is saved separately by the caller.
+                    continue
+                extras["tool_calls"] = serialized
+
+            captured.append({"role": role, "content": content, "extras": extras})
+        return captured
+
+    def _persist_turn_tool_trace(self, start_index: int) -> int:
+        """Append captured tool-trace messages to ``self._session``.
+
+        Returns the number of messages appended.  Skipped silently when the
+        session has no room or persistence is disabled via
+        ``SPOON_BOT_PERSIST_TOOL_TRACE=false`` / ``0`` / ``no``.
+        """
+        if not self._should_persist_tool_trace():
+            return 0
+
+        try:
+            trace = self._capture_turn_tool_trace(start_index)
+        except Exception as exc:
+            logger.debug(f"Tool-trace capture failed: {exc}")
+            return 0
+
+        if not trace:
+            return 0
+
+        for entry in trace:
+            try:
+                self._session.add_message(
+                    entry["role"], entry["content"], **entry.get("extras", {})
+                )
+            except Exception as exc:
+                logger.debug(f"Tool-trace persist skipped a message: {exc}")
+        return len(trace)
+
+    @staticmethod
+    def _should_persist_tool_trace() -> bool:
+        """Whether to persist tool traces alongside user/assistant turns."""
+        import os as _os
+
+        raw = _os.getenv("SPOON_BOT_PERSIST_TOOL_TRACE")
+        if raw is None:
+            return True
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
 
     def _build_runtime_message_content(
         self,
@@ -1284,9 +1578,17 @@ class AgentLoop:
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
+            if getattr(self, "_history_search_tool", None) is not None:
+                try:
+                    self._history_search_tool.set_default_session_key(session_key)
+                except Exception:
+                    pass
             logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message: {message[:100]}...")
+
+        # Reset per-request state
+        self._pre_injected_skill_name = None
 
         # Refresh memory context
         try:
@@ -1323,6 +1625,10 @@ class AgentLoop:
         )
         if isinstance(runtime_message, str):
             message = runtime_message
+
+        # Snapshot runtime memory length before this turn begins so we can
+        # later persist the tool-call trace produced during the turn.
+        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1425,6 +1731,7 @@ class AgentLoop:
                 _strip_attachment_context(message, attachments or []),
                 **save_kwargs,
             )
+            self._persist_turn_tool_trace(_pre_turn_memory_index)
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
@@ -1893,6 +2200,84 @@ class AgentLoop:
             return role == "tool"
         return False
 
+    @classmethod
+    def _snap_drop_end_to_turn_boundary(
+        cls, messages: list, keep_head: int, desired_end: int
+    ) -> int:
+        """Return an index <= desired_end that sits on a safe boundary.
+
+        A *safe* drop boundary is a position ``k`` where:
+          * ``messages[k]`` is ``role="user"`` (start of the next turn), OR
+          * ``messages[k]`` is ``role="assistant"`` with no ``tool_calls`` and
+            not followed immediately by a ``role="tool"`` message (i.e. the
+            tool chain that the previous assistant opened is fully settled
+            at the end of index ``k - 1``).
+
+        Snapping ensures we never split an assistant(tool_calls) → tool(result)
+        pair, which would leak orphans the provider rejects.  If no boundary
+        is found, we fall back to ``keep_head`` (i.e. drop nothing) so the
+        safety invariant wins over the token-budget target.
+        """
+        if desired_end <= keep_head:
+            return keep_head
+        end = min(desired_end, len(messages))
+
+        def _role(i: int) -> str | None:
+            if i < 0 or i >= len(messages):
+                return None
+            return cls._message_role_value(messages[i])
+
+        def _has_tool_calls(i: int) -> bool:
+            if i < 0 or i >= len(messages):
+                return False
+            tc = getattr(messages[i], "tool_calls", None)
+            return bool(tc)
+
+        # Walk backwards from desired_end looking for a clean cut.  The cut
+        # index k means "delete messages[keep_head:k]", so messages[k]
+        # becomes the new first non-head message.
+        for k in range(end, keep_head, -1):
+            role = _role(k)
+            if role == "user":
+                return k
+            if role == "assistant" and not _has_tool_calls(k):
+                if _role(k + 1) != "tool":
+                    return k
+        return keep_head
+
+    def _insert_compaction_marker(self, messages: list, dropped: int) -> None:
+        """Insert a runtime-only marker telling the model history was trimmed.
+
+        The marker is a ``role="user"`` system-style message that documents
+        how many prior messages were removed from runtime memory and points
+        the model at the :class:`SearchHistoryTool` as the recovery path.
+        It is **not** persisted to the session store — the store still holds
+        the full transcript — so adding the marker is idempotent across
+        turns.
+        """
+        if not self._agent or not hasattr(self._agent, "memory"):
+            return
+        try:
+            from spoon_ai.schema import Message, Role  # lazy import
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        marker_text = (
+            "[history-compacted] "
+            f"{dropped} older message(s) (including any tool-call/result pairs) "
+            "were removed from this turn's in-memory context to fit the token "
+            "budget.  The full transcript is preserved on disk — if you need "
+            "an earlier tool result, argument, or user statement, call the "
+            "`search_history` tool (scope='current')."
+        )
+        try:
+            marker = Message(role=Role.USER, content=marker_text)
+        except Exception:
+            return
+
+        insert_at = 1 if messages else 0
+        messages.insert(insert_at, marker)
+
     def _compress_runtime_context(self) -> int:
         """Proactively compress the agent's runtime context.
 
@@ -1953,16 +2338,39 @@ class AgentLoop:
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
+        #
+        # *Segment-aware* drop: we only cut along user-turn boundaries so a
+        # drop never splits an ``assistant(tool_calls) -> tool(result)``
+        # chain.  Partial splits would leak through as orphaned tool
+        # messages and the LLM provider would reject the whole request.
+        # The persisted session store is untouched, so anything dropped
+        # here remains reachable via ``search_history``.
         estimated = self._estimate_runtime_tokens()
+        dropped_in_phase3 = 0
         if estimated > budget and len(messages) > 12:
             keep_head = 1
             keep_tail_drop = min(8, len(messages) - 1)
             droppable = len(messages) - keep_head - keep_tail_drop
             if droppable > 4:
-                drop_count = droppable // 2
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
-                logger.info(f"Phase 3: dropped {drop_count} oldest messages")
+                desired = droppable // 2
+                snap_end = self._snap_drop_end_to_turn_boundary(
+                    messages, keep_head, keep_head + desired
+                )
+                actual_drop = max(0, snap_end - keep_head)
+                if actual_drop > 0:
+                    del messages[keep_head:keep_head + actual_drop]
+                    compressed += actual_drop
+                    dropped_in_phase3 = actual_drop
+                    logger.info(
+                        f"Phase 3: dropped {actual_drop} oldest messages "
+                        f"(segment-snapped from desired {desired})"
+                    )
+
+        # Phase 3b: Insert a compaction marker so the model knows prior
+        # turns are recoverable via ``search_history``.  The marker is
+        # runtime-only; it never touches the persisted session.
+        if dropped_in_phase3 > 0:
+            self._insert_compaction_marker(messages, dropped_in_phase3)
 
         # Phase 4: Repair tool_use/tool_result pairing broken by message deletion.
         compressed += self._repair_tool_pairing(messages)
@@ -1997,14 +2405,23 @@ class AgentLoop:
                 msg.content = compressed_content
                 compressed += 1
 
-        # Drop all but first + last 6 messages
+        # Drop all but first + last 6 messages (segment-aware)
+        dropped = 0
         if len(messages) > 8:
             keep_head = 1
             keep_tail = min(6, len(messages) - 1)
-            drop_count = len(messages) - keep_head - keep_tail
-            if drop_count > 0:
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
+            desired_end = len(messages) - keep_tail
+            snap_end = self._snap_drop_end_to_turn_boundary(
+                messages, keep_head, desired_end
+            )
+            actual_drop = max(0, snap_end - keep_head)
+            if actual_drop > 0:
+                del messages[keep_head:keep_head + actual_drop]
+                compressed += actual_drop
+                dropped = actual_drop
+
+        if dropped > 0:
+            self._insert_compaction_marker(messages, dropped)
 
         # Repair tool pairing broken by message deletion
         compressed += self._repair_tool_pairing(messages)
@@ -2554,6 +2971,10 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
+        # Snapshot runtime memory length before the turn so we can persist
+        # the tool-call trace produced while streaming.
+        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+
         try:
             capture_manager = capture_tool_outputs()
             tool_output_capture_scope = capture_manager.__enter__()
@@ -2943,6 +3364,10 @@ class AgentLoop:
                     _strip_attachment_context(message, attachments or []),
                     **save_kwargs,
                 )
+                # Persist intermediate tool-call artifacts generated while
+                # streaming so they remain searchable even after runtime
+                # context compaction.
+                self._persist_turn_tool_trace(_pre_turn_memory_index)
                 self._session.add_message("assistant", full_content)
                 self.sessions.save(self._session)
             except Exception as e:
@@ -2973,6 +3398,11 @@ class AgentLoop:
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
+            if getattr(self, "_history_search_tool", None) is not None:
+                try:
+                    self._history_search_tool.set_default_session_key(session_key)
+                except Exception:
+                    pass
             logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
@@ -2998,6 +3428,11 @@ class AgentLoop:
         )
         if isinstance(runtime_message, str):
             message = runtime_message
+
+        # Snapshot runtime memory length *before* adding the new user turn
+        # so we can later collect the tool-call trace produced during this
+        # turn and persist it for post-hoc search.
+        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         try:
             _base_prompt = self._select_next_step_prompt(message, thinking=True)
@@ -3054,6 +3489,10 @@ class AgentLoop:
                 _strip_attachment_context(message, attachments or []),
                 **save_kwargs,
             )
+            # Persist intermediate tool-call artifacts (tool results and the
+            # assistant messages that called them) so they remain searchable
+            # even after runtime context compaction.
+            self._persist_turn_tool_trace(_pre_turn_memory_index)
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
@@ -3078,72 +3517,405 @@ class AgentLoop:
             raw = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', raw)
         return raw
 
-    def _pre_inject_matched_skill(self, message: str) -> str:
-        """Match user message to an installed skill and prepend SKILL.md content.
+    # Directories in the workspace root that are never skills
+    _WORKSPACE_INFRA_DIRS = frozenset({
+        "skills", "logs", "sessions", "memory",
+        "channels", "wallet", ".git",
+    })
 
-        Saves 2-5 agent steps by providing skill content upfront so the
-        agent can start executing immediately without calling read_file.
+    # Common stop words filtered out during skill-matching token comparison
+    _SKILL_MATCH_STOP_WORDS = frozenset({
+        "when", "use", "this", "the", "for", "and", "with",
+        "that", "from", "needs", "need", "should", "also",
+        "through", "using", "codex", "claude", "agent",
+        "local", "based", "first", "only", "needed", "prefer", "logic",
+    })
+
+    # Scoring weights for _pre_inject_matched_skill (tune here, not inline)
+    _SCORE_NAME_TOKEN = 2
+    _SCORE_TRIGGER = 3
+    _SCORE_WHEN_TO_USE = 4
+    _SCORE_DESCRIPTION = 1
+    _SCORE_THRESHOLD = 2
+
+    # ------------------------------------------------------------------
+    # Conditional activation helpers
+    # ------------------------------------------------------------------
+
+    def record_touched_paths(self, *paths: str | Path) -> None:
+        """Register file paths the agent has interacted with.
+
+        Called by file-oriented tools (read_file, write_file, edit_file, etc.)
+        so that path-conditional skills can be activated dynamically.
+
+        Also performs **dynamic discovery**: walks up from the touched path
+        looking for directories containing ``SKILL.md`` and adds them to
+        ``_skill_paths`` if not already known (inspired by Claude Code's
+        ``discoverSkillDirsForPaths``).
+        """
+        for p in paths:
+            resolved = Path(p)
+            if not resolved.is_absolute():
+                resolved = self.workspace / resolved
+            try:
+                resolved = resolved.resolve()
+            except OSError:
+                pass
+
+            try:
+                rel = str(resolved.relative_to(self.workspace))
+            except (ValueError, OSError):
+                rel = str(p)
+            self._touched_paths.add(rel.replace("\\", "/"))
+
+            self._discover_skills_near(resolved)
+
+    def _discover_skills_near(self, file_path: Path) -> None:
+        """Walk up from *file_path* looking for ``skills/`` directories.
+
+        When a directory containing ``SKILL.md`` files is found and is not
+        already in ``_skill_paths``, it is added dynamically.  This mirrors
+        Claude Code's ``discoverSkillDirsForPaths`` which walks up from every
+        file operation to find project-level ``.claude/skills/`` directories.
+
+        Only walks up to ``self.workspace`` (never above).
+        """
+        known = {str(Path(sp).resolve()) for sp in self._skill_paths}
+        current = file_path.parent if file_path.is_file() else file_path
+
+        try:
+            ws_resolved = self.workspace.resolve()
+        except OSError:
+            return
+
+        while True:
+            try:
+                if not current.is_relative_to(ws_resolved):
+                    break
+            except (TypeError, ValueError):
+                break
+
+            skills_dir = current / "skills"
+            if skills_dir.is_dir() and str(skills_dir.resolve()) not in known:
+                has_skill = any(
+                    (child / "SKILL.md").exists()
+                    for child in skills_dir.iterdir()
+                    if child.is_dir()
+                )
+                if has_skill:
+                    self._skill_paths.append(skills_dir)
+                    known.add(str(skills_dir.resolve()))
+                    logger.info(f"Dynamic skill discovery: found {skills_dir}")
+
+            if current == ws_resolved:
+                break
+            current = current.parent
+
+    @staticmethod
+    def _skill_paths_match(
+        patterns: list[str], touched: set[str], workspace: Path | None = None,
+    ) -> bool:
+        """Return True if any *touched* file matches at least one *pattern*.
+
+        Patterns use gitignore-style globs (``fnmatch``).  A leading ``!``
+        negates (exclude) the pattern — same semantics as ``.gitignore``.
+        An empty *patterns* list means "always active" (unconditional).
+        """
+        from fnmatch import fnmatch
+
+        if not patterns:
+            return True
+        if not touched:
+            return False
+
+        for fp in touched:
+            included = False
+            for pat in patterns:
+                negate = pat.startswith("!")
+                glob = pat.lstrip("!")
+                if fnmatch(fp, glob) or fnmatch(fp, f"**/{glob}"):
+                    included = not negate
+            if included:
+                return True
+        return False
+
+    @staticmethod
+    def _parse_skill_frontmatter(skill_md: Path) -> dict[str, str | list[str]]:
+        """Extract description, when_to_use, triggers, and paths from SKILL.md YAML frontmatter.
+
+        The ``paths`` field (list of gitignore-style glob patterns) enables
+        conditional activation: skills declaring ``paths`` are only active when
+        recently-touched files match at least one pattern.  Skills without
+        ``paths`` are unconditionally active.
         """
         import re as _re
 
+        result: dict[str, str | list[str]] = {
+            "description": "", "when_to_use": "", "triggers": "", "paths": [],
+        }
+        try:
+            raw = skill_md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return result
+
+        fm = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
+        if not fm:
+            for line in raw.split("\n")[1:20]:
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("#", "---", "```")):
+                    result["description"] = stripped[:300]
+                    break
+            return result
+
+        fm_text = fm.group(1)
+        in_multiline = ""
+        in_paths_list = False
+        trigger_fragments: list[str] = []
+        paths_list: list[str] = []
+
+        for line in fm_text.split("\n"):
+            stripped = line.strip()
+
+            if in_paths_list:
+                if stripped.startswith("- "):
+                    paths_list.append(stripped[2:].strip().strip("'\""))
+                    continue
+                elif line.startswith("  ") or line.startswith("\t"):
+                    if stripped.startswith("- "):
+                        paths_list.append(stripped[2:].strip().strip("'\""))
+                    continue
+                else:
+                    in_paths_list = False
+
+            if in_multiline:
+                if line.startswith("  ") or line.startswith("\t"):
+                    if in_multiline == "description":
+                        result["description"] += " " + stripped
+                    elif in_multiline == "when_to_use":
+                        result["when_to_use"] += " " + stripped
+                    continue
+                else:
+                    in_multiline = ""
+
+            if stripped.startswith("description:"):
+                val = stripped.split(":", 1)[1].strip().strip("'\"")
+                if val and val not in (">", "|"):
+                    result["description"] = val
+                elif val in (">", "|"):
+                    in_multiline = "description"
+
+            elif stripped.startswith(("when_to_use:", "whenToUse:")):
+                val = stripped.split(":", 1)[1].strip().strip("'\"")
+                if val and val not in (">", "|"):
+                    result["when_to_use"] = val
+                elif val in (">", "|"):
+                    in_multiline = "when_to_use"
+
+            elif stripped.startswith("paths:"):
+                inline = stripped.split(":", 1)[1].strip()
+                if inline.startswith("[") and inline.endswith("]"):
+                    for p in inline[1:-1].split(","):
+                        p = p.strip().strip("'\"")
+                        if p:
+                            paths_list.append(p)
+                else:
+                    in_paths_list = True
+
+            elif "triggers" in stripped.lower() or "trigger" in stripped.lower():
+                trigger_fragments.extend(_re.findall(r'"([^"]+)"', stripped))
+
+        if not result["description"]:
+            for line in raw.split("\n")[1:20]:
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("#", "---", "```")):
+                    result["description"] = stripped[:300]
+                    break
+
+        result["description"] = str(result["description"]).strip()[:300]
+        result["when_to_use"] = str(result["when_to_use"]).strip()[:200]
+        result["triggers"] = "|".join(trigger_fragments)
+        result["paths"] = paths_list
+        return result
+
+    def _iter_skill_candidates(
+        self, *, include_dormant: bool = False,
+    ) -> list[tuple[str, Path, Path, bool]]:
+        """Return (name, dir, skill_md_path, is_organized) for all discoverable skills.
+
+        Scans in priority order:
+        1. ``workspace/skills/`` — primary organized location
+        2. All entries in ``_skill_paths`` (includes bundled/dev skills)
+        3. Workspace root — unorganized skills the user may have dropped in
+
+        Deduplicates by both name AND resolved (realpath) canonical path so
+        symlinks pointing to the same physical directory are counted once.
+        Earlier entries take priority (matches Claude Code's first-wins logic).
+
+        **Conditional activation (``paths`` frontmatter)**:
+        Skills declaring ``paths`` patterns are dormant until a touched file
+        matches.  Set *include_dormant* to ``True`` to include them anyway
+        (useful for listing all skills in the prompt with a "dormant" tag).
+        """
         skills_dir = self.workspace / "skills"
-        if not skills_dir.is_dir():
+
+        # (parent_dir, is_organized)
+        scan_dirs: list[tuple[Path, bool]] = []
+        if skills_dir.is_dir():
+            scan_dirs.append((skills_dir, True))
+        for sp in getattr(self, "_skill_paths", []):
+            resolved = Path(sp).resolve()
+            if resolved.is_dir() and resolved != skills_dir.resolve():
+                scan_dirs.append((resolved, True))
+        if self.workspace.is_dir():
+            scan_dirs.append((self.workspace, False))
+
+        candidates: list[tuple[str, Path, Path, bool]] = []
+        seen_names: set[str] = set()
+        seen_realpaths: set[str] = set()
+
+        for parent_dir, is_organized in scan_dirs:
+            for child in sorted(parent_dir.iterdir()):
+                if not (child.is_dir() or child.is_symlink()):
+                    continue
+                if not is_organized and child.name in self._WORKSPACE_INFRA_DIRS:
+                    continue
+                skill_md = child / "SKILL.md"
+                if not skill_md.exists():
+                    continue
+                name = child.name
+                if name in seen_names:
+                    continue
+
+                try:
+                    canonical = str(skill_md.resolve())
+                except OSError:
+                    canonical = str(skill_md)
+                if canonical in seen_realpaths:
+                    logger.debug(
+                        f"Skipping duplicate skill '{name}' "
+                        f"(same file already loaded via another path)"
+                    )
+                    continue
+
+                if not include_dormant:
+                    fm = self._parse_skill_frontmatter(skill_md)
+                    skill_paths = fm.get("paths", [])
+                    if isinstance(skill_paths, list) and skill_paths:
+                        if not self._skill_paths_match(
+                            skill_paths, self._touched_paths, self.workspace,
+                        ):
+                            logger.debug(
+                                f"Skill '{name}' dormant (paths not matched)"
+                            )
+                            continue
+
+                seen_names.add(name)
+                seen_realpaths.add(canonical)
+                candidates.append((name, child, skill_md, is_organized))
+
+        return candidates
+
+    def _pre_inject_matched_skill(self, message: str) -> str:
+        """Match user message to an installed skill and prepend SKILL.md content.
+
+        Scoring uses multiple signals inspired by Claude Code's skill matching:
+        - Skill name tokens (split on ``-`` / ``_``)
+        - YAML frontmatter ``description`` keywords
+        - ``when_to_use`` / ``whenToUse`` field (highest weight)
+        - ``triggers`` keyword list
+
+        Scans both ``workspace/skills/`` (organized) and the workspace root
+        (unorganized).  When an unorganized skill matches, the injection
+        includes a note asking the agent to move it into ``skills/`` first.
+        """
+        import re as _re, sys as _sys
+
+        candidates = self._iter_skill_candidates()
+        if not candidates:
             return message
 
         msg_lower = message.lower()
         best_skill = None
         best_score = 0
 
-        for child in sorted(skills_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            skill_md = child / "SKILL.md"
-            if not skill_md.exists():
-                continue
-
-            name = child.name
+        for name, skill_dir, skill_md, is_organized in candidates:
             score = 0
 
-            # Match skill name tokens against user message
             name_tokens = _re.split(r'[-_]', name)
             for token in name_tokens:
                 if len(token) >= 3 and token.lower() in msg_lower:
-                    score += 2
+                    score += self._SCORE_NAME_TOKEN
 
-            # Match trigger words from frontmatter
-            try:
-                raw = skill_md.read_text(encoding="utf-8", errors="replace")
-                fm = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
-                if fm:
-                    for line in fm.group(1).split("\n"):
-                        if "triggers" in line.lower() or "trigger" in line.lower():
-                            triggers = _re.findall(r'"([^"]+)"', line)
-                            for t in triggers:
-                                if t.lower() in msg_lower:
-                                    score += 3
-            except Exception:
-                pass
+            fm = self._parse_skill_frontmatter(skill_md)
+
+            for t in fm["triggers"].split("|"):
+                if t and t.lower() in msg_lower:
+                    score += self._SCORE_TRIGGER
+
+            if fm["when_to_use"]:
+                wtu_tokens = _re.findall(r'[A-Za-z\u4e00-\u9fff]{2,}', fm["when_to_use"].lower())
+                for token in wtu_tokens:
+                    if token not in self._SKILL_MATCH_STOP_WORDS and token in msg_lower:
+                        score += self._SCORE_WHEN_TO_USE
+
+            if fm["description"]:
+                desc_tokens = _re.findall(r'[A-Za-z\u4e00-\u9fff]{3,}', fm["description"].lower())
+                for token in desc_tokens:
+                    if token not in self._SKILL_MATCH_STOP_WORDS and token in msg_lower:
+                        score += self._SCORE_DESCRIPTION
 
             if score > best_score:
                 best_score = score
-                best_skill = (name, skill_md)
+                best_skill = (name, skill_dir, skill_md, is_organized)
 
-        if not best_skill or best_score < 2:
+        if not best_skill or best_score < self._SCORE_THRESHOLD:
             return message
 
-        skill_name, skill_path = best_skill
+        skill_name, skill_dir, skill_path, is_organized = best_skill
         try:
             content = skill_path.read_text(encoding="utf-8", errors="replace").strip()
         except Exception:
             return message
 
-        logger.info(f"Pre-injected skill '{skill_name}' (score={best_score}) into message")
+        base_dir = str(skill_dir).replace("\\", "/")
+        if _sys.platform == "win32":
+            base_dir = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', base_dir)
+
+        ws_posix = self._workspace_posix_path()
+
+        if is_organized:
+            skill_rel = f"skills/{skill_name}"
+        else:
+            skill_rel = skill_name
+
+        content = content.replace("${SKILL_DIR}", f"{ws_posix}/{skill_rel}")
+        content = content.replace("$SKILL_DIR", f"{ws_posix}/{skill_rel}")
+
+        self._pre_injected_skill_name = skill_name
+
+        organize_note = ""
+        if not is_organized:
+            organize_note = (
+                f"\n⚠️ ORGANIZE FIRST: This skill is at the workspace root, not in skills/.\n"
+                f"Before executing, move it:\n"
+                f"  mv {skill_name} skills/{skill_name}\n"
+                f"Then update your working paths to use skills/{skill_name}/ as the base.\n"
+            )
+
+        logger.info(
+            f"Pre-injected skill '{skill_name}' (score={best_score}, "
+            f"organized={is_organized}) into message"
+        )
         return (
             f"{message}\n\n"
             f"---\n"
-            f"[PRE-LOADED SKILL: {skill_name}] "
-            f"The following SKILL.md is already loaded — execute its steps directly. "
-            f"Do NOT call read_file on this skill again.\n\n"
+            f"[PRE-LOADED SKILL: {skill_name}]\n"
+            f"Base directory: {base_dir}\n"
+            f"Workspace-relative path: {skill_rel}/\n"
+            f"{organize_note}\n"
+            f"The SKILL.md below is already loaded — follow its procedures directly. "
+            f"Do NOT call read_file on this skill. Do NOT search for alternatives. "
+            f"Start executing the skill's instructions immediately.\n\n"
             f"{content}\n"
             f"---"
         )
@@ -3285,75 +4057,50 @@ class AgentLoop:
     def _build_skills_for_prompt(self) -> str:
         """Build Openclaw-style XML metadata for installed skills.
 
-        Scans skill directories, extracts name + description from SKILL.md
-        frontmatter, and returns an <available_skills> XML block for the
-        system prompt. The agent reads SKILL.md lazily when needed.
+        Uses ``_iter_skill_candidates`` and ``_parse_skill_frontmatter`` to
+        build an ``<available_skills>`` XML block.  Unorganized skills (in the
+        workspace root) are flagged so the agent knows to move them first.
+
+        Path-conditional skills are included with ``include_dormant=True``
+        so the agent is *aware* of them, but they carry a ``<status>dormant``
+        tag indicating they will activate when matching files are touched.
         """
-        import re as _re, os as _os, sys as _sys
-
-        skills_dir = self.workspace / "skills"
-        if not skills_dir.is_dir():
+        candidates = self._iter_skill_candidates(include_dormant=True)
+        if not candidates:
             return ""
 
-        ws_str = str(self.workspace).replace("\\", "/")
-        if _sys.platform == "win32":
-            ws_str = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', ws_str)
+        entries: list[str] = []
+        for name, _dir, skill_md, is_organized in candidates:
+            fm = self._parse_skill_frontmatter(skill_md)
+            description = fm["description"] or name
+            when_to_use = fm["when_to_use"]
+            skill_paths = fm.get("paths", [])
 
-        entries = []
-        for child in sorted(skills_dir.iterdir()):
-            if not child.is_dir():
-                continue
-            skill_md = child / "SKILL.md"
-            if not skill_md.exists():
-                continue
+            location = f"skills/{name}/SKILL.md" if is_organized else f"{name}/SKILL.md"
 
-            name = child.name
-            description = ""
-            try:
-                raw = skill_md.read_text(encoding="utf-8", errors="replace")
-                fm_match = _re.match(r'^---\s*\n(.*?)\n---', raw, _re.DOTALL)
-                if fm_match:
-                    for line in fm_match.group(1).split("\n"):
-                        stripped = line.strip()
-                        if stripped.startswith("description:"):
-                            val = stripped.split(":", 1)[1].strip().strip("'\"")
-                            if val and val != ">":
-                                description = val[:200]
-                                break
-                    if not description:
-                        in_desc = False
-                        desc_lines = []
-                        for line in fm_match.group(1).split("\n"):
-                            if line.strip().startswith("description:"):
-                                in_desc = True
-                                val = line.split(":", 1)[1].strip()
-                                if val and val not in (">", "|"):
-                                    desc_lines.append(val)
-                                continue
-                            if in_desc:
-                                if line.startswith("  ") or line.startswith("\t"):
-                                    desc_lines.append(line.strip())
-                                else:
-                                    break
-                        description = " ".join(desc_lines)[:200]
-                if not description:
-                    for line in raw.split("\n")[1:20]:
-                        stripped = line.strip()
-                        if stripped and not stripped.startswith(("#", "---", "```")):
-                            description = stripped[:200]
-                            break
-            except Exception:
-                description = name
+            parts = [
+                f'<skill name="{name}">',
+                f'  <description>{description}</description>',
+            ]
+            if when_to_use:
+                parts.append(f'  <when_to_use>{when_to_use}</when_to_use>')
+            parts.append(f'  <location>{location}</location>')
+            if not is_organized:
+                parts.append(
+                    f'  <status>unorganized — move to skills/{name}/ before use</status>'
+                )
+            elif isinstance(skill_paths, list) and skill_paths:
+                is_active = self._skill_paths_match(
+                    skill_paths, self._touched_paths, self.workspace,
+                )
+                if not is_active:
+                    parts.append(
+                        f'  <status>dormant — activates when files matching '
+                        f'{", ".join(skill_paths[:3])} are touched</status>'
+                    )
+            parts.append('</skill>')
+            entries.append("\n".join(parts))
 
-            entries.append(
-                f'<skill name="{name}">\n'
-                f'  <description>{description}</description>\n'
-                f'  <location>skills/{name}/SKILL.md</location>\n'
-                f'</skill>'
-            )
-
-        if not entries:
-            return ""
         return "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
 
     @staticmethod
@@ -3516,6 +4263,11 @@ class AgentLoop:
         new_key = session_key or f"session-{uuid.uuid4().hex[:8]}"
         self._session = self.sessions.get_or_create(new_key)
         self.session_key = new_key
+        if getattr(self, "_history_search_tool", None) is not None:
+            try:
+                self._history_search_tool.set_default_session_key(new_key)
+            except Exception:
+                pass
         logger.info(f"Switched to new session: {new_key}")
         return new_key
 

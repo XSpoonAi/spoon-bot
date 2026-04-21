@@ -119,6 +119,29 @@ class SessionListResponse(BaseModel):
     sessions: list[SessionInfo]
 
 
+class SessionSearchHit(BaseModel):
+    """A single match from a session history search."""
+
+    session_key: str
+    seq: int
+    role: str
+    content: str
+    timestamp: str | None = None
+    matched_in: str = "content"  # "content" or "extras"
+    snippet: str = ""
+    extras: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionSearchResponse(BaseModel):
+    """Session search response model."""
+
+    query: str
+    total: int
+    limit: int
+    offset: int
+    hits: list[SessionSearchHit] = Field(default_factory=list)
+
+
 class ToolInfo(BaseModel):
     """Tool information."""
 
