@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from spoon_bot.gateway.app import get_agent
 from spoon_bot.gateway.auth.dependencies import CurrentUser
@@ -17,15 +18,14 @@ from spoon_bot.gateway.models.responses import (
     SessionResponse,
     SessionListResponse,
     SessionInfo,
+    SessionSearchHit,
+    SessionSearchResponse,
 )
 
 router = APIRouter()
 
 
-@router.get("", response_model=APIResponse[SessionListResponse])
-async def list_sessions(user: CurrentUser) -> APIResponse[SessionListResponse]:
-    """List all sessions."""
-    request_id = f"req_{uuid4().hex[:12]}"
+def _get_sessions_manager() -> Any:
     agent: Any = get_agent()
     sessions_manager: Any = getattr(agent, "sessions", None)
     if sessions_manager is None:
@@ -33,6 +33,66 @@ async def list_sessions(user: CurrentUser) -> APIResponse[SessionListResponse]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
         )
+    return sessions_manager
+
+
+def _run_search(
+    sessions_manager: Any,
+    *,
+    query: str,
+    session_key: str | None,
+    regex: bool,
+    case_sensitive: bool,
+    roles: list[str] | None,
+    include_extras: bool,
+    limit: int,
+    offset: int,
+    max_content_length: int | None,
+) -> list[SessionSearchHit]:
+    """Call the session manager's ``search_messages`` and shape the results."""
+    try:
+        hits = sessions_manager.search_messages(
+            query,
+            session_key=session_key,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            roles=roles,
+            include_extras=include_extras,
+            limit=limit,
+            offset=offset,
+            max_content_length=max_content_length,
+        )
+    except re.error as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_REGEX", "message": str(exc)},
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "INVALID_QUERY", "message": str(exc)},
+        )
+
+    return [
+        SessionSearchHit(
+            session_key=hit.session_key,
+            seq=hit.seq,
+            role=hit.role,
+            content=hit.content,
+            timestamp=hit.timestamp,
+            matched_in=hit.matched_in,
+            snippet=hit.snippet,
+            extras=hit.extras or {},
+        )
+        for hit in hits
+    ]
+
+
+@router.get("", response_model=APIResponse[SessionListResponse])
+async def list_sessions(user: CurrentUser) -> APIResponse[SessionListResponse]:
+    """List all sessions."""
+    request_id = f"req_{uuid4().hex[:12]}"
+    sessions_manager = _get_sessions_manager()
 
     session_keys = sessions_manager.list_sessions()
     sessions: list[Any] = []
@@ -66,15 +126,8 @@ async def create_session(
 ) -> APIResponse[SessionResponse]:
     """Create a new session."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent: Any = get_agent()
-    sessions_manager: Any = getattr(agent, "sessions", None)
-    if sessions_manager is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
-        )
+    sessions_manager = _get_sessions_manager()
 
-    # Check if session already exists
     existing = sessions_manager.get(request.key)
     if existing:
         raise HTTPException(
@@ -82,7 +135,6 @@ async def create_session(
             detail={"code": "SESSION_EXISTS", "message": f"Session '{request.key}' already exists"},
         )
 
-    # Create session
     session = sessions_manager.get_or_create(request.key)
     sessions_manager.save(session)
 
@@ -99,6 +151,73 @@ async def create_session(
     )
 
 
+# NOTE: Route registration order matters in FastAPI — static paths like
+# ``/search`` MUST be registered before ``/{session_key}`` or the latter
+# will swallow them as ``session_key="search"``.  Keep the search routes
+# ABOVE the ``/{session_key}`` handlers.
+@router.get(
+    "/search",
+    response_model=APIResponse[SessionSearchResponse],
+)
+async def search_sessions(
+    user: CurrentUser,
+    q: str = Query(..., min_length=1, description="Search query"),
+    regex: bool = Query(False, description="Interpret query as a regular expression"),
+    case_sensitive: bool = Query(False, description="Match case-sensitively"),
+    roles: list[str] | None = Query(
+        None,
+        description="Restrict to these message roles (e.g. tool, assistant, user, system)",
+    ),
+    include_extras: bool = Query(
+        True,
+        description="Also match tool_call_id / tool_calls / attachments serialized extras",
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    max_content_length: int | None = Query(
+        2000,
+        ge=1,
+        le=100_000,
+        description="Truncate each returned content to at most this many characters",
+    ),
+) -> APIResponse[SessionSearchResponse]:
+    """Search across *all* persisted sessions for the current agent.
+
+    This is the fallback used when runtime context has been compacted and
+    callers (user or model) want to recover earlier tool calls / results
+    or message bodies.  The underlying store picks the most efficient
+    strategy available (SQL ``LIKE``/``ILIKE``/regex, or an in-memory
+    grep fallback for file-backed stores).
+    """
+    request_id = f"req_{uuid4().hex[:12]}"
+    sessions_manager = _get_sessions_manager()
+
+    hits = _run_search(
+        sessions_manager,
+        query=q,
+        session_key=None,
+        regex=regex,
+        case_sensitive=case_sensitive,
+        roles=roles,
+        include_extras=include_extras,
+        limit=limit,
+        offset=offset,
+        max_content_length=max_content_length,
+    )
+
+    return APIResponse(
+        success=True,
+        data=SessionSearchResponse(
+            query=q,
+            total=len(hits),
+            limit=limit,
+            offset=offset,
+            hits=hits,
+        ),
+        meta=MetaInfo(request_id=request_id),
+    )
+
+
 @router.get("/{session_key}", response_model=APIResponse[SessionResponse])
 async def get_session(
     session_key: str,
@@ -106,13 +225,7 @@ async def get_session(
 ) -> APIResponse[SessionResponse]:
     """Get session details."""
     request_id = f"req_{uuid4().hex[:12]}"
-    agent: Any = get_agent()
-    sessions_manager: Any = getattr(agent, "sessions", None)
-    if sessions_manager is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
-        )
+    sessions_manager = _get_sessions_manager()
 
     session = sessions_manager.get(session_key)
     if not session:
@@ -134,22 +247,71 @@ async def get_session(
     )
 
 
+@router.get(
+    "/{session_key}/search",
+    response_model=APIResponse[SessionSearchResponse],
+)
+async def search_session(
+    session_key: str,
+    user: CurrentUser,
+    q: str = Query(..., min_length=1, description="Search query"),
+    regex: bool = Query(False),
+    case_sensitive: bool = Query(False),
+    roles: list[str] | None = Query(None),
+    include_extras: bool = Query(True),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    max_content_length: int | None = Query(2000, ge=1, le=100_000),
+) -> APIResponse[SessionSearchResponse]:
+    """Search persisted messages within a single session.
+
+    Primary fallback path for the user / model to recover an earlier
+    tool call, tool result, or message body after runtime context
+    compaction has trimmed it from memory.
+    """
+    request_id = f"req_{uuid4().hex[:12]}"
+    sessions_manager = _get_sessions_manager()
+
+    if sessions_manager.get(session_key) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "NOT_FOUND", "message": f"Session '{session_key}' not found"},
+        )
+
+    hits = _run_search(
+        sessions_manager,
+        query=q,
+        session_key=session_key,
+        regex=regex,
+        case_sensitive=case_sensitive,
+        roles=roles,
+        include_extras=include_extras,
+        limit=limit,
+        offset=offset,
+        max_content_length=max_content_length,
+    )
+
+    return APIResponse(
+        success=True,
+        data=SessionSearchResponse(
+            query=q,
+            total=len(hits),
+            limit=limit,
+            offset=offset,
+            hits=hits,
+        ),
+        meta=MetaInfo(request_id=request_id),
+    )
+
+
 @router.delete("/{session_key}")
 async def delete_session(
     session_key: str,
     user: CurrentUser,
 ) -> dict:
     """Delete a session."""
-    agent: Any = get_agent()
-    sessions_manager: Any = getattr(agent, "sessions", None)
-    if sessions_manager is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
-        )
-
+    sessions_manager = _get_sessions_manager()
     deleted = sessions_manager.delete(session_key)
-
     return {"deleted": deleted}
 
 
@@ -159,13 +321,7 @@ async def clear_session(
     user: CurrentUser,
 ) -> dict:
     """Clear session history."""
-    agent: Any = get_agent()
-    sessions_manager: Any = getattr(agent, "sessions", None)
-    if sessions_manager is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "INTERNAL_ERROR", "message": "Session manager unavailable"},
-        )
+    sessions_manager = _get_sessions_manager()
 
     session = sessions_manager.get(session_key)
     if not session:

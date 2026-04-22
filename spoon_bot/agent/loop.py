@@ -81,6 +81,7 @@ from spoon_bot.agent.tools.filesystem import (
     ListDirTool,
 )
 from spoon_bot.agent.tools.grep import GrepTool
+from spoon_bot.agent.tools.history_search import SearchHistoryTool
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_owner,
     build_tool_owner_key,
@@ -835,6 +836,29 @@ class AgentLoop:
         # Background task tool
         self.tools.register(SpawnTool())
 
+        # Conversation history search — fallback for post-compaction
+        # recovery of earlier tool calls / results / user messages.
+        #
+        # Pass a resolver callable instead of relying on
+        # ``set_default_session_key`` being invoked on every session
+        # switch.  Session switches can happen from multiple call
+        # sites (gateway WS handler, channel code, REST routes) and
+        # not all of them go through AgentLoop's explicit switch
+        # hooks, so a pull-based lookup is safer than push-based
+        # synchronisation.
+        def _current_session_key() -> str | None:
+            sess = self._session
+            return sess.session_key if sess is not None else None
+
+        self._history_search_tool = SearchHistoryTool(
+            self.sessions,
+            default_session_key=(
+                self._session.session_key if self._session is not None else None
+            ),
+            session_key_resolver=_current_session_key,
+        )
+        self.tools.register(self._history_search_tool)
+
         # Web tools
         self.tools.register(WebSearchTool())
         self.tools.register(WebFetchTool())
@@ -1101,40 +1125,33 @@ class AgentLoop:
         return sum(len(m.get("content", "")) for m in self._session.messages) // 4
 
     def _trim_context_if_needed(self) -> int:
-        """Auto-trim oldest messages if context budget approaches the limit.
+        """No-op placeholder.
 
-        Keeps at minimum the two most recent messages (last user + assistant pair).
-        Raises ContextOverflowError if even after trimming the context is too large.
+        History compaction is deliberately **runtime-only** now
+        (``_compress_runtime_context`` / ``_force_compress_runtime_context``):
+
+        * The persisted session store remains the authoritative, *complete*
+          transcript — tool-call inputs/outputs included.
+        * Runtime memory (what the LLM sees) is compacted in place with
+          full tool-pair atomicity (see :meth:`_compress_runtime_context`).
+        * Anything that falls out of runtime memory is still reachable via
+          the :class:`SearchHistoryTool` because the store was never
+          mutated.
+
+        Earlier versions of this method would call
+        ``self._session.messages.pop(0)`` whenever the *session-side*
+        estimate exceeded the window.  That permanently destroyed
+        persisted history (breaking ``search_history`` / cross-session
+        recall), and could leave orphan tool results behind because the
+        pop was not tool-segment-aware.  Both problems are now fixed by
+        simply refusing to touch the session store here.
+
+        A future bounded-history policy (e.g. "cap each JSONL at N
+        messages") should be implemented as a dedicated, opt-in pruner
+        that *also* updates any search index — NOT inside the per-turn
+        context-budget path.
         """
-        if not self._session.messages:
-            return 0
-
-        budget = int(self.context_window * 0.75)
-        estimated = self._estimate_token_count()
-
-        if estimated <= budget:
-            return 0
-
-        logger.warning(
-            f"Context approaching limit: ~{estimated:,} tokens "
-            f"(budget: {budget:,}, window: {self.context_window:,}). "
-            f"Trimming oldest messages."
-        )
-
-        messages = self._session.messages
-        trimmed_count = 0
-        while len(messages) > 2 and self._estimate_token_count() > budget:
-            removed = messages.pop(0)
-            trimmed_count += 1
-            logger.debug(
-                f"Trimmed message: role={removed.get('role')}, "
-                f"len={len(removed.get('content', ''))}"
-            )
-
-        # If still over the hard limit after trimming, raise
-        final_estimate = self._estimate_token_count()
-        if final_estimate > self.context_window:
-            raise ContextOverflowError(final_estimate, self.context_window)
+        return 0
 
         return trimmed_count
 
@@ -1196,6 +1213,65 @@ class AgentLoop:
             if hasattr(self._session, "get_messages")
             else self._session.get_history()
         )
+
+        # Lazy import — these are only needed when re-hydrating tool-call
+        # metadata persisted by _capture_turn_tool_trace.
+        try:
+            from spoon_ai.schema import Function as _CoreFunction  # noqa: F401
+        except Exception:  # pragma: no cover - defensive
+            _CoreFunction = None  # type: ignore[assignment]
+
+        def _rehydrate_tool_calls(raw: Any) -> list | None:
+            """Convert persisted ``tool_calls`` extras back into ToolCall objects.
+
+            The tool-trace capture path stores ``tool_calls`` as a list of
+            plain dicts (``{"id", "type", "function": {"name", "arguments"}}``).
+            spoon-core's ``agent.add_message`` expects ``ToolCall`` models so
+            it can normalise / serialise them for the LLM provider.  Without
+            this rehydration the tool_call <-> tool-result pairing is lost on
+            every history sync and ``drop_orphaned_tool_messages`` will prune
+            every tool result before the next API call.
+            """
+            if not raw or _CoreFunction is None:
+                return None
+            if not isinstance(raw, list):
+                return None
+            out: list = []
+            for item in raw:
+                if isinstance(item, CoreToolCall):
+                    out.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                tc_id = item.get("id")
+                if not tc_id:
+                    continue
+                fn = item.get("function") or {}
+                if isinstance(fn, dict):
+                    name = fn.get("name") or ""
+                    arguments = fn.get("arguments") or ""
+                else:
+                    name = getattr(fn, "name", "") or ""
+                    arguments = getattr(fn, "arguments", "") or ""
+                if arguments is not None and not isinstance(arguments, str):
+                    try:
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    except Exception:
+                        arguments = str(arguments)
+                try:
+                    out.append(
+                        CoreToolCall(
+                            id=str(tc_id),
+                            type=str(item.get("type") or "function"),
+                            function=_CoreFunction(
+                                name=str(name), arguments=str(arguments or "")
+                            ),
+                        )
+                    )
+                except Exception:
+                    continue
+            return out or None
+
         for msg in history_messages:
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
@@ -1236,8 +1312,26 @@ class AgentLoop:
                 attachments=attachments,
             )
 
+            # Forward tool metadata so runtime memory stays a faithful
+            # replay of what the LLM originally saw.  Without these
+            # fields, ``drop_orphaned_tool_messages`` will strip every
+            # persisted tool result before the next provider call
+            # because its ``tool_call_id`` will be ``None``.
+            extra_kwargs: dict[str, Any] = {}
+            if role == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id:
+                    extra_kwargs["tool_call_id"] = str(tc_id)
+                tool_name = msg.get("name") or msg.get("tool_name")
+                if tool_name:
+                    extra_kwargs["tool_name"] = str(tool_name)
+            elif role == "assistant":
+                rehydrated = _rehydrate_tool_calls(msg.get("tool_calls"))
+                if rehydrated:
+                    extra_kwargs["tool_calls"] = rehydrated
+
             try:
-                await self._agent.add_message(role, content)
+                await self._agent.add_message(role, content, **extra_kwargs)
                 injected_count += 1
             except Exception as exc:
                 logger.warning(
@@ -1248,28 +1342,206 @@ class AgentLoop:
         return injected_count
 
     async def _prepare_request_context(self) -> None:
-        """Prepare request context by trimming and injecting session history."""
-        trimmed_count = self._trim_context_if_needed()
+        """Prepare request context by injecting session history and, if
+        needed, compacting runtime memory *before* the LLM sees it.
+
+        Persisted history (``self._session.messages``) is the authoritative
+        store and is never trimmed here — see
+        :meth:`_trim_context_if_needed` for the reasoning.  Runtime memory
+        is what goes into the next provider request, so that is the only
+        thing compacted by this method.
+        """
+        trimmed_count = self._trim_context_if_needed()  # always 0 now
         injected_count = await self._sync_runtime_history_from_session()
 
         # Repair tool-call ordering after history injection — session storage
         # may not preserve tool_call_id metadata, producing orphaned tool
         # messages that providers (OpenAI, Gemini, etc.) reject.
         repaired = 0
+        messages_ref: list | None = None
         if self._agent and hasattr(self._agent, "memory"):
-            messages = getattr(self._agent.memory, "messages", None)
-            if isinstance(messages, list):
-                repaired = self._normalize_runtime_tool_context(messages)
+            messages_ref = getattr(self._agent.memory, "messages", None)
+            if isinstance(messages_ref, list):
+                repaired = self._normalize_runtime_tool_context(messages_ref)
 
-        estimated_tokens = self._estimate_token_count()
+        # Proactively compact runtime memory before the turn so we don't
+        # have to rely on a provider token-overflow error to trigger
+        # compaction.  ``_compress_runtime_context`` is a no-op when we're
+        # under the 50 % budget.  It preserves tool-pair atomicity and
+        # (if a drop happens) injects a ``[history-compacted]`` marker
+        # message pointing the model at ``search_history``.
+        compressed = 0
+        if isinstance(messages_ref, list) and messages_ref:
+            try:
+                compressed = self._compress_runtime_context()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Proactive runtime compression skipped: {exc}")
+
+        runtime_tokens = self._estimate_runtime_tokens()
+        session_tokens = self._estimate_token_count()
 
         logger.info(
             f"Session context prepared: session={self.session_key}, "
             f"injected_messages={injected_count}, "
-            f"estimated_tokens~{estimated_tokens}, "
+            f"runtime_tokens~{runtime_tokens}, session_tokens~{session_tokens}, "
             f"trimmed_messages={trimmed_count}"
             + (f", repaired_tool_order={repaired}" if repaired else "")
+            + (f", compressed_actions={compressed}" if compressed else "")
         )
+
+    def _runtime_memory_snapshot_index(self) -> int:
+        """Return the current length of runtime memory.
+
+        Callers snapshot this *before* a turn begins so they can later
+        iterate only the messages that were produced during that turn —
+        typically tool-call and intermediate assistant messages that we
+        want to persist for post-hoc search/recovery.
+        """
+        try:
+            return len(AgentLoop._get_runtime_memory_messages(self))
+        except Exception:
+            return 0
+
+    def _capture_turn_tool_trace(self, start_index: int) -> list[dict[str, Any]]:
+        """Capture tool-call artifacts added since ``start_index``.
+
+        We persist three kinds of messages so a later ``search_history``
+        query can surface them after context compaction:
+
+        * ``role=tool`` — the full tool result the model actually saw.
+          We keep ``tool_call_id`` and ``name`` as extras so they can be
+          correlated with the originating assistant call and filtered by
+          tool name.
+        * ``role=assistant`` messages that carry non-empty ``tool_calls``
+          but no final user-visible content (the "I'm about to call X"
+          turns).  These are normally squashed into the final assistant
+          reply; without them, future history sync can't pair tool
+          results with their call-site.  We serialize ``tool_calls`` in
+          the same shape the OpenAI function-calling spec uses.
+
+        The final assistant reply is persisted separately by the caller.
+        ``role=user`` messages are untouched — the caller handles those
+        with their own media / attachment kwargs.
+        """
+        if not isinstance(start_index, int) or start_index < 0:
+            return []
+
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if not messages or start_index >= len(messages):
+            return []
+
+        captured: list[dict[str, Any]] = []
+        for msg in messages[start_index:]:
+            role = AgentLoop._stream_message_role(msg).lower()
+            if role not in ("tool", "assistant"):
+                continue
+
+            content = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if not isinstance(content, str) or not content:
+                content = AgentLoop._stream_message_attr(msg, "content", "") or ""
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content = str(content)
+
+            extras: dict[str, Any] = {}
+
+            if role == "tool":
+                tool_call_id = AgentLoop._stream_message_attr(msg, "tool_call_id", None) \
+                    or AgentLoop._stream_message_attr(msg, "id", None)
+                if tool_call_id:
+                    extras["tool_call_id"] = str(tool_call_id)
+                name = AgentLoop._stream_message_attr(msg, "name", None)
+                if name:
+                    extras["name"] = str(name)
+            else:  # assistant
+                tool_calls = AgentLoop._stream_message_attr(msg, "tool_calls", None) or []
+                serialized: list[dict[str, Any]] = []
+                for tc in tool_calls:
+                    tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+                    tc_type = (
+                        getattr(tc, "type", None)
+                        or (tc.get("type") if isinstance(tc, dict) else None)
+                        or "function"
+                    )
+                    fn = getattr(tc, "function", None) or (
+                        tc.get("function") if isinstance(tc, dict) else None
+                    )
+                    if fn is not None:
+                        tc_name = getattr(fn, "name", None) or (
+                            fn.get("name") if isinstance(fn, dict) else None
+                        )
+                        tc_args = getattr(fn, "arguments", None) or (
+                            fn.get("arguments") if isinstance(fn, dict) else None
+                        )
+                    else:
+                        tc_name = getattr(tc, "name", None)
+                        tc_args = getattr(tc, "arguments", None)
+
+                    if tc_args is not None and not isinstance(tc_args, str):
+                        try:
+                            tc_args = json.dumps(tc_args, ensure_ascii=False)
+                        except Exception:
+                            tc_args = str(tc_args)
+
+                    if tc_name or tc_id:
+                        serialized.append(
+                            {
+                                "id": tc_id,
+                                "type": tc_type,
+                                "function": {
+                                    "name": tc_name,
+                                    "arguments": tc_args or "",
+                                },
+                            }
+                        )
+                if not serialized:
+                    # Nothing tool-related to preserve; the final assistant
+                    # reply is saved separately by the caller.
+                    continue
+                extras["tool_calls"] = serialized
+
+            captured.append({"role": role, "content": content, "extras": extras})
+        return captured
+
+    def _persist_turn_tool_trace(self, start_index: int) -> int:
+        """Append captured tool-trace messages to ``self._session``.
+
+        Returns the number of messages appended.  Skipped silently when the
+        session has no room or persistence is disabled via
+        ``SPOON_BOT_PERSIST_TOOL_TRACE=false`` / ``0`` / ``no``.
+        """
+        if not self._should_persist_tool_trace():
+            return 0
+
+        try:
+            trace = self._capture_turn_tool_trace(start_index)
+        except Exception as exc:
+            logger.debug(f"Tool-trace capture failed: {exc}")
+            return 0
+
+        if not trace:
+            return 0
+
+        for entry in trace:
+            try:
+                self._session.add_message(
+                    entry["role"], entry["content"], **entry.get("extras", {})
+                )
+            except Exception as exc:
+                logger.debug(f"Tool-trace persist skipped a message: {exc}")
+        return len(trace)
+
+    @staticmethod
+    def _should_persist_tool_trace() -> bool:
+        """Whether to persist tool traces alongside user/assistant turns."""
+        import os as _os
+
+        raw = _os.getenv("SPOON_BOT_PERSIST_TOOL_TRACE")
+        if raw is None:
+            return True
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
 
     def _build_runtime_message_content(
         self,
@@ -1364,10 +1636,18 @@ class AgentLoop:
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
+            if getattr(self, "_history_search_tool", None) is not None:
+                try:
+                    self._history_search_tool.set_default_session_key(session_key)
+                except Exception:
+                    pass
             logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message: {message[:100]}...")
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
+
+        # Reset per-request state
+        self._pre_injected_skill_name = None
 
         # Reset per-request state
         self._pre_injected_skill_name = None
@@ -1407,6 +1687,10 @@ class AgentLoop:
         )
         if isinstance(runtime_message, str):
             message = runtime_message
+
+        # Snapshot runtime memory length before this turn begins so we can
+        # later persist the tool-call trace produced during the turn.
+        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -1515,6 +1799,7 @@ class AgentLoop:
                 _strip_attachment_context(message, attachments or []),
                 **save_kwargs,
             )
+            self._persist_turn_tool_trace(_pre_turn_memory_index)
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
@@ -1983,6 +2268,84 @@ class AgentLoop:
             return role == "tool"
         return False
 
+    @classmethod
+    def _snap_drop_end_to_turn_boundary(
+        cls, messages: list, keep_head: int, desired_end: int
+    ) -> int:
+        """Return an index <= desired_end that sits on a safe boundary.
+
+        A *safe* drop boundary is a position ``k`` where:
+          * ``messages[k]`` is ``role="user"`` (start of the next turn), OR
+          * ``messages[k]`` is ``role="assistant"`` with no ``tool_calls`` and
+            not followed immediately by a ``role="tool"`` message (i.e. the
+            tool chain that the previous assistant opened is fully settled
+            at the end of index ``k - 1``).
+
+        Snapping ensures we never split an assistant(tool_calls) → tool(result)
+        pair, which would leak orphans the provider rejects.  If no boundary
+        is found, we fall back to ``keep_head`` (i.e. drop nothing) so the
+        safety invariant wins over the token-budget target.
+        """
+        if desired_end <= keep_head:
+            return keep_head
+        end = min(desired_end, len(messages))
+
+        def _role(i: int) -> str | None:
+            if i < 0 or i >= len(messages):
+                return None
+            return cls._message_role_value(messages[i])
+
+        def _has_tool_calls(i: int) -> bool:
+            if i < 0 or i >= len(messages):
+                return False
+            tc = getattr(messages[i], "tool_calls", None)
+            return bool(tc)
+
+        # Walk backwards from desired_end looking for a clean cut.  The cut
+        # index k means "delete messages[keep_head:k]", so messages[k]
+        # becomes the new first non-head message.
+        for k in range(end, keep_head, -1):
+            role = _role(k)
+            if role == "user":
+                return k
+            if role == "assistant" and not _has_tool_calls(k):
+                if _role(k + 1) != "tool":
+                    return k
+        return keep_head
+
+    def _insert_compaction_marker(self, messages: list, dropped: int) -> None:
+        """Insert a runtime-only marker telling the model history was trimmed.
+
+        The marker is a ``role="user"`` system-style message that documents
+        how many prior messages were removed from runtime memory and points
+        the model at the :class:`SearchHistoryTool` as the recovery path.
+        It is **not** persisted to the session store — the store still holds
+        the full transcript — so adding the marker is idempotent across
+        turns.
+        """
+        if not self._agent or not hasattr(self._agent, "memory"):
+            return
+        try:
+            from spoon_ai.schema import Message, Role  # lazy import
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        marker_text = (
+            "[history-compacted] "
+            f"{dropped} older message(s) (including any tool-call/result pairs) "
+            "were removed from this turn's in-memory context to fit the token "
+            "budget.  The full transcript is preserved on disk — if you need "
+            "an earlier tool result, argument, or user statement, call the "
+            "`search_history` tool (scope='current')."
+        )
+        try:
+            marker = Message(role=Role.USER, content=marker_text)
+        except Exception:
+            return
+
+        insert_at = 1 if messages else 0
+        messages.insert(insert_at, marker)
+
     def _compress_runtime_context(self) -> int:
         """Proactively compress the agent's runtime context.
 
@@ -2043,16 +2406,39 @@ class AgentLoop:
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
+        #
+        # *Segment-aware* drop: we only cut along user-turn boundaries so a
+        # drop never splits an ``assistant(tool_calls) -> tool(result)``
+        # chain.  Partial splits would leak through as orphaned tool
+        # messages and the LLM provider would reject the whole request.
+        # The persisted session store is untouched, so anything dropped
+        # here remains reachable via ``search_history``.
         estimated = self._estimate_runtime_tokens()
+        dropped_in_phase3 = 0
         if estimated > budget and len(messages) > 12:
             keep_head = 1
             keep_tail_drop = min(8, len(messages) - 1)
             droppable = len(messages) - keep_head - keep_tail_drop
             if droppable > 4:
-                drop_count = droppable // 2
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
-                logger.info(f"Phase 3: dropped {drop_count} oldest messages")
+                desired = droppable // 2
+                snap_end = self._snap_drop_end_to_turn_boundary(
+                    messages, keep_head, keep_head + desired
+                )
+                actual_drop = max(0, snap_end - keep_head)
+                if actual_drop > 0:
+                    del messages[keep_head:keep_head + actual_drop]
+                    compressed += actual_drop
+                    dropped_in_phase3 = actual_drop
+                    logger.info(
+                        f"Phase 3: dropped {actual_drop} oldest messages "
+                        f"(segment-snapped from desired {desired})"
+                    )
+
+        # Phase 3b: Insert a compaction marker so the model knows prior
+        # turns are recoverable via ``search_history``.  The marker is
+        # runtime-only; it never touches the persisted session.
+        if dropped_in_phase3 > 0:
+            self._insert_compaction_marker(messages, dropped_in_phase3)
 
         # Phase 4: Repair tool_use/tool_result pairing broken by message deletion.
         compressed += self._repair_tool_pairing(messages)
@@ -2087,14 +2473,23 @@ class AgentLoop:
                 msg.content = compressed_content
                 compressed += 1
 
-        # Drop all but first + last 6 messages
+        # Drop all but first + last 6 messages (segment-aware)
+        dropped = 0
         if len(messages) > 8:
             keep_head = 1
             keep_tail = min(6, len(messages) - 1)
-            drop_count = len(messages) - keep_head - keep_tail
-            if drop_count > 0:
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
+            desired_end = len(messages) - keep_tail
+            snap_end = self._snap_drop_end_to_turn_boundary(
+                messages, keep_head, desired_end
+            )
+            actual_drop = max(0, snap_end - keep_head)
+            if actual_drop > 0:
+                del messages[keep_head:keep_head + actual_drop]
+                compressed += actual_drop
+                dropped = actual_drop
+
+        if dropped > 0:
+            self._insert_compaction_marker(messages, dropped)
 
         # Repair tool pairing broken by message deletion
         compressed += self._repair_tool_pairing(messages)
@@ -2653,6 +3048,10 @@ class AgentLoop:
         if isinstance(runtime_message, str):
             message = runtime_message
 
+        # Snapshot runtime memory length before the turn so we can persist
+        # the tool-call trace produced while streaming.
+        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+
         try:
             capture_manager = capture_tool_outputs()
             tool_output_capture_scope = capture_manager.__enter__()
@@ -3047,6 +3446,10 @@ class AgentLoop:
                     _strip_attachment_context(message, attachments or []),
                     **save_kwargs,
                 )
+                # Persist intermediate tool-call artifacts generated while
+                # streaming so they remain searchable even after runtime
+                # context compaction.
+                self._persist_turn_tool_trace(_pre_turn_memory_index)
                 self._session.add_message("assistant", full_content)
                 self.sessions.save(self._session)
             except Exception as e:
@@ -3078,6 +3481,11 @@ class AgentLoop:
         if session_key and session_key != self.session_key:
             self._session = self.sessions.get_or_create(session_key)
             self.session_key = session_key
+            if getattr(self, "_history_search_tool", None) is not None:
+                try:
+                    self._history_search_tool.set_default_session_key(session_key)
+                except Exception:
+                    pass
             logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
@@ -3104,6 +3512,11 @@ class AgentLoop:
         )
         if isinstance(runtime_message, str):
             message = runtime_message
+
+        # Snapshot runtime memory length *before* adding the new user turn
+        # so we can later collect the tool-call trace produced during this
+        # turn and persist it for post-hoc search.
+        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         try:
             _base_prompt = self._select_next_step_prompt(message, thinking=True)
@@ -3168,6 +3581,10 @@ class AgentLoop:
                 _strip_attachment_context(message, attachments or []),
                 **save_kwargs,
             )
+            # Persist intermediate tool-call artifacts (tool results and the
+            # assistant messages that called them) so they remain searchable
+            # even after runtime context compaction.
+            self._persist_turn_tool_trace(_pre_turn_memory_index)
             self._session.add_message("assistant", final_content)
             self.sessions.save(self._session)
         except Exception as e:
@@ -3938,6 +4355,11 @@ class AgentLoop:
         new_key = session_key or f"session-{uuid.uuid4().hex[:8]}"
         self._session = self.sessions.get_or_create(new_key)
         self.session_key = new_key
+        if getattr(self, "_history_search_tool", None) is not None:
+            try:
+                self._history_search_tool.set_default_session_key(new_key)
+            except Exception:
+                pass
         logger.info(f"Switched to new session: {new_key}")
         return new_key
 
