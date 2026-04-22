@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-04-14 09:53 UTC.  
+> **Auto-generated** from source code on 2026-04-22 03:18 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:295`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:298`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:742`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:749`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:617`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:624`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:509`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:516`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:553`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:560`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:586`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:593`*
 
 ---
 
@@ -536,6 +536,7 @@ Options for chat requests.
 | `max_iterations` | `int` | Field(default=20, ge=1, le=100) |
 | `stream` | `bool` | False |
 | `thinking` | `bool` | False |
+| `reasoning_effort` | `str | None` | None |
 | `model` | `str | None` | None |
 
 #### `ChatRequest`
