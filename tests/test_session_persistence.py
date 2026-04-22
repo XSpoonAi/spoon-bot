@@ -492,6 +492,14 @@ class _NoChunkRuntimeAgent:
         return type("RunResult", (), {"content": self._final_content})()
 
 
+class _FailingStreamRuntimeAgent(_NoChunkRuntimeAgent):
+    """Runtime agent whose stream run fails before yielding assistant content."""
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        raise RuntimeError("upstream exploded")
+
+
 class _ChunkedRuntimeAgent:
     """Runtime agent that emits real incremental chunks through output_queue."""
 
@@ -544,6 +552,17 @@ class _RetryRuntimeAgent:
         return type("RunResult", (), {"content": self._final_content})()
 
 
+class _OverflowThenSuccessRuntimeAgent(_RetryRuntimeAgent):
+    """Runtime agent that overflows once, then succeeds after compaction."""
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        if self._failures_remaining > 0:
+            self._failures_remaining -= 1
+            raise RuntimeError("context length exceeded for this model")
+        return type("RunResult", (), {"content": self._final_content})()
+
+
 class _ThinkingRuntimeAgent:
     """Runtime agent that supports a thinking kwarg."""
 
@@ -568,6 +587,32 @@ class _ThinkingRuntimeAgent:
 
     async def run(self, *args, **kwargs):
         self.run_calls.append((args, kwargs))
+        return type(
+            "RunResult",
+            (),
+            {"content": self._final_content, "thinking_content": self._thinking_content},
+        )()
+
+
+class _OpenAITransientAPIError(Exception):
+    __module__ = "openai"
+
+
+class _RetryThinkingRuntimeAgent(_ThinkingRuntimeAgent):
+    """Thinking-capable runtime agent that fails once with a retryable API error."""
+
+    def __init__(self, final_content: str, thinking_content: str, failures: int = 1) -> None:
+        super().__init__(final_content, thinking_content)
+        self._failures_remaining = failures
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        if self._failures_remaining > 0:
+            self._failures_remaining -= 1
+            raise _OpenAITransientAPIError(
+                "An error occurred while processing your request. "
+                "You can retry your request, or contact us through our help center."
+            )
         return type(
             "RunResult",
             (),
@@ -622,7 +667,7 @@ class TestAgentLoopCurrentRequestMultimodal:
         assert loop._session.messages[0]["media"] == [str(image_path)]
 
     @pytest.mark.asyncio
-    async def test_process_requeues_multimodal_request_after_retry_compression(self, tmp_dir: Path):
+    async def test_process_does_not_auto_compress_context_on_runtime_failure(self, tmp_dir: Path):
         from spoon_bot.agent.context import ContextBuilder
         from spoon_bot.agent.loop import AgentLoop
 
@@ -658,27 +703,24 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._compress_runtime_context = MagicMock(side_effect=_compress_runtime_context)
         loop._force_compress_runtime_context = MagicMock(return_value=0)
 
-        response = await AgentLoop.process(
-            loop,
-            message="What text appears in the image?",
-            media=[str(image_path)],
-        )
+        with pytest.raises(RuntimeError, match="transient runtime failure"):
+            await AgentLoop.process(
+                loop,
+                message="What text appears in the image?",
+                media=[str(image_path)],
+            )
 
-        assert response == "recovered reply"
-        assert len(loop._agent.add_message_calls) == 2
+        assert len(loop._agent.add_message_calls) == 1
         _assert_multimodal_user_call(
             loop._agent.add_message_calls[0],
             expected_text="What text appears in the image?",
         )
-        _assert_multimodal_user_call(
-            loop._agent.add_message_calls[1],
-            expected_text="What text appears in the image?",
-        )
-        assert loop._agent.run_calls == [((), {}), ((), {})]
-        loop._compress_runtime_context.assert_called_once()
+        assert loop._agent.run_calls == [((), {})]
+        loop._compress_runtime_context.assert_not_called()
+        loop._force_compress_runtime_context.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_process_does_not_duplicate_request_after_noop_retry_compression(self, tmp_dir: Path):
+    async def test_process_persists_user_turn_before_runtime_failure(self, tmp_dir: Path):
         from spoon_bot.agent.context import ContextBuilder
         from spoon_bot.agent.loop import AgentLoop
 
@@ -710,21 +752,78 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._compress_runtime_context = MagicMock(return_value=0)
         loop._force_compress_runtime_context = MagicMock(return_value=0)
 
-        response = await AgentLoop.process(
-            loop,
-            message="What text appears in the image?",
-            media=[str(image_path)],
-        )
+        with pytest.raises(RuntimeError, match="transient runtime failure"):
+            await AgentLoop.process(
+                loop,
+                message="What text appears in the image?",
+                media=[str(image_path)],
+            )
 
-        assert response == "recovered reply"
         assert len(loop._agent.add_message_calls) == 1
         _assert_multimodal_user_call(
             loop._agent.add_message_calls[0],
             expected_text="What text appears in the image?",
         )
+        assert loop._agent.run_calls == [((), {})]
+        assert loop._session.messages == [
+            {
+                "role": "user",
+                "content": "What text appears in the image?",
+                "timestamp": loop._session.messages[0]["timestamp"],
+                "media": [str(image_path)],
+            }
+        ]
+        loop.sessions.save.assert_called_once_with(loop._session)
+        loop._compress_runtime_context.assert_not_called()
+        loop._force_compress_runtime_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_retries_once_after_context_overflow_compaction(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "overflow.png"
+        image_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._stop_requested = False
+        loop._initialized = True
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop._agent = _OverflowThenSuccessRuntimeAgent("recovered after compaction")
+        loop.context_window = 400_000
+        loop._session = Session(session_key="overflow_retry")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._auto_commit = False
+        loop._git = None
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._pre_inject_matched_skill = lambda message: message
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._filter_execution_steps = lambda content: content
+        loop._compress_runtime_context = MagicMock(return_value=2)
+        loop._force_compress_runtime_context = MagicMock(return_value=0)
+
+        response = await AgentLoop.process(
+            loop,
+            message="Keep the image request and continue.",
+            media=[str(image_path)],
+        )
+
+        assert response == "recovered after compaction"
         assert loop._agent.run_calls == [((), {}), ((), {})]
-        loop._compress_runtime_context.assert_called_once()
-        loop._force_compress_runtime_context.assert_called_once()
+        loop._compress_runtime_context.assert_called_once_with(
+            force=True,
+            budget_tokens=380_000,
+        )
+        loop._force_compress_runtime_context.assert_not_called()
 
 
 class TestAgentLoopStreamFallback:
@@ -760,7 +859,8 @@ class TestAgentLoopStreamFallback:
 
         assert loop._session.messages[-1]["role"] == "assistant"
         assert loop._session.messages[-1]["content"] == "fallback from run result"
-        loop.sessions.save.assert_called_once_with(loop._session)
+        assert loop.sessions.save.call_count == 2
+        loop.sessions.save.assert_called_with(loop._session)
 
     @pytest.mark.asyncio
     async def test_stream_preserves_incremental_queue_chunks(self, tmp_dir: Path):
@@ -823,6 +923,38 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[0]["content"] == "Please summarize the attachment."
         assert loop._session.messages[0]["attachments"] == attachments
 
+    @pytest.mark.asyncio
+    async def test_stream_persists_user_turn_when_upstream_fails(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _FailingStreamRuntimeAgent("unused")
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_error_context")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="keep this request in history"):
+            chunks.append(chunk)
+
+        assert any(chunk["type"] == "error" for chunk in chunks)
+        assert loop._session.messages == [
+            {
+                "role": "user",
+                "content": "keep this request in history",
+                "timestamp": loop._session.messages[0]["timestamp"],
+            }
+        ]
+        loop.sessions.save.assert_called_once_with(loop._session)
+
 
 class TestContextBuilderMediaPaths:
     def test_build_user_content_resolves_workspace_alias_and_relative_media(self, tmp_dir: Path):
@@ -871,13 +1003,47 @@ class TestAgentLoopRuntimeCompression:
         loop.context_window = 200
         loop._agent = SimpleNamespace(memory=SimpleNamespace(messages=messages))
 
-        compressed = AgentLoop._compress_runtime_context(loop)
+        compressed = AgentLoop._compress_runtime_context(loop, force=True, budget_tokens=100)
 
         assert compressed >= 1
         assert isinstance(messages[1].content, str)
         assert "image attachment(s) omitted during context compression" in messages[1].content
         assert "Please inspect this image carefully." in messages[1].content
         assert "data:image/png;base64," not in messages[1].content
+
+    def test_force_compaction_preserves_latest_real_multimodal_user_request(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        data_url = "data:image/png;base64," + ("B" * 800)
+        older_multimodal_message = [
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": "Older screenshot."},
+        ]
+        latest_multimodal_message = [
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": "Current request with image must stay intact."},
+        ]
+        messages = [
+            SimpleNamespace(role="system", content="system prompt", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content=older_multimodal_message, tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="assistant 1", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content="another request", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="assistant 2", tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="user", content=latest_multimodal_message, tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="tool summary " * 40, tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="another summary " * 40, tool_calls=None, tool_call_id=None),
+            SimpleNamespace(role="assistant", content="tail summary " * 40, tool_calls=None, tool_call_id=None),
+        ]
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.context_window = 200
+        loop._agent = SimpleNamespace(memory=SimpleNamespace(messages=messages))
+
+        compressed = AgentLoop._force_compress_runtime_context(loop)
+
+        assert compressed >= 1
+        assert any(message.content == latest_multimodal_message for message in messages)
+        assert any(message.content != older_multimodal_message for message in messages if getattr(message, "role", None) == "user")
 
 
 class TestAgentLoopThinkingMode:
@@ -938,6 +1104,38 @@ class TestAgentLoopThinkingMode:
         assert response == "answer"
         assert thinking == "reasoning trace"
         assert loop._agent.run_calls == [((), {"thinking": True, "reasoning_effort": "high"})]
+
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_retries_openai_apierror(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.utils.retry import RetryConfig
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop.workspace = tmp_dir
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._agent = _RetryThinkingRuntimeAgent("answer", "reasoning trace")
+        loop._session = Session(session_key="thinking_retry")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._auto_commit = False
+        loop._git = None
+        loop._retry_config = RetryConfig(max_retries=1, base_delay=0.01, max_delay=0.01, jitter=0.0)
+
+        response, thinking = await AgentLoop.process_with_thinking(loop, message="Explain the answer.")
+
+        assert response == "answer"
+        assert thinking == "reasoning trace"
+        assert loop._agent.run_calls == [
+            ((), {"thinking": True}),
+            ((), {"thinking": True}),
+        ]
 
 
 # ============================================================================

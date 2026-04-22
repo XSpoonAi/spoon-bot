@@ -1550,8 +1550,8 @@ class TestAgentLoopStream:
         assert chunks[-1]["metadata"]["content"] == "partial"
 
     @pytest.mark.asyncio
-    async def test_stream_skips_session_save_on_error(self):
-        """stream() should NOT save session when full_content is empty (error before any content)."""
+    async def test_stream_persists_user_turn_on_error_without_assistant(self):
+        """stream() should keep the user turn even when the provider fails immediately."""
         from spoon_bot.agent.loop import AgentLoop
 
         async def mock_stream(message, **kwargs):
@@ -1576,9 +1576,8 @@ class TestAgentLoopStream:
         assert chunks[-1]["type"] == "done"
         assert "error" in chunks[-1]["metadata"]
 
-        # Session should NOT be saved since full_content is empty
-        agent.sessions.save.assert_not_called()
-        agent._session.add_message.assert_not_called()
+        agent._session.add_message.assert_called_once_with("user", "test")
+        agent.sessions.save.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_stream_saves_session_on_success(self):
@@ -1619,7 +1618,7 @@ class TestAgentLoopStream:
         # Verify session was saved
         agent._session.add_message.assert_any_call("user", "test message")
         agent._session.add_message.assert_any_call("assistant", "hello")
-        agent.sessions.save.assert_called_once()
+        assert agent.sessions.save.call_count == 2
 
     @pytest.mark.asyncio
     async def test_stream_close_cancels_background_run_and_skips_session_save(self):
@@ -1669,8 +1668,8 @@ class TestAgentLoopStream:
         await stream.aclose()
         await asyncio.wait_for(run_cancelled.wait(), timeout=1.0)
 
-        agent.sessions.save.assert_not_called()
-        agent._session.add_message.assert_not_called()
+        agent._session.add_message.assert_called_once_with("user", "test message")
+        agent.sessions.save.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_install_anti_loop_tracker_does_not_stack_previous_request_prompt(self):
@@ -1709,6 +1708,7 @@ class TestAgentLoopStream:
         await agent._agent.think()
 
         assert seen_prompts[-1] == "prompt two"
+        agent._compress_runtime_context.assert_not_called()
 
 
 @pytest.mark.requires_spoon_core

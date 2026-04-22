@@ -514,12 +514,24 @@ Use the `activate_tool` tool with actions `activate` (single or batch) and `list
 
 ## Context Window
 
-spoon-bot automatically resolves the context window based on the selected model. For example, Claude Sonnet 4.5 gets 1M tokens, GPT-5.2 gets 400K, and DeepSeek V3.2 gets 164K. The default for unknown models is 128K.
+spoon-bot automatically resolves the context window based on the selected model. For example, Claude Sonnet 4.5 gets 1M tokens, GPT-5.2 gets 400K, GPT-5.4 is intentionally capped at 400K in spoon-bot, and DeepSeek V3.2 gets 164K. The default for unknown models is 128K.
 
-You can override this via environment variable or code:
+Before a provider call, spoon-bot now proactively compacts runtime context when it nears the configured window. If a provider still rejects the request as too large, spoon-bot compacts once more and retries the same request without dropping the latest user turn.
+
+You can override this via YAML, environment variable, or code:
+
+```yaml
+agent:
+  context_window: 400000
+```
 
 ```bash
 # Override to 256K
+SPOON_BOT_CONTEXT_WINDOW=256000 spoon-bot agent --model gpt-5.2
+```
+
+```bash
+# Legacy alias
 CONTEXT_WINDOW=256000 spoon-bot agent --model gpt-5.2
 ```
 
@@ -860,7 +872,8 @@ ruff check spoon_bot/
 | `SESSION_STORE_BACKEND` | `file` | Session backend: `file`, `sqlite`, `postgres` |
 | `SESSION_STORE_DB_PATH` | `./workspace/sessions.db` | SQLite database path |
 | `SESSION_STORE_DSN` | — | PostgreSQL connection string |
-| `CONTEXT_WINDOW` | auto | Context window override (tokens) |
+| `SPOON_BOT_CONTEXT_WINDOW` | auto | Context window override (tokens, recommended) |
+| `CONTEXT_WINDOW` | auto | Legacy alias for `SPOON_BOT_CONTEXT_WINDOW` |
 | `GATEWAY_AUTH_REQUIRED` | `false` | Enable gateway authentication |
 | `GATEWAY_API_KEY` | — | Gateway API key |
 | `JWT_SECRET` | — | JWT signing secret |

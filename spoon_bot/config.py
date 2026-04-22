@@ -53,6 +53,13 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5.2-codex":           400_000,
     "gpt-5.2-chat":            128_000,
     "gpt-5.2-pro":             400_000,
+    # OpenAI currently documents GPT-5.4 at 1M input tokens, but spoon-bot
+    # intentionally keeps the operational default at 400K for stability.
+    # Users can still raise/lower this explicitly via context_window.
+    "gpt-5.4":                 400_000,
+    "gpt-5.4-pro":             400_000,
+    "gpt-5.4-mini":            400_000,
+    "gpt-5.4-nano":            400_000,
     "gpt-5.1":                 400_000,
     "gpt-5.1-codex":           400_000,
     "gpt-5.1-codex-mini":      400_000,

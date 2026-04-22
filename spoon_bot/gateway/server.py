@@ -87,10 +87,6 @@ async def _lifespan(app: FastAPI):
         session_store_dsn = os.environ.get("SESSION_STORE_DSN")
         session_store_db_path = os.environ.get("SESSION_STORE_DB_PATH")
 
-        # Context window override (optional)
-        _ctx_env = os.environ.get("CONTEXT_WINDOW")
-        context_window = int(_ctx_env) if _ctx_env else None
-
         # YOLO mode: operate directly in user's path without sandbox
         yolo_mode = (
             agent_cfg.get("yolo_mode")
@@ -110,7 +106,6 @@ async def _lifespan(app: FastAPI):
             session_store_backend=session_store_backend,
             session_store_dsn=session_store_dsn,
             session_store_db_path=session_store_db_path,
-            context_window=context_window,
             yolo_mode=bool(yolo_mode),
         )
         if agent_cfg.get("mcp_config") is not None:
