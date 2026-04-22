@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-04-22 03:18 UTC.  
+> **Auto-generated** from source code on 2026-04-22 03:22 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -315,7 +315,7 @@ List all sessions.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:26`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:92`*
 
 ### `POST /v1/sessions`
 
@@ -325,7 +325,16 @@ Create a new session.
 
 **Request Body:** `SessionCreateRequest`
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:63`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:123`*
+
+### `GET /v1/sessions/search`
+
+Search across *all* persisted sessions for the current agent.
+
+**Auth Required:** Yes
+
+
+*Source: `spoon_bot/gateway/api/v1/sessions.py:162`*
 
 ### `GET /v1/sessions/{session_key}`
 
@@ -334,7 +343,16 @@ Get session details.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:103`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:222`*
+
+### `GET /v1/sessions/{session_key}/search`
+
+Search persisted messages within a single session.
+
+**Auth Required:** Yes
+
+
+*Source: `spoon_bot/gateway/api/v1/sessions.py:254`*
 
 ### `DELETE /v1/sessions/{session_key}`
 
@@ -343,7 +361,7 @@ Delete a session.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:138`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:308`*
 
 ### `POST /v1/sessions/{session_key}/clear`
 
@@ -352,7 +370,7 @@ Clear session history.
 **Auth Required:** Yes
 
 
-*Source: `spoon_bot/gateway/api/v1/sessions.py:157`*
+*Source: `spoon_bot/gateway/api/v1/sessions.py:319`*
 
 ---
 
@@ -766,6 +784,33 @@ Session list response model.
 |-------|------|---------|
 | `sessions` | `list[SessionInfo]` | *(required)* |
 
+#### `SessionSearchHit`
+
+A single match from a session history search.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `session_key` | `str` | *(required)* |
+| `seq` | `int` | *(required)* |
+| `role` | `str` | *(required)* |
+| `content` | `str` | *(required)* |
+| `timestamp` | `str | None` | None |
+| `matched_in` | `str` | 'content' |
+| `snippet` | `str` | '' |
+| `extras` | `dict[str, Any]` | Field(default_factory=dict) |
+
+#### `SessionSearchResponse`
+
+Session search response model.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `query` | `str` | *(required)* |
+| `total` | `int` | *(required)* |
+| `limit` | `int` | *(required)* |
+| `offset` | `int` | *(required)* |
+| `hits` | `list[SessionSearchHit]` | Field(default_factory=list) |
+
 #### `ToolInfo`
 
 Tool information.
@@ -1034,7 +1079,9 @@ Set mode via `SPOON_BOT_MODE` environment variable.
 | `POST` | `/v1/agent/voice/chat` | Yes | Send voice + optional text to the agent (multipart upload). |
 | `GET` | `/v1/sessions` | Yes | List all sessions. |
 | `POST` | `/v1/sessions` | Yes | Create a new session. |
+| `GET` | `/v1/sessions/search` | Yes | Search across *all* persisted sessions for the current agent |
 | `GET` | `/v1/sessions/{session_key}` | Yes | Get session details. |
+| `GET` | `/v1/sessions/{session_key}/search` | Yes | Search persisted messages within a single session. |
 | `DELETE` | `/v1/sessions/{session_key}` | Yes | Delete a session. |
 | `POST` | `/v1/sessions/{session_key}/clear` | Yes | Clear session history. |
 | `GET` | `/v1/tools` | Yes | List all available tools. |
