@@ -355,6 +355,11 @@ async def websocket_endpoint(
         while True:
             try:
                 data = await websocket.receive_json()
+                # Every inbound frame counts as liveness evidence, even when
+                # we don't end up sending a response. Without this, a mostly
+                # client-driven conversation could look idle to the ping loop
+                # and get evicted during a long streaming turn.
+                manager.touch(conn_id)
                 message = parse_message(data)
 
                 if message.type.value == "ping":

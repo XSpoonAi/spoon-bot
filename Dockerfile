@@ -122,6 +122,13 @@ ENV SPOON_BOT_WORKSPACE_PATH=/data/workspace
 #     -e SPOON_BOT_WORKSPACE_PATH=/project ...
 ENV SPOON_BOT_YOLO_MODE=false
 
+# --- Tini signal handling ---
+# Register tini as a child subreaper so zombie processes are reaped even when
+# the container runtime doesn't schedule tini as PID 1 (e.g. nested sandboxes,
+# some orchestrators that inject their own init). Without this, long-running
+# gateway pods that fork subprocesses (skills, MCP servers) accumulate zombies.
+ENV TINI_SUBREAPER=1
+
 # Create workspace directory with correct ownership
 RUN mkdir -p /data/workspace/memory /data/workspace/skills \
     && chown -R spoonbot:spoonbot /data /app
@@ -139,5 +146,7 @@ USER spoonbot
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${GATEWAY_PORT}/health || exit 1
 
-# Use tini as PID 1 for proper signal handling
-ENTRYPOINT ["tini", "--", "/app/docker-entrypoint.sh"]
+# Use tini for proper signal handling. The ``-s`` flag asks tini to register
+# itself as a child subreaper at startup, which is a no-op when tini already
+# runs as PID 1 but crucial when it doesn't (matches TINI_SUBREAPER above).
+ENTRYPOINT ["tini", "-s", "--", "/app/docker-entrypoint.sh"]
