@@ -201,6 +201,18 @@ class ChannelManager:
         return False
 
     @staticmethod
+    def _reasoning_effort_from_think_level(level: object) -> str | None:
+        normalized = str(level or "").strip().lower()
+        aliases = {
+            "basic": "low",
+            "extended": "high",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in {"low", "medium", "high", "xhigh"}:
+            return normalized
+        return None
+
+    @staticmethod
     def _sanitize_workspace_segment(name: str) -> str:
         """Return a filesystem-safe workspace segment for a channel/account."""
         safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
@@ -1001,18 +1013,31 @@ class ChannelManager:
 
             # Route based on think/verbose metadata from channel
             think_level = message.metadata.get("think_level", "off")
+            raw_think_level = str(think_level or "").strip().lower()
+            reasoning_effort = self._reasoning_effort_from_think_level(think_level)
+            thinking_enabled = raw_think_level in {
+                "basic",
+                "extended",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+            }
             media = message.media if message.has_media else None
             raw_attachments = message.metadata.get("attachments")
             attachments = raw_attachments if isinstance(raw_attachments, list) else None
             session_key = message.session_key or None
 
-            if think_level != "off":
-                response_text, thinking_content = await agent.process_with_thinking(
-                    message=content,
-                    media=media,
-                    session_key=session_key,
-                    attachments=attachments,
-                )
+            if thinking_enabled:
+                process_kwargs = {
+                    "message": content,
+                    "media": media,
+                    "session_key": session_key,
+                    "attachments": attachments,
+                }
+                if reasoning_effort:
+                    process_kwargs["reasoning_effort"] = reasoning_effort
+                response_text, thinking_content = await agent.process_with_thinking(**process_kwargs)
                 # Include thinking content in verbose mode
                 if message.metadata.get("verbose") and thinking_content:
                     response_text = (
@@ -1020,12 +1045,15 @@ class ChannelManager:
                         f"---\n\n{response_text}"
                     )
             else:
-                response_text = await agent.process(
-                    message=content,
-                    media=media,
-                    session_key=session_key,
-                    attachments=attachments,
-                )
+                process_kwargs = {
+                    "message": content,
+                    "media": media,
+                    "session_key": session_key,
+                    "attachments": attachments,
+                }
+                if reasoning_effort:
+                    process_kwargs["reasoning_effort"] = reasoning_effort
+                response_text = await agent.process(**process_kwargs)
 
             self._circuit_breaker.record_success()
 

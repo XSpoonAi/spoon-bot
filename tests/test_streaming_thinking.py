@@ -32,6 +32,7 @@ class TestChatOptionsModel:
         opts = ChatOptions()
         assert opts.stream is False
         assert opts.thinking is False
+        assert opts.reasoning_effort is None
         assert opts.max_iterations == 20
         assert opts.model is None
 
@@ -74,6 +75,14 @@ class TestChatOptionsModel:
         parsed = json.loads(json_str)
         assert parsed["stream"] is True
         assert parsed["thinking"] is True
+
+    def test_reasoning_effort_roundtrip(self):
+        from spoon_bot.gateway.models.requests import ChatOptions
+
+        opts = ChatOptions(stream=True, thinking=True, reasoning_effort="high")
+        data = opts.model_dump()
+        restored = ChatOptions(**data)
+        assert restored.reasoning_effort == "high"
 
 
 class TestStreamChunkModel:
@@ -1873,6 +1882,45 @@ class TestAgentLoopProcessWithThinking:
 
         response, thinking = await AgentLoop.process_with_thinking(agent, message="test")
         assert thinking == "Metadata thought"
+
+    @pytest.mark.asyncio
+    async def test_thinking_from_reasoning_metadata(self):
+        """Should fall back to provider reasoning metadata when thinking is absent."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        result = MagicMock(spec=["content", "metadata"])
+        result.content = "Answer"
+        result.metadata = {"reasoning": "Provider reasoning summary"}
+
+        mock_inner_agent = MagicMock()
+        mock_inner_agent.run = AsyncMock(return_value=result)
+        mock_inner_agent.add_message = AsyncMock()
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = mock_inner_agent
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._auto_commit = False
+        agent._git = None
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._looks_like_duplicate_thinking = AgentLoop._looks_like_duplicate_thinking.__get__(agent, AgentLoop)
+        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
+        agent._latest_reasoning_excerpt = None
+
+        response, thinking = await AgentLoop.process_with_thinking(agent, message="test")
+        assert response == "Answer"
+        assert thinking == "Provider reasoning summary"
 
     @pytest.mark.asyncio
     async def test_does_not_fall_back_to_tracked_reasoning_when_provider_omits_thinking_fields(self):

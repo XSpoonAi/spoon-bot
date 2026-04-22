@@ -178,6 +178,10 @@ def agent(
         None, "--base-url",
         help="Custom LLM API base URL (overrides YAML agent.base_url)",
     ),
+    reasoning_effort: Optional[str] = typer.Option(
+        None, "--reasoning-effort",
+        help="Reasoning effort hint (e.g. low/medium/high/xhigh)",
+    ),
     tool_profile: Optional[str] = typer.Option(
         None, "--tool-profile",
         help="Tool profile (core/coding/research/full) (overrides YAML agent.tool_profile)",
@@ -210,6 +214,7 @@ def agent(
         provider=provider,
         api_key=api_key,
         base_url=base_url,
+        reasoning_effort=reasoning_effort,
         tool_profile=tool_profile,
         workspace=workspace,
         max_iterations=max_iterations,
@@ -499,6 +504,7 @@ async def _run_agent(
     provider: Optional[str],
     api_key: Optional[str],
     base_url: Optional[str],
+    reasoning_effort: Optional[str],
     tool_profile: Optional[str],
     workspace: Optional[Path],
     max_iterations: int,
@@ -531,6 +537,7 @@ async def _run_agent(
     effective_model = model or agent_cfg.get("model")
     effective_base_url = base_url or agent_cfg.get("base_url")
     effective_api_key = api_key or agent_cfg.get("api_key")
+    effective_reasoning_effort = reasoning_effort or agent_cfg.get("reasoning_effort")
     effective_workspace = (
         workspace
         or (Path(agent_cfg["workspace"]) if agent_cfg.get("workspace") else None)
@@ -568,6 +575,7 @@ async def _run_agent(
         provider=effective_provider,
         api_key=effective_api_key,
         base_url=effective_base_url,
+        reasoning_effort=effective_reasoning_effort,
         workspace=effective_workspace,
         max_iterations=effective_max_iterations,
         enable_skills=effective_enable_skills,
@@ -921,6 +929,10 @@ def gateway(
         None, "--base-url",
         help="Custom LLM API base URL (overrides YAML agent.base_url)",
     ),
+    reasoning_effort: Optional[str] = typer.Option(
+        None, "--reasoning-effort",
+        help="Reasoning effort hint (e.g. low/medium/high/xhigh)",
+    ),
     tool_profile: Optional[str] = typer.Option(
         None, "--tool-profile",
         help="Tool profile (core/coding/research/full) (overrides YAML agent.tool_profile)",
@@ -959,6 +971,7 @@ def gateway(
         provider=provider,
         api_key=api_key,
         base_url=base_url,
+        reasoning_effort=reasoning_effort,
         tool_profile=tool_profile,
         workspace=workspace,
     ))
@@ -972,6 +985,7 @@ async def _run_gateway(
     provider: Optional[str] = None,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     tool_profile: Optional[str] = None,
     workspace: Optional[Path] = None,
 ) -> None:
@@ -1006,6 +1020,7 @@ async def _run_gateway(
     effective_model = model or agent_cfg.get("model")
     effective_base_url = base_url or agent_cfg.get("base_url")
     effective_api_key = api_key or agent_cfg.get("api_key")
+    effective_reasoning_effort = reasoning_effort or agent_cfg.get("reasoning_effort")
     effective_workspace = (
         workspace
         or (Path(agent_cfg["workspace"]) if agent_cfg.get("workspace") else None)
@@ -1051,6 +1066,7 @@ async def _run_gateway(
         provider=effective_provider,
         api_key=effective_api_key,
         base_url=effective_base_url,
+        reasoning_effort=effective_reasoning_effort,
         workspace=effective_workspace,
         enable_skills=effective_enable_skills,
     )

@@ -73,9 +73,24 @@ MODELS_PER_PROVIDER_PAGE = 8
 
 THINK_LEVELS: dict[str, str] = {
     "off": "Disabled",
-    "basic": "Basic",
-    "extended": "Extended",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "X-High",
 }
+
+THINK_LEVEL_ALIASES: dict[str, str] = {
+    "basic": "low",
+    "extended": "high",
+}
+
+
+def normalize_think_level(level: object) -> str:
+    normalized = str(level or "").strip().lower()
+    if not normalized:
+        return "off"
+    normalized = THINK_LEVEL_ALIASES.get(normalized, normalized)
+    return normalized if normalized in THINK_LEVELS else "off"
 
 # ---------------------------------------------------------------------------
 # Reasoning display levels for /reasoning command

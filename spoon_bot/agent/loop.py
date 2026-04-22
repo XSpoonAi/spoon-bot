@@ -369,6 +369,7 @@ class AgentLoop:
         provider_retry_base_delay: float = 1.0,
         provider_retry_max_delay: float = 60.0,
         provider_retry_backoff_factor: float = 2.0,
+        reasoning_effort: str | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -402,6 +403,7 @@ class AgentLoop:
             self._config = validate_agent_loop_params(
                 workspace=workspace,
                 model=model,
+                reasoning_effort=reasoning_effort,
                 max_iterations=max_iterations,
                 shell_timeout=shell_timeout,
                 shell_max_timeout=shell_max_timeout,
@@ -426,6 +428,7 @@ class AgentLoop:
         self.provider = provider
         self.api_key = api_key
         self.base_url = base_url
+        self.reasoning_effort = self._config.reasoning_effort
         self.max_iterations = self._config.max_iterations
         self.shell_timeout = self._config.shell_timeout
         self.shell_max_timeout = self._config.shell_max_timeout
@@ -1279,6 +1282,7 @@ class AgentLoop:
         media: list[str] | None = None,
         session_key: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -1309,6 +1313,7 @@ class AgentLoop:
             logger.debug(f"Switched to session: {session_key}")
 
         logger.info(f"Processing message: {message[:100]}...")
+        effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
 
         # Reset per-request state
         self._pre_injected_skill_name = None
@@ -1375,7 +1380,13 @@ class AgentLoop:
                     ):
                         await self._agent.add_message("user", runtime_message)
                     retry_requires_runtime_message_check = False
-                    result = await self._run_agent_with_retry(label="process")
+                    run_kwargs: dict[str, Any] = {}
+                    if (
+                        effective_reasoning_effort
+                        and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
+                    ):
+                        run_kwargs["reasoning_effort"] = effective_reasoning_effort
+                    result = await self._run_agent_with_retry(label="process", **run_kwargs)
 
                     logger.debug(f"Agent result type: {type(result)}")
                     if hasattr(result, 'content'):
@@ -2217,6 +2228,13 @@ class AgentLoop:
         def _log_agent_reasoning():
             """Extract and log the agent's reasoning text from its last response."""
             from spoon_bot.utils.privacy import mask_secrets
+            provider_reasoning = getattr(agent, "last_reasoning_summary", None)
+            if isinstance(provider_reasoning, str) and provider_reasoning.strip():
+                safe_reasoning = mask_secrets(provider_reasoning.strip())
+                captured = agent_loop._capture_reasoning_text(safe_reasoning)
+                if captured:
+                    logger.info(f"💭 Agent reasoning: {captured}")
+                return
             if not hasattr(agent, 'memory') or not agent.memory.messages:
                 return
             for msg in reversed(agent.memory.messages[-3:]):
@@ -2528,6 +2546,7 @@ class AgentLoop:
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking: bool = False,
+        reasoning_effort: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Stream a response with typed chunks.
@@ -2548,6 +2567,7 @@ class AgentLoop:
 
         logger.info(f"Streaming message: {message[:100]}...")
         self._reset_reasoning_capture()
+        effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
 
         # Refresh memory context
         try:
@@ -2618,6 +2638,11 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
+                    if (
+                        effective_reasoning_effort
+                        and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
+                    ):
+                        run_kwargs["reasoning_effort"] = effective_reasoning_effort
 
                     def _drain_queue() -> None:
                         while not self._agent.output_queue.empty():
@@ -2979,6 +3004,7 @@ class AgentLoop:
         media: list[str] | None = None,
         session_key: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -3002,6 +3028,7 @@ class AgentLoop:
 
         logger.info(f"Processing message (with thinking): {message[:100]}...")
         self._reset_reasoning_capture()
+        effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
 
@@ -3037,6 +3064,11 @@ class AgentLoop:
             run_kwargs: dict[str, Any] = {}
             if self._callable_accepts_kwarg(self._agent.run, "thinking"):
                 run_kwargs["thinking"] = True
+            if (
+                effective_reasoning_effort
+                and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
+            ):
+                run_kwargs["reasoning_effort"] = effective_reasoning_effort
             with bind_tool_owner(self._current_tool_owner_key()):
                 result = await self._agent.run(**run_kwargs)
 
@@ -3052,7 +3084,10 @@ class AgentLoop:
             elif hasattr(result, "thinking"):
                 thinking_content = result.thinking
             elif hasattr(result, "metadata") and isinstance(result.metadata, dict):
-                thinking_content = result.metadata.get("thinking")
+                thinking_content = (
+                    result.metadata.get("thinking")
+                    or result.metadata.get("reasoning")
+                )
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
 
@@ -3922,6 +3957,7 @@ async def create_agent(
     auto_reload_interval: float = 5.0,
     config_path: Path | str | None = None,
     yolo_mode: bool = False,
+    reasoning_effort: str | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -3990,6 +4026,7 @@ async def create_agent(
         auto_reload_interval=auto_reload_interval,
         config_path=config_path,
         yolo_mode=yolo_mode,
+        reasoning_effort=reasoning_effort,
         **kwargs,
     )
 

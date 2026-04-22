@@ -53,6 +53,36 @@ class TestConfigPriority:
         assert result["model"] == "claude-sonnet"  # from YAML
         assert result["provider"] == "openai"       # from env
 
+    def test_reasoning_effort_loaded_from_yaml_or_env(self, tmp_path, monkeypatch):
+        """reasoning_effort should resolve like other top-level agent settings."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              reasoning_effort: high
+        """)
+        monkeypatch.setenv("SPOON_BOT_REASONING_EFFORT", "low")
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["reasoning_effort"] == "high"
+
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              provider: openai
+        """)
+        result = load_agent_config(cfg_path)
+        assert result["reasoning_effort"] == "low"
+
+    def test_validate_agent_loop_params_accepts_reasoning_effort(self, tmp_path):
+        from spoon_bot.config import validate_agent_loop_params
+
+        config = validate_agent_loop_params(
+            workspace=tmp_path / "workspace",
+            reasoning_effort="high",
+        )
+
+        assert config.reasoning_effort == "high"
+
     def test_no_hidden_defaults_for_model_provider(self, tmp_path, monkeypatch):
         """model/provider must not have silent fallback values."""
         for var in (
@@ -363,6 +393,66 @@ class TestManagedChannelAgents:
             attachments=None,
         )
         manager._channel_agents["feishu:testbot"].process.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_message_maps_legacy_think_level_to_reasoning_effort(self):
+        from spoon_bot.bus.events import InboundMessage
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._agent = MagicMock()
+        manager._channel_agents["feishu:testbot"] = MagicMock()
+        manager._channel_agents["feishu:testbot"].process_with_thinking = AsyncMock(
+            return_value=("ok", "thoughts")
+        )
+
+        message = InboundMessage(
+            content="analyze this",
+            channel="feishu:testbot",
+            sender_id="u1",
+            metadata={"chat_type": "dm", "is_dm": True, "think_level": "basic"},
+        )
+
+        response = await manager._handle_message(message)
+
+        assert response is not None
+        manager._channel_agents["feishu:testbot"].process_with_thinking.assert_awaited_once_with(
+            message="analyze this",
+            media=None,
+            session_key="default",
+            attachments=None,
+            reasoning_effort="low",
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_message_maps_canonical_think_level_to_reasoning_effort(self):
+        from spoon_bot.bus.events import InboundMessage
+        from spoon_bot.channels.manager import ChannelManager
+
+        manager = ChannelManager()
+        manager._agent = MagicMock()
+        manager._channel_agents["feishu:testbot"] = MagicMock()
+        manager._channel_agents["feishu:testbot"].process_with_thinking = AsyncMock(
+            return_value=("ok", "thoughts")
+        )
+
+        message = InboundMessage(
+            content="analyze this",
+            channel="feishu:testbot",
+            sender_id="u1",
+            metadata={"chat_type": "dm", "is_dm": True, "think_level": "xhigh"},
+        )
+
+        response = await manager._handle_message(message)
+
+        assert response is not None
+        manager._channel_agents["feishu:testbot"].process_with_thinking.assert_awaited_once_with(
+            message="analyze this",
+            media=None,
+            session_key="default",
+            attachments=None,
+            reasoning_effort="xhigh",
+        )
 
     @pytest.mark.asyncio
     async def test_handle_message_creates_scoped_group_agent_for_group_override(self, tmp_path):

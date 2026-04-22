@@ -42,6 +42,11 @@ def _make_mock_stream_agent(run_impl) -> tuple[object, asyncio.Queue, asyncio.Ev
     agent._build_step_prompt = MagicMock(return_value="prompt")
     agent._install_anti_loop_tracker = MagicMock()
     agent._restore_agent_think = MagicMock()
+
+    async def _run_with_retry_stub(**kwargs):
+        return await run_impl(**kwargs)
+
+    agent._run_agent_with_retry = AsyncMock(side_effect=_run_with_retry_stub)
     agent._callable_accepts_kwarg = AgentLoop._callable_accepts_kwarg
     return agent, oq, td
 
@@ -75,6 +80,34 @@ class TestStreamThinkingParam:
 
         assert len(run_kwargs_captured) == 1
         assert run_kwargs_captured[0].get("thinking") is True
+
+    @pytest.mark.asyncio
+    async def test_reasoning_effort_passed_to_run(self):
+        """stream() should forward reasoning_effort alongside thinking mode."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        run_kwargs_captured: list[dict] = []
+
+        async def mock_run(**kwargs):
+            run_kwargs_captured.append(kwargs)
+            result = MagicMock()
+            result.content = "done"
+            return result
+
+        agent, _, _ = _make_mock_stream_agent(mock_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(
+            agent,
+            message="test",
+            thinking=True,
+            reasoning_effort="high",
+        ):
+            chunks.append(chunk)
+
+        assert len(run_kwargs_captured) == 1
+        assert run_kwargs_captured[0].get("thinking") is True
+        assert run_kwargs_captured[0].get("reasoning_effort") == "high"
 
     @pytest.mark.asyncio
     async def test_thinking_false_not_passed_to_run(self):

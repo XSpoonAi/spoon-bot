@@ -133,6 +133,8 @@ async def _lifespan(app: FastAPI):
             create_kwargs["tool_profile"] = agent_cfg["tool_profile"]
         if agent_cfg.get("max_iterations"):
             create_kwargs["max_iterations"] = int(agent_cfg["max_iterations"])
+        if agent_cfg.get("reasoning_effort") is not None:
+            create_kwargs["reasoning_effort"] = str(agent_cfg["reasoning_effort"])
 
         agent = await create_agent(**create_kwargs)
         app_module._agent = agent
