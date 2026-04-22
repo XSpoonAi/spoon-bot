@@ -447,6 +447,60 @@ class TestAgentLoopStream:
         assert loop._agent.system_prompt == "base system"
         assert loop._agent._original_system_prompt == "base original"
 
+    def test_build_request_context_prompt_preserves_tail_output_constraints(self):
+        """Compact request scaffolding must keep the latest request ending verbatim."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        message = (
+            "Inspect the workspace carefully. "
+            + ("middle context " * 30)
+            + "When you are done, reply with exactly: FINAL_OK. Do not summarize."
+        )
+
+        prompt = AgentLoop._build_request_context_prompt(loop, message)
+
+        assert "[... middle omitted to save tokens; preserve latest tail instructions ...]" in prompt
+        assert "reply with exactly: final_ok" in prompt.lower()
+        assert "Do not summarize." in prompt
+        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
+        assert "[LATEST REQUEST ENDING]:" in prompt
+
+    def test_build_request_context_prompt_skips_extra_tail_block_for_short_requests(self):
+        """Short requests are already preserved whole and do not need an extra tail block."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "Return FINAL_OK")
+
+        assert "[AUTHORITATIVE REQUEST ENDING]" not in prompt
+
+    def test_build_request_context_prompt_keeps_non_english_tail_constraints(self):
+        """Long non-English requests should preserve their tail verbatim without keyword matching."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        message = (
+            "Revisa el repositorio con cuidado. "
+            + ("contexto intermedio " * 40)
+            + "Al terminar, responde solo con FINAL_OK y no hagas resumen."
+        )
+
+        prompt = AgentLoop._build_request_context_prompt(loop, message)
+
+        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
+        assert "responde solo con final_ok" in prompt.lower()
+        assert "no hagas resumen" in prompt.lower()
+
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
         """stream() should yield dicts with type, delta, metadata keys."""

@@ -337,10 +337,13 @@ class AgentLoop:
     # Minimal per-step prompt. Kept short since it's injected every iteration.
     # The agent builds its own reasoning from the system prompt + memory.
     DEFAULT_NEXT_STEP_PROMPT = (
-        "Continue working on the user's request. "
+        "Continue working on the user's latest request. "
+        "Treat the latest real user request as authoritative, even if earlier history was compacted. "
         "Do NOT repeat previous actions. Do NOT fabricate output. "
         "Make autonomous choices when input is needed. "
-        "When the task is complete, summarize concrete results."
+        "Do NOT summarize prior work unless the user explicitly asked for a summary. "
+        "If the task can be completed now, return the final user-facing answer in the format the user requested and stop. "
+        "If an authoritative request-ending block is present, it is copied verbatim from the newest user message and your final answer must satisfy it exactly."
     )
 
     def __init__(
@@ -642,7 +645,8 @@ class AgentLoop:
             "2. Otherwise, if a skill matches, `read_file` its SKILL.md path, "
             "then execute.\n"
             "3. Run commands from SKILL.md directly via shell. Do NOT write script files.\n"
-            "4. Summarize result when done.\n\n"
+            "4. When done, return the user-facing result in the format the latest user requested. "
+            "Only summarize if the user explicitly asked for a summary.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
             "- `source .env.local` before commands that need env vars.\n"
@@ -2800,7 +2804,13 @@ class AgentLoop:
                     completed_parts.append(f"  - {key} (x{count})")
                 completed_summary = "\n".join(completed_parts)
 
-                anti_loop = f"\n[DONE]:\n{completed_summary}"
+                anti_loop = (
+                    "\n[ALREADY COMPLETED ACTIONS - do not repeat]:\n"
+                    f"{completed_summary}\n"
+                    "Use this only to avoid repetition. Do not restate this list to the user.\n"
+                    "Continue from the latest unfinished user instruction. "
+                    "If the task is already complete, send the final answer once in the requested format and stop."
+                )
 
                 if read_files:
                     recent = sorted(read_files)[-8:]
@@ -2811,7 +2821,7 @@ class AgentLoop:
                 if repeated_details:
                     anti_loop += (
                         "\n⚠️ STOP REPEATING! You already did these actions. "
-                        "Move to the NEXT step toward the goal."
+                        "Choose the next missing action, or finish immediately if nothing remains."
                     )
 
                 if len(anti_loop) > 1000:
@@ -4199,13 +4209,16 @@ class AgentLoop:
         Injects env vars so they survive short-term memory pruning.
         The anti-loop tracker dynamically appends progress info.
         """
-        _truncated = message[:300] + ("…" if len(message) > 300 else "")
+        _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
         prompt = (
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
         )
+        output_requirements = self._extract_output_contract_for_prompt(message)
+        if output_requirements:
+            prompt += output_requirements
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -4213,16 +4226,71 @@ class AgentLoop:
 
     def _build_request_context_prompt(self, message: str) -> str:
         """Build the compact request context block used for thinking runs."""
-        _truncated = message[:300] + ("…" if len(message) > 300 else "")
+        _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
         prompt = (
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n"
         )
+        output_requirements = self._extract_output_contract_for_prompt(message)
+        if output_requirements:
+            prompt += output_requirements
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
         return prompt
+
+    @staticmethod
+    def _truncate_request_for_prompt(
+        message: str,
+        *,
+        head_chars: int = 220,
+        tail_chars: int = 180,
+    ) -> str:
+        """Keep both the head and tail of the latest request for prompt scaffolding."""
+        normalized = (message or "").strip()
+        if len(normalized) <= head_chars + tail_chars + 24:
+            return normalized
+        head = normalized[:head_chars].rstrip()
+        tail = normalized[-tail_chars:].lstrip()
+        return (
+            f"{head}\n"
+            "[... middle omitted to save tokens; preserve latest tail instructions ...]\n"
+            f"{tail}"
+        )
+
+    @staticmethod
+    def _extract_output_contract_for_prompt(
+        message: str,
+        *,
+        full_request_chars: int = 420,
+        tail_chars: int = 240,
+    ) -> str:
+        """Preserve the latest request ending without language-specific intent matching.
+
+        We avoid keyword heuristics here. Compression failures often happen
+        because the *tail* of a long request carries the final delivery rule,
+        regardless of language.  For longer requests, surface that tail
+        verbatim so the model can continue execution and finish in the
+        requested format without relying on English/Chinese phrase lists.
+        """
+        normalized = (message or "").strip()
+        if not normalized:
+            return ""
+
+        if len(normalized) <= full_request_chars:
+            return ""
+
+        tail_snippet = normalized[-tail_chars:]
+        return (
+            "\n[AUTHORITATIVE REQUEST ENDING]: "
+            "The block below is copied verbatim from the newest user message. "
+            "It may contain the exact completion contract in any language. "
+            "It overrides earlier assistant guesses, stale summaries, and unrelated context. "
+            "Do not answer a different question. Do not translate it away, soften it, or replace it with a recap. "
+            "Your final answer must satisfy this block exactly.\n"
+            f"[LATEST REQUEST ENDING]: {tail_snippet}\n"
+        )
 
     def _apply_request_context_to_system_prompt(
         self,
