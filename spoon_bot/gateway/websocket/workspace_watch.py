@@ -176,18 +176,35 @@ class WorkspaceWatchService:
         if target.is_file():
             try:
                 relative = target.relative_to(self._workspace_root)
-            except ValueError:
+                snapshot = self._entry_snapshot(target)
+            except (ValueError, FileNotFoundError, OSError):
                 return {}
-            return {self._sandbox_path_for(relative): self._entry_snapshot(target)}
+            return {self._sandbox_path_for(relative): snapshot}
 
         entries: dict[str, dict[str, Any]] = {}
-        iterator = target.rglob("*") if recursive else target.iterdir()
-        for entry in iterator:
+        try:
+            iterator = iter(target.rglob("*") if recursive else target.iterdir())
+        except (FileNotFoundError, OSError):
+            return entries
+
+        while True:
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                break
+            except (FileNotFoundError, OSError):
+                # Highly volatile trees (for example pnpm/node_modules during install)
+                # can lose paths mid-walk. Keep the watch alive and retry next poll.
+                break
+
             try:
                 relative = entry.relative_to(self._workspace_root)
             except ValueError:
                 continue
-            entries[self._sandbox_path_for(relative)] = self._entry_snapshot(entry)
+            try:
+                entries[self._sandbox_path_for(relative)] = self._entry_snapshot(entry)
+            except (FileNotFoundError, OSError):
+                continue
         return entries
 
     @staticmethod
