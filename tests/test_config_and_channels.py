@@ -73,6 +73,41 @@ class TestConfigPriority:
         result = load_agent_config(cfg_path)
         assert result["reasoning_effort"] == "low"
 
+    def test_context_window_loaded_from_yaml_or_env(self, tmp_path, monkeypatch):
+        """context_window should resolve via YAML > env using integer parsing."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              context_window: 400000
+        """)
+        monkeypatch.setenv("SPOON_BOT_CONTEXT_WINDOW", "256000")
+        monkeypatch.setenv("CONTEXT_WINDOW", "128000")
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["context_window"] == 400000
+
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              provider: openai
+        """)
+        result = load_agent_config(cfg_path)
+        assert result["context_window"] == 256000
+
+    def test_context_window_prefers_namespaced_env_alias(self, tmp_path, monkeypatch):
+        """The SPOON_BOT_ namespaced env should win over the legacy alias."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              provider: openai
+        """)
+        monkeypatch.setenv("SPOON_BOT_CONTEXT_WINDOW", "400000")
+        monkeypatch.setenv("CONTEXT_WINDOW", "256000")
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["context_window"] == 400000
+
     def test_validate_agent_loop_params_accepts_reasoning_effort(self, tmp_path):
         from spoon_bot.config import validate_agent_loop_params
 

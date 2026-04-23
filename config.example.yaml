@@ -39,7 +39,9 @@ agent:
   # shell_max_timeout: 7200    # Max allowed per-command timeout override (2 hours).
                                 # The agent can request longer timeouts up to this cap.
   # max_output: 10000
-  # context_window: 200000
+  # context_window: 400000      # Optional explicit cap in tokens.
+                                 # spoon-bot proactively compacts near this limit.
+                                 # Example: keep GPT-5.4 at 400K for stability.
   # auto_reload: false          # Watch skill paths & config for changes, auto-reload
   # auto_reload_interval: 5     # Poll interval in seconds (1-300)
 

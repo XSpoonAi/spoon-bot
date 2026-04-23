@@ -8,6 +8,7 @@ import pytest
 
 from spoon_bot.utils.retry import (
     RetryConfig,
+    is_context_overflow_error,
     is_retryable,
     with_provider_retry,
 )
@@ -127,6 +128,62 @@ class TestIsRetryable:
         class FakeError(Exception):
             response = FakeResponse()
         assert is_retryable(FakeError("oops")) is True
+
+    def test_openai_apierror_without_status_is_retryable(self):
+        class FakeOpenAIAPIError(Exception):
+            __module__ = "openai"
+
+        exc = FakeOpenAIAPIError(
+            "An error occurred while processing your request. Please retry your request."
+        )
+        assert is_retryable(exc) is True
+
+    def test_common_sdk_retryable_exception_names_are_retryable(self):
+        class RateLimitError(Exception):
+            pass
+
+        class APIConnectionError(Exception):
+            pass
+
+        class ServiceUnavailableError(Exception):
+            pass
+
+        assert is_retryable(RateLimitError("slow down")) is True
+        assert is_retryable(APIConnectionError("socket reset")) is True
+        assert is_retryable(ServiceUnavailableError("please retry")) is True
+
+    def test_common_sdk_non_retryable_exception_names_are_not_retryable(self):
+        class AuthenticationError(Exception):
+            pass
+
+        class BadRequestError(Exception):
+            pass
+
+        assert is_retryable(AuthenticationError("bad key")) is False
+        assert is_retryable(BadRequestError("invalid request")) is False
+
+
+class TestIsContextOverflowError:
+    def test_context_overflow_exception_is_detected(self):
+        assert is_context_overflow_error(ContextOverflowError(200_000, 128_000)) is True
+
+    def test_context_length_pattern_is_detected(self):
+        assert is_context_overflow_error(Exception("context length exceeded for this model")) is True
+
+    def test_request_too_large_tpm_error_is_treated_as_overflow_not_retryable(self):
+        exc = Exception(
+            "Request too large for gpt-5.4 (for limit gpt-5.4-long-context) "
+            "on tokens per min (TPM): Limit 400000, Requested 860809."
+        )
+
+        assert is_context_overflow_error(exc) is True
+        assert is_retryable(exc) is False
+
+    def test_request_too_large_status_is_detected(self):
+        class FakeError(Exception):
+            status_code = 413
+
+        assert is_context_overflow_error(FakeError("payload too large")) is True
 
 
 # ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@ _TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"gateway.?timeout", re.IGNORECASE),
     re.compile(r"overloaded", re.IGNORECASE),
     re.compile(r"temporarily", re.IGNORECASE),
+    re.compile(r"an error occurred while processing your request", re.IGNORECASE),
     re.compile(r"ECONNRESET", re.IGNORECASE),
     re.compile(r"ECONNREFUSED", re.IGNORECASE),
 ]
@@ -58,6 +59,43 @@ _NON_RETRYABLE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"content.*filter", re.IGNORECASE),
     re.compile(r"content.*policy", re.IGNORECASE),
 ]
+
+_CONTEXT_OVERFLOW_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"context.*length.*exceeded", re.IGNORECASE),
+    re.compile(r"maximum.*context", re.IGNORECASE),
+    re.compile(r"context.*overflow", re.IGNORECASE),
+    re.compile(r"prompt.*too long", re.IGNORECASE),
+    re.compile(r"too many input tokens", re.IGNORECASE),
+    re.compile(r"request.*too large", re.IGNORECASE),
+]
+
+_RETRYABLE_EXCEPTION_NAMES: set[str] = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "InternalServerError",
+    "OverloadedError",
+    "RateLimitError",
+    "ResourceExhausted",
+    "ServerError",
+    "ServiceUnavailableError",
+    "TooManyRequestsError",
+    "UnavailableError",
+}
+
+_NON_RETRYABLE_EXCEPTION_NAMES: set[str] = {
+    "AuthenticationError",
+    "BadRequestError",
+    "ContextLengthExceededError",
+    "InvalidRequestError",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "UnauthorizedError",
+    "UnprocessableEntityError",
+}
+
+_CONTEXT_OVERFLOW_EXCEPTION_NAMES: set[str] = {
+    "ContextLengthExceededError",
+}
 
 
 @dataclass
@@ -132,6 +170,9 @@ def is_retryable(exc: Exception) -> bool:
         APIKeyMissingError,
     )
 
+    if is_context_overflow_error(exc):
+        return False
+
     if isinstance(exc, (APIKeyMissingError, ContextOverflowError)):
         return False
 
@@ -156,15 +197,49 @@ def is_retryable(exc: Exception) -> bool:
             return True
 
     err_str = str(exc)
+    exc_name = type(exc).__name__
+    exc_module = (type(exc).__module__ or "").lower()
 
     for pat in _NON_RETRYABLE_PATTERNS:
         if pat.search(err_str):
             return False
 
+    if exc_name in _NON_RETRYABLE_EXCEPTION_NAMES:
+        return False
+
+    if exc_name == "APIError" and exc_module.startswith("openai"):
+        return True
+
+    if exc_name in _RETRYABLE_EXCEPTION_NAMES:
+        return True
+
     for pat in _RATE_LIMIT_PATTERNS:
         if pat.search(err_str):
             return True
     for pat in _TRANSIENT_PATTERNS:
+        if pat.search(err_str):
+            return True
+
+    return False
+
+
+def is_context_overflow_error(exc: Exception) -> bool:
+    """Decide whether *exc* signals a recoverable context-overflow failure."""
+    from spoon_bot.exceptions import ContextOverflowError
+
+    if isinstance(exc, ContextOverflowError):
+        return True
+
+    status = _extract_status_code(exc)
+    if status == 413:
+        return True
+
+    exc_name = type(exc).__name__
+    if exc_name in _CONTEXT_OVERFLOW_EXCEPTION_NAMES:
+        return True
+
+    err_str = str(exc)
+    for pat in _CONTEXT_OVERFLOW_PATTERNS:
         if pat.search(err_str):
             return True
 

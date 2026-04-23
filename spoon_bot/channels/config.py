@@ -764,7 +764,7 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         "shell_timeout": ["SPOON_BOT_SHELL_TIMEOUT"],
         "shell_max_timeout": ["SPOON_BOT_SHELL_MAX_TIMEOUT"],
         "max_output": ["SPOON_BOT_MAX_OUTPUT"],
-        "context_window": ["CONTEXT_WINDOW"],
+        "context_window": ["SPOON_BOT_CONTEXT_WINDOW", "CONTEXT_WINDOW"],
         "provider_max_retries":        ["SPOON_BOT_PROVIDER_MAX_RETRIES"],
         "provider_retry_base_delay":   ["SPOON_BOT_PROVIDER_RETRY_BASE_DELAY"],
         "provider_retry_max_delay":    ["SPOON_BOT_PROVIDER_RETRY_MAX_DELAY"],

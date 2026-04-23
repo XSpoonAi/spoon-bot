@@ -18,7 +18,7 @@ so they do not require any LLM / network setup.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -39,6 +39,64 @@ def _roles(messages: list) -> list[str | None]:
     from spoon_bot.agent.loop import AgentLoop
 
     return [AgentLoop._message_role_value(m) for m in messages]
+
+
+def test_resolve_context_window_uses_400k_for_gpt54():
+    from spoon_bot.config import resolve_context_window
+
+    assert resolve_context_window("gpt-5.4") == 400_000
+    assert resolve_context_window("openai/gpt-5.4") == 400_000
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_context_proactively_compacts_near_context_limit():
+    from spoon_bot.agent.loop import AgentLoop
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.context_window = 400_000
+    loop.session_key = "ctx-limit"
+    loop._agent = MagicMock()
+    loop._agent.memory = MagicMock()
+    loop._agent.memory.messages = [MagicMock()]
+    loop._trim_context_if_needed = MagicMock(return_value=0)
+    loop._sync_runtime_history_from_session = AsyncMock(return_value=5)
+    loop._normalize_runtime_tool_context = MagicMock(return_value=0)
+    loop._estimate_runtime_tokens = MagicMock(side_effect=[390_000, 280_000])
+    loop._estimate_token_count = MagicMock(return_value=390_000)
+    loop._compress_runtime_context = MagicMock(return_value=3)
+    loop._force_compress_runtime_context = MagicMock(return_value=0)
+
+    await AgentLoop._prepare_request_context(loop)
+
+    loop._compress_runtime_context.assert_called_once_with(
+        force=True,
+        budget_tokens=380_000,
+    )
+    loop._force_compress_runtime_context.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prepare_request_context_skips_proactive_compaction_until_near_limit():
+    from spoon_bot.agent.loop import AgentLoop
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.context_window = 400_000
+    loop.session_key = "ctx-not-near-limit"
+    loop._agent = MagicMock()
+    loop._agent.memory = MagicMock()
+    loop._agent.memory.messages = [MagicMock()]
+    loop._trim_context_if_needed = MagicMock(return_value=0)
+    loop._sync_runtime_history_from_session = AsyncMock(return_value=5)
+    loop._normalize_runtime_tool_context = MagicMock(return_value=0)
+    loop._estimate_runtime_tokens = MagicMock(return_value=360_000)
+    loop._estimate_token_count = MagicMock(return_value=360_000)
+    loop._compress_runtime_context = MagicMock(return_value=0)
+    loop._force_compress_runtime_context = MagicMock(return_value=0)
+
+    await AgentLoop._prepare_request_context(loop)
+
+    loop._compress_runtime_context.assert_not_called()
+    loop._force_compress_runtime_context.assert_not_called()
 
 
 @pytest.mark.requires_spoon_core
@@ -122,6 +180,42 @@ def test_insert_compaction_marker_is_runtime_only():
     assert "[history-compacted]" in content
     assert "7" in content
     assert "search_history" in content
+    assert "latest real user request" in content
+    assert "assistant analysis/conclusions" in content
+
+
+@pytest.mark.requires_spoon_core
+def test_compress_runtime_context_neutralizes_old_assistant_conclusions_but_keeps_latest_user_request():
+    from spoon_ai.schema import Message
+    from spoon_bot.agent.loop import AgentLoop
+
+    latest_request = (
+        "Please inspect the repo, follow the latest instruction, and do not stop at a summary. "
+        + "z" * 220
+    )
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="Earlier request 1 " + "a" * 400),
+        Message(
+            role="assistant",
+            content="Conclusion: the task is already done, so no more tools are needed. " + "b" * 320,
+        ),
+        Message(role="user", content="Earlier request 2 " + "c" * 400),
+        Message(role="assistant", content="Older analysis " + "d" * 320),
+        Message(role="user", content="Earlier request 3 " + "e" * 400),
+        Message(role="assistant", content="Recent note"),
+        Message(role="user", content=latest_request),
+        Message(role="assistant", content="Working on it."),
+    ]
+
+    loop = _make_loop(messages, context_window=400)
+    compressed = AgentLoop._compress_runtime_context(loop, force=True, budget_tokens=1)
+
+    assert compressed > 0
+    assert messages[1].content.startswith("[earlier user message compacted]")
+    assert messages[2].content.startswith("[assistant reply compacted;")
+    assert "Prioritize the latest user request" in messages[2].content
+    assert messages[7].content == latest_request
 
 
 @pytest.mark.requires_spoon_core

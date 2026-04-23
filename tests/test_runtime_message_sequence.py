@@ -156,3 +156,49 @@ async def test_install_anti_loop_tracker_logs_provider_reasoning_summary():
         call.args and call.args[0] == "💭 Agent reasoning: Plan from provider summary"
         for call in log_info.call_args_list
     )
+
+
+@pytest.mark.requires_spoon_core
+@pytest.mark.asyncio
+async def test_install_anti_loop_tracker_uses_non_summary_progress_guard():
+    from spoon_ai.schema import Function, ToolCall
+    from spoon_bot.agent.loop import AgentLoop
+
+    seen_prompts: list[str | None] = []
+    assistant_tool_call = ToolCall(
+        id="call_1",
+        function=Function(name="shell", arguments='{"command":"cat result.txt"}'),
+    )
+
+    async def base_think() -> bool:
+        seen_prompts.append(agent._agent.next_step_prompt)
+        agent._agent.tool_calls = [assistant_tool_call]
+        return True
+
+    agent = AgentLoop.__new__(AgentLoop)
+    agent.workspace = Path("/workspace")
+    agent.provider = "anthropic"
+    agent.model = "claude-sonnet-4.5"
+    agent.base_url = None
+    agent._agent = MagicMock()
+    agent._agent.think = base_think
+    agent._agent._spoon_bot_base_think = base_think
+    agent._agent.next_step_prompt = "prompt"
+    agent._agent.tool_calls = []
+    agent._agent.memory = MagicMock()
+    agent._agent.memory.messages = []
+    agent._agent.last_reasoning_summary = None
+    agent._compress_runtime_context = MagicMock(return_value=0)
+    agent._latest_reasoning_excerpt = None
+    agent._pending_reasoning_chunks = []
+
+    AgentLoop._install_anti_loop_tracker(agent, "prompt")
+    await agent._agent.think()
+    await agent._agent.think()
+
+    assert len(seen_prompts) == 2
+    assert seen_prompts[0] == "prompt"
+    assert seen_prompts[1] is not None
+    assert "[ALREADY COMPLETED ACTIONS - do not repeat]" in seen_prompts[1]
+    assert "[DONE]" not in seen_prompts[1]
+    assert "Do not restate this list to the user." in seen_prompts[1]
