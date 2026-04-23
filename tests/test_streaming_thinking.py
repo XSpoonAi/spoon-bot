@@ -469,6 +469,20 @@ class TestAgentLoopStream:
         assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
         assert "[LATEST REQUEST ENDING]:" in prompt
 
+    def test_build_request_context_prompt_marks_latest_turn_authoritative(self):
+        """Thinking scaffolding should explicitly supersede unfinished prior plans."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "Handle only this newest request.")
+
+        assert "[TURN PRIORITY]:" in prompt
+        assert "Execute only the newest user request." in prompt
+        assert "stale tool sequence" in prompt
+
     def test_build_request_context_prompt_skips_extra_tail_block_for_short_requests(self):
         """Short requests are already preserved whole and do not need an extra tail block."""
         from spoon_bot.agent.loop import AgentLoop
@@ -500,6 +514,45 @@ class TestAgentLoopStream:
         assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
         assert "responde solo con final_ok" in prompt.lower()
         assert "no hagas resumen" in prompt.lower()
+
+    def test_build_step_prompt_marks_latest_turn_authoritative(self):
+        """Per-step prompts should make the newest user task override prior execution plans."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_step_prompt(loop, "Fix the bug now.")
+
+        assert "[TURN PRIORITY]:" in prompt
+        assert "Execute only the newest user request." in prompt
+        assert "[USER REQUEST]: Fix the bug now." in prompt
+
+    def test_prepare_agent_for_new_turn_clears_stale_runtime_state(self):
+        """A new turn should not inherit unfinished runtime state from the prior task."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        shutdown_event = asyncio.Event()
+        shutdown_event.set()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._pre_injected_skill_name = "joker-game-agent"
+        loop._agent = MagicMock()
+        loop._agent.name = "sandbox"
+        loop._agent.state = "thinking"
+        loop._agent.current_step = 7
+        loop._agent._shutdown_event = shutdown_event
+        loop._agent.tool_calls = [{"name": "shell"}]
+
+        AgentLoop._prepare_agent_for_new_turn(loop)
+
+        assert loop._pre_injected_skill_name is None
+        normalized_state = getattr(loop._agent.state, "value", loop._agent.state)
+        assert str(normalized_state).lower() == "idle"
+        assert loop._agent.current_step == 0
+        assert loop._agent.tool_calls == []
+        assert shutdown_event.is_set() is False
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
@@ -559,6 +612,71 @@ class TestAgentLoopStream:
         assert content_chunks[1]["delta"] == " World"
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Hello World"
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_compaction_notice_and_continues_latest_request_after_overflow_retry(self):
+        """Overflow recovery should surface a notice, then continue with the latest task output."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.exceptions import ContextOverflowError
+
+        class _Result:
+            content = "Latest task executed."
+
+        attempts = 0
+
+        async def mock_retry_runner(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ContextOverflowError(estimated_tokens=450_000, max_tokens=400_000)
+            await agent._agent.output_queue.put({"content": "Latest task executed."})
+            return _Result()
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = AsyncMock()
+        agent._agent.add_message = AsyncMock()
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._select_next_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=False)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent._compress_runtime_context_for_overflow_retry = MagicMock(return_value=7)
+        agent._reset_agent_state_for_retry = MagicMock()
+        agent._run_agent_with_retry = AsyncMock(side_effect=mock_retry_runner)
+        agent._current_tool_owner_key = MagicMock(return_value="ws:test")
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="execute only the newest request"):
+            chunks.append(chunk)
+
+        notice_chunks = [c for c in chunks if c["type"] == "notice"]
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert attempts == 2
+        assert len(notice_chunks) == 1
+        assert notice_chunks[0]["metadata"]["kind"] == "runtime_compaction"
+        assert notice_chunks[0]["metadata"]["stage"] == "overflow_retry"
+        assert notice_chunks[0]["metadata"]["compressed_actions"] == 7
+        assert "resumed the latest request" in notice_chunks[0]["delta"]
+        assert "".join(chunk["delta"] for chunk in content_chunks) == "Latest task executed."
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "Latest task executed."
 
     @pytest.mark.asyncio
     async def test_stream_handles_string_chunks(self):

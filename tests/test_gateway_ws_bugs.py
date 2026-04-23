@@ -1095,6 +1095,59 @@ class TestWSStreamingContent:
             assert response is not None
             assert response["result"]["content"] != ""
 
+    def test_stream_surfaces_runtime_compaction_notice(self, client):
+        """WS streaming should forward runtime compaction notice chunks to the client."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _stream_with_notice(**kwargs):
+            yield {
+                "type": "notice",
+                "delta": "Context window near limit. Earlier history was compacted before continuing the latest request.",
+                "metadata": {
+                    "kind": "runtime_compaction",
+                    "stage": "preflight",
+                    "compressed_actions": 5,
+                    "visible": True,
+                },
+            }
+            yield {"type": "content", "delta": "Hello from test agent", "metadata": {}}
+            yield {"type": "done", "delta": "", "metadata": {"content": "Hello from test agent"}}
+
+        agent.stream = _stream_with_notice
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_notice1",
+                "method": "chat.send",
+                "params": {
+                    "message": "hello stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            notice_events = [
+                e for e in events
+                if e.get("type") == "event"
+                and e.get("event") == "agent.stream.chunk"
+                and e.get("data", {}).get("type") == "notice"
+            ]
+
+            assert len(notice_events) == 1
+            assert notice_events[0]["data"]["metadata"]["kind"] == "runtime_compaction"
+            assert notice_events[0]["data"]["metadata"]["stage"] == "preflight"
+            assert "compacted" in notice_events[0]["data"]["delta"]
+
     def test_non_stream_returns_content(self, client):
         """Non-streaming chat should return non-empty content."""
         with client.websocket_connect("/v1/ws") as ws:

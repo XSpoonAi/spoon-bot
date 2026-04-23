@@ -96,6 +96,22 @@ class SearchHistoryTool(Tool):
                 return str(resolved)
         return self._default_session_key
 
+    @staticmethod
+    def _is_tool_call_trace_hit(hit: Any) -> bool:
+        """Return True when an assistant hit represents a persisted tool call."""
+        if str(getattr(hit, "role", "")).lower() != "assistant":
+            return False
+        extras = getattr(hit, "extras", None) or {}
+        return bool(extras.get("tool_calls"))
+
+    @classmethod
+    def _is_plain_assistant_reply_hit(cls, hit: Any) -> bool:
+        """Return True for assistant narrative/final replies that may be stale."""
+        return (
+            str(getattr(hit, "role", "")).lower() == "assistant"
+            and not cls._is_tool_call_trace_hit(hit)
+        )
+
     @property
     def name(self) -> str:
         return "search_history"
@@ -107,10 +123,13 @@ class SearchHistoryTool(Tool):
             "calls, and tool results) using literal substring or regex "
             "matching. Use this to recover information after the runtime "
             "context has been compacted, for example to look up an earlier "
-            "tool result, attachment id, or user question. By default the "
-            "current session is searched; pass scope='all' to search every "
-            "session for the current agent. Returns a JSON object with a "
-            "'hits' array containing role, snippet, timestamp, and "
+            "tool result, attachment id, user question, or assistant tool-"
+            "call trace. By default the current session is searched and "
+            "plain assistant replies are omitted to avoid reviving stale "
+            "plans; pass roles=['assistant'] when you explicitly need the "
+            "literal earlier assistant wording. Pass scope='all' to search "
+            "every session for the current agent. Returns a JSON object "
+            "with a 'hits' array containing role, snippet, timestamp, and "
             "tool_call metadata for each match."
         )
 
@@ -157,8 +176,10 @@ class SearchHistoryTool(Tool):
                     "items": {"type": "string"},
                     "description": (
                         "Restrict to these message roles, e.g. "
-                        "['tool', 'assistant']. Useful for finding only "
-                        "tool results or only the user's prior questions."
+                        "['tool', 'assistant']. When omitted, the tool "
+                        "searches broadly but filters out plain assistant "
+                        "replies by default; assistant tool-call traces are "
+                        "still included."
                     ),
                 },
                 "include_extras": {
@@ -252,6 +273,15 @@ class SearchHistoryTool(Tool):
             if not roles_list:
                 roles_list = None
 
+        raw_limit = limit_int
+        raw_offset = offset_int
+        default_assistant_filter_active = roles_list is None
+        if default_assistant_filter_active:
+            # Search a slightly wider window so post-filter pagination still
+            # returns enough factual hits after assistant narrative replies are dropped.
+            raw_offset = 0
+            raw_limit = min(200, max(limit_int * 4, limit_int + offset_int + 20))
+
         try:
             hits = self._sessions_manager.search_messages(
                 query,
@@ -260,14 +290,26 @@ class SearchHistoryTool(Tool):
                 case_sensitive=bool(case_sensitive),
                 roles=roles_list,
                 include_extras=bool(include_extras),
-                limit=limit_int,
-                offset=offset_int,
+                limit=raw_limit,
+                offset=raw_offset,
                 max_content_length=mcl,
             )
         except re.error as exc:
             return f"Error: invalid regex: {exc}"
         except ValueError as exc:
             return f"Error: {exc}"
+
+        omitted_assistant_replies = 0
+        if default_assistant_filter_active:
+            filtered_hits = []
+            for hit in hits:
+                if self._is_plain_assistant_reply_hit(hit):
+                    omitted_assistant_replies += 1
+                    continue
+                filtered_hits.append(hit)
+            if offset_int:
+                filtered_hits = filtered_hits[offset_int:]
+            hits = filtered_hits[:limit_int]
 
         payload = {
             "query": query,
@@ -298,10 +340,20 @@ class SearchHistoryTool(Tool):
             ],
         }
 
+        note_parts: list[str] = []
         if not hits:
-            payload["note"] = (
+            note_parts.append(
                 "No matches found. Try a broader substring, scope='all', "
                 "or regex=true for fuzzier matching."
             )
+        if default_assistant_filter_active and (omitted_assistant_replies or not hits):
+            payload["omitted_assistant_replies"] = omitted_assistant_replies
+            note_parts.append(
+                "Plain assistant replies are omitted by default to avoid reviving "
+                "stale plans; pass roles=['assistant'] if you need the literal "
+                "earlier assistant wording."
+            )
+        if note_parts:
+            payload["note"] = " ".join(note_parts)
 
         return json.dumps(payload, ensure_ascii=False, default=str)

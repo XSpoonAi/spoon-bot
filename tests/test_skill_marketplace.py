@@ -47,6 +47,11 @@ async def test_install_skill_writes_into_workspace_skills_directory(
     monkeypatch.setenv("SPOON_BOT_WORKSPACE_PATH", str(tmp_path))
     recorded_targets: list[Path] = []
 
+    async def fake_resolve(owner, repo, branch, subpath):
+        return branch, subpath, "wallet"
+
+    monkeypatch.setattr(skill_manager_module, "_resolve_github_skill_source", fake_resolve)
+
     async def fake_download(owner, repo, branch, subpath, target):
         recorded_targets.append(target)
         target.mkdir(parents=True, exist_ok=True)
@@ -77,6 +82,11 @@ async def test_install_root_skill_repo_writes_into_workspace_skills_directory(
 ):
     monkeypatch.setenv("SPOON_BOT_WORKSPACE_PATH", str(tmp_path))
     recorded_calls: list[tuple[str, str, str, str, Path]] = []
+
+    async def fake_resolve(owner, repo, branch, subpath):
+        return branch, "", "joker-game-agent"
+
+    monkeypatch.setattr(skill_manager_module, "_resolve_github_skill_source", fake_resolve)
 
     async def fake_download(owner, repo, branch, subpath, target):
         recorded_calls.append((owner, repo, branch, subpath, target))
@@ -129,3 +139,31 @@ def test_git_clone_command_uses_sparse_clone_for_nested_skill(skill_manager_modu
     )
 
     assert "--sparse" in cmd
+
+
+def test_select_skill_root_subpath_prefers_root(skill_manager_module):
+    resolved = skill_manager_module._select_skill_root_subpath(
+        ["SKILL.md", "examples/demo/SKILL.md"],
+    )
+
+    assert resolved == ""
+
+
+def test_select_skill_root_subpath_picks_unique_nested_skill(skill_manager_module):
+    resolved = skill_manager_module._select_skill_root_subpath(
+        ["skills/demo/joker-game-agent/SKILL.md"],
+    )
+
+    assert resolved == "skills/demo/joker-game-agent"
+
+
+def test_select_skill_root_subpath_scopes_to_requested_parent(skill_manager_module):
+    resolved = skill_manager_module._select_skill_root_subpath(
+        [
+            "skills/demo/joker-game-agent/SKILL.md",
+            "skills/other/unrelated/SKILL.md",
+        ],
+        requested_subpath="skills/demo",
+    )
+
+    assert resolved == "skills/demo/joker-game-agent"
