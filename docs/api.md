@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-04-24 07:40 UTC.  
+> **Auto-generated** from source code on 2026-04-24 13:42 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -102,14 +102,14 @@ Health check endpoint.
 Readiness check endpoint.
 
 
-*Source: `spoon_bot/gateway/api/health.py:62`*
+*Source: `spoon_bot/gateway/api/health.py:77`*
 
 ### `GET /`
 
 Root endpoint with API information.
 
 
-*Source: `spoon_bot/gateway/api/health.py:94`*
+*Source: `spoon_bot/gateway/api/health.py:109`*
 
 ---
 
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:319`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:316`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:776`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:774`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:651`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:630`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:541`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:528`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:585`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:564`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:620`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:599`*
 
 ---
 
