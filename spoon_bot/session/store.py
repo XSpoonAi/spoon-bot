@@ -364,8 +364,29 @@ class FileSessionStore(SessionStore):
             deleted = True
         return deleted
 
-    def list_session_keys(self) -> List[str]:
-        keys = {f.stem for f in self._dir.glob("*.jsonl")}
+    def archive_session(self, session_key: str) -> bool:
+        """Archive a session by renaming its files with a deleted marker."""
+        path = self._path(session_key)
+        meta = path.with_suffix(".meta.json")
+        marker = f".deleted.{int(datetime.now().timestamp())}"
+        archived = False
+
+        if path.exists():
+            archived_path = path.with_name(f"{path.stem}{marker}{path.suffix}")
+            path.rename(archived_path)
+            archived = True
+        if meta.exists():
+            archived_meta = meta.with_name(f"{meta.stem}{marker}{meta.suffix}")
+            meta.rename(archived_meta)
+            archived = True
+        return archived
+
+    def list_session_keys(self, include_archived: bool = False) -> List[str]:
+        keys = {
+            f.stem
+            for f in self._dir.glob("*.jsonl")
+            if include_archived or ".deleted." not in f.stem
+        }
         return sorted(keys)
 
 

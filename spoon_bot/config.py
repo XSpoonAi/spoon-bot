@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import (
     BaseModel,
@@ -373,6 +373,77 @@ class MemSearchConfig(BaseModel):
         return self.embedding_model or os.environ.get("OPENAI_EMBEDDING_MODEL")
 
 
+class SubagentLimitsConfig(BaseModel):
+    """Limits and defaults for the sub-agent system."""
+
+    max_depth: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description=(
+            "Maximum spawn depth "
+            "(1 = direct children only, 2 = children + grandchildren, max 8)"
+        ),
+    )
+    max_children_per_agent: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum concurrent children per agent (1-20)",
+    )
+    max_total_subagents: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+        description="Maximum total active sub-agents across all depths (1-50)",
+    )
+    default_model: Optional[str] = Field(
+        default=None,
+        description="Default model for sub-agents (inherits from parent if None)",
+    )
+    default_tool_profile: str = Field(
+        default="core",
+        description="Default tool profile for sub-agents (core, coding, research, full)",
+    )
+    # --- Persistence settings ---
+    persist_runs: bool = Field(
+        default=True,
+        description=(
+            "Persist sub-agent records to disk as JSON so they survive process restarts"
+        ),
+    )
+    persist_file: str = Field(
+        default="subagents/runs.json",
+        description=(
+            "Path to the persistence file. Relative paths are resolved against workspace. "
+            "Absolute paths are used as-is."
+        ),
+    )
+    archive_after_minutes: int = Field(
+        default=60,
+        ge=1,
+        le=10080,
+        description=(
+            "Minutes after which terminal sub-agent records (completed/failed/cancelled) "
+            "are removed from the persistence file (1-10080, i.e. up to 7 days)"
+        ),
+    )
+    sweeper_interval_seconds: int = Field(
+        default=60,
+        ge=10,
+        le=3600,
+        description="Interval in seconds for the background archive sweeper (10-3600)",
+    )
+    max_persistent_agents: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum number of persistent (session-mode) named agents that can be created (1-50)"
+        ),
+    )
+
+
 class AgentLoopConfig(BaseModel):
     """Configuration for AgentLoop with validation."""
 
@@ -515,6 +586,12 @@ class AgentLoopConfig(BaseModel):
         ge=1.0,
         le=300.0,
         description="Polling interval in seconds for auto-reload file watcher (1-300)"
+    )
+
+    # Sub-agent system
+    subagent: SubagentLimitsConfig = Field(
+        default_factory=SubagentLimitsConfig,
+        description="Sub-agent system limits and defaults",
     )
 
     @field_validator("workspace", mode="before")

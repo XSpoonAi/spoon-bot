@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import time
 from enum import Enum
@@ -28,6 +29,7 @@ from spoon_bot.gateway.models.responses import (
     APIResponse,
     MetaInfo,
     ChatResponse,
+    ResponseSource,
     StreamChunk,
     TranscriptionInfo,
     UsageInfo,
@@ -54,6 +56,21 @@ from spoon_bot.gateway.websocket.handler import (
 logger = getLogger(__name__)
 
 router = APIRouter()
+
+
+def _get_agent_response_source(agent) -> ResponseSource:
+    """Read machine-readable response source metadata from the agent."""
+    getter = getattr(agent, "get_last_response_source", None)
+    if callable(getter) and not inspect.iscoroutinefunction(getter):
+        try:
+            raw = getter()
+            if inspect.isawaitable(raw):
+                return ResponseSource()
+            if isinstance(raw, dict):
+                return ResponseSource(**raw)
+        except Exception:
+            pass
+    return ResponseSource()
 
 
 def _format_sse_event(event: str, payload: dict[str, Any]) -> str:
@@ -242,6 +259,7 @@ async def _stream_sse(
                             type="error",
                             delta=chunk_data.get("delta", ""),
                             metadata=chunk_data.get("metadata", {}),
+                            source=ResponseSource(**(chunk_data.get("source") or {})),
                         )
                         yield f"data: {error_chunk.model_dump_json()}\n\n"
                         continue
@@ -259,6 +277,7 @@ async def _stream_sse(
                                 type="content",
                                 delta=done_content,
                                 metadata={"fallback": "done_metadata_content"},
+                                source=ResponseSource(**(chunk_data.get("source") or {})),
                             )
                             yield f"data: {fallback_chunk.model_dump_json()}\n\n"
                             streamed_content = done_content
@@ -268,6 +287,7 @@ async def _stream_sse(
                         type=chunk_type,
                         delta=chunk_data["delta"],
                         metadata=chunk_data.get("metadata", {}),
+                        source=ResponseSource(**(chunk_data.get("source") or {})),
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     if chunk_type == "content" and chunk.delta:
@@ -277,6 +297,7 @@ async def _stream_sse(
                     type="error",
                     delta="",
                     metadata={"error": str(e), "trace_id": resolved_trace_id},
+                    source=_get_agent_response_source(agent),
                 )
                 yield f"data: {error_chunk.model_dump_json()}\n\n"
 
@@ -386,6 +407,7 @@ async def chat(
                 else:
                     response_text = await agent.process(**kwargs)
 
+        response_source = _get_agent_response_source(agent)
         duration_ms = int((time.time() - start_time) * 1000)
         request_span.stop()
         timing = build_timing_payload(request_span, extra={"trace_id": trace_id})
@@ -398,6 +420,7 @@ async def chat(
                 usage=None,  # TODO: Track usage
                 thinking_content=thinking_content,
                 transcription=transcription_info,
+                source=response_source,
             ),
             meta=MetaInfo(
                 request_id=request_id,
@@ -466,6 +489,7 @@ class AsyncTask:
     owner_user_id: str
     status: TaskStatus = TaskStatus.PENDING
     result: str | None = None
+    source: dict[str, Any] | None = None
     error: str | None = None
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
@@ -498,6 +522,7 @@ async def _run_async_task(
                     task.status = TaskStatus.CANCELLED
                     return
                 response = await agent.process(message=message)
+                task.source = _get_agent_response_source(agent).model_dump()
         if task._cancel_event.is_set():
             task.status = TaskStatus.CANCELLED
             return
@@ -582,6 +607,8 @@ async def get_task(
     }
     if task.result is not None:
         payload["result"] = task.result
+    if task.source is not None:
+        payload["source"] = task.source
     if task.error is not None:
         payload["error"] = task.error
     if task.completed_at is not None:
@@ -820,6 +847,7 @@ async def voice_chat(
     _switch_session(agent, session_key)
     setattr(agent, "user_id", owner_user_id)
     response_text = await agent.process(message=processed_message)
+    response_source = _get_agent_response_source(agent)
     duration_ms = int((time.time() - start_time) * 1000)
 
     return APIResponse(
@@ -827,6 +855,7 @@ async def voice_chat(
         data=ChatResponse(
             response=response_text,
             transcription=transcription_info,
+            source=response_source,
         ),
         meta=MetaInfo(request_id=request_id, duration_ms=duration_ms),
     )

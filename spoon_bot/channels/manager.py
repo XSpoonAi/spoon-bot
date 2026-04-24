@@ -151,6 +151,12 @@ class ChannelManager:
         )
         self._bus.set_handler(self._handle_message)
 
+        # Give the sub-agent manager a reference to the bus so it can
+        # push wake-continuation messages when sub-agents complete.
+        _sm = getattr(agent, "subagent_manager", None)
+        if _sm is not None:
+            _sm.set_bus(self._bus)
+
         # Align bus concurrency with agent pool size so neither is wasted.
         pool_size = getattr(agent, "_pool_size", None)
         if pool_size is not None and pool_size != self._bus.max_concurrency:
@@ -1033,6 +1039,9 @@ class ChannelManager:
                     "message": content,
                     "media": media,
                     "session_key": session_key,
+                    "channel": message.channel,
+                    "metadata": message.metadata.copy(),
+                    "reply_to": message.message_id,
                     "attachments": attachments,
                 }
                 if reasoning_effort:
@@ -1049,6 +1058,9 @@ class ChannelManager:
                     "message": content,
                     "media": media,
                     "session_key": session_key,
+                    "channel": message.channel,
+                    "metadata": message.metadata.copy(),
+                    "reply_to": message.message_id,
                     "attachments": attachments,
                 }
                 if reasoning_effort:
@@ -1072,7 +1084,7 @@ class ChannelManager:
             return OutboundMessage(
                 content=response_text,
                 channel=message.channel,
-                reply_to=message.message_id,
+                reply_to=message.metadata.get("reply_to") or message.message_id,
                 metadata=message.metadata.copy(),
             )
 
@@ -1082,14 +1094,20 @@ class ChannelManager:
             # Use a generic user-facing message to avoid leaking internal
             # details (file paths, API keys, tracebacks).
             try:
+                from spoon_bot.exceptions import SpoonBotError as LegacySpoonBotError
                 from spoon_bot.exceptions import user_friendly_error
-                friendly = user_friendly_error(e)
+                from spoon_bot.utils.errors import format_user_error
+
+                if isinstance(e, LegacySpoonBotError):
+                    friendly = user_friendly_error(e)
+                else:
+                    friendly = format_user_error(e)
             except Exception:
                 friendly = "Sorry, an unexpected error occurred. Please try again."
             return OutboundMessage(
                 content=friendly,
                 channel=message.channel,
-                reply_to=message.message_id,
+                reply_to=message.metadata.get("reply_to") or message.message_id,
                 metadata=message.metadata.copy(),
             )
         finally:
