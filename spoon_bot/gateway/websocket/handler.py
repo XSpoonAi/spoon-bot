@@ -771,6 +771,40 @@ class WebSocketHandler:
                             else:
                                 if chunk_type == "content" and delta:
                                     full_content += delta
+                                elif (
+                                    chunk_type == "tool_result"
+                                    and not delta
+                                    and isinstance(metadata, dict)
+                                ):
+                                    tool_output = (
+                                        metadata.get("output")
+                                        or metadata.get("result")
+                                        or metadata.get("content")
+                                        or metadata.get("full_output")
+                                        or metadata.get("full_result")
+                                    )
+                                    if tool_output not in (None, ""):
+                                        delta = (
+                                            tool_output
+                                            if isinstance(tool_output, str)
+                                            else str(tool_output)
+                                        )
+                                if chunk_type == "tool_result" and isinstance(metadata, dict):
+                                    tool_output = (
+                                        metadata.get("output")
+                                        or metadata.get("result")
+                                        or metadata.get("content")
+                                        or metadata.get("full_output")
+                                        or metadata.get("full_result")
+                                    )
+                                    if tool_output not in (None, ""):
+                                        if isinstance(tool_output, str):
+                                            normalized_output = tool_output
+                                        else:
+                                            normalized_output = str(tool_output)
+                                        metadata.setdefault("output", normalized_output)
+                                        metadata.setdefault("result", normalized_output)
+                                        metadata.setdefault("content", normalized_output)
 
                                 # Send stream chunk event (even for non-content types like tool_call)
                                 if delta or chunk_type != "content":

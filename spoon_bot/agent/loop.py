@@ -3325,11 +3325,14 @@ class AgentLoop:
         if full_result:
             merged["result"] = full_result
             merged["content"] = full_result
+            merged["output"] = full_result
             merged["full_result"] = full_result
             merged["full_content"] = full_result
+            merged["full_output"] = full_result
         if summary_result:
             merged.setdefault("model_result", summary_result)
             merged.setdefault("model_content", summary_result)
+            merged.setdefault("model_output", summary_result)
         if full_result and summary_result and full_result != summary_result:
             merged["result_truncated_for_model"] = True
         return merged
