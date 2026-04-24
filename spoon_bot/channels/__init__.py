@@ -6,7 +6,11 @@ from spoon_bot.channels.base import (
     ChannelMode,
     ChannelStatus,
 )
-from spoon_bot.channels.manager import ChannelManager
+
+try:
+    from spoon_bot.channels.manager import ChannelManager
+except Exception:  # pragma: no cover - optional import for lightweight consumers
+    ChannelManager = None  # type: ignore[assignment]
 
 __all__ = [
     "BaseChannel",

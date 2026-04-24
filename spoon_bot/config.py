@@ -10,6 +10,7 @@ import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     BaseModel,
@@ -444,6 +445,102 @@ class SubagentLimitsConfig(BaseModel):
     )
 
 
+class CronStoreConfig(BaseModel):
+    """Persistent cron storage configuration."""
+
+    path: Path = Field(
+        default_factory=lambda: Path.home() / ".spoon-bot" / "cron" / "jobs.json",
+        description="Path to the cron job store JSON file",
+    )
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def coerce_path(cls, value: Path | str | None) -> Path:
+        if value is None:
+            return Path.home() / ".spoon-bot" / "cron" / "jobs.json"
+        return Path(value) if isinstance(value, str) else value
+
+
+class CronRunLogConfig(BaseModel):
+    """Cron execution log configuration."""
+
+    keep_lines: int = Field(
+        default=2000,
+        ge=10,
+        le=50000,
+        description="Maximum JSONL lines kept per job run log",
+    )
+
+
+class CronExecutionConfig(BaseModel):
+    """Cron execution safeguards."""
+
+    max_concurrent_runs: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Maximum concurrently running cron jobs",
+    )
+    isolated_clear_before_run: bool = Field(
+        default=True,
+        description="Clear isolated sessions before each execution",
+    )
+
+
+class CronConfig(BaseModel):
+    """Top-level cron service configuration."""
+
+    enabled: bool = Field(default=False, description="Enable scheduled tasks service")
+    timezone: str = Field(default="UTC", description="Default cron timezone")
+    catch_up_on_start: bool = Field(
+        default=True,
+        description="Run overdue jobs immediately after startup",
+    )
+    poll_interval: float = Field(
+        default=1.0,
+        ge=0.2,
+        le=60.0,
+        description="Scheduler polling interval in seconds",
+    )
+    store: CronStoreConfig = Field(default_factory=CronStoreConfig)
+    run_log: CronRunLogConfig = Field(default_factory=CronRunLogConfig)
+    execution: CronExecutionConfig = Field(default_factory=CronExecutionConfig)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        ZoneInfo(value)
+        return value
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any] | None = None) -> "CronConfig":
+        """Build config from YAML/env-compatible raw data."""
+        payload = dict(raw or {})
+        store_raw = dict(payload.get("store", {}) or {})
+        run_log_raw = dict(payload.get("run_log", {}) or {})
+        execution_raw = dict(payload.get("execution", {}) or {})
+
+        if "store_path" in payload and "path" not in store_raw:
+            store_raw["path"] = payload["store_path"]
+        if "run_log_keep_lines" in payload and "keep_lines" not in run_log_raw:
+            run_log_raw["keep_lines"] = payload["run_log_keep_lines"]
+        if "max_concurrent_runs" in payload and "max_concurrent_runs" not in execution_raw:
+            execution_raw["max_concurrent_runs"] = payload["max_concurrent_runs"]
+        if (
+            "isolated_clear_before_run" in payload
+            and "isolated_clear_before_run" not in execution_raw
+        ):
+            execution_raw["isolated_clear_before_run"] = payload["isolated_clear_before_run"]
+
+        return cls(
+            enabled=payload.get("enabled", False),
+            timezone=payload.get("timezone", "UTC"),
+            catch_up_on_start=payload.get("catch_up_on_start", True),
+            poll_interval=payload.get("poll_interval", 1.0),
+            store=CronStoreConfig(**store_raw),
+            run_log=CronRunLogConfig(**run_log_raw),
+            execution=CronExecutionConfig(**execution_raw),
+        )
 class AgentLoopConfig(BaseModel):
     """Configuration for AgentLoop with validation."""
 

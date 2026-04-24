@@ -40,6 +40,9 @@ from spoon_bot.agent.tools.web import (
 from spoon_bot.agent.tools.document import (
     DocumentParseTool,
 )
+from spoon_bot.agent.tools.cron import (
+    CronTool,
+)
 
 __all__ = [
     # Base
@@ -76,4 +79,6 @@ __all__ = [
     "WebBrowserTool",
     # Document
     "DocumentParseTool",
+    # Cron
+    "CronTool",
 ]

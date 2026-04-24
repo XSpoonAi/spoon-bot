@@ -19,6 +19,8 @@ from spoon_bot.channels.config import (
     merge_agent_config,
     uses_risky_local_tools,
 )
+from spoon_bot.channels.delivery import ChannelDeliveryService
+from spoon_bot.runtime.execution import ExecutionCoordinator
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
@@ -92,7 +94,14 @@ class ChannelManager:
     - Status reporting
     """
 
-    def __init__(self, config: ChannelsConfig | None = None, bus: MessageBus | None = None):
+    def __init__(
+        self,
+        config: ChannelsConfig | None = None,
+        bus: MessageBus | None = None,
+        *,
+        execution_coordinator: ExecutionCoordinator | None = None,
+        delivery_service: ChannelDeliveryService | None = None,
+    ):
         """
         Initialize channel manager.
 
@@ -114,6 +123,12 @@ class ChannelManager:
         self._running = False
         self._health_check_task: asyncio.Task | None = None
         self._circuit_breaker = _CircuitBreaker()
+        self._execution = execution_coordinator or ExecutionCoordinator()
+        self._delivery = delivery_service or ChannelDeliveryService()
+        self._delivery.attach_channel_lookup(
+            self.get_channel,
+            lambda: list(self._channels.keys()),
+        )
 
     def set_agent(
         self,
@@ -530,6 +545,16 @@ class ChannelManager:
             Channel instance or None
         """
         return self._channels.get(name)
+
+    @property
+    def execution_coordinator(self) -> ExecutionCoordinator:
+        """Expose the shared execution coordinator."""
+        return self._execution
+
+    @property
+    def delivery_service(self) -> ChannelDeliveryService:
+        """Expose the proactive delivery service."""
+        return self._delivery
 
     # Channel type registry - single source of truth for channel metadata
     # Each entry: kind -> {import_path, class_name, packages, install_extra, pip_package}
@@ -1034,7 +1059,12 @@ class ChannelManager:
             attachments = raw_attachments if isinstance(raw_attachments, list) else None
             session_key = message.session_key or None
 
-            if thinking_enabled:
+            session_lock = self._execution.get_session_lock(session_key)
+            agent_lock = self._execution.get_runner_lock("primary-agent")
+
+            async with session_lock:
+                self._persist_delivery_binding(message)
+
                 process_kwargs = {
                     "message": content,
                     "media": media,
@@ -1046,26 +1076,18 @@ class ChannelManager:
                 }
                 if reasoning_effort:
                     process_kwargs["reasoning_effort"] = reasoning_effort
-                response_text, thinking_content = await agent.process_with_thinking(**process_kwargs)
-                # Include thinking content in verbose mode
-                if message.metadata.get("verbose") and thinking_content:
-                    response_text = (
-                        f"\ud83d\udcad *Thinking:*\n{thinking_content}\n\n"
-                        f"---\n\n{response_text}"
-                    )
-            else:
-                process_kwargs = {
-                    "message": content,
-                    "media": media,
-                    "session_key": session_key,
-                    "channel": message.channel,
-                    "metadata": message.metadata.copy(),
-                    "reply_to": message.message_id,
-                    "attachments": attachments,
-                }
-                if reasoning_effort:
-                    process_kwargs["reasoning_effort"] = reasoning_effort
-                response_text = await agent.process(**process_kwargs)
+                if thinking_enabled:
+                    async with agent_lock:
+                        response_text, thinking_content = await agent.process_with_thinking(**process_kwargs)
+                    # Include thinking content in verbose mode
+                    if message.metadata.get("verbose") and thinking_content:
+                        response_text = (
+                            f"\ud83d\udcad *Thinking:*\n{thinking_content}\n\n"
+                            f"---\n\n{response_text}"
+                        )
+                else:
+                    async with agent_lock:
+                        response_text = await agent.process(**process_kwargs)
 
             self._circuit_breaker.record_success()
 
@@ -1117,6 +1139,24 @@ class ChannelManager:
                     await channel.on_processing_end(message)
                 except Exception as e:
                     logger.debug(f"on_processing_end failed: {e}")
+
+    def _persist_delivery_binding(self, message: InboundMessage) -> None:
+        """Persist the latest reply target on the session metadata."""
+        if not self._agent or not hasattr(self._agent, "sessions"):
+            return
+
+        binding = self._delivery.build_binding(message)
+        if binding is None:
+            return
+
+        try:
+            session = self._agent.sessions.get_or_create(message.session_key)
+            metadata = dict(session.metadata or {})
+            metadata["delivery_binding"] = binding.to_metadata()
+            session.metadata = metadata
+            self._agent.sessions.save(session)
+        except Exception as exc:
+            logger.warning(f"Failed to persist delivery binding for {message.session_key}: {exc}")
 
     @property
     def channel_names(self) -> list[str]:

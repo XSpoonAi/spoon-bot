@@ -7,7 +7,7 @@ from datetime import datetime
 
 from fastapi import APIRouter
 
-from spoon_bot.gateway.models.responses import HealthResponse, HealthCheck
+from spoon_bot.gateway.models.responses import HealthCheck, HealthResponse
 
 router = APIRouter(tags=["health"])
 
@@ -37,13 +37,28 @@ async def health_check() -> HealthResponse:
     ]
 
     if _channel_manager is not None:
-        running = _channel_manager.running_channels_count
-        total = len(_channel_manager.channel_names)
+        health = await _channel_manager.health_check_all()
+        running = int(health.get("running_channels", _channel_manager.running_channels_count))
+        total = int(health.get("total_channels", len(_channel_manager.channel_names)))
         ch_status = "healthy" if running == total else ("degraded" if running > 0 else "unhealthy")
+        failing: list[str] = []
+        raw_channels = health.get("channels", {})
+        if isinstance(raw_channels, dict):
+            for name, item in raw_channels.items():
+                if not isinstance(item, dict):
+                    continue
+                status = str(item.get("status") or "").lower()
+                if status == "running":
+                    continue
+                error = str(item.get("error") or "").strip()
+                failing.append(f"{name}: {error or status or 'unknown'}")
+        message = f"{running}/{total} running"
+        if failing:
+            message += " | " + "; ".join(failing[:3])
         checks.append(HealthCheck(
             name="channels",
             status=ch_status,
-            message=f"{running}/{total} running",
+            message=message,
         ))
 
     overall = "healthy"

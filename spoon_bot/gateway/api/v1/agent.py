@@ -8,36 +8,35 @@ import inspect
 import json
 import time
 from enum import Enum
-from typing import Any, Annotated, AsyncGenerator
-from uuid import uuid4
-
 from logging import getLogger
+from typing import Annotated, Any, AsyncGenerator
+from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from spoon_bot.gateway.app import (
     get_agent,
-    get_config,
     get_agent_execution_lock,
+    get_config,
     get_session_execution_lock,
 )
 from spoon_bot.gateway.auth.dependencies import CurrentUser
 from spoon_bot.gateway.errors import TimeoutCode, build_timeout_error_detail
 from spoon_bot.gateway.models.requests import AsyncChatRequest, ChatRequest
 from spoon_bot.gateway.models.responses import (
-    APIResponse,
-    MetaInfo,
-    ChatResponse,
-    ResponseSource,
-    StreamChunk,
-    TranscriptionInfo,
-    UsageInfo,
-    ToolCallInfo,
-    StatusResponse,
     AgentStats,
+    APIResponse,
     ChannelsInfo,
     ChannelStatusInfo,
+    ChatResponse,
+    MetaInfo,
+    ResponseSource,
+    StatusResponse,
+    StreamChunk,
+    TranscriptionInfo,
+    ToolCallInfo,
+    UsageInfo,
 )
 from spoon_bot.gateway.observability.budget import BudgetExhaustedError
 from spoon_bot.gateway.observability.tracing import (
@@ -211,7 +210,6 @@ async def _stream_sse(
     reasoning_effort: str | None = None,
     *,
     session_key: str | None = None,
-    user_id: str | None = None,
     trace_id: str | None = None,
     request_id: str | None = None,
     cancel_event: asyncio.Event | None = None,
@@ -236,7 +234,6 @@ async def _stream_sse(
     async with session_lock:
         async with agent_lock:
             _switch_session(agent, resolved_session_key)
-            setattr(agent, "user_id", user_id or "anonymous")
 
             kwargs = {"message": message, "thinking": thinking}
             if reasoning_effort:
@@ -338,7 +335,6 @@ async def chat(
 
     try:
         agent = get_agent()
-        owner_user_id = getattr(user, "user_id", "anonymous")
 
         # Session key: request body takes priority over user token.
         session_key = _resolve_session_key(request.session_key, user)
@@ -372,7 +368,6 @@ async def chat(
                     thinking,
                     reasoning_effort,
                     session_key=session_key,
-                    user_id=owner_user_id,
                     trace_id=trace_id,
                     request_id=request_id,
                 ),
@@ -391,7 +386,6 @@ async def chat(
             async with agent_lock:
                 # Non-streaming mode — switch session before processing
                 _switch_session(agent, session_key)
-                setattr(agent, "user_id", owner_user_id)
 
                 kwargs = {"message": message}
                 if reasoning_effort:
@@ -501,13 +495,7 @@ class AsyncTask:
 _task_store: dict[str, AsyncTask] = {}
 
 
-async def _run_async_task(
-    task: AsyncTask,
-    agent,
-    message: str,
-    session_key: str | None = None,
-    user_id: str | None = None,
-):
+async def _run_async_task(task: AsyncTask, agent, message: str, session_key: str | None = None):
     """Background coroutine that drives agent processing for an async task."""
     task.status = TaskStatus.RUNNING
     try:
@@ -517,7 +505,6 @@ async def _run_async_task(
         async with session_lock:
             async with agent_lock:
                 _switch_session(agent, resolved_session_key)
-                setattr(agent, "user_id", user_id or "anonymous")
                 if task._cancel_event.is_set():
                     task.status = TaskStatus.CANCELLED
                     return
@@ -563,15 +550,7 @@ async def chat_async(
     task = AsyncTask(task_id=task_id, owner_user_id=owner_user_id)
     _task_store[task_id] = task
 
-    bg = asyncio.create_task(
-        _run_async_task(
-            task,
-            agent,
-            request.message,
-            session_key=session_key,
-            user_id=owner_user_id,
-        )
-    )
+    bg = asyncio.create_task(_run_async_task(task, agent, request.message, session_key=session_key))
     task._bg_task = bg
 
     return {
@@ -663,8 +642,27 @@ async def get_status(user: CurrentUser) -> APIResponse[StatusResponse]:
             ch_list: list[ChannelStatusInfo] = []
             for name in _channel_manager.channel_names:
                 ch = _channel_manager.get_channel(name)
-                ch_status = "running" if ch and ch.is_running else "stopped"
-                ch_list.append(ChannelStatusInfo(name=name, status=ch_status))
+                if ch is None:
+                    ch_list.append(ChannelStatusInfo(name=name, status="stopped"))
+                    continue
+                try:
+                    health = await ch.health_check()
+                except Exception as exc:
+                    health = {"status": "error", "error": str(exc)}
+                raw_status = str(health.get("status") or "stopped").lower()
+                if raw_status == "running":
+                    ch_status = "running"
+                elif raw_status == "error":
+                    ch_status = "error"
+                else:
+                    ch_status = "stopped"
+                ch_list.append(
+                    ChannelStatusInfo(
+                        name=name,
+                        status=ch_status,
+                        message=str(health.get("error") or "") or None,
+                    )
+                )
             channels_info = ChannelsInfo(
                 running=_channel_manager.running_channels_count,
                 total=len(_channel_manager.channel_names),
@@ -785,7 +783,6 @@ async def voice_chat(
     request_id = f"req_{uuid4().hex[:12]}"
     start_time = time.time()
     trace_id = new_trace_id()
-    owner_user_id = getattr(user, "user_id", "anonymous") if user else "anonymous"
 
     config = get_config()
     if not config.audio.enabled:
@@ -831,7 +828,6 @@ async def voice_chat(
                 None,
                 False,
                 session_key=session_key,
-                user_id=owner_user_id,
                 trace_id=trace_id,
                 request_id=request_id,
             ),
@@ -845,7 +841,6 @@ async def voice_chat(
         )
 
     _switch_session(agent, session_key)
-    setattr(agent, "user_id", owner_user_id)
     response_text = await agent.process(message=processed_message)
     response_source = _get_agent_response_source(agent)
     duration_ms = int((time.time() - start_time) * 1000)

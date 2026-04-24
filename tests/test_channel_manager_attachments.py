@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -38,5 +38,8 @@ async def test_handle_message_passes_attachments_to_agent():
         message="[Alice]: look at this",
         media=None,
         session_key="default",
+        channel="feishu:testbot",
+        metadata=message.metadata,
+        reply_to=ANY,
         attachments=message.metadata["attachments"],
     )

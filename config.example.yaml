@@ -58,6 +58,16 @@ sessions:
   max_sessions: 100      # Maximum concurrent sessions
   persistence: true      # Save sessions to disk
 
+# Scheduled Tasks
+cron:
+  enabled: false
+  store_path: "~/.spoon-bot/cron/jobs.json"
+  timezone: "Asia/Shanghai"
+  catch_up_on_start: true
+  max_concurrent_runs: 1
+  isolated_clear_before_run: true
+  run_log_keep_lines: 2000
+
 # Channels Configuration
 channels:
   # ========== Telegram Bot ==========
