@@ -9,7 +9,8 @@ from __future__ import annotations
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     BaseModel,
@@ -373,6 +374,173 @@ class MemSearchConfig(BaseModel):
         return self.embedding_model or os.environ.get("OPENAI_EMBEDDING_MODEL")
 
 
+class SubagentLimitsConfig(BaseModel):
+    """Limits and defaults for the sub-agent system."""
+
+    max_depth: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description=(
+            "Maximum spawn depth "
+            "(1 = direct children only, 2 = children + grandchildren, max 8)"
+        ),
+    )
+    max_children_per_agent: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum concurrent children per agent (1-20)",
+    )
+    max_total_subagents: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+        description="Maximum total active sub-agents across all depths (1-50)",
+    )
+    default_model: Optional[str] = Field(
+        default=None,
+        description="Default model for sub-agents (inherits from parent if None)",
+    )
+    default_tool_profile: str = Field(
+        default="core",
+        description="Default tool profile for sub-agents (core, coding, research, full)",
+    )
+    # --- Persistence settings ---
+    persist_runs: bool = Field(
+        default=True,
+        description=(
+            "Persist sub-agent records to disk as JSON so they survive process restarts"
+        ),
+    )
+    persist_file: str = Field(
+        default="subagents/runs.json",
+        description=(
+            "Path to the persistence file. Relative paths are resolved against workspace. "
+            "Absolute paths are used as-is."
+        ),
+    )
+    archive_after_minutes: int = Field(
+        default=60,
+        ge=1,
+        le=10080,
+        description=(
+            "Minutes after which terminal sub-agent records (completed/failed/cancelled) "
+            "are removed from the persistence file (1-10080, i.e. up to 7 days)"
+        ),
+    )
+    sweeper_interval_seconds: int = Field(
+        default=60,
+        ge=10,
+        le=3600,
+        description="Interval in seconds for the background archive sweeper (10-3600)",
+    )
+    max_persistent_agents: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description=(
+            "Maximum number of persistent (session-mode) named agents that can be created (1-50)"
+        ),
+    )
+
+
+class CronStoreConfig(BaseModel):
+    """Persistent cron storage configuration."""
+
+    path: Path = Field(
+        default_factory=lambda: Path.home() / ".spoon-bot" / "cron" / "jobs.json",
+        description="Path to the cron job store JSON file",
+    )
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def coerce_path(cls, value: Path | str | None) -> Path:
+        if value is None:
+            return Path.home() / ".spoon-bot" / "cron" / "jobs.json"
+        return Path(value) if isinstance(value, str) else value
+
+
+class CronRunLogConfig(BaseModel):
+    """Cron execution log configuration."""
+
+    keep_lines: int = Field(
+        default=2000,
+        ge=10,
+        le=50000,
+        description="Maximum JSONL lines kept per job run log",
+    )
+
+
+class CronExecutionConfig(BaseModel):
+    """Cron execution safeguards."""
+
+    max_concurrent_runs: int = Field(
+        default=1,
+        ge=1,
+        le=16,
+        description="Maximum concurrently running cron jobs",
+    )
+    isolated_clear_before_run: bool = Field(
+        default=True,
+        description="Clear isolated sessions before each execution",
+    )
+
+
+class CronConfig(BaseModel):
+    """Top-level cron service configuration."""
+
+    enabled: bool = Field(default=False, description="Enable scheduled tasks service")
+    timezone: str = Field(default="UTC", description="Default cron timezone")
+    catch_up_on_start: bool = Field(
+        default=True,
+        description="Run overdue jobs immediately after startup",
+    )
+    poll_interval: float = Field(
+        default=1.0,
+        ge=0.2,
+        le=60.0,
+        description="Scheduler polling interval in seconds",
+    )
+    store: CronStoreConfig = Field(default_factory=CronStoreConfig)
+    run_log: CronRunLogConfig = Field(default_factory=CronRunLogConfig)
+    execution: CronExecutionConfig = Field(default_factory=CronExecutionConfig)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        ZoneInfo(value)
+        return value
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any] | None = None) -> "CronConfig":
+        """Build config from YAML/env-compatible raw data."""
+        payload = dict(raw or {})
+        store_raw = dict(payload.get("store", {}) or {})
+        run_log_raw = dict(payload.get("run_log", {}) or {})
+        execution_raw = dict(payload.get("execution", {}) or {})
+
+        if "store_path" in payload and "path" not in store_raw:
+            store_raw["path"] = payload["store_path"]
+        if "run_log_keep_lines" in payload and "keep_lines" not in run_log_raw:
+            run_log_raw["keep_lines"] = payload["run_log_keep_lines"]
+        if "max_concurrent_runs" in payload and "max_concurrent_runs" not in execution_raw:
+            execution_raw["max_concurrent_runs"] = payload["max_concurrent_runs"]
+        if (
+            "isolated_clear_before_run" in payload
+            and "isolated_clear_before_run" not in execution_raw
+        ):
+            execution_raw["isolated_clear_before_run"] = payload["isolated_clear_before_run"]
+
+        return cls(
+            enabled=payload.get("enabled", False),
+            timezone=payload.get("timezone", "UTC"),
+            catch_up_on_start=payload.get("catch_up_on_start", True),
+            poll_interval=payload.get("poll_interval", 1.0),
+            store=CronStoreConfig(**store_raw),
+            run_log=CronRunLogConfig(**run_log_raw),
+            execution=CronExecutionConfig(**execution_raw),
+        )
 class AgentLoopConfig(BaseModel):
     """Configuration for AgentLoop with validation."""
 
@@ -515,6 +683,12 @@ class AgentLoopConfig(BaseModel):
         ge=1.0,
         le=300.0,
         description="Polling interval in seconds for auto-reload file watcher (1-300)"
+    )
+
+    # Sub-agent system
+    subagent: SubagentLimitsConfig = Field(
+        default_factory=SubagentLimitsConfig,
+        description="Sub-agent system limits and defaults",
     )
 
     @field_validator("workspace", mode="before")

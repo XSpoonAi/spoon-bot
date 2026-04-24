@@ -2,7 +2,7 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-04-23 08:55 UTC.  
+> **Auto-generated** from source code on 2026-04-24 13:42 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
 Base URL (local): `http://localhost:8080`  
@@ -102,14 +102,14 @@ Health check endpoint.
 Readiness check endpoint.
 
 
-*Source: `spoon_bot/gateway/api/health.py:62`*
+*Source: `spoon_bot/gateway/api/health.py:77`*
 
 ### `GET /`
 
 Root endpoint with API information.
 
 
-*Source: `spoon_bot/gateway/api/health.py:94`*
+*Source: `spoon_bot/gateway/api/health.py:109`*
 
 ---
 
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:298`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:316`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:749`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:774`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:624`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:630`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:516`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:528`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:560`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:564`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:593`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:599`*
 
 ---
 
@@ -735,6 +735,17 @@ Audio transcription information.
 | `duration_seconds` | `float | None` | None |
 | `provider` | `str` | 'whisper' |
 
+#### `ResponseSource`
+
+Machine-readable metadata describing who produced a response.
+
+| Field | Type | Default |
+|-------|------|---------|
+| `type` | `str` | 'agent' |
+| `is_subagent` | `bool` | False |
+| `subagent_id` | `str | None` | None |
+| `subagent_name` | `str | None` | None |
+
 #### `ChatResponse`
 
 Chat response model.
@@ -746,6 +757,7 @@ Chat response model.
 | `usage` | `UsageInfo | None` | None |
 | `thinking_content` | `str | None` | None |
 | `transcription` | `TranscriptionInfo | None` | None |
+| `source` | `ResponseSource | None` | None |
 
 #### `StreamChunk`
 
@@ -756,6 +768,7 @@ Streaming response chunk model.
 | `type` | `str` | *(required)* |
 | `delta` | `str` | '' |
 | `metadata` | `dict[str, Any]` | Field(default_factory=dict) |
+| `source` | `ResponseSource | None` | None |
 
 #### `SessionInfo`
 

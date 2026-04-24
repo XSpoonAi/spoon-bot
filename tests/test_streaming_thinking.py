@@ -133,7 +133,12 @@ class TestStreamChunkModel:
 
         chunk = StreamChunk(type="content", delta="hello world")
         data = chunk.model_dump()
-        assert data == {"type": "content", "delta": "hello world", "metadata": {}}
+        assert data == {
+            "type": "content",
+            "delta": "hello world",
+            "metadata": {},
+            "source": None,
+        }
 
     def test_json_serialization(self):
         from spoon_bot.gateway.models.responses import StreamChunk
@@ -388,6 +393,62 @@ class TestAgentLoopStream:
         loop.sessions.save = MagicMock()
         return loop
 
+    def _make_stream_agent(self, items, *, run_result_text: str = "", run_error: Exception | None = None):
+        from spoon_bot.agent.loop import AgentLoop
+
+        queue: asyncio.Queue = asyncio.Queue()
+        task_done = asyncio.Event()
+
+        async def run(**kwargs):
+            for item in items:
+                await queue.put(item)
+            if run_error:
+                raise run_error
+            if run_result_text:
+                return MagicMock(content=run_result_text)
+            return MagicMock(content=None)
+
+        async def run_with_retry(label="agent", pre_retry_cleanup=None, **run_kwargs):
+            return await agent._agent.run(**run_kwargs)
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent.provider = "anthropic"
+        agent._chatbot = None
+        agent._agent = MagicMock()
+        agent._agent.add_message = AsyncMock()
+        agent._agent.run = AsyncMock(side_effect=run)
+        agent._agent.output_queue = queue
+        agent._agent.task_done = task_done
+        agent._agent.state = "idle"
+        agent._agent.system_prompt = "base system"
+        agent._agent._original_system_prompt = "base original"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent._run_agent_with_retry = AsyncMock(side_effect=run_with_retry)
+        agent._select_next_step_prompt = AgentLoop._select_next_step_prompt.__get__(agent, AgentLoop)
+        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
+        agent._persist_turn = MagicMock()
+        agent._current_tool_owner_key = MagicMock(return_value="user:test|session:default")
+        agent._maybe_create_persistent_subagent_from_request = MagicMock(return_value=None)
+        agent._maybe_route_to_persistent_specialist_result = AsyncMock(return_value=None)
+        agent.set_subagent_context = MagicMock()
+        return agent
+
     def test_select_next_step_prompt_keeps_context_for_openrouter_thinking(self):
         """Thinking mode should use the same lightweight next-step prompt on OpenRouter."""
         from spoon_bot.agent.loop import AgentLoop
@@ -593,33 +654,7 @@ class TestAgentLoopStream:
         mock_chunk_2.content = " World"
         mock_chunk_2.metadata = None
 
-        async def mock_run(**kwargs):
-            for c in [mock_chunk_1, mock_chunk_2]:
-                await agent._agent.output_queue.put(c)
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = asyncio.Queue()
-        agent._agent.task_done = asyncio.Event()
-        agent._agent.run = mock_run
-        agent._agent.add_message = AsyncMock()
-        agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent = self._make_stream_agent([mock_chunk_1, mock_chunk_2])
 
         # Call the real stream method bound to our mock
         chunks = []
@@ -706,33 +741,7 @@ class TestAgentLoopStream:
         """stream() should handle plain string chunks."""
         from spoon_bot.agent.loop import AgentLoop
 
-        async def mock_run(**kwargs):
-            await agent._agent.output_queue.put("Hello")
-            await agent._agent.output_queue.put(" World")
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = asyncio.Queue()
-        agent._agent.task_done = asyncio.Event()
-        agent._agent.run = mock_run
-        agent._agent.add_message = AsyncMock()
-        agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent = self._make_stream_agent(["Hello", " World"])
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test"):
@@ -757,33 +766,7 @@ class TestAgentLoopStream:
         content_chunk.content = "Result"
         content_chunk.metadata = None
 
-        async def mock_run(**kwargs):
-            await agent._agent.output_queue.put(thinking_chunk)
-            await agent._agent.output_queue.put(content_chunk)
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = asyncio.Queue()
-        agent._agent.task_done = asyncio.Event()
-        agent._agent.run = mock_run
-        agent._agent.add_message = AsyncMock()
-        agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent = self._make_stream_agent([thinking_chunk, content_chunk])
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test", thinking=True):
@@ -798,6 +781,38 @@ class TestAgentLoopStream:
         assert content_chunks[0]["delta"] == "Result"
 
     @pytest.mark.asyncio
+    async def test_stream_builds_runtime_message_with_media_and_attachments(self):
+        """stream() should build the runtime message with media and attachments."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        agent = self._make_stream_agent(["hello"])
+        media = ["/workspace/uploads/demo.png"]
+        attachments = [{"uri": "/workspace/uploads/demo.txt", "name": "demo.txt"}]
+
+        chunks = []
+        async for chunk in AgentLoop.stream(
+            agent,
+            message="test",
+            media=media,
+            attachments=attachments,
+        ):
+            chunks.append(chunk)
+
+        assert any(chunk["type"] == "content" for chunk in chunks)
+        agent._build_runtime_message_content.assert_called_with(
+            "user",
+            "test",
+            media=media,
+            attachments=attachments,
+        )
+        agent._persist_turn.assert_called_once_with(
+            "test",
+            "hello",
+            media=media,
+            attachments=attachments,
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_downgrades_to_content_when_no_tool_call_follows(self):
         """stream() should keep normal content when tool calls never follow."""
         from spoon_bot.agent.loop import AgentLoop
@@ -808,12 +823,16 @@ class TestAgentLoopStream:
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
+        agent.provider = "anthropic"
+        agent._chatbot = None
         agent._agent = MagicMock()
         agent._agent.output_queue = asyncio.Queue()
         agent._agent.task_done = asyncio.Event()
         agent._agent.run = mock_run
         agent._agent.add_message = AsyncMock()
         agent._agent.state = "idle"
+        agent._agent.system_prompt = "base system"
+        agent._agent._original_system_prompt = "base original"
         agent._session = MagicMock()
         agent._session.add_message = MagicMock()
         agent.sessions = MagicMock()
@@ -823,10 +842,21 @@ class TestAgentLoopStream:
         agent.context = MagicMock()
         agent._prepare_request_context = AsyncMock()
         agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
         agent._build_step_prompt = MagicMock(return_value="prompt")
         agent._install_anti_loop_tracker = MagicMock()
         agent._restore_agent_think = MagicMock()
         agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._run_agent_with_retry = AsyncMock(
+            side_effect=lambda label="agent", pre_retry_cleanup=None, **run_kwargs: agent._agent.run(**run_kwargs)
+        )
+        agent._select_next_step_prompt = AgentLoop._select_next_step_prompt.__get__(agent, AgentLoop)
+        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
+        agent._current_tool_owner_key = MagicMock(return_value="user:test|session:default")
+        agent._persist_turn = MagicMock()
+        agent._maybe_create_persistent_subagent_from_request = MagicMock(return_value=None)
+        agent._maybe_route_to_persistent_specialist_result = AsyncMock(return_value=None)
+        agent.set_subagent_context = MagicMock()
         agent._drain_reasoning_chunks = AgentLoop._drain_reasoning_chunks.__get__(agent, AgentLoop)
         agent._reset_reasoning_capture = AgentLoop._reset_reasoning_capture.__get__(agent, AgentLoop)
         agent._capture_reasoning_text = AgentLoop._capture_reasoning_text.__get__(agent, AgentLoop)
@@ -1704,39 +1734,13 @@ class TestAgentLoopStream:
         """stream() should catch errors and emit done with error metadata."""
         from spoon_bot.agent.loop import AgentLoop
 
-        async def mock_run(**kwargs):
-            await agent._agent.output_queue.put("partial")
-            raise RuntimeError("Connection lost")
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = asyncio.Queue()
-        agent._agent.task_done = asyncio.Event()
-        agent._agent.run = mock_run
-        agent._agent.add_message = AsyncMock()
-        agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent = self._make_stream_agent(["partial"], run_error=RuntimeError("Connection lost"))
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test"):
             chunks.append(chunk)
 
-        # Should get the partial content + error done
+        # Should get the partial content + error event
         assert chunks[0]["type"] == "content"
         assert chunks[0]["delta"] == "partial"
         assert chunks[-2]["type"] == "error"
@@ -1749,27 +1753,16 @@ class TestAgentLoopStream:
         """stream() should keep the user turn even when the provider fails immediately."""
         from spoon_bot.agent.loop import AgentLoop
 
-        async def mock_stream(message, **kwargs):
-            raise RuntimeError("Immediate failure")
-            yield "never"  # pragma: no cover
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.stream = mock_stream
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
+        agent = self._make_stream_agent([], run_error=RuntimeError("Immediate failure"))
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test"):
             chunks.append(chunk)
 
-        # Should get error done chunk
+        # Should get error + done chunks
+        assert chunks[-2]["type"] == "error"
         assert chunks[-1]["type"] == "done"
-        assert "error" in chunks[-1]["metadata"]
+        assert chunks[-1]["metadata"]["content"] == ""
 
         user_call = agent._session.add_message.call_args_list[0]
         assert user_call.args[:2] == ("user", "test")
@@ -1780,32 +1773,7 @@ class TestAgentLoopStream:
         """stream() should save session after successful completion."""
         from spoon_bot.agent.loop import AgentLoop
 
-        async def mock_run(**kwargs):
-            await agent._agent.output_queue.put("hello")
-
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = MagicMock()
-        agent._agent.output_queue = asyncio.Queue()
-        agent._agent.task_done = asyncio.Event()
-        agent._agent.run = mock_run
-        agent._agent.add_message = AsyncMock()
-        agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent = self._make_stream_agent(["hello"])
 
         chunks = []
         async for chunk in AgentLoop.stream(agent, message="test message"):
@@ -1916,6 +1884,45 @@ class TestAgentLoopStream:
 class TestAgentLoopProcessWithThinking:
     """Test AgentLoop.process_with_thinking() method."""
 
+    def _make_process_with_thinking_agent(self, inner_agent):
+        from spoon_bot.agent.loop import AgentLoop
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent.provider = "anthropic"
+        agent._chatbot = None
+        agent._agent = inner_agent
+        agent._agent.add_message = getattr(inner_agent, "add_message", AsyncMock())
+        if not hasattr(agent._agent, "system_prompt"):
+            agent._agent.system_prompt = "base system"
+        if not hasattr(agent._agent, "_original_system_prompt"):
+            agent._agent._original_system_prompt = "base original"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._looks_like_duplicate_thinking = AgentLoop._looks_like_duplicate_thinking.__get__(agent, AgentLoop)
+        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
+        agent._latest_reasoning_excerpt = None
+        agent._current_tool_owner_key = MagicMock(return_value="user:test|session:default")
+        agent._select_next_step_prompt = AgentLoop._select_next_step_prompt.__get__(agent, AgentLoop)
+        agent._maybe_create_persistent_subagent_from_request = MagicMock(return_value=None)
+        agent._maybe_route_to_persistent_specialist_result = AsyncMock(return_value=None)
+        agent.set_subagent_context = MagicMock()
+        agent._auto_commit = False
+        agent._git = None
+        return agent
+
     @pytest.mark.asyncio
     async def test_returns_tuple(self):
         """process_with_thinking() should return (response, thinking_content)."""
@@ -1926,30 +1933,10 @@ class TestAgentLoopProcessWithThinking:
         result.thinking_content = "I need to think about this..."
 
         mock_inner_agent = MagicMock()
-        mock_inner_agent.run = AsyncMock(return_value=result)
         mock_inner_agent.add_message = AsyncMock()
+        mock_inner_agent.state = "idle"
 
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = mock_inner_agent
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._auto_commit = False
-        agent._git = None
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._looks_like_duplicate_thinking = AgentLoop._looks_like_duplicate_thinking.__get__(agent, AgentLoop)
-        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
-        agent._latest_reasoning_excerpt = None
+        agent = self._make_process_with_thinking_agent(mock_inner_agent)
 
         response, thinking = await AgentLoop.process_with_thinking(agent, message="What is 6*7?")
 
@@ -2020,28 +2007,9 @@ class TestAgentLoopProcessWithThinking:
         mock_inner_agent = MagicMock()
         mock_inner_agent.run = AsyncMock(return_value=result)
         mock_inner_agent.add_message = AsyncMock()
+        mock_inner_agent.state = "idle"
 
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = mock_inner_agent
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._auto_commit = False
-        agent._git = None
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._looks_like_duplicate_thinking = AgentLoop._looks_like_duplicate_thinking.__get__(agent, AgentLoop)
-        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
-        agent._latest_reasoning_excerpt = None
+        agent = self._make_process_with_thinking_agent(mock_inner_agent)
 
         response, thinking = await AgentLoop.process_with_thinking(agent, message="test")
         assert thinking == "My thought process"
@@ -2058,28 +2026,9 @@ class TestAgentLoopProcessWithThinking:
         mock_inner_agent = MagicMock()
         mock_inner_agent.run = AsyncMock(return_value=result)
         mock_inner_agent.add_message = AsyncMock()
+        mock_inner_agent.state = "idle"
 
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = mock_inner_agent
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
-        agent.sessions = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._auto_commit = False
-        agent._git = None
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._looks_like_duplicate_thinking = AgentLoop._looks_like_duplicate_thinking.__get__(agent, AgentLoop)
-        agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
-        agent._latest_reasoning_excerpt = None
+        agent = self._make_process_with_thinking_agent(mock_inner_agent)
 
         response, thinking = await AgentLoop.process_with_thinking(agent, message="test")
         assert thinking == "Metadata thought"
@@ -2215,25 +2164,9 @@ class TestAgentLoopProcessWithThinking:
         mock_inner_agent = MagicMock()
         mock_inner_agent.run = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
         mock_inner_agent.add_message = AsyncMock()
+        mock_inner_agent.state = "idle"
 
-        agent = MagicMock(spec=AgentLoop)
-        agent._initialized = True
-        agent._agent = mock_inner_agent
-        agent._session = MagicMock()
-        agent.sessions = MagicMock()
-        agent.memory = MagicMock()
-        agent.memory.get_memory_context = MagicMock(return_value=None)
-        agent.context = MagicMock()
-        agent._auto_commit = False
-        agent._git = None
-        agent._prepare_request_context = AsyncMock()
-        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
-        agent._build_step_prompt = MagicMock(return_value="prompt")
-        agent._install_anti_loop_tracker = MagicMock()
-        agent._restore_agent_think = MagicMock()
-        agent._callable_accepts_kwarg = MagicMock(return_value=True)
-        agent._reset_reasoning_capture = MagicMock()
-        agent._latest_reasoning_excerpt = None
+        agent = self._make_process_with_thinking_agent(mock_inner_agent)
 
         with pytest.raises(RuntimeError, match="LLM unavailable"):
             await AgentLoop.process_with_thinking(agent, message="test")

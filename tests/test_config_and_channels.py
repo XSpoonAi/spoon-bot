@@ -6,7 +6,7 @@ import asyncio
 import os
 import textwrap
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -425,6 +425,9 @@ class TestManagedChannelAgents:
             message="[Alice]: show files",
             media=None,
             session_key="default",
+            channel="feishu:testbot",
+            metadata={"chat_type": "group", "is_dm": False},
+            reply_to=ANY,
             attachments=None,
         )
         manager._channel_agents["feishu:testbot"].process.assert_not_awaited()
@@ -455,6 +458,9 @@ class TestManagedChannelAgents:
             message="analyze this",
             media=None,
             session_key="default",
+            channel="feishu:testbot",
+            metadata={"chat_type": "dm", "is_dm": True, "think_level": "basic"},
+            reply_to=ANY,
             attachments=None,
             reasoning_effort="low",
         )
@@ -485,6 +491,9 @@ class TestManagedChannelAgents:
             message="analyze this",
             media=None,
             session_key="default",
+            channel="feishu:testbot",
+            metadata={"chat_type": "dm", "is_dm": True, "think_level": "xhigh"},
+            reply_to=ANY,
             attachments=None,
             reasoning_effort="xhigh",
         )
@@ -554,6 +563,14 @@ class TestManagedChannelAgents:
             message="[Alice]: hello",
             media=None,
             session_key="default",
+            channel="feishu:team_bot",
+            metadata={
+                "chat_type": "group",
+                "is_dm": False,
+                "agent_scope_key": "group:oc_team",
+                "runtime_agent_override": {"tool_profile": "group_safe"},
+            },
+            reply_to=ANY,
             attachments=None,
         )
         assert mock_create.await_count == 1

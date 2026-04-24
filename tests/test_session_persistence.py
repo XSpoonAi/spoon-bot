@@ -164,6 +164,17 @@ class TestFileSessionStore:
         loaded = file_store.load_session("test-session")
         assert len(loaded.messages) == 3
 
+    def test_archive_hides_deleted_session_from_default_listing(self, file_store: FileSessionStore):
+        s = _sample_session("alpha")
+        file_store.save_session(s)
+
+        assert file_store.archive_session("alpha") is True
+        assert file_store.list_session_keys() == []
+
+        archived_keys = file_store.list_session_keys(include_archived=True)
+        assert len(archived_keys) == 1
+        assert archived_keys[0].startswith("alpha.deleted.")
+
     def test_special_chars_in_key(self, file_store: FileSessionStore):
         s = _sample_session("user@example.com:session/1")
         file_store.save_session(s)

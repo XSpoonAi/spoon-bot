@@ -13,7 +13,6 @@ from loguru import logger
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import capture_tool_output
 
-
 # Shared httpx client for connection pooling across web tools.
 # Created lazily on first use to avoid issues at import time.
 _shared_client: httpx.AsyncClient | None = None
@@ -41,6 +40,52 @@ async def close_shared_http_client() -> None:
     _shared_client = None
 
 
+_WEB_SEARCH_ENV_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "tavily": ("TAVILY_API_KEY",),
+    "brave": ("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"),
+}
+
+
+def get_configured_web_search_provider(preferred: str | None = None) -> str | None:
+    """Return the first usable web_search provider configured in the environment."""
+    preferred_provider = (preferred or "").strip().lower()
+    candidates: list[str] = []
+    if preferred_provider:
+        candidates.append(preferred_provider)
+    candidates.extend(["tavily", "brave"])
+
+    seen: set[str] = set()
+    for provider in candidates:
+        if provider in seen:
+            continue
+        seen.add(provider)
+        if _get_web_search_api_key(provider):
+            return provider
+    return None
+
+
+def describe_web_search_capability(preferred: str | None = None) -> tuple[bool, str]:
+    """Describe whether a usable web_search provider is configured."""
+    provider = get_configured_web_search_provider(preferred)
+    if provider is not None:
+        return True, f"Configured web_search provider: {provider}"
+    return (
+        False,
+        "No web_search provider is configured. Set TAVILY_API_KEY, "
+        "BRAVE_SEARCH_API_KEY/BRAVE_API_KEY, or disable live web retrieval for this task.",
+    )
+
+
+def _get_web_search_api_key(provider: str) -> str | None:
+    for env_var in _WEB_SEARCH_ENV_CANDIDATES.get(provider, ()):
+        value = os.environ.get(env_var)
+        if value:
+            text = value.strip()
+            if text:
+                return text
+    return None
+
+
 class WebSearchTool(Tool):
     """
     Tool to search the web for information.
@@ -56,7 +101,7 @@ class WebSearchTool(Tool):
     _ENV_VAR_MAP: dict[str, str] = {
         "tavily": "TAVILY_API_KEY",
         "google": "GOOGLE_SEARCH_API_KEY",
-        "brave": "BRAVE_SEARCH_API_KEY",
+        "brave": "BRAVE_SEARCH_API_KEY or BRAVE_API_KEY",
         "serper": "SERPER_API_KEY",
         # DuckDuckGo doesn't require an API key for basic search
     }
@@ -117,7 +162,7 @@ class WebSearchTool(Tool):
         provider: str | None = None,
         **kwargs: Any,
     ) -> str:
-        provider = provider or self._default_provider
+        provider = self._resolve_provider(provider)
         max_results = min(max_results or self._max_results, 20)
 
         if provider not in self.SUPPORTED_PROVIDERS:
@@ -129,9 +174,18 @@ class WebSearchTool(Tool):
         # Dispatch
         if provider == "tavily":
             return await self._search_tavily(query, max_results, topic, time_range)
+        if provider == "brave":
+            return await self._search_brave(query, max_results, topic, time_range)
 
         # Fallback: stub for other providers (can be implemented later)
         return await self._search_stub(query, provider, max_results, time_range)
+
+    def _resolve_provider(self, provider: str | None) -> str:
+        explicit = (provider or "").strip().lower()
+        if explicit:
+            return explicit
+        configured = get_configured_web_search_provider(self._default_provider)
+        return configured or self._default_provider
 
     # ---- Tavily implementation ---------------------------------------------
 
@@ -142,7 +196,7 @@ class WebSearchTool(Tool):
         topic: str | None,
         time_range: str | None,
     ) -> str:
-        api_key = os.environ.get("TAVILY_API_KEY")
+        api_key = _get_web_search_api_key("tavily")
         if not api_key:
             return (
                 "Error: Tavily API key not configured. "
@@ -198,6 +252,70 @@ class WebSearchTool(Tool):
         elif not answer:
             parts.append("No results found.")
 
+        return "\n".join(parts)
+
+    async def _search_brave(
+        self,
+        query: str,
+        max_results: int,
+        topic: str | None,
+        time_range: str | None,
+    ) -> str:
+        api_key = _get_web_search_api_key("brave")
+        if not api_key:
+            return (
+                "Error: Brave Search API key not configured. "
+                "Set BRAVE_SEARCH_API_KEY or BRAVE_API_KEY in your environment."
+            )
+
+        endpoint = (
+            "https://api.search.brave.com/res/v1/news/search"
+            if topic == "news"
+            else "https://api.search.brave.com/res/v1/web/search"
+        )
+        params: dict[str, Any] = {
+            "q": query,
+            "count": max_results,
+        }
+        if time_range:
+            params["freshness"] = time_range
+
+        try:
+            client = _get_http_client()
+            resp = await client.get(
+                endpoint,
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": api_key,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"Brave API error: {exc.response.status_code} {exc.response.text[:300]}")
+            return f"Error: Brave search failed ({exc.response.status_code})"
+        except Exception as exc:
+            logger.error(f"Brave request error: {exc}")
+            return f"Error: Web search failed — {exc}"
+
+        results = data.get("results", [])
+        if not results:
+            return "No results found."
+
+        parts = [f"**Search results ({len(results)}):**\n"]
+        for i, item in enumerate(results, 1):
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            content = str(
+                item.get("description")
+                or item.get("snippet")
+                or item.get("content")
+                or ""
+            ).strip()
+            age = str(item.get("age") or "").strip()
+            time_note = f" ({age})" if age else ""
+            parts.append(f"{i}. **{title or url or 'Untitled'}**{time_note}\n   {url}\n   {content}\n")
         return "\n".join(parts)
 
     # ---- Stub for unimplemented providers ----------------------------------
@@ -533,7 +651,7 @@ class WebBrowserTool(Tool):
         try:
             parsed = urlparse(url)
             if parsed.scheme not in ("http", "https"):
-                return f"Error: Invalid URL scheme. Only http and https are allowed."
+                return "Error: Invalid URL scheme. Only http and https are allowed."
         except Exception as e:
             return f"Error: Invalid URL: {str(e)}"
 

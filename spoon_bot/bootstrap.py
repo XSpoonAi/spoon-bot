@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from spoon_bot.channels.delivery import ChannelDeliveryService
+from spoon_bot.runtime.execution import ExecutionCoordinator
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
@@ -21,6 +23,8 @@ async def init_channels(
     config_path: str | Path | None = None,
     channel_names: list[str] | None = None,
     cli_enabled: bool = False,
+    execution_coordinator: ExecutionCoordinator | None = None,
+    delivery_service: ChannelDeliveryService | None = None,
 ) -> ChannelManager:
     """Create a ChannelManager, load channels from config, and start them.
 
@@ -42,13 +46,16 @@ async def init_channels(
     from spoon_bot.channels.manager import ChannelManager
     from spoon_bot.channels.config import load_agent_config
 
-    manager = ChannelManager()
+    manager = ChannelManager(
+        execution_coordinator=execution_coordinator,
+        delivery_service=delivery_service,
+    )
     manager.set_agent(
         agent,
         agent_config=load_agent_config(config_path),
         config_path=config_path,
     )
-    await manager.load_from_config(config_path, include_cli=cli_enabled)
+    await manager.load_from_config(config_path)
 
     # Remove CLI channel unless explicitly requested — avoids stdin conflicts
     # with the Rich REPL (agent mode) or Docker (no tty).

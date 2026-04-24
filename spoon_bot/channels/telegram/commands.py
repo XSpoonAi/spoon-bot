@@ -76,6 +76,8 @@ class CommandHandlers:
             "compact": self.handle_compact,
             "clear": self.handle_clear,
             "cancel": self.handle_cancel,
+            "subagents": self.handle_subagents,
+            "agents": self.handle_subagents,
         }
         for name, handler in commands.items():
             app.add_handler(CommandHandler(name, handler))
@@ -99,6 +101,23 @@ class CommandHandlers:
         except Exception:
             # Strip parse_mode and retry as plain text
             await update.message.reply_text(text, **kwargs)
+
+    def _subagent_request_context(
+        self,
+        update: Update,
+    ) -> tuple[str | None, str | None, dict[str, Any], str | None]:
+        """Return the session/channel context for sub-agent wake delivery."""
+        chat = getattr(update, "effective_chat", None)
+        message = getattr(update, "message", None)
+        metadata: dict[str, Any] = {}
+        if chat is not None and getattr(chat, "id", None) is not None:
+            metadata["chat_id"] = chat.id
+            metadata["chat_type"] = getattr(chat, "type", None)
+        if chat is None or chat.id is None:
+            return None, self._channel.full_name, metadata, None
+        session_key = f"telegram_{self._channel.account_id}_{chat.id}"
+        reply_to = str(message.message_id) if message and getattr(message, "message_id", None) else None
+        return session_key, self._channel.full_name, metadata, reply_to
 
     # ------------------------------------------------------------------
     # /start
@@ -437,6 +456,522 @@ class CommandHandlers:
             return
 
         await update.message.reply_text("Operation cancelled.")
+
+    # ------------------------------------------------------------------
+    # /subagents [list|spawn <task>|cancel [id|all]]
+    # /agents — alias for /subagents
+    # ------------------------------------------------------------------
+
+    async def handle_subagents(self, update: Update, context: Any) -> None:
+        if not self._check(update):
+            return
+
+        if not self._agent:
+            await self._reply(update, "Agent not available.")
+            return
+
+        manager = self._agent.subagent_manager
+        if manager is None:
+            await self._reply(update, "Sub-agent manager not available.")
+            return
+
+        args = context.args or []
+        subcommand = args[0].lower() if args else "list"
+
+        if subcommand in ("list", "ls"):
+            await self._subagents_list(update, manager)
+        elif subcommand == "spawn":
+            rest = args[1:]
+            await self._subagents_spawn(update, manager, rest)
+        elif subcommand == "resume":
+            agent_name = args[1] if len(args) > 1 else ""
+            task = " ".join(args[2:]).strip()
+            await self._subagents_resume(update, manager, agent_name, task)
+        elif subcommand in ("cancel", "kill"):
+            target = args[1] if len(args) > 1 else ""
+            await self._subagents_cancel(update, manager, target)
+        elif subcommand == "steer":
+            agent_id = args[1] if len(args) > 1 else ""
+            message = " ".join(args[2:]).strip()
+            await self._subagents_steer(update, manager, agent_id, message)
+        elif subcommand == "info":
+            agent_id = args[1] if len(args) > 1 else ""
+            await self._subagents_info(update, manager, agent_id)
+        elif subcommand == "help":
+            await self._reply(
+                update,
+                "*Sub-agent commands:*\n"
+                "`/subagents` — list all sub-agents\n"
+                "`/subagents spawn [--model M] [--thinking L] [--mode run|session] [--name N] <task>` — spawn\n"
+                "`/subagents resume <name> <new task>` — re-invoke a session agent\n"
+                "`/subagents cancel <id|all>` — cascade-cancel sub-agent(s)\n"
+                "`/subagents kill <id|all>` — alias for cancel\n"
+                "`/subagents steer <id> <new instructions>` — redirect running agent\n"
+                "`/subagents info <id>` — detailed metadata\n"
+                "`/agents` — alias for /subagents",
+            )
+        else:
+            await self._reply(
+                update,
+                "*Usage:*\n"
+                "`/subagents` — list all sub-agents\n"
+                "`/subagents spawn [--mode session --name N] <task>` — spawn\n"
+                "`/subagents resume <name> <new task>` — re-invoke a session agent\n"
+                "`/subagents cancel <id|all>` — cascade-cancel sub-agent(s)\n"
+                "`/subagents steer <id> <message>` — redirect running agent\n"
+                "`/subagents info <id>` — show details\n"
+                "`/subagents help` — full command reference",
+            )
+
+    async def _subagents_list(self, update: Update, manager: Any) -> None:
+        spawner_session_key, _, _, _ = self._subagent_request_context(update)
+        summary = manager.get_status_summary(
+            spawner_session_key=spawner_session_key
+        )
+        total = summary.get("total", 0)
+        if total == 0:
+            await self._reply(update, "No sub-agents spawned.")
+            return
+
+        lines = [f"*Sub-agents ({total} total):*"]
+
+        active = summary.get("active", [])
+        if active:
+            lines.append("\n*Active:*")
+            for e in active:
+                agent_id = e["agent_id"]
+                label = e["label"]
+                state = e["state"]
+                elapsed = e.get("elapsed_seconds")
+                model = e.get("model") or ""
+                pending_desc = e.get("pending_descendants", 0)
+                elapsed_str = f" — {elapsed}s" if elapsed is not None else ""
+                model_str = f" \\[{model}]" if model else ""
+                desc_str = (
+                    f" *(+{pending_desc} descendants)*"
+                    if pending_desc > 0 else ""
+                )
+                mode_str = (
+                    f" \\[session:{e['agent_name']}]"
+                    if e.get("spawn_mode") == "session" else ""
+                )
+                lines.append(
+                    f"`[{agent_id}]` {label}: *{state}*{elapsed_str}{model_str}{mode_str}{desc_str}"
+                )
+
+        recent = summary.get("recent", [])
+        if recent:
+            lines.append("\n*Recent:*")
+            for e in recent:
+                agent_id = e["agent_id"]
+                label = e["label"]
+                state = e["state"]
+                elapsed = e.get("elapsed_seconds")
+                model = e.get("model") or ""
+                elapsed_str = f" — {elapsed}s" if elapsed is not None else ""
+                model_str = f" \\[{model}]" if model else ""
+                mode_str = (
+                    f" \\[session:{e['agent_name']}]"
+                    if e.get("spawn_mode") == "session" else ""
+                )
+                lines.append(f"`[{agent_id}]` {label}: *{state}*{elapsed_str}{model_str}{mode_str}")
+
+        await self._reply(update, "\n".join(lines))
+
+    async def _subagents_spawn(
+        self, update: Update, manager: Any, args: list
+    ) -> None:
+        """Parse optional flags, then spawn."""
+        from spoon_bot.subagent.models import (
+            CleanupMode,
+            RoutingMode,
+            SpawnMode,
+            SubagentConfig,
+            normalize_thinking_level,
+        )
+
+        model: str | None = None
+        thinking: str | None = None
+        enable_skills: bool | None = None
+        mode: str | None = None
+        agent_name: str | None = None
+        cleanup: str | None = None
+        specialization: str | None = None
+        keywords_raw: str | None = None
+        auto_route = False
+        routing_mode: str | None = None
+        task_parts: list[str] = []
+
+        def _parse_bool_flag(value: str) -> bool:
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "on", "yes", "enabled"}:
+                return True
+            if normalized in {"0", "false", "off", "no", "disabled"}:
+                return False
+            raise ValueError("Use on/off, true/false, yes/no, or 1/0.")
+
+        i = 0
+        while i < len(args):
+            token = args[i]
+            if token == "--model" and i + 1 < len(args):
+                model = args[i + 1]; i += 2
+            elif token == "--thinking" and i + 1 < len(args):
+                thinking = args[i + 1]; i += 2
+            elif token == "--skills":
+                if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                    try:
+                        enable_skills = _parse_bool_flag(args[i + 1])
+                    except ValueError as exc:
+                        await self._reply(update, f"Invalid --skills value {args[i + 1]!r}: {exc}")
+                        return
+                    i += 2
+                else:
+                    enable_skills = True; i += 1
+            elif token == "--no-skills":
+                enable_skills = False; i += 1
+            elif token == "--mode" and i + 1 < len(args):
+                mode = args[i + 1]; i += 2
+            elif token == "--name" and i + 1 < len(args):
+                agent_name = args[i + 1]; i += 2
+            elif token == "--cleanup" and i + 1 < len(args):
+                cleanup = args[i + 1]; i += 2
+            elif token == "--auto-route":
+                auto_route = True; i += 1
+            elif token == "--specialization":
+                values: list[str] = []
+                j = i + 1
+                while j < len(args) and not args[j].startswith("--"):
+                    values.append(args[j])
+                    j += 1
+                specialization = " ".join(values).strip() or None
+                i = j
+            elif token == "--keywords":
+                values: list[str] = []
+                j = i + 1
+                while j < len(args) and not args[j].startswith("--"):
+                    values.append(args[j])
+                    j += 1
+                keywords_raw = " ".join(values).strip() or None
+                i = j
+            elif token == "--routing" and i + 1 < len(args):
+                routing_mode = args[i + 1]; i += 2
+            elif token.startswith("--model="):
+                model = token.split("=", 1)[1]; i += 1
+            elif token.startswith("--thinking="):
+                thinking = token.split("=", 1)[1]; i += 1
+            elif token.startswith("--skills="):
+                try:
+                    enable_skills = _parse_bool_flag(token.split("=", 1)[1])
+                except ValueError as exc:
+                    await self._reply(update, f"Invalid --skills value {token.split('=', 1)[1]!r}: {exc}")
+                    return
+                i += 1
+            elif token.startswith("--mode="):
+                mode = token.split("=", 1)[1]; i += 1
+            elif token.startswith("--name="):
+                agent_name = token.split("=", 1)[1]; i += 1
+            elif token.startswith("--cleanup="):
+                cleanup = token.split("=", 1)[1]; i += 1
+            elif token.startswith("--specialization="):
+                specialization = token.split("=", 1)[1].strip() or None; i += 1
+            elif token.startswith("--keywords="):
+                keywords_raw = token.split("=", 1)[1].strip() or None; i += 1
+            elif token.startswith("--routing="):
+                routing_mode = token.split("=", 1)[1]; i += 1
+            else:
+                task_parts.append(token); i += 1
+
+        task = " ".join(task_parts).strip()
+        if not task:
+            await self._reply(
+                update,
+                "Usage: `/subagents spawn [--model M] [--thinking off|basic|extended] [--skills|--no-skills] [--mode run|session] [--name N] "
+                "[--specialization TEXT] [--keywords a,b] [--auto-route] [--routing direct|orchestrated] <task>`",
+            )
+            return
+
+        config = SubagentConfig()
+        if model:
+            config.model = model
+        if thinking:
+            try:
+                config.thinking_level = normalize_thinking_level(thinking)
+            except ValueError as exc:
+                await self._reply(update, f"Invalid --thinking value {thinking!r}: {exc}")
+                return
+        if enable_skills is not None:
+            config.enable_skills = enable_skills
+        if mode:
+            try:
+                config.spawn_mode = SpawnMode(mode)
+            except ValueError:
+                await self._reply(update, f"Invalid --mode {mode!r}. Use 'run' or 'session'.")
+                return
+        if agent_name:
+            config.agent_name = agent_name
+        if cleanup:
+            try:
+                config.cleanup = CleanupMode(cleanup)
+            except ValueError:
+                await self._reply(update, f"Invalid --cleanup {cleanup!r}. Use 'keep' or 'delete'.")
+                return
+        if specialization:
+            config.specialization = specialization
+        if keywords_raw:
+            config.match_keywords = [
+                item.strip() for item in keywords_raw.split(",") if item.strip()
+            ]
+        config.auto_route = auto_route
+        if routing_mode:
+            try:
+                config.routing_mode = RoutingMode(routing_mode)
+            except ValueError:
+                await self._reply(update, f"Invalid --routing {routing_mode!r}. Use 'direct' or 'orchestrated'.")
+                return
+
+        try:
+            spawner_session_key, spawner_channel, spawner_metadata, spawner_reply_to = self._subagent_request_context(update)
+            record = await manager.spawn(
+                task=task,
+                label=task[:60],
+                config=config,
+                spawner_session_key=spawner_session_key,
+                spawner_channel=spawner_channel,
+                spawner_metadata=spawner_metadata,
+                spawner_reply_to=spawner_reply_to,
+            )
+            model_str = f"\nModel: `{record.model_name}`" if record.model_name else ""
+            thinking_str = (
+                f"\nThinking: {record.config.thinking_level}"
+                if record.config.thinking_level
+                else ""
+            )
+            if record.config.enable_skills is None:
+                skills_str = "\nSkills: inherit"
+            else:
+                skills_str = (
+                    f"\nSkills: {'ON' if record.config.enable_skills else 'OFF'}"
+                )
+            mode_str = f"\nMode: {record.spawn_mode.value}"
+            name_str = f" `[{record.agent_name}]`" if record.agent_name else ""
+            route_str = "\nAuto-route: ON" if record.config.auto_route else ""
+            specialization_str = (
+                f"\nSpecialization: {record.config.specialization}"
+                if record.config.specialization else ""
+            )
+            keywords_str = (
+                f"\nKeywords: {', '.join(record.config.match_keywords)}"
+                if record.config.match_keywords else ""
+            )
+            nested_str = (
+                "\nNested spawn: ON"
+                if (
+                    record.config.allow_subagents
+                    or record.config.routing_mode == RoutingMode.ORCHESTRATED
+                )
+                else ""
+            )
+            await self._reply(
+                update,
+                f"*Sub-agent spawned!*\n"
+                f"ID: `{record.agent_id}`\n"
+                f"Label: {record.label}"
+                f"{model_str}{thinking_str}{skills_str}{mode_str}{name_str}"
+                f"{route_str}{specialization_str}{keywords_str}{nested_str}\n"
+                f"Use /subagents to monitor progress.",
+            )
+        except ValueError as exc:
+            await self._reply(update, f"Failed to spawn sub-agent: {exc}")
+        except Exception as exc:
+            logger.error(f"Unexpected error spawning sub-agent: {exc}")
+            await self._reply(update, f"Error spawning sub-agent: {exc}")
+
+    async def _subagents_resume(
+        self, update: Update, manager: Any, agent_name: str, task: str
+    ) -> None:
+        if not agent_name:
+            await self._reply(
+                update,
+                "Usage: `/subagents resume <agent_name> <new task>`",
+            )
+            return
+        if not task:
+            await self._reply(
+                update,
+                "Usage: `/subagents resume <agent_name> <new task>`\n"
+                "You must provide a new task for the agent.",
+            )
+            return
+
+        try:
+            spawner_session_key, spawner_channel, spawner_metadata, spawner_reply_to = self._subagent_request_context(update)
+            record = await manager.resume_agent(
+                agent_name=agent_name,
+                task=task,
+                spawner_session_key=spawner_session_key,
+                spawner_channel=spawner_channel,
+                spawner_metadata=spawner_metadata,
+                spawner_reply_to=spawner_reply_to,
+            )
+            model_str = f"\nModel: `{record.model_name}`" if record.model_name else ""
+            await self._reply(
+                update,
+                f"*Session agent resumed!*\n"
+                f"Name: `{agent_name}`\n"
+                f"ID: `{record.agent_id}`\n"
+                f"Task: {record.label}{model_str}\n"
+                f"Session history is preserved.\n"
+                f"Use /subagents to monitor progress.",
+            )
+        except ValueError as exc:
+            await self._reply(update, f"Failed to resume agent: {exc}")
+        except Exception as exc:
+            logger.error(f"Unexpected error resuming agent: {exc}")
+            await self._reply(update, f"Error resuming agent: {exc}")
+
+    async def _subagents_cancel(self, update: Update, manager: Any, target: str) -> None:
+        if not target:
+            await self._reply(
+                update,
+                "Usage: `/subagents cancel <agent_id>` or `/subagents cancel all`",
+            )
+            return
+
+        if target.lower() == "all":
+            spawner_session_key, _, _, _ = self._subagent_request_context(update)
+            count = await manager.cancel_all(
+                spawner_session_key=spawner_session_key
+            )
+            await self._reply(
+                update,
+                f"Cascade cancellation requested for {count} sub-agent(s).",
+            )
+        else:
+            # Count descendants for informative message
+            spawner_session_key, _, _, _ = self._subagent_request_context(update)
+            info = await manager.get_info(
+                target,
+                spawner_session_key=spawner_session_key,
+            )
+            record = manager.registry.get(target) if info is not None else None
+            descendants = (
+                manager.registry.get_descendants(target) if record else []
+            )
+            found = await manager.cancel(
+                target,
+                cascade=True,
+                spawner_session_key=spawner_session_key,
+            )
+            if found:
+                desc_count = len(descendants)
+                desc_str = f" and {desc_count} descendants" if desc_count else ""
+                await self._reply(
+                    update,
+                    f"Cancellation requested for sub-agent `{target}`{desc_str}.",
+                )
+            else:
+                await self._reply(
+                    update,
+                    f"Sub-agent `{target}` not found or already finished.",
+                )
+
+    async def _subagents_steer(
+        self, update: Update, manager: Any, agent_id: str, message: str
+    ) -> None:
+        if not agent_id:
+            await self._reply(
+                update,
+                "Usage: `/subagents steer <agent_id> <new instructions>`",
+            )
+            return
+        if not message:
+            await self._reply(
+                update,
+                "Usage: `/subagents steer <agent_id> <new instructions>`\n"
+                "You must provide new instructions for the sub-agent.",
+            )
+            return
+
+        spawner_session_key, _, _, _ = self._subagent_request_context(update)
+        result = await manager.steer(
+            agent_id,
+            message,
+            spawner_session_key=spawner_session_key,
+        )
+        status = result.get("status")
+        msg = result.get("message", "")
+
+        if status == "accepted":
+            await self._reply(
+                update,
+                f"*Steer accepted!*\n"
+                f"Sub-agent `{agent_id}` will be redirected.\n"
+                f"{msg}",
+            )
+        elif status == "rate_limited":
+            await self._reply(update, f"*Rate limited:* {msg}")
+        elif status == "done":
+            await self._reply(update, f"*Cannot steer:* {msg}")
+        else:
+            await self._reply(update, f"Sub-agent not found: `{agent_id}`.")
+
+    async def _subagents_info(
+        self, update: Update, manager: Any, agent_id: str
+    ) -> None:
+        if not agent_id:
+            await self._reply(update, "Usage: `/subagents info <agent_id>`")
+            return
+
+        spawner_session_key, _, _, _ = self._subagent_request_context(update)
+        info = await manager.get_info(
+            agent_id,
+            spawner_session_key=spawner_session_key,
+        )
+        if info is None:
+            await self._reply(update, f"Sub-agent `{agent_id}` not found.")
+            return
+
+        lines = [f"*Sub-agent `{agent_id}` info:*"]
+        lines.append(f"Label: {info['label']}")
+        lines.append(f"State: *{info['state']}*")
+        lines.append(f"Task: {info['task'][:120]}")
+        lines.append(f"Depth: {info['depth']}")
+        if info.get("model"):
+            lines.append(f"Model: `{info['model']}`")
+        lines.append(f"Tool profile: {info['tool_profile']}")
+        if info.get("specialization"):
+            lines.append(f"Specialization: {info['specialization']}")
+        if info.get("auto_route"):
+            lines.append("Auto-route: ON")
+        if info.get("routing_mode"):
+            lines.append(f"Routing mode: {info['routing_mode']}")
+        if info.get("match_keywords"):
+            lines.append(f"Keywords: {', '.join(info['match_keywords'])}")
+        if "effective_enable_skills" in info:
+            inherited = " (inherited)" if info.get("enable_skills") is None else ""
+            lines.append(
+                f"Skills: {'ON' if info['effective_enable_skills'] else 'OFF'}{inherited}"
+            )
+        if info.get("thinking_level"):
+            lines.append(f"Thinking: {info['thinking_level']}")
+        if info.get("elapsed_seconds") is not None:
+            lines.append(f"Elapsed: {info['elapsed_seconds']}s")
+        if info.get("pending_descendants", 0) > 0:
+            lines.append(f"Pending descendants: {info['pending_descendants']}")
+        if info.get("children"):
+            lines.append(f"Children: {', '.join(f'`{c}`' for c in info['children'])}")
+        if info.get("token_usage"):
+            tu = info["token_usage"]
+            lines.append(
+                f"Tokens: {tu.get('total_tokens', 0)} "
+                f"(in {tu.get('input_tokens', 0)} / out {tu.get('output_tokens', 0)})"
+            )
+        if info.get("result_preview"):
+            lines.append(f"Result preview:\n_{info['result_preview']}_")
+        if info.get("error"):
+            lines.append(f"Error: {info['error']}")
+
+        await self._reply(update, "\n".join(lines))
 
     # ------------------------------------------------------------------
     # /whoami  — user info (no agent needed)

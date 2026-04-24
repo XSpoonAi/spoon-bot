@@ -1,4 +1,4 @@
-"""
+﻿"""
 Agent loop: the core processing engine using spoon-core SDK.
 
 This module provides the main agent interface, integrating spoon-core's
@@ -8,6 +8,7 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import logging as stdlib_logging
@@ -97,6 +98,7 @@ from spoon_bot.agent.tools.self_config import (
     MemoryManagementTool,
     SelfUpgradeTool,
 )
+from spoon_bot.agent.tools.cron import CronTool
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.config import (
     AgentLoopConfig,
@@ -108,7 +110,10 @@ from spoon_bot.config import (
     validate_agent_loop_params,
 )
 from spoon_bot.services.hotreload import HotReloadService
-from spoon_bot.services.spawn import SpawnTool
+from spoon_bot.subagent.manager import SubagentManager
+from spoon_bot.subagent.tools import SubagentTool
+from spoon_bot.subagent.catalog import format_roles_for_prompt
+from spoon_bot.subagent.models import SubagentState
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import create_session_store
 from spoon_bot.memory.store import MemoryStore
@@ -371,6 +376,8 @@ class AgentLoop:
         auto_commit: bool = True,
         enabled_tools: set[str] | None = None,
         tool_profile: str | None = None,
+        session_manager: SessionManager | None = None,
+        subagent_manager: SubagentManager | None = None,
         session_store_backend: str = "file",
         session_store_dsn: str | None = None,
         session_store_db_path: str | None = None,
@@ -407,6 +414,8 @@ class AgentLoop:
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
             tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            session_manager: Existing SessionManager to reuse for persistence.
+            subagent_manager: Existing SubagentManager to reuse for child agents.
             session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
             session_store_dsn: PostgreSQL DSN for 'postgres' backend.
             session_store_db_path: SQLite DB path for 'sqlite' backend.
@@ -436,7 +445,7 @@ class AgentLoop:
             logger.error(f"Configuration validation failed: {e}")
             raise ValueError(f"Invalid AgentLoop configuration: {e}") from e
 
-        # Store config — callers must provide model/provider explicitly
+        # Store config - callers must provide model/provider explicitly
         self.workspace = self._config.workspace
         self.yolo_mode = self._config.yolo_mode
         self.model = model
@@ -454,8 +463,14 @@ class AgentLoop:
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
         self._auto_commit = auto_commit
+        self._enabled_tools_override = set(enabled_tools) if enabled_tools is not None else None
+        self._tool_profile = tool_profile
+        self._session_store_backend = session_store_backend or "file"
+        self._session_store_dsn = session_store_dsn
+        self._session_store_db_path = session_store_db_path
+        self._user_skill_paths = [Path(p) for p in skill_paths] if skill_paths else []
 
-        # Context window — auto-resolved from model when not explicit
+        # Context window - auto-resolved from model when not explicit
         self.context_window = resolve_context_window(model, context_window)
         logger.info(f"Context window: {self.context_window:,} tokens (model={model})")
 
@@ -476,29 +491,34 @@ class AgentLoop:
         # spoon-bot components
         self.context = ContextBuilder(self.workspace, yolo_mode=self.yolo_mode)
         self.tools = ToolRegistry()
+        self._cron_service = None
 
         if self.yolo_mode:
-            logger.info(f"YOLO mode enabled — operating directly in: {self.workspace}")
+            logger.info(f"YOLO mode enabled - operating directly in: {self.workspace}")
 
-        # Session persistence — configurable backend
-        _store_backend = session_store_backend or "file"
-        _store_db_path = session_store_db_path
-        if _store_backend == "sqlite" and not _store_db_path:
-            _store_db_path = str(self.workspace / "sessions.db")
-        try:
-            _session_store = create_session_store(
-                backend=_store_backend,
-                workspace=self.workspace,
-                db_path=_store_db_path,
-                dsn=session_store_dsn,
-            )
-            self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
-            logger.info(f"Session store: {_store_backend}")
-        except Exception as exc:
-            logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
-            self.sessions = SessionManager(self.workspace)
+        # Session persistence - configurable backend
+        if session_manager is not None:
+            self.sessions = session_manager
+            logger.info("Session store: inherited from parent SessionManager")
+        else:
+            _store_backend = self._session_store_backend
+            _store_db_path = self._session_store_db_path
+            if _store_backend == "sqlite" and not _store_db_path:
+                _store_db_path = str(self.workspace / "sessions.db")
+            try:
+                _session_store = create_session_store(
+                    backend=_store_backend,
+                    workspace=self.workspace,
+                    db_path=_store_db_path,
+                    dsn=self._session_store_dsn,
+                )
+                self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
+                logger.info(f"Session store: {_store_backend}")
+            except Exception as exc:
+                logger.warning(f"Session store '{_store_backend}' init failed ({exc}), falling back to file")
+                self.sessions = SessionManager(self.workspace)
 
-        # Memory store — semantic (memsearch) or file-based
+        # Memory store - semantic (memsearch) or file-based
         self._memsearch_config: MemSearchConfig | None = None
         if memsearch_config is not None:
             if isinstance(memsearch_config, dict):
@@ -527,6 +547,32 @@ class AgentLoop:
 
         self._git = GitManager(self.workspace) if auto_commit else None
 
+        # Sub-agent manager - shares this agent's SessionManager so sub-agents
+        # can reuse the same persistence backend with their own unique session keys.
+        if subagent_manager is not None:
+            self._subagent_manager = subagent_manager
+            self._owns_subagent_manager = False
+        else:
+            self._subagent_manager = SubagentManager(
+                session_manager=self.sessions,
+                workspace=self.workspace,
+                max_depth=self._config.subagent.max_depth,
+                max_children_per_agent=self._config.subagent.max_children_per_agent,
+                max_total_subagents=self._config.subagent.max_total_subagents,
+                parent_model=model,
+                parent_provider=provider,
+                parent_api_key=api_key,
+                parent_base_url=base_url,
+                parent_enable_skills=enable_skills,
+                default_model=self._config.subagent.default_model,
+                default_tool_profile=self._config.subagent.default_tool_profile,
+                persist_runs=self._config.subagent.persist_runs,
+                persist_file=self._config.subagent.persist_file,
+                archive_after_minutes=self._config.subagent.archive_after_minutes,
+                sweeper_interval_seconds=self._config.subagent.sweeper_interval_seconds,
+                max_persistent_agents=self._config.subagent.max_persistent_agents,
+            )
+            self._owns_subagent_manager = True
         # Deploy built-in skills to the runtime workspace (idempotent)
         try:
             from spoon_bot.skills.builtin import ensure_builtin_skills
@@ -544,8 +590,8 @@ class AgentLoop:
         _bundled_skills = Path(__file__).resolve().parent.parent.parent / "workspace" / "skills"
         if _bundled_skills.is_dir() and _bundled_skills != self._skill_paths[0]:
             self._skill_paths.append(_bundled_skills)
-        if skill_paths:
-            self._skill_paths.extend([Path(p) for p in skill_paths])
+        if self._user_skill_paths:
+            self._skill_paths.extend(self._user_skill_paths)
 
         # Session
         self._session = self.sessions.get_or_create(self.session_key)
@@ -559,10 +605,10 @@ class AgentLoop:
         self._register_native_tools()
 
         # Apply tool filter: explicit > profile > core default
-        if enabled_tools is not None or tool_profile is not None:
+        if self._enabled_tools_override is not None or self._tool_profile is not None:
             self.tools.set_tool_filter(
-                enabled_tools=enabled_tools,
-                tool_profile=tool_profile,
+                enabled_tools=self._enabled_tools_override,
+                tool_profile=self._tool_profile,
             )
         else:
             # Default: only load core tools into the agent.
@@ -579,16 +625,17 @@ class AgentLoop:
         # Track initialization state
         self._initialized = False
 
-        # Skill tool names registered via _register_skill_tools() — for cleanup on reload
+        # Skill tool names registered via _register_skill_tools() - for cleanup on reload
         self._skill_tool_names: set[str] = set()
 
         # Stop flag: set by stop_current_task(), cleared on next process() call
         self._stop_requested = False
+        self._last_response_source = self._build_response_source()
 
         # Tracks the skill name injected by _pre_inject_matched_skill()
         self._pre_injected_skill_name: str | None = None
 
-        # Conditional activation — file paths touched during this session.
+        # Conditional activation - file paths touched during this session.
         # Skills declaring ``paths`` frontmatter are dormant until a touched
         # file matches one of their patterns (mirrors Claude Code behaviour).
         self._touched_paths: set[str] = set()
@@ -607,6 +654,34 @@ class AgentLoop:
             f"AgentLoop created: model={model}, provider={provider}, "
             f"tools={active_count}/{total_count}, session={session_key}"
         )
+
+    @staticmethod
+    def _build_response_source(
+        *,
+        source_type: str = "agent",
+        subagent_id: str | None = None,
+        subagent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Build machine-readable metadata describing who produced a result."""
+        return {
+            "type": source_type,
+            "is_subagent": source_type == "subagent",
+            "subagent_id": subagent_id,
+            "subagent_name": subagent_name,
+        }
+
+    def _set_last_response_source(
+        self,
+        source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Store and return the latest result source metadata."""
+        resolved = dict(source or self._build_response_source())
+        self._last_response_source = resolved
+        return dict(resolved)
+
+    def get_last_response_source(self) -> dict[str, Any]:
+        """Return the latest result source metadata."""
+        return dict(getattr(self, "_last_response_source", self._build_response_source()))
 
     async def initialize(self) -> None:
         """Initialize spoon-core components."""
@@ -632,7 +707,7 @@ class AgentLoop:
         system_prompt = self._system_prompt or self.context.build_system_prompt()
 
         # Context budget hint (compact)
-        system_prompt += f"\n\n[Context: {self.context_window:,} tokens — be concise.]\n"
+        system_prompt += f"\n\n[Context: {self.context_window:,} tokens - be concise.]\n"
 
         # Skills section (Openclaw pattern: XML metadata in system prompt)
         skills_xml = self._build_skills_for_prompt()
@@ -648,7 +723,7 @@ class AgentLoop:
             "\n## Workflow\n"
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
             "1. If a [PRE-LOADED SKILL] block is present in the user message, "
-            "execute its instructions immediately — do NOT re-read it.\n"
+            "execute its instructions immediately - do NOT re-read it.\n"
             "2. Otherwise, if a skill matches, `read_file` its SKILL.md path, "
             "then execute.\n"
             "3. Run commands from SKILL.md directly via shell. Do NOT write script files.\n"
@@ -658,7 +733,7 @@ class AgentLoop:
             "- Do NOT re-read files already in context.\n"
             "- `source .env.local` before commands that need env vars.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
-            "- Follow user instructions exactly — respect specific IDs, names, actions.\n"
+            "- Follow user instructions exactly - respect specific IDs, names, actions.\n"
             "- Only use `web_search` if NO installed skill matches the task.\n"
         )
 
@@ -674,6 +749,51 @@ class AgentLoop:
                     system_prompt += f"\n## Agent Memory (from soul.md)\n{soul_content}\n"
             except Exception:
                 pass
+
+        # ----------------------------------------------------------------
+        # Multi-Agent Orchestration section
+        # Injected when the SubagentTool (spawn) is available.
+        # Mirrors opencode task.txt's usage notes and openclaw's
+        # sessions-spawn-tool description pattern.
+        # ----------------------------------------------------------------
+        if "spawn" in self.tools.get_active_tools():
+            roles_block = format_roles_for_prompt()
+            system_prompt += (
+                "\n\n## Multi-Agent Orchestration\n\n"
+                "You are an **Orchestrator**. For complex tasks (e.g. 'build a user "
+                "management system', 'implement a REST API with frontend'), decompose "
+                "the work and delegate to specialised sub-agents using the `spawn` tool.\n\n"
+                "**You decide which agents to use and in what order** - there is no fixed "
+                "pipeline. Use your judgement based on the task requirements.\n\n"
+                "### Available specialised agent roles\n"
+                f"{roles_block}\n\n"
+                "### When to use sub-agents\n"
+                "- Complex tasks requiring multiple specialised skills\n"
+                "- Tasks that benefit from sequential specialisation "
+                "(e.g. plan -> implement -> review)\n"
+                "- Research + implementation tasks that can be parallelised\n\n"
+                "### When NOT to use sub-agents\n"
+                "- Simple, single-step tasks (file reads, quick questions, small edits)\n"
+                "- Tasks you can complete directly in a few tool calls\n\n"
+                "### Orchestration workflow (decide autonomously)\n"
+                "1. For complex tasks, start with `spawn(action='spawn', role='planner', "
+                "task='Analyse requirements for: <user request>')` to get a technical plan\n"
+                "2. Wait for the planner: `spawn(action='wait', timeout=120)`\n"
+                "3. Based on the plan, spawn implementation agents as needed:\n"
+                "   - `spawn(action='spawn', role='backend', task='...<plan context>...')`\n"
+                "   - `spawn(action='spawn', role='frontend', task='...<plan context>...')`\n"
+                "   - Launch independent agents in parallel (multiple tool calls at once)\n"
+                "4. Wait for results: `spawn(action='wait', timeout=180)`\n"
+                "5. Optionally spawn a `reviewer` to check the implementation\n"
+                "6. Summarise all results to the user\n\n"
+                "### Key rules (from opencode task.txt)\n"
+                "- Each sub-agent starts with a **fresh context** - provide all necessary "
+                "context in the `task` parameter\n"
+                "- The sub-agent's output is NOT visible to the user until you summarise it\n"
+                "- Use `task_id` from a result to resume the same sub-agent session later\n"
+                "- Use `spawn(action='list_roles')` to see all available roles at runtime\n"
+            )
+            logger.info("Injected Multi-Agent Orchestration section into system prompt")
 
         # NOTE: inactive-tools prompt is built later, after skill tools are
         # registered so that skill-provided tools are included in the list.
@@ -709,10 +829,10 @@ class AgentLoop:
                         f"the model to the provider."
                     )
 
-        # Create MCP tools – expand each server into individual tools (#5)
+        # Create MCP tools - expand each server into individual tools (#5)
         await self._init_mcp_tools()
 
-        # Create SkillManager if enabled — BEFORE building active_tools
+        # Create SkillManager if enabled - BEFORE building active_tools
         # so that skill tools are included in the agent's ToolManager.
         if self._enable_skills:
             import inspect
@@ -756,7 +876,6 @@ class AgentLoop:
         # and can cause the model to summarize instead of continue).
         self._agent.next_step_prompt = self.DEFAULT_NEXT_STEP_PROMPT
         self._agent._custom_next_step_prompt = True
-        self._agent._spoon_bot_base_think = self._agent.think
 
         # Build dynamic-tools prompt now that all tools (native + skill) are registered
         inactive_tools = self.tools.get_inactive_tools()
@@ -783,6 +902,9 @@ class AgentLoop:
             f"skills_enabled={self._enable_skills}"
         )
 
+        # Start sub-agent archive sweeper (no-op if persistence is disabled)
+        await self._subagent_manager.start_sweeper()
+
         # Start background hot-reload service if enabled
         if self._auto_reload:
             self._hot_reload = HotReloadService(
@@ -796,7 +918,7 @@ class AgentLoop:
 
     def _register_native_tools(self) -> None:
         """Register the default native OS tools."""
-        # Shell tool — allow_chaining + allow_substitution lets the agent
+        # Shell tool - allow_chaining + allow_substitution lets the agent
         # compose multi-step ops and use $(), ${}, and backtick expressions.
         self.tools.register(ShellTool(
             timeout=self.shell_timeout,
@@ -807,7 +929,7 @@ class AgentLoop:
             allow_substitution=True,
         ))
 
-        # Filesystem tools — allow reads from the user home directory so that
+        # Filesystem tools - allow reads from the user home directory so that
         # skill-managed data (e.g. ~/.agent-wallet, ~/.spoon-bot/skills) is
         # accessible.  The PathValidator blocklist still blocks truly sensitive
         # paths (.ssh, .aws, etc.).
@@ -835,12 +957,12 @@ class AgentLoop:
         memory_tool.set_memory_store(self.memory)
         self.tools.register(memory_tool)
 
-        # Self-upgrade tool — with agent loop reference for hot-reload
+        # Self-upgrade tool - with agent loop reference for hot-reload
         upgrade_tool = SelfUpgradeTool(workspace=self.workspace)
         upgrade_tool.set_agent_loop(self)
         self.tools.register(upgrade_tool)
 
-        # Dynamic tool activation — lets the LLM load tools on demand
+        # Dynamic tool activation - lets the LLM load tools on demand
         self.tools.register(ActivateToolTool(
             activate_fn=self.add_tool,
             list_inactive_fn=lambda: [
@@ -849,19 +971,14 @@ class AgentLoop:
             ],
         ))
 
-        # Background task tool
-        self.tools.register(SpawnTool())
+        cron_tool = CronTool()
+        cron_tool.set_agent_loop(self)
+        self.tools.register(cron_tool)
 
-        # Conversation history search — fallback for post-compaction
-        # recovery of earlier tool calls / results / user messages.
-        #
-        # Pass a resolver callable instead of relying on
-        # ``set_default_session_key`` being invoked on every session
-        # switch.  Session switches can happen from multiple call
-        # sites (gateway WS handler, channel code, REST routes) and
-        # not all of them go through AgentLoop's explicit switch
-        # hooks, so a pull-based lookup is safer than push-based
-        # synchronisation.
+        # Sub-agent tool - replaces the old placeholder SpawnTool
+        spawn_tool = SubagentTool(manager=getattr(self, "_subagent_manager", None))
+        self.tools.register(spawn_tool)
+
         def _current_session_key() -> str | None:
             sess = self._session
             return sess.session_key if sess is not None else None
@@ -931,7 +1048,7 @@ class AgentLoop:
     async def _init_mcp_tools(self) -> None:
         """Discover and create MCP tools from ``self._mcp_config``.
 
-        Populates ``self._mcp_tools``.  Safe to call multiple times — the
+        Populates ``self._mcp_tools``. Safe to call multiple times - the
         caller is responsible for cleaning up old tools first.
         """
         if self._mcp_config and not MCP_TOOL_AVAILABLE:
@@ -1109,7 +1226,14 @@ class AgentLoop:
         return {"skills": skills_result, "mcp": mcp_result}
 
     async def cleanup(self) -> None:
-        """Shut down all managed resources (MCP tools, skills, etc.)."""
+        """Shut down all managed resources (MCP tools, skills, sub-agents, etc.)."""
+        # Cleanup sub-agents first so they can still access tools during their own cleanup
+        if hasattr(self, "_subagent_manager") and getattr(self, "_owns_subagent_manager", True):
+            try:
+                await self._subagent_manager.cleanup()
+            except Exception as exc:
+                logger.debug(f"Sub-agent manager cleanup: {exc}")
+
         # Cleanup MCP tools
         for mcp_tool in self._mcp_tools:
             for method in ("close", "cleanup", "shutdown"):
@@ -1143,44 +1267,13 @@ class AgentLoop:
     def _trim_context_if_needed(self) -> int:
         """No-op placeholder.
 
-        History compaction is deliberately **runtime-only** now
-        (``_compress_runtime_context`` / ``_force_compress_runtime_context``):
-
-        * The persisted session store remains the authoritative, *complete*
-          transcript — tool-call inputs/outputs included.
-        * Runtime memory (what the LLM sees) is compacted in place with
-          full tool-pair atomicity (see :meth:`_compress_runtime_context`).
-        * Anything that falls out of runtime memory is still reachable via
-          the :class:`SearchHistoryTool` because the store was never
-          mutated.
-
-        Earlier versions of this method would call
-        ``self._session.messages.pop(0)`` whenever the *session-side*
-        estimate exceeded the window.  That permanently destroyed
-        persisted history (breaking ``search_history`` / cross-session
-        recall), and could leave orphan tool results behind because the
-        pop was not tool-segment-aware.  Both problems are now fixed by
-        simply refusing to touch the session store here.
-
-        A future bounded-history policy (e.g. "cap each JSONL at N
-        messages") should be implemented as a dedicated, opt-in pruner
-        that *also* updates any search index — NOT inside the per-turn
-        context-budget path.
+        History compaction is deliberately runtime-only now. Persisted session
+        history remains the source of truth so search/recovery keeps working.
         """
         return 0
 
-        return trimmed_count
-
     def _warn_dropped_refs(self, *, kind: str, dropped: list[str]) -> None:
-        """Log dropped persisted refs once per (session, ref) pair.
-
-        The previous implementation emitted a generic warning on *every*
-        history sync — producing a large volume of duplicate log lines for
-        sessions that carried stale references (e.g. attachments uploaded in
-        a prior container lifetime whose workspace paths no longer resolve).
-        We now deduplicate per session and include the offending paths the
-        first time we see them so operators can diagnose the root cause.
-        """
+        """Log dropped persisted refs once per (session, ref) pair."""
         unique_refs = [ref for ref in dict.fromkeys(filter(None, dropped))]
         if not unique_refs:
             return
@@ -1230,24 +1323,12 @@ class AgentLoop:
             else self._session.get_history()
         )
 
-        # Lazy import — these are only needed when re-hydrating tool-call
-        # metadata persisted by _capture_turn_tool_trace.
         try:
             from spoon_ai.schema import Function as _CoreFunction  # noqa: F401
-        except Exception:  # pragma: no cover - defensive
+        except Exception:
             _CoreFunction = None  # type: ignore[assignment]
 
         def _rehydrate_tool_calls(raw: Any) -> list | None:
-            """Convert persisted ``tool_calls`` extras back into ToolCall objects.
-
-            The tool-trace capture path stores ``tool_calls`` as a list of
-            plain dicts (``{"id", "type", "function": {"name", "arguments"}}``).
-            spoon-core's ``agent.add_message`` expects ``ToolCall`` models so
-            it can normalise / serialise them for the LLM provider.  Without
-            this rehydration the tool_call <-> tool-result pairing is lost on
-            every history sync and ``drop_orphaned_tool_messages`` will prune
-            every tool result before the next API call.
-            """
             if not raw or _CoreFunction is None:
                 return None
             if not isinstance(raw, list):
@@ -1326,6 +1407,7 @@ class AgentLoop:
                     if str(item.get("workspace_path") or item.get("uri") or "").strip() not in kept
                 ]
                 self._warn_dropped_refs(kind="attachment", dropped=dropped)
+
             content = self._build_runtime_message_content(
                 role,
                 content,
@@ -1333,11 +1415,6 @@ class AgentLoop:
                 attachments=attachments,
             )
 
-            # Forward tool metadata so runtime memory stays a faithful
-            # replay of what the LLM originally saw.  Without these
-            # fields, ``drop_orphaned_tool_messages`` will strip every
-            # persisted tool result before the next provider call
-            # because its ``tool_call_id`` will be ``None``.
             extra_kwargs: dict[str, Any] = {}
             if role == "tool":
                 tc_id = msg.get("tool_call_id")
@@ -1373,10 +1450,10 @@ class AgentLoop:
         compacted before the provider call starts.
         """
         self._refresh_recent_turn_notice()
-        trimmed_count = self._trim_context_if_needed()  # always 0 now
+        trimmed_count = self._trim_context_if_needed()
         injected_count = await self._sync_runtime_history_from_session()
 
-        # Repair tool-call ordering after history injection — session storage
+        # Repair tool-call ordering after history injection - session storage
         # may not preserve tool_call_id metadata, producing orphaned tool
         # messages that providers (OpenAI, Gemini, etc.) reject.
         repaired = 0
@@ -1423,39 +1500,14 @@ class AgentLoop:
         )
 
     def _runtime_memory_snapshot_index(self) -> int:
-        """Return the current length of runtime memory.
-
-        Callers snapshot this *before* a turn begins so they can later
-        iterate only the messages that were produced during that turn —
-        typically tool-call and intermediate assistant messages that we
-        want to persist for post-hoc search/recovery.
-        """
+        """Return the current length of runtime memory."""
         try:
             return len(AgentLoop._get_runtime_memory_messages(self))
         except Exception:
             return 0
 
     def _capture_turn_tool_trace(self, start_index: int) -> list[dict[str, Any]]:
-        """Capture tool-call artifacts added since ``start_index``.
-
-        We persist three kinds of messages so a later ``search_history``
-        query can surface them after context compaction:
-
-        * ``role=tool`` — the full tool result the model actually saw.
-          We keep ``tool_call_id`` and ``name`` as extras so they can be
-          correlated with the originating assistant call and filtered by
-          tool name.
-        * ``role=assistant`` messages that carry non-empty ``tool_calls``
-          but no final user-visible content (the "I'm about to call X"
-          turns).  These are normally squashed into the final assistant
-          reply; without them, future history sync can't pair tool
-          results with their call-site.  We serialize ``tool_calls`` in
-          the same shape the OpenAI function-calling spec uses.
-
-        The final assistant reply is persisted separately by the caller.
-        ``role=user`` messages are untouched — the caller handles those
-        with their own media / attachment kwargs.
-        """
+        """Capture tool-call artifacts added since ``start_index``."""
         if not isinstance(start_index, int) or start_index < 0:
             return []
 
@@ -1488,7 +1540,7 @@ class AgentLoop:
                 name = AgentLoop._stream_message_attr(msg, "name", None)
                 if name:
                     extras["name"] = str(name)
-            else:  # assistant
+            else:
                 tool_calls = AgentLoop._stream_message_attr(msg, "tool_calls", None) or []
                 serialized: list[dict[str, Any]] = []
                 for tc in tool_calls:
@@ -1530,8 +1582,6 @@ class AgentLoop:
                             }
                         )
                 if not serialized:
-                    # Nothing tool-related to preserve; the final assistant
-                    # reply is saved separately by the caller.
                     continue
                 extras["tool_calls"] = serialized
 
@@ -1539,12 +1589,7 @@ class AgentLoop:
         return captured
 
     def _persist_turn_tool_trace(self, start_index: int) -> int:
-        """Append captured tool-trace messages to ``self._session``.
-
-        Returns the number of messages appended.  Skipped silently when the
-        session has no room or persistence is disabled via
-        ``SPOON_BOT_PERSIST_TOOL_TRACE=false`` / ``0`` / ``no``.
-        """
+        """Append captured tool-trace messages to ``self._session``."""
         if not self._should_persist_tool_trace():
             return 0
 
@@ -1733,6 +1778,187 @@ class AgentLoop:
         except Exception as exc:
             logger.warning(f"Failed to persist user turn: {exc}")
 
+    def set_subagent_context(
+        self,
+        *,
+        session_key: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
+    ) -> None:
+        """Bind the spawn tool to the current requester session/channel."""
+        resolved_session_key = session_key or getattr(self, "session_key", None)
+        manager = getattr(self, "_subagent_manager", None)
+        if manager is not None:
+            manager.set_spawner_context(
+                session_key=resolved_session_key,
+                channel=channel,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+
+        registry = getattr(self, "tools", None)
+        if registry is None:
+            return
+        spawn_tool = registry.get("spawn")
+        if spawn_tool and isinstance(spawn_tool, SubagentTool):
+            spawn_tool.set_spawner_context(
+                session_key=resolved_session_key,
+                channel=channel,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+
+    def _persist_turn(
+        self,
+        user_message: str,
+        assistant_message: str,
+        *,
+        media: list[str] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Save a completed user/assistant turn to session storage."""
+        try:
+            save_kwargs: dict[str, Any] = {}
+            if media:
+                save_kwargs["media"] = list(media)
+            if attachments:
+                save_kwargs["attachments"] = [dict(item) for item in attachments if isinstance(item, dict)]
+            self._session.add_message(
+                "user",
+                _strip_attachment_context(user_message, attachments or []),
+                **save_kwargs,
+            )
+            self._session.add_message("assistant", assistant_message)
+            self.sessions.save(self._session)
+        except Exception as e:
+            logger.warning(f"Failed to save session: {e}")
+
+    def _should_skip_specialist_auto_route(self, message: str) -> bool:
+        """Return True when the current message should not be auto-routed."""
+        stripped = message.lstrip()
+        return (
+            self.session_key.startswith("subagent-")
+            or stripped.startswith("[Sub-agent Completed]")
+        )
+
+    def _maybe_create_persistent_subagent_from_request(
+        self,
+        message: str,
+    ) -> str | None:
+        """Create a persistent subagent from a natural-language user request."""
+        if self._should_skip_specialist_auto_route(message):
+            return None
+        parsed = self._subagent_manager.parse_persistent_subagent_request(message)
+        if parsed is None:
+            return None
+
+        profile = self._subagent_manager.create_persistent_subagent(
+            description=parsed["specialization"],
+        )
+        keywords = ", ".join(profile.match_keywords[:8]) or "(none)"
+        response = (
+            f"Persistent subagent `{profile.name}` created.\n"
+            f"Specialization: {profile.specialization}\n"
+            f"Auto-route: {'ON' if profile.auto_route else 'OFF'}\n"
+            f"Tool profile: {profile.tool_profile}\n"
+            f"Keywords: {keywords}\n\n"
+            "Future matching requests will be routed to this subagent automatically."
+        )
+        return response
+
+    async def _maybe_route_to_persistent_specialist_result(
+        self,
+        message: str,
+    ) -> tuple[str, str | None, dict[str, Any]] | None:
+        """Attempt to route a matching top-level request to a persistent subagent."""
+        if self._should_skip_specialist_auto_route(message):
+            return None
+
+        matched = self._subagent_manager.find_best_auto_route_specialist(message)
+        if matched is None:
+            return None
+
+        agent_name = matched["agent_name"]
+        reason_text = ", ".join(matched["reasons"]) or "high-confidence subagent match"
+        logger.info(
+            f"Auto-routing request to persistent subagent {agent_name!r} "
+            f"(score={matched['score']}; {reason_text})"
+        )
+
+        current_channel = getattr(self._subagent_manager, "_current_spawner_channel", None)
+        current_metadata = getattr(self._subagent_manager, "_current_spawner_metadata", {})
+        current_reply_to = getattr(self._subagent_manager, "_current_spawner_reply_to", None)
+        record = await self._subagent_manager.dispatch_persistent_subagent(
+            agent_name=agent_name,
+            task=message,
+            spawner_session_key=self.session_key,
+            spawner_channel=current_channel,
+            spawner_metadata=current_metadata,
+            spawner_reply_to=current_reply_to,
+        )
+        wait_timeout = float(record.config.timeout_seconds or 300)
+        results = await self._subagent_manager.collect_results(
+            timeout=wait_timeout,
+            spawner_session_key=self.session_key,
+            agent_id=record.agent_id,
+            run_id=record.run_id,
+        )
+        if not results:
+            response = (
+                f"Auto-routed to subagent `{agent_name}`, but it did not finish "
+                f"within {int(wait_timeout)}s."
+            )
+            note = (
+                f"Auto-routed to persistent subagent {agent_name} "
+                f"(score={matched['score']}; {reason_text})."
+            )
+            return (
+                response,
+                note,
+                self._build_response_source(
+                    source_type="subagent",
+                    subagent_id=record.agent_id,
+                    subagent_name=agent_name,
+                ),
+            )
+
+        result = results[-1]
+        source = self._build_response_source(
+            source_type="subagent",
+            subagent_id=result.agent_id or record.agent_id,
+            subagent_name=agent_name,
+        )
+        if result.state == SubagentState.COMPLETED:
+            result_text = self._filter_execution_steps(result.result or "(no output)")
+            response = f"Subagent `{agent_name}` handled this request.\n\n{result_text}"
+        elif result.state == SubagentState.FAILED:
+            response = (
+                f"Subagent `{agent_name}` failed while handling this request.\n\n"
+                f"{result.error or '(no error message)'}"
+            )
+        elif result.state == SubagentState.CANCELLED:
+            response = f"Subagent `{agent_name}` was cancelled before finishing."
+        else:
+            response = result.result or result.error or f"Subagent `{agent_name}` returned no output."
+
+        note = (
+            f"Auto-routed to persistent subagent {agent_name} "
+            f"(score={matched['score']}; {reason_text})."
+        )
+        return response, note, source
+
+    async def _maybe_route_to_persistent_specialist(
+        self,
+        message: str,
+    ) -> tuple[str, str | None] | None:
+        """Backward-compatible wrapper without source metadata."""
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if routed is None:
+            return None
+        response, note, _source = routed
+        return response, note
+
     def _current_tool_owner_key(self, session_key: str | None = None) -> str:
         """Resolve a user-scoped ownership key for background tool jobs."""
         return build_tool_owner_key(
@@ -1902,10 +2128,6 @@ class AgentLoop:
 
     def _runtime_compaction_trigger_budget(self) -> int:
         """Return the runtime token budget that should trigger preflight compaction."""
-        # Keep preflight compaction close to the hard limit so long-running
-        # streaming sessions do not repeatedly pay the full compression cost
-        # on every request. Explicit overflow recovery still handles the final
-        # "too large" edge if a request slips past this soft threshold.
         safety_margin = max(8_000, int(self.context_window * 0.05))
         return max(8_000, self.context_window - safety_margin)
 
@@ -1913,8 +2135,11 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
-        session_key: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_key: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
         reasoning_effort: str | None = None,
     ) -> str:
         """
@@ -1929,6 +2154,8 @@ class AgentLoop:
         Returns:
             The agent's response text.
         """
+        AgentLoop._set_last_response_source(self)
+
         # Honour stop request from previous /stop command
         if self._stop_requested:
             self._stop_requested = False
@@ -1950,9 +2177,37 @@ class AgentLoop:
                     pass
             logger.debug(f"Switched to session: {session_key}")
 
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
         logger.info(f"Processing message: {message[:100]}...")
         AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
+
+        # Reset per-request state
+        self._pre_injected_skill_name = None
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            self._persist_turn(message, created)
+            return created
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, _route_note, route_source = routed
+            AgentLoop._set_last_response_source(self, route_source)
+            self._persist_turn(message, routed_content)
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
+            return routed_content
 
         # Refresh memory context
         try:
@@ -1977,15 +2232,13 @@ class AgentLoop:
         )
         if isinstance(runtime_message, str):
             message = runtime_message
+
         AgentLoop._persist_user_turn_to_session(
             self,
             message,
             media=media,
             attachments=attachments,
         )
-
-        # Snapshot runtime memory length before this turn begins so we can
-        # later persist the tool-call trace produced during the turn.
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         # Build a minimal per-step prompt with the user's request for context.
@@ -2026,7 +2279,7 @@ class AgentLoop:
 
             if final_content.strip() in ("No results", ""):
                 logger.warning(
-                    "Agent returned empty/no-results — attempting to extract "
+                    "Agent returned empty/no-results attempting to extract "
                     "content from agent memory"
                 )
                 _extracted = self._extract_last_assistant_content()
@@ -2057,7 +2310,6 @@ class AgentLoop:
                 self._agent.state = AgentState.IDLE
                 self._agent.current_step = 0
 
-        # Save to session
         try:
             AgentLoop._mark_latest_user_turn_state(
                 self,
@@ -2156,14 +2408,6 @@ class AgentLoop:
         if extracted:
             return extracted
         return str(content)
-
-    @classmethod
-    def _message_content_fingerprint(cls, content: Any) -> str:
-        """Create a stable string fingerprint for runtime content comparisons."""
-        serialized = cls._serialize_message_content(content)
-        if isinstance(serialized, str):
-            return f"str:{serialized}"
-        return json.dumps(serialized, sort_keys=True, ensure_ascii=True, default=str)
 
     @classmethod
     def _multimodal_content_summary(cls, content: list[Any], max_text_chars: int) -> str:
@@ -2341,54 +2585,10 @@ class AgentLoop:
         return text.startswith('[ORIGINAL USER REQUEST]') or text.startswith('Focus on the user')
 
     @staticmethod
-    def _is_history_compaction_marker(msg: Any) -> bool:
-        """True when *msg* is the runtime-only history-compacted marker."""
-        role = AgentLoop._message_role_value(msg)
-        if role != "user":
-            return False
-        content = getattr(msg, "content", None)
-        return isinstance(content, str) and content.startswith("[history-compacted]")
-
-    def _latest_real_user_message_index(self, messages: list[Any]) -> int | None:
-        """Return the latest user-authored message that must survive compaction intact."""
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            if self._message_role_value(message) != "user":
-                continue
-            if self._is_next_step_user_msg(message):
-                continue
-            if self._is_history_compaction_marker(message):
-                continue
-            return index
-        return None
-
-    def _recent_runtime_has_user_message_content(
-        self,
-        content: Any,
-        recent_messages: int = 10,
-    ) -> bool:
-        """Check whether recent runtime memory still contains the active user request."""
-        if not self._agent or not hasattr(self._agent, "memory"):
-            return False
-        messages = getattr(self._agent.memory, "messages", None)
-        if not isinstance(messages, list) or not messages:
-            return False
-
-        target = self._message_content_fingerprint(content)
-        for msg in reversed(messages[-recent_messages:]):
-            role = getattr(msg, "role", None)
-            role = role.value if hasattr(role, "value") else role
-            if role != "user":
-                continue
-            if self._is_next_step_user_msg(msg):
-                continue
-            if self._message_content_fingerprint(getattr(msg, "content", None)) == target:
-                return True
-        return False
-
-    @staticmethod
     def _callable_accepts_kwarg(func: Any, kwarg: str) -> bool:
         """Return True when *func* can accept *kwarg* as a keyword argument."""
+        import inspect
+
         try:
             signature = inspect.signature(func)
         except (TypeError, ValueError):
@@ -2495,7 +2695,7 @@ class AgentLoop:
         """
         removed = 0
 
-        # Phase 1: remove orphaned tool messages — delegate to spoon-core's
+        # Phase 1: remove orphaned tool messages - delegate to spoon-core's
         # shared utility when available so detection logic isn't duplicated.
         try:
             from spoon_ai.llm.message_utils import drop_orphaned_tool_messages
@@ -2700,7 +2900,7 @@ class AgentLoop:
         2. Truncate ALL older message content (tool results, assistant, user).
         3. If still over budget, drop entire old message rounds.
 
-        Trigger: estimated tokens > the active runtime compaction budget.
+        Trigger: estimated tokens > 50 % of context_window.
         """
         if not self._agent or not hasattr(self._agent, 'memory'):
             return 0
@@ -2711,9 +2911,9 @@ class AgentLoop:
             return normalized
 
         estimated = self._estimate_runtime_tokens()
-        budget = budget_tokens if budget_tokens is not None else self._runtime_compaction_trigger_budget()
+        budget = int(self.context_window * 0.50)
 
-        if not force and estimated <= budget:
+        if estimated <= budget:
             return normalized
 
         logger.warning(
@@ -2740,58 +2940,28 @@ class AgentLoop:
         if indices_to_remove:
             logger.info(f"Phase 1: removed {len(indices_to_remove)} old next_step_prompt messages")
 
-        protected_user_index = self._latest_real_user_message_index(messages)
-
-        # Phase 2: Compact older messages except the first and last 6.
+        # Phase 2: Truncate content of ALL messages except the first and last 6.
         keep_tail = min(6, len(messages))
         max_content = 300
         for i in range(1, max(1, len(messages) - keep_tail)):
-            if protected_user_index is not None and i == protected_user_index:
-                continue
             msg = messages[i]
             original_content = getattr(msg, "content", None)
-            compressed_content = self._compact_runtime_message_content(msg, max_content)
+            compressed_content = self._compress_message_content(original_content, max_content)
             if compressed_content != original_content:
                 msg.content = compressed_content
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
-        #
-        # *Segment-aware* drop: we only cut along user-turn boundaries so a
-        # drop never splits an ``assistant(tool_calls) -> tool(result)``
-        # chain.  Partial splits would leak through as orphaned tool
-        # messages and the LLM provider would reject the whole request.
-        # The persisted session store is untouched, so anything dropped
-        # here remains reachable via ``search_history``.
         estimated = self._estimate_runtime_tokens()
-        dropped_in_phase3 = 0
         if estimated > budget and len(messages) > 12:
             keep_head = 1
             keep_tail_drop = min(8, len(messages) - 1)
-            tail_start = len(messages) - keep_tail_drop
-            if protected_user_index is not None:
-                tail_start = min(tail_start, protected_user_index)
-            droppable = max(0, tail_start - keep_head)
+            droppable = len(messages) - keep_head - keep_tail_drop
             if droppable > 4:
-                desired = droppable // 2
-                snap_end = self._snap_drop_end_to_turn_boundary(
-                    messages, keep_head, keep_head + desired
-                )
-                actual_drop = max(0, snap_end - keep_head)
-                if actual_drop > 0:
-                    del messages[keep_head:keep_head + actual_drop]
-                    compressed += actual_drop
-                    dropped_in_phase3 = actual_drop
-                    logger.info(
-                        f"Phase 3: dropped {actual_drop} oldest messages "
-                        f"(segment-snapped from desired {desired})"
-                    )
-
-        # Phase 3b: Insert a compaction marker so the model knows prior
-        # turns are recoverable via ``search_history``.  The marker is
-        # runtime-only; it never touches the persisted session.
-        if dropped_in_phase3 > 0:
-            self._insert_compaction_marker(messages, dropped_in_phase3)
+                drop_count = droppable // 2
+                del messages[keep_head:keep_head + drop_count]
+                compressed += drop_count
+                logger.info(f"Phase 3: dropped {drop_count} oldest messages")
 
         # Phase 4: Repair tool_use/tool_result pairing broken by message deletion.
         compressed += self._repair_tool_pairing(messages)
@@ -2818,37 +2988,22 @@ class AgentLoop:
         if len(messages) <= 4:
             return compressed
 
-        protected_user_index = self._latest_real_user_message_index(messages)
-
-        # Compact older messages aggressively while preserving the latest real user turn.
-        for index, msg in enumerate(messages):
-            if protected_user_index is not None and index == protected_user_index:
-                continue
+        # Truncate ALL messages to 150 chars
+        for msg in messages:
             original_content = getattr(msg, "content", None)
-            compressed_content = self._compact_runtime_message_content(msg, 150)
+            compressed_content = self._compress_message_content(original_content, 150)
             if compressed_content != original_content:
                 msg.content = compressed_content
                 compressed += 1
 
-        # Drop all but first + last 6 messages (segment-aware)
-        dropped = 0
+        # Drop all but first + last 6 messages
         if len(messages) > 8:
             keep_head = 1
             keep_tail = min(6, len(messages) - 1)
-            desired_end = len(messages) - keep_tail
-            if protected_user_index is not None:
-                desired_end = min(desired_end, protected_user_index)
-            snap_end = self._snap_drop_end_to_turn_boundary(
-                messages, keep_head, desired_end
-            )
-            actual_drop = max(0, snap_end - keep_head)
-            if actual_drop > 0:
-                del messages[keep_head:keep_head + actual_drop]
-                compressed += actual_drop
-                dropped = actual_drop
-
-        if dropped > 0:
-            self._insert_compaction_marker(messages, dropped)
+            drop_count = len(messages) - keep_head - keep_tail
+            if drop_count > 0:
+                del messages[keep_head:keep_head + drop_count]
+                compressed += drop_count
 
         # Repair tool pairing broken by message deletion
         compressed += self._repair_tool_pairing(messages)
@@ -2962,7 +3117,7 @@ class AgentLoop:
                     old_msg = messages[old_idx]
                     old_content = old_msg.content if isinstance(old_msg.content, str) else ''
                     if len(old_content) > 100:
-                        old_msg.content = f"[{dedup_key} — superseded by newer result]"
+                        old_msg.content = f"[{dedup_key} - superseded by newer result]"
                         evicted += 1
                 latest_by_key[dedup_key] = i
 
@@ -2971,6 +3126,7 @@ class AgentLoop:
 
         async def _tracked_think(*args: Any, **kwargs: Any) -> bool:
             _evict_duplicate_tool_results()
+            agent_loop._compress_runtime_context()
 
             desired_next_step_prompt = agent.next_step_prompt or base_prompt
             if call_tracker:
@@ -2980,29 +3136,30 @@ class AgentLoop:
                 completed_summary = "\n".join(completed_parts)
 
                 anti_loop = (
-                    "\n[ALREADY COMPLETED ACTIONS - do not repeat]:\n"
-                    f"{completed_summary}\n"
-                    "Use this only to avoid repetition. Do not restate this list to the user.\n"
-                    "Continue from the latest unfinished user instruction. "
-                    "If the task is already complete, send the final answer once in the requested format and stop."
+                    "\n[ALREADY COMPLETED ACTIONS - do not repeat]\n"
+                    f"{completed_summary}"
                 )
 
                 if read_files:
                     recent = sorted(read_files)[-8:]
-                    anti_loop += "\n[FILES ALREADY READ — do NOT read again]:\n"
+                    anti_loop += "\n[FILES ALREADY READ - do NOT read again]:\n"
                     anti_loop += "\n".join(f"  - {f}" for f in recent)
 
                 repeated_details = [k for k, c in detail_tracker.items() if c >= 2]
                 if repeated_details:
                     anti_loop += (
-                        "\n⚠️ STOP REPEATING! You already did these actions. "
-                        "Choose the next missing action, or finish immediately if nothing remains."
+                        "\nSTOP REPEATING! You already did these actions. "
+                        "Move to the NEXT step toward the goal."
                     )
 
                 if len(anti_loop) > 1000:
                     anti_loop = anti_loop[:1000] + "..."
 
-                desired_next_step_prompt = base_prompt + anti_loop
+                desired_next_step_prompt = (
+                    base_prompt
+                    + anti_loop
+                    + "\nDo not restate this list to the user."
+                )
 
             suppress_runtime_prompt = AgentLoop._should_skip_runtime_next_step_prompt(agent_loop)
             if suppress_runtime_prompt:
@@ -3041,12 +3198,11 @@ class AgentLoop:
         def _log_agent_reasoning():
             """Extract and log the agent's reasoning text from its last response."""
             from spoon_bot.utils.privacy import mask_secrets
-            provider_reasoning = getattr(agent, "last_reasoning_summary", None)
-            if isinstance(provider_reasoning, str) and provider_reasoning.strip():
-                safe_reasoning = mask_secrets(provider_reasoning.strip())
-                captured = agent_loop._capture_reasoning_text(safe_reasoning)
-                if captured:
-                    logger.info(f"💭 Agent reasoning: {captured}")
+            summary = getattr(agent, "last_reasoning_summary", None)
+            if isinstance(summary, str) and summary.strip():
+                captured_summary = agent_loop._capture_reasoning_text(mask_secrets(summary.strip()))
+                if captured_summary:
+                    logger.info(f"💭 Agent reasoning: {captured_summary}")
                 return
             if not hasattr(agent, 'memory') or not agent.memory.messages:
                 return
@@ -3422,6 +3578,9 @@ class AgentLoop:
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         thinking: bool = False,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
         reasoning_effort: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
@@ -3437,16 +3596,69 @@ class AgentLoop:
               type:     "content" | "thinking" | "tool_call" | "tool_result" | "notice" | "done"
               delta:    Incremental text (may be empty for non-text events)
               metadata: Extra context (tool name, args, step number, etc.)
+              source:   Machine-readable producer metadata for this output
         """
         if not self._initialized:
             await self.initialize()
 
+        current_source = AgentLoop._set_last_response_source(self)
         logger.info(f"Streaming message: {message[:100]}...")
         self._reset_reasoning_capture()
         AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
 
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            if created:
+                full_content = created
+                yield {
+                    "type": "content",
+                    "delta": created,
+                    "metadata": {"persistent_subagent_created": True},
+                    "source": current_source,
+                }
+                yield {
+                    "type": "done",
+                    "delta": "",
+                    "metadata": {"content": full_content},
+                    "source": current_source,
+                }
+                self._persist_turn(message, full_content)
+            return
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, _route_note, current_source = routed
+            AgentLoop._set_last_response_source(self, current_source)
+            full_content = routed_content or ""
+            if full_content:
+                yield {
+                    "type": "content",
+                    "delta": full_content,
+                    "metadata": {"auto_routed_to_subagent": True},
+                    "source": current_source,
+                }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": full_content},
+                "source": current_source,
+            }
+            if full_content:
+                self._persist_turn(message, full_content)
+            return
+
         # Refresh memory context
+        bg_task: asyncio.Task | None = None
+
         try:
             memory_context = self.memory.get_memory_context()
             if memory_context:
@@ -3482,9 +3694,6 @@ class AgentLoop:
             media=media,
             attachments=attachments,
         )
-
-        # Snapshot runtime memory length before the turn so we can persist
-        # the tool-call trace produced while streaming.
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         try:
@@ -3500,7 +3709,7 @@ class AgentLoop:
             # ------------------------------------------------------------------
             # Streaming uses the spoon-core run+stream pattern:
             #   1. Clear task_done + drain output_queue
-            #   2. Start run(message) in background — sets task_done on finish
+            #   2. Start run(message) in background - sets task_done on finish
             #   3. Read chunks from output_queue until task_done AND queue empty
             # ------------------------------------------------------------------
 
@@ -3516,14 +3725,12 @@ class AgentLoop:
             stream_tool_result_index = len(AgentLoop._get_runtime_memory_messages(self))
             emitted_tool_result_ids: set[str] = set()
             tool_call_arguments_by_id: dict[str, str] = {}
-
             # 2. Start run() in background
             run_result_text = ""
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
-                    retry_runner = AgentLoop._resolve_retry_runner(self)
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
@@ -3537,11 +3744,8 @@ class AgentLoop:
                         while not self._agent.output_queue.empty():
                             self._agent.output_queue.get_nowait()
 
-                    result = await AgentLoop._run_agent_with_context_overflow_recovery(
-                        self,
+                    result = await self._run_agent_with_retry(
                         label="stream",
-                        retry_runner=retry_runner,
-                        pre_overflow_retry_cleanup=_drain_queue,
                         pre_retry_cleanup=_drain_queue,
                         **run_kwargs,
                     )
@@ -3605,6 +3809,7 @@ class AgentLoop:
                 return {
                     **event,
                     "metadata": metadata,
+                    "source": event.get("source", current_source),
                 }
 
             def _drain_runtime_notice_events() -> list[dict[str, Any]]:
@@ -3642,7 +3847,7 @@ class AgentLoop:
                 try:
                     # Poll without a hard stream deadline so long-running tasks
                     # only stop when the caller explicitly cancels them.
-                    # Use oq.get() without timeout kwarg — works for both
+                    # Use oq.get() without timeout kwarg - works for both
                     # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
                     # handled by the outer asyncio.wait_for.
                     chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
@@ -3651,9 +3856,8 @@ class AgentLoop:
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
-                    stream_cancelled = True
-                    logger.warning("Streaming cancelled while waiting for output")
-                    raise
+                    logger.warning("Streaming cancelled")
+                    break
                 except Exception as e:
                     logger.warning(f"Queue get error: {type(e).__name__}: {e}")
                     continue
@@ -3685,6 +3889,7 @@ class AgentLoop:
                             "type": "error",
                             "delta": chunk.get("delta", ""),
                             "metadata": chunk.get("metadata", {}),
+                            "source": current_source,
                         }
                         continue
 
@@ -3861,7 +4066,12 @@ class AgentLoop:
 
             # Emit done
             stream_completed = True
-            yield {"type": "done", "delta": "", "metadata": {"content": full_content}}
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": full_content},
+                "source": current_source,
+            }
 
         except asyncio.CancelledError:
             stream_cancelled = True
@@ -3875,8 +4085,19 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"Streaming error: {e}")
             stream_completed = True
-            yield {"type": "error", "delta": str(e), "metadata": {"error": str(e)}}
-            yield {"type": "done", "delta": "", "metadata": {"error": str(e)}}
+            current_source = AgentLoop.get_last_response_source(self)
+            yield {
+                "type": "error",
+                "delta": str(e),
+                "metadata": {"error": str(e)},
+                "source": current_source,
+            }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"error": str(e)},
+                "source": current_source,
+            }
         finally:
             if capture_manager is not None:
                 capture_manager.__exit__(None, None, None)
@@ -3899,7 +4120,6 @@ class AgentLoop:
                     reason="task_cancelled",
                 )
 
-        # Save to session only if we got actual content
         if full_content and stream_completed and not stream_cancelled:
             try:
                 AgentLoop._mark_latest_user_turn_state(
@@ -3919,8 +4139,12 @@ class AgentLoop:
         self,
         message: str,
         media: list[str] | None = None,
-        session_key: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_key: str | None = None,
+        thinking_level: str | None = None,
+        channel: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
         reasoning_effort: str | None = None,
     ) -> tuple[str, str | None]:
         """
@@ -3934,6 +4158,8 @@ class AgentLoop:
         Returns:
             Tuple of (response_text, thinking_content). thinking_content may be None.
         """
+        AgentLoop._set_last_response_source(self)
+
         if not self._initialized:
             await self.initialize()
 
@@ -3948,12 +4174,37 @@ class AgentLoop:
                     pass
             logger.debug(f"Switched to session: {session_key}")
 
+        current_session_key = getattr(self, "session_key", "default")
+        self.set_subagent_context(
+            session_key=current_session_key,
+            channel=channel,
+            metadata=metadata,
+            reply_to=reply_to,
+        )
         logger.info(f"Processing message (with thinking): {message[:100]}...")
         self._reset_reasoning_capture()
         AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
+
+        created = self._maybe_create_persistent_subagent_from_request(message)
+        if isinstance(created, str):
+            self._persist_turn(message, created)
+            return created, "Created persistent subagent from natural-language request."
+
+        routed = await self._maybe_route_to_persistent_specialist_result(message)
+        if isinstance(routed, tuple) and len(routed) == 3:
+            routed_content, route_note, route_source = routed
+            AgentLoop._set_last_response_source(self, route_source)
+            self._persist_turn(message, routed_content)
+            if self._auto_commit and self._git:
+                try:
+                    if self._git.has_changes():
+                        self._git.commit(message)
+                except Exception as e:
+                    logger.warning(f"Failed to auto-commit: {e}")
+            return routed_content, route_note
 
         # Refresh memory context
         try:
@@ -3980,10 +4231,6 @@ class AgentLoop:
             media=media,
             attachments=attachments,
         )
-
-        # Snapshot runtime memory length *before* adding the new user turn
-        # so we can later collect the tool-call trace produced during this
-        # turn and persist it for post-hoc search.
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
         try:
@@ -3998,8 +4245,9 @@ class AgentLoop:
 
             # Run agent with thinking enabled
             run_kwargs: dict[str, Any] = {}
+            requested_thinking = thinking_level or True
             if self._callable_accepts_kwarg(self._agent.run, "thinking"):
-                run_kwargs["thinking"] = True
+                run_kwargs["thinking"] = requested_thinking
             if (
                 effective_reasoning_effort
                 and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
@@ -4049,7 +4297,6 @@ class AgentLoop:
                 original_base_system_prompt,
             )
 
-        # Save to session
         try:
             AgentLoop._mark_latest_user_turn_state(
                 self,
@@ -4184,7 +4431,7 @@ class AgentLoop:
         """Return True if any *touched* file matches at least one *pattern*.
 
         Patterns use gitignore-style globs (``fnmatch``).  A leading ``!``
-        negates (exclude) the pattern — same semantics as ``.gitignore``.
+        negates (exclude) the pattern - same semantics as ``.gitignore``.
         An empty *patterns* list means "always active" (unconditional).
         """
         from fnmatch import fnmatch
@@ -4309,9 +4556,9 @@ class AgentLoop:
         """Return (name, dir, skill_md_path, is_organized) for all discoverable skills.
 
         Scans in priority order:
-        1. ``workspace/skills/`` — primary organized location
+        1. ``workspace/skills/`` - primary organized location
         2. All entries in ``_skill_paths`` (includes bundled/dev skills)
-        3. Workspace root — unorganized skills the user may have dropped in
+        3. Workspace root - unorganized skills the user may have dropped in
 
         Deduplicates by both name AND resolved (realpath) canonical path so
         symlinks pointing to the same physical directory are counted once.
@@ -4462,7 +4709,7 @@ class AgentLoop:
         organize_note = ""
         if not is_organized:
             organize_note = (
-                f"\n⚠️ ORGANIZE FIRST: This skill is at the workspace root, not in skills/.\n"
+                f"\n鈿狅笍 ORGANIZE FIRST: This skill is at the workspace root, not in skills/.\n"
                 f"Before executing, move it:\n"
                 f"  mv {skill_name} skills/{skill_name}\n"
                 f"Then update your working paths to use skills/{skill_name}/ as the base.\n"
@@ -4479,7 +4726,7 @@ class AgentLoop:
             f"Base directory: {base_dir}\n"
             f"Workspace-relative path: {skill_rel}/\n"
             f"{organize_note}\n"
-            f"The SKILL.md below is already loaded — follow its procedures directly. "
+            f"The SKILL.md below is already loaded - follow its procedures directly. "
             f"Do NOT call read_file on this skill. Do NOT search for alternatives. "
             f"Start executing the skill's instructions immediately.\n\n"
             f"{content}\n"
@@ -4493,7 +4740,7 @@ class AgentLoop:
         Injects env vars so they survive short-term memory pruning.
         The anti-loop tracker dynamically appends progress info.
         """
-        _truncated = self._truncate_request_for_prompt(message)
+        _truncated = message[:300] + ("..." if len(message) > 300 else "")
         _ws = self._workspace_posix_path()
         prompt = (
             "[TURN PRIORITY]: Execute only the newest user request. "
@@ -4519,7 +4766,7 @@ class AgentLoop:
 
     def _build_request_context_prompt(self, message: str) -> str:
         """Build the compact request context block used for thinking runs."""
-        _truncated = self._truncate_request_for_prompt(message)
+        _truncated = message[:300] + ("..." if len(message) > 300 else "")
         _ws = self._workspace_posix_path()
         prompt = (
             "[TURN PRIORITY]: Execute only the newest user request. "
@@ -4541,58 +4788,6 @@ class AgentLoop:
         if env_section:
             prompt += env_section
         return prompt
-
-    @staticmethod
-    def _truncate_request_for_prompt(
-        message: str,
-        *,
-        head_chars: int = 220,
-        tail_chars: int = 180,
-    ) -> str:
-        """Keep both the head and tail of the latest request for prompt scaffolding."""
-        normalized = (message or "").strip()
-        if len(normalized) <= head_chars + tail_chars + 24:
-            return normalized
-        head = normalized[:head_chars].rstrip()
-        tail = normalized[-tail_chars:].lstrip()
-        return (
-            f"{head}\n"
-            "[... middle omitted to save tokens; preserve latest tail instructions ...]\n"
-            f"{tail}"
-        )
-
-    @staticmethod
-    def _extract_output_contract_for_prompt(
-        message: str,
-        *,
-        full_request_chars: int = 420,
-        tail_chars: int = 240,
-    ) -> str:
-        """Preserve the latest request ending without language-specific intent matching.
-
-        We avoid keyword heuristics here. Compression failures often happen
-        because the *tail* of a long request carries the final delivery rule,
-        regardless of language.  For longer requests, surface that tail
-        verbatim so the model can continue execution and finish in the
-        requested format without relying on English/Chinese phrase lists.
-        """
-        normalized = (message or "").strip()
-        if not normalized:
-            return ""
-
-        if len(normalized) <= full_request_chars:
-            return ""
-
-        tail_snippet = normalized[-tail_chars:]
-        return (
-            "\n[AUTHORITATIVE REQUEST ENDING]: "
-            "The block below is copied verbatim from the newest user message. "
-            "It may contain the exact completion contract in any language. "
-            "It overrides earlier assistant guesses, stale summaries, and unrelated context. "
-            "Do not answer a different question. Do not translate it away, soften it, or replace it with a recap. "
-            "Your final answer must satisfy this block exactly.\n"
-            f"[LATEST REQUEST ENDING]: {tail_snippet}\n"
-        )
 
     def _apply_request_context_to_system_prompt(
         self,
@@ -4657,7 +4852,7 @@ class AgentLoop:
     def _extract_env_for_prompt(self) -> str:
         """Extract env vars from .env.local for the step prompt.
 
-        Non-sensitive values shown directly. Private keys masked —
+        Non-sensitive values shown directly. Private keys masked -
         agent told to use ``source .env.local`` then ``$VAR``.
         Persists across short-term memory pruning.
         """
@@ -4687,7 +4882,7 @@ class AgentLoop:
         if not env_vars:
             return ""
 
-        parts = ["\n[ENV — from .env.local — do NOT re-read, use `source .env.local` for secrets]:"]
+        parts = ["\n[ENV - from .env.local - do NOT re-read, use `source .env.local` for secrets]:"]
         for k, v in env_vars.items():
             parts.append(f"  {k}={v}")
         return "\n".join(parts) + "\n"
@@ -4729,7 +4924,7 @@ class AgentLoop:
             parts.append(f'  <location>{location}</location>')
             if not is_organized:
                 parts.append(
-                    f'  <status>unorganized — move to skills/{name}/ before use</status>'
+                    f'  <status>unorganized - move to skills/{name}/ before use</status>'
                 )
             elif isinstance(skill_paths, list) and skill_paths:
                 is_active = self._skill_paths_match(
@@ -4737,7 +4932,7 @@ class AgentLoop:
                 )
                 if not is_active:
                     parts.append(
-                        f'  <status>dormant — activates when files matching '
+                        f'  <status>dormant - activates when files matching '
                         f'{", ".join(skill_paths[:3])} are touched</status>'
                     )
             parts.append('</skill>')
@@ -4751,7 +4946,7 @@ class AgentLoop:
 
         Lists ALL inactive tools with their descriptions so the AI Agent
         can autonomously decide which to activate. No hardcoded topic
-        mapping — the LLM reads tool descriptions and decides for itself.
+        mapping - the LLM reads tool descriptions and decides for itself.
         """
         lines: list[str] = [
             "\n\n## Inactive Tools (activate on demand)\n\n"
@@ -4847,10 +5042,16 @@ class AgentLoop:
         """
         return self.tools.get_all_tool_summaries()
 
+    def attach_cron_service(self, cron_service: Any | None) -> None:
+        """Attach the active cron service so the cron tool can call it directly."""
+        self._cron_service = cron_service
+        tool = self.tools.get("cron")
+        if tool is not None and hasattr(tool, "set_cron_service"):
+            tool.set_cron_service(cron_service)
+
     def clear_history(self) -> None:
         """Clear conversation history."""
-        self._session.clear()
-        self.sessions.save(self._session)
+        self.clear_session_history()
         logger.info("Conversation history cleared")
 
     def get_history(self) -> list[dict[str, str]]:
@@ -4869,6 +5070,62 @@ class AgentLoop:
             raise ValueError("Note content cannot be empty")
         self.memory.add_daily_note(content.strip())
 
+    def clear_session_history(self, session_key: str | None = None) -> str:
+        """Clear a persisted session and keep the in-memory pointer in sync."""
+        target_key = session_key or self.session_key
+        session = self.sessions.get_or_create(target_key)
+        session.clear()
+        self.sessions.save(session)
+        if target_key == self.session_key:
+            self._session = session
+        logger.info(f"Cleared session history: {target_key}")
+        return target_key
+
+    def build_creation_kwargs(self, **overrides: Any) -> dict[str, Any]:
+        """Return kwargs that recreate this agent's runtime configuration."""
+        kwargs: dict[str, Any] = {
+            "workspace": self.workspace,
+            "model": self.model,
+            "provider": self.provider,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "max_iterations": self.max_iterations,
+            "shell_timeout": self.shell_timeout,
+            "shell_max_timeout": self.shell_max_timeout,
+            "max_output": self.max_output,
+            "session_key": self.session_key,
+            "skill_paths": list(self._user_skill_paths),
+            "mcp_config": copy.deepcopy(self._mcp_config),
+            "system_prompt": self._system_prompt,
+            "enable_skills": self._enable_skills,
+            "auto_commit": self._auto_commit,
+            "enabled_tools": (
+                set(self._enabled_tools_override)
+                if self._enabled_tools_override is not None
+                else None
+            ),
+            "tool_profile": self._tool_profile,
+            "session_store_backend": self._session_store_backend,
+            "session_store_dsn": self._session_store_dsn,
+            "session_store_db_path": self._session_store_db_path,
+            "context_window": self.context_window,
+            "memsearch_config": (
+                self._memsearch_config.model_dump(mode="python")
+                if isinstance(self._memsearch_config, MemSearchConfig)
+                else None
+            ),
+            "auto_reload": self._auto_reload,
+            "auto_reload_interval": self._auto_reload_interval,
+            "config_path": self._config_path,
+            "yolo_mode": self.yolo_mode,
+            "provider_max_retries": self._config.provider_max_retries,
+            "provider_retry_base_delay": self._config.provider_retry_base_delay,
+            "provider_retry_max_delay": self._config.provider_retry_max_delay,
+            "provider_retry_backoff_factor": self._config.provider_retry_backoff_factor,
+        }
+        kwargs.update(overrides)
+        return kwargs
+
     # ------------------------------------------------------------------
     # Session management helpers (new)
     # ------------------------------------------------------------------
@@ -4884,7 +5141,7 @@ class AgentLoop:
             True (always succeeds in setting the flag).
         """
         self._stop_requested = True
-        logger.info("Stop requested — will be honoured on next process() call")
+        logger.info("Stop requested - will be honoured on next process() call")
         return True
 
     def new_session(self, session_key: str | None = None) -> str:
@@ -4905,11 +5162,6 @@ class AgentLoop:
         new_key = session_key or f"session-{uuid.uuid4().hex[:8]}"
         self._session = self.sessions.get_or_create(new_key)
         self.session_key = new_key
-        if getattr(self, "_history_search_tool", None) is not None:
-            try:
-                self._history_search_tool.set_default_session_key(new_key)
-            except Exception:
-                pass
         logger.info(f"Switched to new session: {new_key}")
         return new_key
 
@@ -4965,6 +5217,11 @@ class AgentLoop:
         """Access the underlying spoon-core agent."""
         return self._agent
 
+    @property
+    def subagent_manager(self) -> SubagentManager | None:
+        """Expose sub-agent manager for external access (e.g. slash commands)."""
+        return getattr(self, "_subagent_manager", None)
+
 
 async def create_agent(
     model: str | None = None,
@@ -4983,7 +5240,6 @@ async def create_agent(
     auto_reload_interval: float = 5.0,
     config_path: Path | str | None = None,
     yolo_mode: bool = False,
-    reasoning_effort: str | None = None,
     **kwargs: Any,
 ) -> AgentLoop:
     """
@@ -5021,7 +5277,7 @@ async def create_agent(
         >>> # Load all tools
         >>> agent = await create_agent(tool_profile="full")
 
-        >>> # YOLO mode — work in /home/user/project directly
+        >>> # YOLO mode - work in /home/user/project directly
         >>> agent = await create_agent(yolo_mode=True, workspace="/home/user/project")
     """
     wallet_required = bool(enabled_tools and _WALLET_REQUIRED_TOOLS.intersection(enabled_tools))
@@ -5052,7 +5308,6 @@ async def create_agent(
         auto_reload_interval=auto_reload_interval,
         config_path=config_path,
         yolo_mode=yolo_mode,
-        reasoning_effort=reasoning_effort,
         **kwargs,
     )
 

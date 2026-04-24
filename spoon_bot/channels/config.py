@@ -18,6 +18,7 @@ from spoon_bot.agent.tools.registry import (
 )
 from spoon_bot.channels.base import ChannelConfig, ChannelMode
 from spoon_bot.channels.feishu.policy import normalize_feishu_allowlist
+from spoon_bot.config import CronConfig
 
 
 class ConfigValidationError(ValueError):
@@ -844,6 +845,27 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
     return resolved
 
 
+def load_cron_config(config_path: str | Path | None = None) -> CronConfig:
+    """Load cron configuration from YAML and return validated config."""
+    try:
+        full_config = _find_and_load_yaml(config_path)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        logger.warning(f"Could not load cron config from YAML: {exc}")
+        full_config = {}
+
+    cron_raw = full_config.get("cron", {}) if isinstance(full_config, dict) else {}
+    cron_config = CronConfig.from_raw(cron_raw if isinstance(cron_raw, dict) else {})
+    logger.debug(
+        "Resolved cron config: "
+        f"enabled={cron_config.enabled}, "
+        f"store={cron_config.store.path}, "
+        f"timezone={cron_config.timezone}"
+    )
+    return cron_config
+
+
 def create_default_config(output_path: str | Path) -> None:
     """
     Create a default configuration file.
@@ -866,6 +888,15 @@ def create_default_config(output_path: str | Path) -> None:
             "default_timeout": 3600,
             "max_sessions": 100,
             "persistence": True,
+        },
+        "cron": {
+            "enabled": False,
+            "store_path": "~/.spoon-bot/cron/jobs.json",
+            "timezone": "UTC",
+            "catch_up_on_start": True,
+            "max_concurrent_runs": 1,
+            "isolated_clear_before_run": True,
+            "run_log_keep_lines": 2000,
         },
         "channels": {
             "telegram": {

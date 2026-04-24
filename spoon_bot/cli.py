@@ -16,7 +16,6 @@ from typing import Any, Optional
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -304,10 +303,6 @@ def _truncate(text: str, max_len: int = 200) -> str:
     return first_line
 
 
-def _escape_and_indent(text: str, indent: str = "      ") -> str:
-    return _escape_markup(text).replace("\n", f"\n{indent}")
-
-
 def _format_tool_args(tool_name: str, raw_args: str) -> str:
     """Extract a human-readable summary from raw JSON tool args."""
     import json as _json
@@ -317,48 +312,34 @@ def _format_tool_args(tool_name: str, raw_args: str) -> str:
     try:
         obj = _json.loads(raw_args)
     except (ValueError, TypeError):
-        if tool_name == "shell":
-            return f"\n      [dim]{_escape_and_indent(raw_args)}[/dim]"
-        return f"[dim]{_escape_and_indent(_truncate(raw_args, 100))}[/dim]"
+        return f"[dim]{_truncate(raw_args, 100)}[/dim]"
 
     if not isinstance(obj, dict):
-        if tool_name == "shell":
-            return f"\n      [dim]{_escape_and_indent(str(obj))}[/dim]"
-        return f"[dim]{_escape_and_indent(_truncate(raw_args, 100))}[/dim]"
+        return f"[dim]{_truncate(raw_args, 100)}[/dim]"
 
     if tool_name == "shell":
         cmd = obj.get("command", "")
-        lines = []
-        if cmd:
-            lines.append(f"$ {cmd}")
-        for key, value in obj.items():
-            if key == "command":
-                continue
-            lines.append(f"{key}: {value}")
-        if not lines:
-            return ""
-        return f"\n      [dim]{_escape_and_indent(chr(10).join(lines))}[/dim]"
+        return f"\n      [dim]$ {cmd}[/dim]" if cmd else ""
     if tool_name == "skill_marketplace":
         action = obj.get("action", "")
         url = obj.get("url", obj.get("skill_name", ""))
         if url:
-            return f"[dim]{_escape_and_indent(f'{action} → {url}')}[/dim]"
-        return f"[dim]{_escape_and_indent(action)}[/dim]"
+            return f"[dim]{action} → {url}[/dim]"
+        return f"[dim]{action}[/dim]"
     if tool_name in ("read_file", "read_text_file"):
-        return f"[dim]{_escape_and_indent(obj.get('path', ''))}[/dim]"
+        return f"[dim]{obj.get('path', '')}[/dim]"
     if tool_name == "write_file":
-        path_value = obj.get("path", obj.get("file_path", ""))
-        return f"[dim]{_escape_and_indent(f'→ {path_value}')}[/dim]"
+        return f"[dim]→ {obj.get('path', obj.get('file_path', ''))}[/dim]"
     if tool_name == "edit_file":
-        return f"[dim]{_escape_and_indent(obj.get('path', ''))}[/dim]"
+        return f"[dim]{obj.get('path', '')}[/dim]"
     if tool_name in ("list_dir", "list_directory"):
-        return f"[dim]{_escape_and_indent(obj.get('path', ''))}[/dim]"
+        return f"[dim]{obj.get('path', '')}[/dim]"
     if tool_name == "grep":
         pat = obj.get("pattern", "")
         path = obj.get("path", "")
-        return f"[dim]{_escape_and_indent(f'{pat} in {path}')}[/dim]"
+        return f"[dim]{pat} in {path}[/dim]"
     if tool_name == "self_upgrade":
-        return f"[dim]{_escape_and_indent(obj.get('action', ''))}[/dim]"
+        return f"[dim]{obj.get('action', '')}[/dim]"
 
     parts = []
     for k, v in list(obj.items())[:4]:
@@ -366,7 +347,7 @@ def _format_tool_args(tool_name: str, raw_args: str) -> str:
         if len(sv) > 60:
             sv = sv[:57] + "..."
         parts.append(f"{k}={sv}")
-    return "[dim]" + _escape_and_indent(", ".join(parts)) + "[/dim]"
+    return "[dim]" + ", ".join(parts) + "[/dim]"
 
 
 def _tui_step_sink(message):
@@ -383,7 +364,7 @@ def _tui_step_sink(message):
     if m:
         thought = m.group(1).strip()
         if thought:
-            display = _escape_and_indent(thought)
+            display = thought[:200] + "…" if len(thought) > 200 else thought
             console.print(f"    [dim]💭[/dim] [italic]{display}[/italic]", highlight=False)
         return
 
@@ -411,15 +392,13 @@ def _tui_step_sink(message):
             return
 
         lines = raw.split("\n")
-        max_lines = None if tool_name == "shell" else 3
-        display_lines = lines if max_lines is None else lines[:max_lines]
-        display = "\n".join(ln.rstrip() for ln in display_lines) if tool_name == "shell" else "\n".join(ln.strip() for ln in display_lines)
-        if tool_name != "shell" and len(display) > 500:
+        max_lines = 5 if tool_name == "shell" else 3
+        display_lines = lines[:max_lines]
+        display = "\n".join(ln.strip() for ln in display_lines)
+        if len(display) > 500:
             display = display[:500] + "..."
-        if max_lines is not None and len(lines) > max_lines:
+        if len(lines) > max_lines:
             display += f"\n      ... ({len(lines) - max_lines} more lines)"
-
-        rendered_display = _escape_and_indent(display)
 
         if "Error" in display or "failed" in display.lower() or "Security Error" in display:
             style = "[red]"
@@ -432,9 +411,9 @@ def _tui_step_sink(message):
             end_style = ""
 
         if "\n" in display:
-            console.print(f"    [dim]╰→[/dim] {style}{rendered_display}{end_style}", highlight=False)
+            console.print(f"    [dim]╰→[/dim] {style}{display}{end_style}", highlight=False)
         else:
-            console.print(f"    [dim]╰→[/dim] {style}{rendered_display}{end_style}", highlight=False)
+            console.print(f"    [dim]╰→[/dim] {style}{display}{end_style}", highlight=False)
         return
 
 
@@ -1000,7 +979,10 @@ async def _run_gateway(
 
     from spoon_bot.agent.loop import create_agent
     from spoon_bot.channels.manager import ChannelManager
-    from spoon_bot.channels.config import load_agent_config
+    from spoon_bot.channels.config import load_agent_config, load_cron_config
+    from spoon_bot.cron.service import create_cron_service
+    from spoon_bot.channels.delivery import ChannelDeliveryService
+    from spoon_bot.runtime.execution import ExecutionCoordinator
 
     # ------------------------------------------------------------------
     # 1. Load agent config (YAML > env vars) — centralized resolution
@@ -1012,6 +994,14 @@ async def _run_gateway(
     except Exception as exc:
         print_warning(f"Could not read agent config: {exc}")
         agent_cfg = {}
+
+    try:
+        cron_cfg = load_cron_config(config)
+    except FileNotFoundError:
+        cron_cfg = None
+    except Exception as exc:
+        print_warning(f"Could not read cron config: {exc}")
+        cron_cfg = None
 
     # ------------------------------------------------------------------
     # 2. Overlay CLI args on top (CLI args take highest priority)
@@ -1117,8 +1107,14 @@ async def _run_gateway(
         raise typer.Exit(1)
 
     # Create channel manager
-    manager = ChannelManager()
+    execution_coordinator = ExecutionCoordinator()
+    delivery_service = ChannelDeliveryService()
+    manager = ChannelManager(
+        execution_coordinator=execution_coordinator,
+        delivery_service=delivery_service,
+    )
     manager.set_agent(agent, agent_config=agent_cfg, config_path=config)
+    cron_service = None
 
     # Load channels from config
     try:
@@ -1168,8 +1164,25 @@ async def _run_gateway(
         ))
 
         if health['running_channels'] == 0:
-            print_warning("No channels are running. Check your configuration.")
-            raise typer.Exit(1)
+            print_warning(
+                "No channels are running. Gateway will stay up, but channel delivery is unavailable "
+                "until a channel starts."
+            )
+
+        if cron_cfg and cron_cfg.enabled:
+            from spoon_bot.gateway import app as gateway_app_module
+
+            cron_service = create_cron_service(
+                cron_config=cron_cfg,
+                agent=agent,
+                execution_coordinator=execution_coordinator,
+                delivery_service=delivery_service,
+            )
+            await cron_service.start()
+            if hasattr(agent, "attach_cron_service"):
+                agent.attach_cron_service(cron_service)
+            gateway_app_module.set_cron_service(cron_service)
+            print_success("Cron service started")
 
     except FileNotFoundError:
         print_warning("No config file found. Using defaults.")
@@ -1247,6 +1260,17 @@ async def _run_gateway(
         # Stop all channels, message bus, and clean up resources
         with console.status("[bold blue]Stopping channels...[/bold blue]"):
             await manager.stop()
+        if cron_service is not None:
+            with console.status("[bold blue]Stopping cron...[/bold blue]"):
+                await cron_service.stop()
+            if hasattr(agent, "attach_cron_service"):
+                agent.attach_cron_service(None)
+            try:
+                from spoon_bot.gateway import app as gateway_app_module
+
+                gateway_app_module.set_cron_service(None)
+            except Exception:
+                pass
         with console.status("[bold blue]Cleaning up agent...[/bold blue]"):
             await agent.cleanup()
         # Restore original signal handler
@@ -1274,18 +1298,34 @@ service_app = typer.Typer(
 app.add_typer(service_app)
 
 
+def _parse_service_mode(value: str):
+    """Validate and normalize a service mode CLI option."""
+    from spoon_bot.services.daemon import ServiceMode
+
+    try:
+        return ServiceMode(value)
+    except ValueError as exc:
+        raise typer.BadParameter("Mode must be one of: gateway, http-gateway") from exc
+
+
 @service_app.command("start")
 def service_start(
     config: Optional[Path] = typer.Option(
         None, "--config", "-c",
         help="Path to config.yaml (defaults to ~/.spoon-bot/config.yaml)",
     ),
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
+    ),
 ) -> None:
-    """Start the gateway in the background."""
+    """Start a background service."""
     from spoon_bot.services.daemon import start
 
+    service_mode = _parse_service_mode(mode)
     with console.status("[bold blue]Starting service...[/bold blue]"):
-        ok, msg = start(config)
+        ok, msg = start(config=config, mode=service_mode)
 
     if ok:
         print_success(msg)
@@ -1295,12 +1335,19 @@ def service_start(
 
 
 @service_app.command("stop")
-def service_stop() -> None:
+def service_stop(
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
+    ),
+) -> None:
     """Stop the background service."""
     from spoon_bot.services.daemon import stop
 
+    service_mode = _parse_service_mode(mode)
     with console.status("[bold blue]Stopping service...[/bold blue]"):
-        ok, msg = stop()
+        ok, msg = stop(mode=service_mode)
 
     if ok:
         print_success(msg)
@@ -1315,12 +1362,18 @@ def service_restart(
         None, "--config", "-c",
         help="Path to config.yaml",
     ),
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
+    ),
 ) -> None:
     """Restart the background service."""
     from spoon_bot.services.daemon import restart
 
+    service_mode = _parse_service_mode(mode)
     with console.status("[bold blue]Restarting service...[/bold blue]"):
-        ok, msg = restart(config)
+        ok, msg = restart(config=config, mode=service_mode)
 
     if ok:
         print_success(msg)
@@ -1330,11 +1383,18 @@ def service_restart(
 
 
 @service_app.command("status")
-def service_status() -> None:
+def service_status(
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
+    ),
+) -> None:
     """Show the service status."""
     from spoon_bot.services.daemon import get_status
 
-    info = get_status()
+    service_mode = _parse_service_mode(mode)
+    info = get_status(mode=service_mode)
 
     status_icon = "[green]●[/green]" if info["running"] else "[red]●[/red]"
     status_text = "[green]running[/green]" if info["running"] else "[red]stopped[/red]"
@@ -1342,10 +1402,27 @@ def service_status() -> None:
     table = Table.grid(padding=(0, 2))
     table.add_column(style="dim")
     table.add_column()
+    table.add_row("Mode:", str(info["mode"]))
     table.add_row("Status:", f"{status_icon} {status_text}")
+    table.add_row("Supervisor:", str(info.get("supervisor", "unknown")))
     if info["pid"]:
         table.add_row("PID:", str(info["pid"]))
+    table.add_row("Installed:", "[green]yes[/green]" if info.get("installed") else "[dim]no[/dim]")
     table.add_row("Auto-start:", "[green]installed[/green]" if info["auto_start"] else "[dim]not installed[/dim]")
+    if info.get("task_name"):
+        table.add_row("Task:", str(info["task_name"]))
+    if info.get("task_status"):
+        table.add_row("Task status:", str(info["task_status"]))
+    if info.get("startup_entry"):
+        table.add_row("Startup entry:", str(info["startup_entry"]))
+    if info.get("url"):
+        table.add_row("URL:", str(info["url"]))
+    if info.get("gateway_health"):
+        table.add_row("Gateway health:", str(info["gateway_health"]))
+    if info.get("channels_health"):
+        table.add_row("Channels health:", str(info["channels_health"]))
+    if info.get("channels_message"):
+        table.add_row("Channels:", str(info["channels_message"]))
     table.add_row("Log file:", info["log_file"])
     table.add_row("PID file:", info["pid_file"])
 
@@ -1354,13 +1431,19 @@ def service_status() -> None:
 
 @service_app.command("logs")
 def service_logs(
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
+    ),
     lines: int = typer.Option(50, "-n", "--lines", help="Number of lines to show"),
     follow: bool = typer.Option(False, "-f", "--follow", help="Stream new log output"),
 ) -> None:
     """View service logs."""
     from spoon_bot.services.daemon import tail_logs
 
-    tail_logs(lines=lines, follow=follow)
+    service_mode = _parse_service_mode(mode)
+    tail_logs(lines=lines, follow=follow, mode=service_mode)
 
 
 @service_app.command("install")
@@ -1368,6 +1451,11 @@ def service_install(
     config: Optional[Path] = typer.Option(
         None, "--config", "-c",
         help="Path to config.yaml to use at startup",
+    ),
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
     ),
 ) -> None:
     """Install spoon-bot to auto-start at user login.
@@ -1379,30 +1467,491 @@ def service_install(
     """
     from spoon_bot.services.daemon import install_auto_start
 
+    service_mode = _parse_service_mode(mode)
     with console.status("[bold blue]Installing auto-start...[/bold blue]"):
-        ok, msg = install_auto_start(config)
+        ok, msg = install_auto_start(config=config, mode=service_mode)
 
     if ok:
         print_success(msg)
-        console.print("\n[dim]Run [bold]spoon-bot service start[/bold] to start immediately.[/dim]")
+        console.print(
+            f"\n[dim]Run [bold]spoon-bot service start --mode {service_mode.value}"
+            "[/bold] to start immediately.[/dim]"
+        )
     else:
         print_error(Exception(msg))
         raise typer.Exit(1)
 
 
 @service_app.command("uninstall")
-def service_uninstall() -> None:
+def service_uninstall(
+    mode: str = typer.Option(
+        "gateway",
+        "--mode",
+        help="Service mode: gateway or http-gateway",
+    ),
+) -> None:
     """Remove auto-start registration."""
     from spoon_bot.services.daemon import uninstall_auto_start
 
+    service_mode = _parse_service_mode(mode)
     with console.status("[bold blue]Removing auto-start...[/bold blue]"):
-        ok, msg = uninstall_auto_start()
+        ok, msg = uninstall_auto_start(mode=service_mode)
 
     if ok:
         print_success(msg)
     else:
         print_error(Exception(msg))
         raise typer.Exit(1)
+
+
+cron_app = typer.Typer(
+    name="cron",
+    help="Manage scheduled tasks.",
+    no_args_is_help=True,
+)
+app.add_typer(cron_app)
+
+
+def _parse_datetime_option(value: str, default_timezone: str) -> "datetime":
+    """Parse CLI datetime input, defaulting naive values to the configured timezone."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(default_timezone))
+    return dt.astimezone(timezone.utc)
+
+
+def _build_cli_delivery_target(
+    channel: Optional[str],
+    account: Optional[str],
+    chat_id: Optional[str],
+    channel_id: Optional[str],
+):
+    from spoon_bot.channels.delivery import normalize_channel_name
+    from spoon_bot.cron.models import CronDeliveryTarget
+
+    if not channel:
+        return None
+
+    channel, account = normalize_channel_name(channel, account)
+    if not channel:
+        return None
+
+    target: dict[str, str] = {}
+    if chat_id:
+        target["chat_id"] = chat_id
+    if channel_id:
+        target["channel_id"] = channel_id
+    return CronDeliveryTarget(
+        channel=channel,
+        account_id=account,
+        target=target,
+    )
+
+
+def _default_gateway_url() -> str:
+    """Build the local gateway URL from environment variables."""
+    host = os.environ.get("GATEWAY_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    port = os.environ.get("GATEWAY_PORT", "8080").strip() or "8080"
+    return f"http://{host}:{port}"
+
+
+def _create_cron_gateway_client(
+    gateway_url: Optional[str],
+    gateway_api_key: Optional[str],
+):
+    from spoon_bot.gateway.client import CronGatewayClient
+
+    return CronGatewayClient(
+        base_url=(gateway_url or _default_gateway_url()),
+        api_key=(gateway_api_key or os.environ.get("GATEWAY_API_KEY")),
+    )
+
+
+def _load_cli_cron_config(config: Optional[Path]):
+    from spoon_bot.channels.config import load_cron_config
+    from spoon_bot.config import CronConfig
+
+    try:
+        return load_cron_config(config)
+    except FileNotFoundError:
+        return CronConfig()
+
+
+def _run_cron_async(coro: Any) -> None:
+    from spoon_bot.gateway.client import GatewayClientError
+
+    try:
+        asyncio.run(coro)
+    except GatewayClientError as exc:
+        print_error(APIError(str(exc), user_message=str(exc)))
+        raise typer.Exit(1) from exc
+
+
+@cron_app.command("status")
+def cron_status(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """Show cron service status."""
+
+    async def _run() -> None:
+        cron_cfg = _load_cli_cron_config(config)
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+        status_payload = await client.status()
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="dim")
+        table.add_column()
+        table.add_row("Enabled:", str(cron_cfg.enabled))
+        table.add_row("Store:", str(cron_cfg.store.path))
+        table.add_row("Timezone:", cron_cfg.timezone)
+        table.add_row("Jobs:", str(status_payload.total_jobs))
+        table.add_row("Enabled jobs:", str(status_payload.enabled_jobs))
+        table.add_row("Active runs:", str(status_payload.active_runs))
+        table.add_row("Next run:", str(status_payload.next_run_at or "None"))
+        console.print(Panel(table, title="[bold]Cron Status[/bold]"))
+
+    _run_cron_async(_run())
+
+
+@cron_app.command("list")
+def cron_list(
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """List scheduled jobs."""
+
+    async def _run() -> None:
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+        jobs = await client.list_jobs()
+        table = Table()
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Schedule")
+        table.add_column("Mode")
+        table.add_column("Next run")
+        table.add_column("Enabled")
+        for job in jobs:
+            if job.schedule.kind == "at":
+                schedule_text = job.schedule.run_at.isoformat()
+            elif job.schedule.kind == "every":
+                schedule_text = f"every {job.schedule.seconds}s"
+            else:
+                schedule_text = f"{job.schedule.expression} ({job.schedule.timezone or 'UTC'})"
+            table.add_row(
+                job.id,
+                job.name,
+                schedule_text,
+                job.target_mode,
+                str(job.state.next_run_at or "None"),
+                "yes" if job.enabled else "no",
+            )
+        console.print(table if jobs else "[dim]No cron jobs configured.[/dim]")
+
+    _run_cron_async(_run())
+
+
+@cron_app.command("create")
+def cron_create(
+    name: str = typer.Option(..., "--name", help="Job name"),
+    prompt: str = typer.Option(..., "--prompt", help="Prompt to execute"),
+    at: Optional[str] = typer.Option(None, "--at", help="ISO datetime, e.g. 2026-03-29T09:00:00+08:00"),
+    every_seconds: Optional[int] = typer.Option(None, "--every-seconds", help="Interval in seconds"),
+    cron_expr: Optional[str] = typer.Option(None, "--cron", help="Cron expression"),
+    timezone_name: Optional[str] = typer.Option(None, "--timezone", help="Cron timezone"),
+    session_key: Optional[str] = typer.Option(None, "--session-key", help="Existing session to reuse"),
+    target_mode: str = typer.Option("session", "--target-mode", help="session, current, main, or isolated"),
+    delivery_channel: Optional[str] = typer.Option(None, "--delivery-channel", help="Explicit channel, e.g. telegram:bot"),
+    delivery_account: Optional[str] = typer.Option(None, "--delivery-account", help="Explicit account id"),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id", help="Telegram chat id"),
+    channel_id: Optional[str] = typer.Option(None, "--channel-id", help="Discord channel id"),
+    delivery_mode: str = typer.Option("announce", "--delivery-mode", help="announce or none"),
+    max_attempts: int = typer.Option(1, "--max-attempts", min=1, max=10, help="Maximum execution attempts for transient failures"),
+    backoff_seconds: int = typer.Option(0, "--backoff-seconds", min=0, max=3600, help="Fixed retry backoff in seconds"),
+    enabled: bool = typer.Option(True, "--enabled/--disabled", help="Enable the job immediately"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """Create a scheduled job."""
+
+    async def _run() -> None:
+        from spoon_bot.cron.models import AtSchedule, CronJobCreate, CronExpressionSchedule, EverySchedule
+
+        cron_cfg = _load_cli_cron_config(config)
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+        selectors = [value is not None for value in (at, every_seconds, cron_expr)]
+        if sum(selectors) != 1:
+            raise typer.BadParameter("Exactly one of --at, --every-seconds, or --cron must be provided")
+
+        if at is not None:
+            schedule = AtSchedule(run_at=_parse_datetime_option(at, cron_cfg.timezone))
+        elif every_seconds is not None:
+            schedule = EverySchedule(seconds=every_seconds)
+        else:
+            schedule = CronExpressionSchedule(
+                expression=str(cron_expr),
+                timezone=timezone_name or cron_cfg.timezone,
+            )
+
+        payload = CronJobCreate(
+            name=name,
+            prompt=prompt,
+            schedule=schedule,
+            target_mode=target_mode,
+            session_key=session_key,
+            delivery=(
+                None
+                if delivery_mode == "none"
+                else _build_cli_delivery_target(
+                    delivery_channel,
+                    delivery_account,
+                    chat_id,
+                    channel_id,
+                )
+            ),
+            delivery_mode=delivery_mode,
+            max_attempts=max_attempts,
+            backoff_seconds=backoff_seconds,
+            enabled=enabled,
+        )
+        job = await client.create_job(payload)
+        print_success(f"Created cron job: {job.id}")
+
+    _run_cron_async(_run())
+
+
+@cron_app.command("delete")
+def cron_delete(
+    job_id: str,
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """Delete a scheduled job."""
+
+    async def _run() -> None:
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+        deleted = await client.delete_job(job_id)
+        if not deleted:
+            raise typer.BadParameter(f"Cron job not found: {job_id}")
+        print_success(f"Deleted cron job: {job_id}")
+
+    _run_cron_async(_run())
+
+
+@cron_app.command("update")
+def cron_update(
+    job_id: str,
+    name: Optional[str] = typer.Option(None, "--name", help="Updated job name"),
+    prompt: Optional[str] = typer.Option(None, "--prompt", help="Updated prompt"),
+    at: Optional[str] = typer.Option(None, "--at", help="Replace schedule with ISO datetime"),
+    every_seconds: Optional[int] = typer.Option(None, "--every-seconds", help="Replace schedule with interval seconds"),
+    cron_expr: Optional[str] = typer.Option(None, "--cron", help="Replace schedule with cron expression"),
+    timezone_name: Optional[str] = typer.Option(None, "--timezone", help="Cron timezone"),
+    session_key: Optional[str] = typer.Option(None, "--session-key", help="Updated session key"),
+    target_mode: Optional[str] = typer.Option(None, "--target-mode", help="session, current, main, or isolated"),
+    delivery_channel: Optional[str] = typer.Option(None, "--delivery-channel", help="Explicit channel, e.g. telegram:bot"),
+    delivery_account: Optional[str] = typer.Option(None, "--delivery-account", help="Explicit account id"),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id", help="Telegram chat id"),
+    channel_id: Optional[str] = typer.Option(None, "--channel-id", help="Discord channel id"),
+    delivery_mode: Optional[str] = typer.Option(None, "--delivery-mode", help="announce or none"),
+    max_attempts: Optional[int] = typer.Option(None, "--max-attempts", min=1, max=10, help="Maximum execution attempts for transient failures"),
+    backoff_seconds: Optional[int] = typer.Option(None, "--backoff-seconds", min=0, max=3600, help="Fixed retry backoff in seconds"),
+    enable: bool = typer.Option(False, "--enable", help="Enable the job"),
+    disable: bool = typer.Option(False, "--disable", help="Disable the job"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """Update a scheduled job."""
+
+    async def _run() -> None:
+        from spoon_bot.cron.models import AtSchedule, CronExpressionSchedule, CronJobPatch, EverySchedule
+
+        if enable and disable:
+            raise typer.BadParameter("Only one of --enable or --disable can be provided")
+
+        selectors = [value is not None for value in (at, every_seconds, cron_expr)]
+        if sum(selectors) > 1:
+            raise typer.BadParameter("Only one of --at, --every-seconds, or --cron can be provided")
+
+        cron_cfg = _load_cli_cron_config(config)
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+
+        schedule = None
+        if at is not None:
+            schedule = AtSchedule(run_at=_parse_datetime_option(at, cron_cfg.timezone))
+        elif every_seconds is not None:
+            schedule = EverySchedule(seconds=every_seconds)
+        elif cron_expr is not None:
+            schedule = CronExpressionSchedule(
+                expression=cron_expr,
+                timezone=timezone_name or cron_cfg.timezone,
+            )
+
+        enabled_value: Optional[bool] = None
+        if enable:
+            enabled_value = True
+        elif disable:
+            enabled_value = False
+
+        delivery = None
+        if any(value is not None for value in (delivery_channel, delivery_account, chat_id, channel_id)):
+            delivery = _build_cli_delivery_target(
+                delivery_channel,
+                delivery_account,
+                chat_id,
+                channel_id,
+            )
+            if delivery is None:
+                raise typer.BadParameter("--delivery-channel is required when updating delivery target")
+
+        payload = CronJobPatch(
+            name=name,
+            prompt=prompt,
+            schedule=schedule,
+            target_mode=target_mode,
+            session_key=session_key,
+            delivery=delivery,
+            delivery_mode=delivery_mode,
+            max_attempts=max_attempts,
+            backoff_seconds=backoff_seconds,
+            enabled=enabled_value,
+        )
+        if not payload.model_dump(exclude_none=True):
+            raise typer.BadParameter("No updates requested")
+
+        job = await client.update_job(job_id, payload)
+        print_success(f"Updated cron job: {job.id}")
+
+    _run_cron_async(_run())
+
+
+@cron_app.command("run")
+def cron_run(
+    job_id: str,
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """Run a scheduled job immediately."""
+
+    async def _run() -> None:
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+        result = await client.run_job(job_id)
+
+        if result.status == "error":
+            raise RuntimeError(result.error or "Cron run failed")
+        print_success(f"Ran cron job {job_id}")
+        if result.output:
+            console.print(Markdown(result.output))
+
+    _run_cron_async(_run())
+
+
+@cron_app.command("runs")
+def cron_runs(
+    job_id: str,
+    limit: int = typer.Option(20, "--limit", min=1, max=200, help="Number of recent runs to show"),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+    gateway_url: Optional[str] = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+    ),
+    gateway_api_key: Optional[str] = typer.Option(
+        None,
+        "--gateway-api-key",
+        help="Gateway API key sent as X-API-Key",
+    ),
+) -> None:
+    """Show recent runs for a scheduled job."""
+
+    async def _run() -> None:
+        client = _create_cron_gateway_client(gateway_url, gateway_api_key)
+        runs = await client.list_runs(job_id, limit=limit)
+
+        if not runs:
+            console.print(f"[dim]No recorded runs for {job_id}.[/dim]")
+            return
+
+        table = Table()
+        table.add_column("Started", style="cyan")
+        table.add_column("Status")
+        table.add_column("Delivery")
+        table.add_column("Session")
+        table.add_column("Summary", overflow="fold")
+        for run in runs:
+            summary = run.error or run.output_excerpt or ""
+            table.add_row(
+                run.started_at.isoformat(),
+                run.status,
+                str(run.delivery_status or "unknown"),
+                run.session_key,
+                summary,
+            )
+        console.print(table)
+
+    _run_cron_async(_run())
 
 
 if __name__ == "__main__":

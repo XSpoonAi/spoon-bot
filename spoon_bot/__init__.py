@@ -72,7 +72,10 @@ except ImportError as e:
     create_agent = None
 
 # Import spoon-bot components that don't require spoon-core
-from spoon_bot.agent.tools.base import Tool
+try:
+    from spoon_bot.agent.tools.base import Tool
+except Exception:
+    Tool = None  # type: ignore[assignment]
 from spoon_bot.exceptions import (
     SpoonBotError,
     ConfigurationError,

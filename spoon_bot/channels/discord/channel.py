@@ -92,6 +92,44 @@ class DiscordChannel(BaseChannel):
         self._reaction_max_age: float = 600.0  # 10 minutes
 
     # ------------------------------------------------------------------
+    # Agent lifecycle integration
+    # ------------------------------------------------------------------
+
+    def set_agent(self, agent: Any) -> None:
+        """Override to register sub-agent lifecycle event listener."""
+        super().set_agent(agent)
+        _sm = getattr(agent, "subagent_manager", None)
+        if _sm is not None:
+            _sm.add_event_listener(self._on_subagent_event)
+            logger.debug(f"[{self.full_name}] Registered sub-agent event listener")
+
+    def _on_subagent_event(self, event: Any) -> None:
+        """Handle sub-agent lifecycle events for Discord notifications."""
+        event_type = getattr(event, "event_type", "")
+        agent_id = getattr(event, "agent_id", "?")
+        label = getattr(event, "label", "?")
+        model = getattr(event, "model_name", None)
+
+        if event_type == "spawning":
+            model_str = f" [{model}]" if model else ""
+            logger.info(
+                f"[{self.full_name}] Sub-agent spawned: {label!r} ({agent_id}){model_str}"
+            )
+        elif event_type == "completed":
+            elapsed = getattr(event, "elapsed_seconds", None)
+            elapsed_str = f" in {elapsed}s" if elapsed else ""
+            logger.info(
+                f"[{self.full_name}] Sub-agent completed: {label!r} ({agent_id}){elapsed_str}"
+            )
+        elif event_type in ("failed", "cancelled"):
+            error = getattr(event, "error", None)
+            error_str = f": {error}" if error else ""
+            logger.warning(
+                f"[{self.full_name}] Sub-agent {event_type}: "
+                f"{label!r} ({agent_id}){error_str}"
+            )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 

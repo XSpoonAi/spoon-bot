@@ -9,6 +9,7 @@ Based on: docs/plans/2025-02-05-spoon-bot-api-design.md
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from collections import defaultdict
@@ -20,18 +21,12 @@ from fastapi import WebSocket, WebSocketDisconnect, Query
 from loguru import logger
 
 from spoon_bot.gateway.app import (
-    cancel_ws_session_chat_task,
-    clear_ws_session_chat_task,
     get_agent,
     get_connection_manager,
     get_config,
     get_agent_execution_lock,
-    get_ws_session_chat_lock,
-    get_ws_session_chat_task_id,
     get_session_execution_lock,
-    has_active_ws_session_chat_task,
     is_auth_required,
-    register_ws_session_chat_task,
 )
 from spoon_bot.gateway.auth.jwt import verify_token
 from spoon_bot.gateway.auth.api_key import verify_api_key
@@ -280,6 +275,31 @@ def _switch_agent_session(agent, session_key: str | None) -> None:
             pass  # Gracefully degrade
 
 
+def _get_agent_response_source(agent) -> dict[str, Any]:
+    """Read machine-readable response source metadata from the agent."""
+    getter = getattr(agent, "get_last_response_source", None)
+    if callable(getter) and not inspect.iscoroutinefunction(getter):
+        try:
+            raw = getter()
+            if inspect.isawaitable(raw):
+                return {
+                    "type": "agent",
+                    "is_subagent": False,
+                    "subagent_id": None,
+                    "subagent_name": None,
+                }
+            if isinstance(raw, dict):
+                return dict(raw)
+        except Exception:
+            pass
+    return {
+        "type": "agent",
+        "is_subagent": False,
+        "subagent_id": None,
+        "subagent_name": None,
+    }
+
+
 async def websocket_endpoint(
     websocket: WebSocket,
     token: str | None = Query(default=None),
@@ -339,7 +359,7 @@ async def websocket_endpoint(
 
     # Connect
     conn_id = await manager.connect(websocket, user_id, session_key)
-    handler = WebSocketHandler(conn_id, session_key, user_id=user_id)
+    handler = WebSocketHandler(conn_id)
 
     try:
         # Send connection success event
@@ -374,73 +394,23 @@ async def websocket_endpoint(
                     # loop stays free to process cancel / status requests.
                     if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
                         _req = message  # capture for closure
-                        session_key = handler._resolve_effective_session_key(_req.params)
-                        registry_user_id = handler._resolve_registry_user_id()
-                        session_chat_lock = get_ws_session_chat_lock(
-                            session_key,
-                            user_id=registry_user_id,
-                        )
 
-                        async with session_chat_lock:
-                            # New chat for the same session should replace any stale/disconnected run.
-                            had_active_task = has_active_ws_session_chat_task(
-                                session_key,
-                                user_id=registry_user_id,
-                            )
-                            cancelled = await cancel_ws_session_chat_task(
-                                session_key,
-                                user_id=registry_user_id,
-                            )
-                            if had_active_task and not cancelled and has_active_ws_session_chat_task(
-                                session_key,
-                                user_id=registry_user_id,
-                            ):
+                        async def _run_chat(req: WSRequest = _req) -> None:
+                            try:
+                                result = await handler._handle_chat(req.params)
+                                await manager.send_message(
+                                    conn_id, WSResponse(id=req.id, result=result),
+                                )
+                            except Exception as exc:
+                                logger.error(f"Chat error: {exc}")
                                 await manager.send_message(
                                     conn_id,
-                                    WSError(
-                                        id=_req.id,
-                                        code="TASK_BUSY",
-                                        message=(
-                                            "A previous chat task for this session is still shutting down. "
-                                            "Send chat.cancel and retry shortly."
-                                        ),
-                                    ),
+                                    WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
                                 )
-                                continue
+                            finally:
+                                handler._current_task = None
 
-                            async def _run_chat(
-                                req: WSRequest = _req,
-                                bound_session_key: str = session_key,
-                                bound_user_id: str = registry_user_id,
-                            ) -> None:
-                                try:
-                                    result = await handler._handle_chat(req.params)
-                                    await manager.send_message(
-                                        conn_id, WSResponse(id=req.id, result=result),
-                                    )
-                                except Exception as exc:
-                                    logger.error(f"Chat error: {exc}")
-                                    await manager.send_message(
-                                        conn_id,
-                                        WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
-                                    )
-                                finally:
-                                    handler._current_task = None
-                                    clear_ws_session_chat_task(
-                                        bound_session_key,
-                                        user_id=bound_user_id,
-                                        task=asyncio.current_task(),
-                                    )
-
-                            chat_task = asyncio.create_task(_run_chat())
-                            handler._current_task = chat_task
-                            register_ws_session_chat_task(
-                                session_key,
-                                chat_task,
-                                user_id=registry_user_id,
-                                cancel_cb=handler._request_current_task_cancel,
-                                task_id_cb=handler._current_task_id_for_cancel,
-                            )
+                        handler._current_task = asyncio.create_task(_run_chat())
 
                     elif message.method in _CONCURRENT_METHODS:
                         task = asyncio.create_task(
@@ -467,6 +437,9 @@ async def websocket_endpoint(
     except Exception as e:
         logger.error(f"WebSocket error for {conn_id}: {e}")
     finally:
+        cancelled = await handler._cancel_current_task_for_cleanup()
+        if cancelled:
+            logger.info(f"Cancelled background WS chat task on disconnect: {conn_id}")
         await handler._cleanup_resources()
         await manager.disconnect(conn_id)
 
@@ -479,17 +452,9 @@ class WebSocketHandler:
     Supports confirmation flow for dangerous tool calls.
     """
 
-    def __init__(
-        self,
-        connection_id: str,
-        session_id: str | None = None,
-        *,
-        user_id: str | None = None,
-    ):
+    def __init__(self, connection_id: str, session_id: str | None = None):
         self.connection_id = connection_id
         self.session_id = session_id or connection_id
-        self._default_session_key = session_id or "default"
-        self._user_id = user_id.strip() if isinstance(user_id, str) and user_id.strip() else "anonymous"
         self._cancel_requested = False
         self._current_task_id: str | None = None
         self._current_task: asyncio.Task | None = None
@@ -605,46 +570,6 @@ class WebSocketHandler:
 
     # ========== Chat ==========
 
-    def _resolve_effective_session_key(self, params: dict[str, Any]) -> str:
-        """Resolve the session key for a request using connection binding fallback."""
-        bound_session_key = self._default_session_key
-        try:
-            manager = get_connection_manager()
-            conn = manager.get_connection(self.connection_id)
-        except RuntimeError:
-            conn = None
-
-        if conn:
-            bound_session_key = conn.session_key
-
-        session_key = params.get("session_key", bound_session_key)
-        if not isinstance(session_key, str) or not session_key.strip():
-            session_key = bound_session_key
-        return session_key.strip()
-
-    def _resolve_registry_user_id(self) -> str:
-        """Resolve the user identity key for WS task ownership."""
-        user_id = self._user_id
-        try:
-            manager = get_connection_manager()
-            conn = manager.get_connection(self.connection_id)
-        except RuntimeError:
-            conn = None
-        conn_user_id = getattr(conn, "user_id", None) if conn else None
-        if isinstance(conn_user_id, str) and conn_user_id.strip():
-            user_id = conn_user_id.strip()
-        return user_id
-
-    def _request_current_task_cancel(self) -> None:
-        """Signal cancellation for the current task owned by this handler."""
-        self._cancel_requested = True
-        task = self._current_task
-        if task is not None and not task.done():
-            task.cancel()
-
-    def _current_task_id_for_cancel(self) -> str | None:
-        return self._current_task_id
-
     async def _handle_chat(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle chat.send / agent.chat — serialized to prevent state races."""
         async with self._chat_lock:
@@ -656,11 +581,9 @@ class WebSocketHandler:
         manager = get_connection_manager()
         config = get_config()
         conn = manager.get_connection(self.connection_id)
+
         if not conn:
-            logger.info(
-                f"WS connection {self.connection_id} is no longer live; "
-                "continuing chat task without WebSocket delivery"
-            )
+            raise ValueError("Connection not found")
 
         attachments = _validate_attachment_paths(_normalize_attachment_refs(params.get("attachments")))
         media = _string_list_from_any(params.get("media"))
@@ -669,8 +592,10 @@ class WebSocketHandler:
         if not message:
             raise ValueError("Message or attachments are required")
 
-        session_key = self._resolve_effective_session_key(params)
-        self._default_session_key = session_key
+        session_key = params.get("session_key", conn.session_key)
+        # Validate session_key type
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = conn.session_key
 
         stream = params.get("stream", False)
         thinking = params.get("thinking", False)
@@ -690,7 +615,6 @@ class WebSocketHandler:
                 async with agent_lock:
                     # Switch agent session to the requested session_key (#11)
                     _switch_agent_session(agent, session_key)
-                    setattr(agent, "user_id", self._resolve_registry_user_id())
 
                     # Emit thinking event
                     await manager.send_message(
@@ -721,6 +645,7 @@ class WebSocketHandler:
                             # Support both "delta" and "content" keys (#10)
                             delta = chunk_data.get("delta", "") or chunk_data.get("content", "")
                             metadata = chunk_data.get("metadata", {})
+                            source = chunk_data.get("source") or _get_agent_response_source(agent)
 
                             # Detect error chunks and propagate as agent.error event
                             if chunk_type == "error":
@@ -735,6 +660,7 @@ class WebSocketHandler:
                                             "code": metadata.get("error_code", "AGENT_RUNTIME_ERROR"),
                                             "message": delta,
                                         },
+                                        "source": source,
                                     }),
                                 )
                                 continue
@@ -755,6 +681,7 @@ class WebSocketHandler:
                                             "delta": done_content,
                                             "metadata": {"fallback": "done_metadata_content"},
                                             "trace_id": trace_id,
+                                            "source": source,
                                         }),
                                     )
 
@@ -766,6 +693,7 @@ class WebSocketHandler:
                                         "content": full_content,
                                         "trace_id": trace_id,
                                         "timing": build_timing_payload(span),
+                                        "source": source,
                                     }),
                                 )
                             else:
@@ -816,6 +744,7 @@ class WebSocketHandler:
                                             "delta": delta,
                                             "metadata": metadata,
                                             "trace_id": trace_id,
+                                            "source": source,
                                         }),
                                     )
 
@@ -839,6 +768,7 @@ class WebSocketHandler:
                             thinking_content = None
                         check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
+            response_source = _get_agent_response_source(agent)
             # Emit complete event
             span.stop()
             timing = build_timing_payload(span)
@@ -848,6 +778,7 @@ class WebSocketHandler:
                 "response": response if isinstance(response, str) else str(response),
                 "trace_id": trace_id,
                 "timing": timing,
+                "source": response_source,
             }
             if not stream and thinking and thinking_content:
                 complete_data["thinking_content"] = thinking_content
@@ -864,6 +795,7 @@ class WebSocketHandler:
                 "session_key": session_key,
                 "trace_id": trace_id,
                 "timing": timing,
+                "source": response_source,
             }
             if not stream and thinking and thinking_content:
                 result["thinking_content"] = thinking_content
@@ -886,6 +818,7 @@ class WebSocketHandler:
                             "elapsed_ms": exc.elapsed_ms,
                             "limit_ms": exc.limit_ms,
                         },
+                        "source": _get_agent_response_source(agent),
                     },
                 ),
             )
@@ -906,6 +839,7 @@ class WebSocketHandler:
                         "trace_id": trace_id,
                         "timing": build_timing_payload(span),
                         "error": timeout_detail.model_dump(),
+                        "source": _get_agent_response_source(agent),
                     },
                 ),
             )
@@ -916,26 +850,10 @@ class WebSocketHandler:
     async def _handle_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle cancel request (#13) — cancels both stream and non-stream."""
         self._cancel_requested = True
-        target_session_key = self._resolve_effective_session_key(params)
-        registry_user_id = self._resolve_registry_user_id()
-        session_chat_lock = get_ws_session_chat_lock(
-            target_session_key,
-            user_id=registry_user_id,
-        )
-        async with session_chat_lock:
-            task_id = (
-                get_ws_session_chat_task_id(target_session_key, user_id=registry_user_id)
-                or self._current_task_id
-            )
+        task_id = self._current_task_id
 
-            # Prefer session-level cancellation so reconnects can stop stale tasks.
-            cancelled = await cancel_ws_session_chat_task(
-                target_session_key,
-                user_id=registry_user_id,
-            )
-        if not cancelled:
-            # Compatibility fallback for direct/unit invocations.
-            cancelled = await self._cancel_current_task_for_cleanup()
+        # Also cancel the asyncio task if running (#13)
+        cancelled = await self._cancel_current_task_for_cleanup()
 
         return {"cancelled": True, "task_id": task_id, "task_interrupted": cancelled}
 
@@ -949,7 +867,7 @@ class WebSocketHandler:
             self._current_task = None
             return False
 
-        self._request_current_task_cancel()
+        task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.CancelledError:
@@ -961,11 +879,6 @@ class WebSocketHandler:
             )
         finally:
             self._current_task = None
-            clear_ws_session_chat_task(
-                self._default_session_key,
-                user_id=self._resolve_registry_user_id(),
-                task=task,
-            )
 
         return True
 
@@ -1126,7 +1039,6 @@ class WebSocketHandler:
             raise ValueError("session_key must be a non-empty string")
 
         conn.session_key = new_session
-        self._default_session_key = new_session
         return {"session_key": new_session, "switched": True}
 
     async def _handle_session_list(self, params: dict[str, Any]) -> dict[str, Any]:
