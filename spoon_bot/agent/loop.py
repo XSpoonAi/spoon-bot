@@ -8,6 +8,8 @@ ChatBot, SpoonReactMCP, and SkillManager with spoon-bot's native OS tools.
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import json
 import logging as stdlib_logging
 import re
@@ -94,6 +96,7 @@ from spoon_bot.agent.tools.self_config import (
     MemoryManagementTool,
     SelfUpgradeTool,
 )
+from spoon_bot.agent.tools.cron import CronTool
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.config import (
     AgentLoopConfig,
@@ -454,6 +457,12 @@ class AgentLoop:
         self._mcp_config = mcp_config or {}
         self._system_prompt = system_prompt
         self._auto_commit = auto_commit
+        self._enabled_tools_override = set(enabled_tools) if enabled_tools is not None else None
+        self._tool_profile = tool_profile
+        self._session_store_backend = session_store_backend or "file"
+        self._session_store_dsn = session_store_dsn
+        self._session_store_db_path = session_store_db_path
+        self._user_skill_paths = [Path(p) for p in skill_paths] if skill_paths else []
 
         # Context window - auto-resolved from model when not explicit
         self.context_window = resolve_context_window(model, context_window)
@@ -472,6 +481,7 @@ class AgentLoop:
         # spoon-bot components
         self.context = ContextBuilder(self.workspace, yolo_mode=self.yolo_mode)
         self.tools = ToolRegistry()
+        self._cron_service = None
 
         if self.yolo_mode:
             logger.info(f"YOLO mode enabled - operating directly in: {self.workspace}")
@@ -481,8 +491,8 @@ class AgentLoop:
             self.sessions = session_manager
             logger.info("Session store: inherited from parent SessionManager")
         else:
-            _store_backend = session_store_backend or "file"
-            _store_db_path = session_store_db_path
+            _store_backend = self._session_store_backend
+            _store_db_path = self._session_store_db_path
             if _store_backend == "sqlite" and not _store_db_path:
                 _store_db_path = str(self.workspace / "sessions.db")
             try:
@@ -490,7 +500,7 @@ class AgentLoop:
                     backend=_store_backend,
                     workspace=self.workspace,
                     db_path=_store_db_path,
-                    dsn=session_store_dsn,
+                    dsn=self._session_store_dsn,
                 )
                 self.sessions = SessionManager(workspace=self.workspace, store=_session_store)
                 logger.info(f"Session store: {_store_backend}")
@@ -570,8 +580,8 @@ class AgentLoop:
         _bundled_skills = Path(__file__).resolve().parent.parent.parent / "workspace" / "skills"
         if _bundled_skills.is_dir() and _bundled_skills != self._skill_paths[0]:
             self._skill_paths.append(_bundled_skills)
-        if skill_paths:
-            self._skill_paths.extend([Path(p) for p in skill_paths])
+        if self._user_skill_paths:
+            self._skill_paths.extend(self._user_skill_paths)
 
         # Session
         self._session = self.sessions.get_or_create(self.session_key)
@@ -585,10 +595,10 @@ class AgentLoop:
         self._register_native_tools()
 
         # Apply tool filter: explicit > profile > core default
-        if enabled_tools is not None or tool_profile is not None:
+        if self._enabled_tools_override is not None or self._tool_profile is not None:
             self.tools.set_tool_filter(
-                enabled_tools=enabled_tools,
-                tool_profile=tool_profile,
+                enabled_tools=self._enabled_tools_override,
+                tool_profile=self._tool_profile,
             )
         else:
             # Default: only load core tools into the agent.
@@ -950,6 +960,10 @@ class AgentLoop:
                 for t in self.tools.get_inactive_tools().values()
             ],
         ))
+
+        cron_tool = CronTool()
+        cron_tool.set_agent_loop(self)
+        self.tools.register(cron_tool)
 
         # Sub-agent tool - replaces the old placeholder SpawnTool
         spawn_tool = SubagentTool(manager=getattr(self, "_subagent_manager", None))
@@ -2795,7 +2809,10 @@ class AgentLoop:
                     completed_parts.append(f"  - {key} (x{count})")
                 completed_summary = "\n".join(completed_parts)
 
-                anti_loop = f"\n[DONE]:\n{completed_summary}"
+                anti_loop = (
+                    "\n[ALREADY COMPLETED ACTIONS - do not repeat]\n"
+                    f"{completed_summary}"
+                )
 
                 if read_files:
                     recent = sorted(read_files)[-8:]
@@ -2805,14 +2822,18 @@ class AgentLoop:
                 repeated_details = [k for k, c in detail_tracker.items() if c >= 2]
                 if repeated_details:
                     anti_loop += (
-                        "\n鈿狅笍 STOP REPEATING! You already did these actions. "
+                        "\nSTOP REPEATING! You already did these actions. "
                         "Move to the NEXT step toward the goal."
                     )
 
                 if len(anti_loop) > 1000:
                     anti_loop = anti_loop[:1000] + "..."
 
-                desired_next_step_prompt = base_prompt + anti_loop
+                desired_next_step_prompt = (
+                    base_prompt
+                    + anti_loop
+                    + "\nDo not restate this list to the user."
+                )
 
             suppress_runtime_prompt = AgentLoop._should_skip_runtime_next_step_prompt(agent_loop)
             if suppress_runtime_prompt:
@@ -2851,6 +2872,12 @@ class AgentLoop:
         def _log_agent_reasoning():
             """Extract and log the agent's reasoning text from its last response."""
             from spoon_bot.utils.privacy import mask_secrets
+            summary = getattr(agent, "last_reasoning_summary", None)
+            if isinstance(summary, str) and summary.strip():
+                captured_summary = agent_loop._capture_reasoning_text(mask_secrets(summary.strip()))
+                if captured_summary:
+                    logger.info(f"💭 Agent reasoning: {captured_summary}")
+                return
             if not hasattr(agent, 'memory') or not agent.memory.messages:
                 return
             for msg in reversed(agent.memory.messages[-3:]):
@@ -2863,7 +2890,7 @@ class AgentLoop:
                 safe_text = mask_secrets(content.strip())
                 captured = agent_loop._capture_reasoning_text(safe_text)
                 if captured:
-                    logger.info(f"馃挱 Agent reasoning: {captured}")
+                    logger.info(f"💭 Agent reasoning: {captured}")
                 break
 
         def _log_tool_calls():
@@ -4550,10 +4577,16 @@ class AgentLoop:
         """
         return self.tools.get_all_tool_summaries()
 
+    def attach_cron_service(self, cron_service: Any | None) -> None:
+        """Attach the active cron service so the cron tool can call it directly."""
+        self._cron_service = cron_service
+        tool = self.tools.get("cron")
+        if tool is not None and hasattr(tool, "set_cron_service"):
+            tool.set_cron_service(cron_service)
+
     def clear_history(self) -> None:
         """Clear conversation history."""
-        self._session.clear()
-        self.sessions.save(self._session)
+        self.clear_session_history()
         logger.info("Conversation history cleared")
 
     def get_history(self) -> list[dict[str, str]]:
@@ -4571,6 +4604,62 @@ class AgentLoop:
         if not content or not content.strip():
             raise ValueError("Note content cannot be empty")
         self.memory.add_daily_note(content.strip())
+
+    def clear_session_history(self, session_key: str | None = None) -> str:
+        """Clear a persisted session and keep the in-memory pointer in sync."""
+        target_key = session_key or self.session_key
+        session = self.sessions.get_or_create(target_key)
+        session.clear()
+        self.sessions.save(session)
+        if target_key == self.session_key:
+            self._session = session
+        logger.info(f"Cleared session history: {target_key}")
+        return target_key
+
+    def build_creation_kwargs(self, **overrides: Any) -> dict[str, Any]:
+        """Return kwargs that recreate this agent's runtime configuration."""
+        kwargs: dict[str, Any] = {
+            "workspace": self.workspace,
+            "model": self.model,
+            "provider": self.provider,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "max_iterations": self.max_iterations,
+            "shell_timeout": self.shell_timeout,
+            "shell_max_timeout": self.shell_max_timeout,
+            "max_output": self.max_output,
+            "session_key": self.session_key,
+            "skill_paths": list(self._user_skill_paths),
+            "mcp_config": copy.deepcopy(self._mcp_config),
+            "system_prompt": self._system_prompt,
+            "enable_skills": self._enable_skills,
+            "auto_commit": self._auto_commit,
+            "enabled_tools": (
+                set(self._enabled_tools_override)
+                if self._enabled_tools_override is not None
+                else None
+            ),
+            "tool_profile": self._tool_profile,
+            "session_store_backend": self._session_store_backend,
+            "session_store_dsn": self._session_store_dsn,
+            "session_store_db_path": self._session_store_db_path,
+            "context_window": self.context_window,
+            "memsearch_config": (
+                self._memsearch_config.model_dump(mode="python")
+                if isinstance(self._memsearch_config, MemSearchConfig)
+                else None
+            ),
+            "auto_reload": self._auto_reload,
+            "auto_reload_interval": self._auto_reload_interval,
+            "config_path": self._config_path,
+            "yolo_mode": self.yolo_mode,
+            "provider_max_retries": self._config.provider_max_retries,
+            "provider_retry_base_delay": self._config.provider_retry_base_delay,
+            "provider_retry_max_delay": self._config.provider_retry_max_delay,
+            "provider_retry_backoff_factor": self._config.provider_retry_backoff_factor,
+        }
+        kwargs.update(overrides)
+        return kwargs
 
     # ------------------------------------------------------------------
     # Session management helpers (new)

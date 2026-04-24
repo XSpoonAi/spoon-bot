@@ -54,13 +54,21 @@ async def _lifespan(app: FastAPI):
 
     # Auto-create agent.
     # All config resolution (YAML > env vars) is handled by load_agent_config().
-    from spoon_bot.channels.config import load_agent_config
+    from spoon_bot.channels.config import load_agent_config, load_cron_config
 
     try:
         agent_cfg = load_agent_config()
     except Exception as _cfg_err:
         logger.warning(f"Could not load agent config: {_cfg_err}")
         agent_cfg = {}
+
+    try:
+        cron_cfg = load_cron_config()
+    except Exception as _cron_err:
+        logger.warning(f"Could not load cron config: {_cron_err}")
+        from spoon_bot.config import CronConfig
+
+        cron_cfg = CronConfig()
 
     provider = agent_cfg.get("provider")
     model = agent_cfg.get("model")
@@ -132,7 +140,7 @@ async def _lifespan(app: FastAPI):
             create_kwargs["reasoning_effort"] = str(agent_cfg["reasoning_effort"])
 
         agent = await create_agent(**create_kwargs)
-        app_module._agent = agent
+        app_module.set_agent(agent)
 
         # Log tool/skill counts
         tool_count = len(agent.tools) if hasattr(agent.tools, '__len__') else len(agent.tools.list_tools()) if hasattr(agent.tools, 'list_tools') else 0
@@ -168,8 +176,12 @@ async def _lifespan(app: FastAPI):
         try:
             from spoon_bot.bootstrap import init_channels
 
-            channel_manager = await init_channels(app_module._agent)
-            app_module._channel_manager = channel_manager
+            channel_manager = await init_channels(
+                app_module._agent,
+                execution_coordinator=app_module.get_execution_coordinator(),
+                delivery_service=app_module.get_channel_delivery_service(),
+            )
+            app_module.set_channel_manager(channel_manager)
             logger.info(
                 f"Channels loaded: {channel_manager.running_channels_count} running"
             )
@@ -180,12 +192,31 @@ async def _lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Could not start channels: {e}")
 
+    if app_module._agent is not None and cron_cfg.enabled:
+        try:
+            from spoon_bot.cron.service import create_cron_service
+
+            cron_service = create_cron_service(
+                cron_config=cron_cfg,
+                agent=app_module._agent,
+                execution_coordinator=app_module.get_execution_coordinator(),
+                delivery_service=app_module.get_channel_delivery_service(),
+            )
+            await cron_service.start()
+            if hasattr(app_module._agent, "attach_cron_service"):
+                app_module._agent.attach_cron_service(cron_service)
+            app_module.set_cron_service(cron_service)
+            logger.info("Cron service started")
+        except Exception as e:
+            logger.warning(f"Could not start cron service: {e}")
+
     # ---- Startup summary ----
     logger.info("===== spoon-bot Docker gateway ready =====")
     logger.info(f"  Provider : {agent_cfg.get('provider', '(not set)')}")
     logger.info(f"  Model    : {agent_cfg.get('model', '(not set)')}")
     logger.info(f"  Workspace: {agent_cfg.get('workspace', '/data/workspace')}")
     logger.info(f"  YOLO mode: {bool(yolo_mode)}")
+    logger.info(f"  Cron     : {'enabled' if cron_cfg.enabled else 'disabled'}")
     if channel_manager:
         logger.info(
             f"  Channels : {channel_manager.running_channels_count} running "
@@ -199,8 +230,18 @@ async def _lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down spoon-bot gateway...")
+    try:
+        cron_service = app_module.get_cron_service()
+    except RuntimeError:
+        cron_service = None
+    if cron_service:
+        await cron_service.stop()
+        if app_module._agent is not None and hasattr(app_module._agent, "attach_cron_service"):
+            app_module._agent.attach_cron_service(None)
+        app_module.set_cron_service(None)
     if channel_manager:
         await channel_manager.stop()
+        app_module.set_channel_manager(None)
         logger.info("Channels stopped")
     if connection_manager:
         await connection_manager.stop()

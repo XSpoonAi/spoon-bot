@@ -9,7 +9,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **OS-native**: Built-in shell/filesystem tools as priority
 - **Memory-first**: Four-layer memory system (file + semantic search via memsearch + short-term + checkpointer)
 - **Session Persistence**: Pluggable backends — JSONL files (default), SQLite, or PostgreSQL
-- **Web Search**: Built-in Tavily integration for real-time information retrieval
+- **Web Search**: Built-in Tavily/Brave integration for real-time information retrieval
 - **Self-managing**: Self-configuration, self-upgrade, memory management tools
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem with dynamic tool activation
@@ -74,6 +74,7 @@ cp .env.example .env
 | Google Gemini | `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/) |
 | OpenRouter | `OPENROUTER_API_KEY` | [openrouter.ai](https://openrouter.ai/) |
 | Tavily (web search) | `TAVILY_API_KEY` | [tavily.com](https://tavily.com/) |
+| Brave Search (web search) | `BRAVE_SEARCH_API_KEY` or `BRAVE_API_KEY` | [api.search.brave.com](https://api.search.brave.com/) |
 
 Example `.env` file:
 
@@ -87,6 +88,7 @@ OPENROUTER_API_KEY=sk-or-xxx
 
 # Optional: web search
 TAVILY_API_KEY=tvly-xxx
+BRAVE_SEARCH_API_KEY=bsa-xxx
 ```
 
 ### Channel Configuration (config.yaml)
@@ -611,9 +613,10 @@ spoon-bot gateway --no-cli             # Disable CLI input in gateway mode
 spoon-bot gateway --config path/to/config.yaml  # Custom config file
 
 # Background service management
-spoon-bot service start                # Start gateway in the background
-spoon-bot service stop                 # Stop the background service
-spoon-bot service restart              # Restart the service
+spoon-bot service start                # Start the default gateway service in the background
+spoon-bot service start --mode http-gateway  # Start the HTTP gateway for cron/API + channels
+spoon-bot service stop                 # Stop the default gateway service
+spoon-bot service restart              # Restart the default gateway service
 spoon-bot service status               # Show PID, auto-start, and log path
 spoon-bot service logs                 # Show last 50 log lines
 spoon-bot service logs -f              # Follow log output (tail -f)
@@ -628,6 +631,16 @@ spoon-bot version                      # Show version
 
 ## Background Service
 
+Two service modes are available:
+
+- `gateway` (default): the existing multi-channel gateway
+- `http-gateway`: the HTTP Gateway used by `spoon-bot cron ...`, and the recommended single-process mode for Telegram + scheduled tasks
+
+Windows recommendation:
+
+- Prefer `spoon-bot service install --mode http-gateway` for Telegram + cron.
+- The Windows service path now prefers Task Scheduler, falls back to a Startup-folder launcher when Task Scheduler is denied, and only uses a hidden detached process as the manual start fallback.
+
 Run the gateway as a persistent background service — no Docker, no terminal window required. Once started, the bot keeps running and responds to your chat tools (Telegram, Discord, etc.) automatically.
 
 ### Quick Start
@@ -637,23 +650,29 @@ Run the gateway as a persistent background service — no Docker, no terminal wi
 cp config.example.yaml ~/.spoon-bot/config.yaml
 # edit ~/.spoon-bot/config.yaml with your tokens
 
-# 2. Start the service in the background
+# 2. Start the default gateway service in the background
 spoon-bot service start
 
-# 3. Check it's running
+# 3. Or start the HTTP gateway service for cron + channels
+spoon-bot service start --mode http-gateway
+
+# 4. Check it's running
 spoon-bot service status
 
-# 4. Follow logs
+# 5. Follow logs
 spoon-bot service logs -f
+spoon-bot service logs --mode http-gateway -f
 ```
 
 ### Auto-Start at Login
 
-Register the gateway to start automatically every time you log in:
+Register a service to start automatically every time you log in:
 
 ```bash
 spoon-bot service install    # register
 spoon-bot service uninstall  # remove
+spoon-bot service install --mode http-gateway    # register HTTP gateway
+spoon-bot service uninstall --mode http-gateway  # remove HTTP gateway
 ```
 
 | Platform | Method | Requires Admin? |
@@ -661,6 +680,8 @@ spoon-bot service uninstall  # remove
 | Windows (7+) | Task Scheduler (`ONLOGON` trigger) | No |
 | Linux | systemd user service (`~/.config/systemd/user/`) | No |
 | macOS | launchd agent (`~/Library/LaunchAgents/`) | No |
+
+`spoon-bot service status --mode http-gateway` now reports which supervisor is active on Windows: `schtasks`, `startup-folder`, or `manual-detached`.
 
 ### Service Files
 
@@ -673,7 +694,11 @@ All state is stored in `~/.spoon-bot/`:
 └── gateway.log      # Rolling log (append-only)
 ```
 
+`gateway` continues to use `service.pid` and `gateway.log`. The new `http-gateway` mode writes separate PID and log files under `~/.spoon-bot/`, so the two services can run independently.
+
 ### Commands Reference
+
+All service subcommands accept `--mode gateway|http-gateway`. Use `--mode http-gateway` when you want one background process to serve Telegram/Discord channels and `spoon-bot cron ...` at the same time.
 
 | Command | Description |
 |---------|-------------|
@@ -830,6 +855,58 @@ Fetch weather data for any city.
 
 Skills are automatically discovered at startup. The agent autonomously decides which skills to activate based on the conversation context. Script-based skills support structured `input_schema` for type-safe parameter passing.
 
+## Scheduled Tasks
+
+Scheduled tasks run inside the HTTP gateway process and persist jobs under `~/.spoon-bot/cron/`.
+
+Enable cron in `config.yaml`:
+
+```yaml
+cron:
+  enabled: true
+  store_path: "~/.spoon-bot/cron/jobs.json"
+  timezone: "Asia/Shanghai"
+  catch_up_on_start: true
+  max_concurrent_runs: 1
+  isolated_clear_before_run: true
+  run_log_keep_lines: 2000
+```
+
+Start the HTTP gateway service, then manage jobs from the CLI:
+
+```bash
+spoon-bot service start --mode http-gateway
+spoon-bot cron status
+spoon-bot cron create --name "Heartbeat" --prompt "Check system status" --every-seconds 300 --target-mode isolated
+spoon-bot cron list
+spoon-bot cron run <job-id>
+spoon-bot cron runs <job-id> --limit 10
+```
+
+Execution modes:
+
+- `session`: reuse an existing `--session-key`, so the task continues an existing conversation thread.
+- `isolated`: run in a dedicated cron session (`cron_<job-id>`), optionally clearing history before each run.
+
+Run history is stored at `~/.spoon-bot/cron/runs/<job-id>.jsonl` and surfaced through `spoon-bot cron runs`.
+
+When Telegram or Discord is running through `spoon-bot service start --mode http-gateway`, users can also create and manage scheduled tasks directly in chat with natural language. The agent uses the built-in `cron` tool, prepares a confirmation draft first, and by default sends scheduled replies back to the current chat/channel.
+
+Complex scheduled tasks follow a stricter runtime model:
+
+- Live-data jobs such as news summaries, weather checks, and website monitoring default to `target_mode=isolated` unless you explicitly ask to continue the current conversation context.
+- Scheduled runs use the `automation` tool profile and no longer receive the `cron` management tool, so a running cron job cannot recursively create/update/delete other cron jobs.
+- Live-data jobs automatically narrow their runtime tools to a minimal allowlist such as `web_search`, `web_fetch`, `read_file`, and `list_dir`.
+- If no web-search provider is configured, the confirmation preview warns before creation and the run log records a capability error instead of pretending the task can fetch current information.
+
+For news/weather/search-driven cron jobs, configure at least one web-search provider before enabling the task:
+
+```bash
+export TAVILY_API_KEY=tvly-your-key
+# or
+export BRAVE_SEARCH_API_KEY=bsa-your-key
+```
+
 ## Development
 
 ```bash
@@ -866,6 +943,8 @@ ruff check spoon_bot/
 | `GEMINI_API_KEY` | — | Google Gemini API key |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key |
 | `TAVILY_API_KEY` | — | Tavily web search API key |
+| `BRAVE_SEARCH_API_KEY` | — | Brave Search API key |
+| `BRAVE_API_KEY` | — | Alias for `BRAVE_SEARCH_API_KEY` |
 | `OPENAI_EMBEDDING_API_KEY` | — | Embedding provider API key (falls back to `OPENAI_API_KEY`) |
 | `OPENAI_EMBEDDING_BASE_URL` | — | Embedding provider base URL (falls back to `OPENAI_BASE_URL`) |
 | `OPENAI_EMBEDDING_MODEL` | — | Embedding model name (e.g. `Qwen3-Embedding-0.6B`) |

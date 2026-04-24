@@ -4,26 +4,28 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+from spoon_bot.agent.tools.web import close_shared_http_client
+from spoon_bot.channels.delivery import ChannelDeliveryService
 from spoon_bot.gateway.config import GatewayConfig
-from spoon_bot.gateway.websocket.manager import ConnectionManager
 from spoon_bot.gateway.core_integration import (
     SpoonCoreAgent,
     SpoonCoreIdentity,
     SpoonCorePayments,
     is_spoon_core_available,
 )
-from spoon_bot.agent.tools.web import close_shared_http_client
+from spoon_bot.gateway.websocket.manager import ConnectionManager
+from spoon_bot.runtime.execution import ExecutionCoordinator
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
     from spoon_bot.channels.manager import ChannelManager
+    from spoon_bot.cron.service import CronService
 
 
 # Global state (set during lifespan)
@@ -34,17 +36,9 @@ _config: GatewayConfig | None = None
 _identity: SpoonCoreIdentity | None = None
 _payments: SpoonCorePayments | None = None
 _auth_required: bool = True  # Can be set to False via GATEWAY_AUTH_REQUIRED=false
-_agent_execution_lock: asyncio.Lock | None = None
-_session_execution_locks: dict[str, asyncio.Lock] = {}
-_ws_session_chat_tasks: dict[str, "_WSSessionTaskHandle"] = {}
-_ws_session_chat_locks: dict[str, asyncio.Lock] = {}
-
-
-@dataclass
-class _WSSessionTaskHandle:
-    task: asyncio.Task
-    cancel_cb: Callable[[], None] | None = None
-    task_id_cb: Callable[[], str | None] | None = None
+_execution_coordinator: ExecutionCoordinator | None = None
+_channel_delivery_service: ChannelDeliveryService | None = None
+_cron_service: "CronService | None" = None
 
 
 def is_auth_required() -> bool:
@@ -73,131 +67,30 @@ def get_config() -> GatewayConfig:
     return _config
 
 
+def get_execution_coordinator() -> ExecutionCoordinator:
+    """Get the shared execution coordinator."""
+    global _execution_coordinator
+    if _execution_coordinator is None:
+        _execution_coordinator = ExecutionCoordinator()
+    return _execution_coordinator
+
+
+def get_channel_delivery_service() -> ChannelDeliveryService:
+    """Get the proactive delivery service."""
+    global _channel_delivery_service
+    if _channel_delivery_service is None:
+        _channel_delivery_service = ChannelDeliveryService()
+    return _channel_delivery_service
+
+
 def get_agent_execution_lock() -> asyncio.Lock:
     """Get the shared lock guarding global agent execution."""
-    global _agent_execution_lock
-    if _agent_execution_lock is None:
-        _agent_execution_lock = asyncio.Lock()
-    return _agent_execution_lock
-
-
-def _normalize_session_key(session_key: str | None) -> str:
-    return session_key.strip() if isinstance(session_key, str) and session_key.strip() else "default"
-
-
-def _normalize_user_id(user_id: str | None) -> str:
-    return user_id.strip() if isinstance(user_id, str) and user_id.strip() else "anonymous"
-
-
-def _ws_session_chat_registry_key(session_key: str | None, user_id: str | None) -> str:
-    return f"user:{_normalize_user_id(user_id)}|session:{_normalize_session_key(session_key)}"
+    return get_execution_coordinator().get_runner_lock("primary-agent")
 
 
 def get_session_execution_lock(session_key: str) -> asyncio.Lock:
     """Get/create a lock for a specific session key."""
-    key = _normalize_session_key(session_key)
-    lock = _session_execution_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _session_execution_locks[key] = lock
-    return lock
-
-
-def register_ws_session_chat_task(
-    session_key: str,
-    task: asyncio.Task,
-    *,
-    user_id: str | None = None,
-    cancel_cb: Callable[[], None] | None = None,
-    task_id_cb: Callable[[], str | None] | None = None,
-) -> None:
-    """Register the active websocket chat task for a session."""
-    _ws_session_chat_tasks[_ws_session_chat_registry_key(session_key, user_id)] = _WSSessionTaskHandle(
-        task=task,
-        cancel_cb=cancel_cb,
-        task_id_cb=task_id_cb,
-    )
-
-
-def get_ws_session_chat_lock(session_key: str, user_id: str | None = None) -> asyncio.Lock:
-    """Get/create the serialized replacement lock for a WS user+session key."""
-    key = _ws_session_chat_registry_key(session_key, user_id)
-    lock = _ws_session_chat_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _ws_session_chat_locks[key] = lock
-    return lock
-
-
-def get_ws_session_chat_task_id(session_key: str, user_id: str | None = None) -> str | None:
-    """Get the current websocket chat task id for a session, if available."""
-    handle = _ws_session_chat_tasks.get(_ws_session_chat_registry_key(session_key, user_id))
-    if handle is None or handle.task_id_cb is None:
-        return None
-    try:
-        return handle.task_id_cb()
-    except Exception:
-        return None
-
-
-def has_active_ws_session_chat_task(session_key: str, user_id: str | None = None) -> bool:
-    """Whether a session currently has a running websocket chat task."""
-    handle = _ws_session_chat_tasks.get(_ws_session_chat_registry_key(session_key, user_id))
-    return bool(handle is not None and not handle.task.done())
-
-
-def clear_ws_session_chat_task(
-    session_key: str,
-    *,
-    user_id: str | None = None,
-    task: asyncio.Task | None = None,
-) -> bool:
-    """Clear the active websocket chat task for a session."""
-    key = _ws_session_chat_registry_key(session_key, user_id)
-    handle = _ws_session_chat_tasks.get(key)
-    if handle is None:
-        return False
-    if task is not None and handle.task is not task:
-        return False
-    _ws_session_chat_tasks.pop(key, None)
-    return True
-
-
-async def cancel_ws_session_chat_task(
-    session_key: str,
-    timeout: float = 2.0,
-    *,
-    user_id: str | None = None,
-) -> bool:
-    """Cancel and await an active websocket chat task for a session."""
-    key = _ws_session_chat_registry_key(session_key, user_id)
-    handle = _ws_session_chat_tasks.get(key)
-    if handle is None:
-        return False
-
-    task = handle.task
-    if task.done():
-        clear_ws_session_chat_task(session_key, user_id=user_id, task=task)
-        return True
-
-    if handle.cancel_cb is not None:
-        try:
-            handle.cancel_cb()
-        except Exception:
-            pass
-    task.cancel()
-    timed_out = False
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-    except asyncio.CancelledError:
-        pass
-    except asyncio.TimeoutError:
-        timed_out = True
-        logger.warning(f"Timed out waiting for ws chat task cleanup: session={key}")
-    if task.done():
-        clear_ws_session_chat_task(session_key, user_id=user_id, task=task)
-        return True
-    return False if timed_out else task.done()
+    return get_execution_coordinator().get_session_lock(session_key)
 
 
 def set_agent(agent: SpoonCoreAgent | AgentLoop) -> None:
@@ -205,6 +98,30 @@ def set_agent(agent: SpoonCoreAgent | AgentLoop) -> None:
     global _agent
     _agent = agent
     logger.info(f"Agent set for gateway (type: {type(agent).__name__})")
+
+
+def set_channel_manager(channel_manager: "ChannelManager | None") -> None:
+    """Register the active channel manager."""
+    global _channel_manager
+    _channel_manager = channel_manager
+    if channel_manager is not None:
+        get_channel_delivery_service().attach_channel_lookup(
+            channel_manager.get_channel,
+            lambda: list(channel_manager.channel_names),
+        )
+
+
+def get_cron_service() -> "CronService":
+    """Get the active cron service."""
+    if _cron_service is None:
+        raise RuntimeError("Cron service is not initialized.")
+    return _cron_service
+
+
+def set_cron_service(service: "CronService | None") -> None:
+    """Register the active cron service."""
+    global _cron_service
+    _cron_service = service
 
 
 def get_identity() -> SpoonCoreIdentity | None:
@@ -274,6 +191,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down spoon-bot gateway...")
+    if _cron_service:
+        await _cron_service.stop()
     if _connection_manager:
         await _connection_manager.stop()
     await close_shared_http_client()
@@ -289,13 +208,13 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     Returns:
         Configured FastAPI application.
     """
-    global _config, _agent_execution_lock, _session_execution_locks, _ws_session_chat_tasks, _ws_session_chat_locks
+    global _config, _execution_coordinator, _channel_delivery_service, _cron_service, _channel_manager
 
     _config = config or GatewayConfig.from_env()
-    _agent_execution_lock = None
-    _session_execution_locks = {}
-    _ws_session_chat_tasks = {}
-    _ws_session_chat_locks = {}
+    _execution_coordinator = ExecutionCoordinator()
+    _channel_delivery_service = ChannelDeliveryService()
+    _cron_service = None
+    _channel_manager = None
 
     app = FastAPI(
         title="spoon-bot Gateway",
