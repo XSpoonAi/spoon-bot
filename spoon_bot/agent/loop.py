@@ -12,7 +12,9 @@ import inspect
 import json
 import logging as stdlib_logging
 import re
+import uuid
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
 
@@ -140,6 +142,10 @@ _ATTACHMENT_ONLY_PLACEHOLDER = (
 )
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
 _MISSING = object()
+_TURN_STATE_PENDING = "pending"
+_TURN_STATE_COMPLETED = "completed"
+_TURN_STATE_INTERRUPTED = "interrupted"
+_TURN_STATE_SUPERSEDED = "superseded"
 _WALLET_REQUIRED_TOOLS: frozenset[str] = frozenset({
     "balance_check",
     "transfer",
@@ -1286,6 +1292,11 @@ class AgentLoop:
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
                 continue
+            if role == "user" and AgentLoop._turn_state_of_message(msg) in {
+                _TURN_STATE_INTERRUPTED,
+                _TURN_STATE_SUPERSEDED,
+            }:
+                continue
 
             content = msg.get("content", "")
             if not isinstance(content, str):
@@ -1361,6 +1372,7 @@ class AgentLoop:
         the configured ``context_window``, older runtime-only history is
         compacted before the provider call starts.
         """
+        self._refresh_recent_turn_notice()
         trimmed_count = self._trim_context_if_needed()  # always 0 now
         injected_count = await self._sync_runtime_history_from_session()
 
@@ -1592,6 +1604,115 @@ class AgentLoop:
             ]
         return save_kwargs
 
+    @staticmethod
+    def _turn_state_of_message(message: Any) -> str:
+        """Normalize persisted turn state metadata for user messages."""
+        if not isinstance(message, dict):
+            return ""
+        return str(message.get("turn_state") or "").strip().lower()
+
+    @staticmethod
+    def _update_session_user_turn_state(
+        session: Any,
+        state: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update the latest unresolved user turn in persisted session history."""
+        messages = getattr(session, "messages", None)
+        if not isinstance(messages, list):
+            return None
+
+        terminal_states = {_TURN_STATE_COMPLETED, _TURN_STATE_INTERRUPTED, _TURN_STATE_SUPERSEDED}
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "").strip().lower() != "user":
+                continue
+
+            current_state = AgentLoop._turn_state_of_message(message)
+            if current_state in terminal_states:
+                continue
+
+            message["turn_state"] = state
+            message["turn_state_updated_at"] = datetime.now().isoformat()
+            if reason:
+                message["turn_state_reason"] = reason
+            elif "turn_state_reason" in message:
+                message.pop("turn_state_reason", None)
+            return message
+        return None
+
+    @staticmethod
+    def _persist_session_if_possible(self) -> None:
+        """Persist the current session when the manager is available."""
+        try:
+            self.sessions.save(self._session)
+        except Exception as exc:
+            logger.warning(f"Failed to save session: {exc}")
+
+    @staticmethod
+    def _mark_latest_user_turn_state(
+        self,
+        state: str,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """Mark the latest unresolved user turn as completed/interrupted/superseded."""
+        message = AgentLoop._update_session_user_turn_state(
+            getattr(self, "_session", None),
+            state,
+            reason=reason,
+        )
+        if message is None:
+            return False
+        AgentLoop._persist_session_if_possible(self)
+        return True
+
+    def _refresh_recent_turn_notice(self) -> None:
+        """Expose immediate prior interruption/supersede state to the next prompt."""
+        notice: str | None = None
+        session = getattr(self, "_session", None)
+        history_messages = (
+            session.get_messages()
+            if session is not None and hasattr(session, "get_messages")
+            else getattr(session, "messages", [])
+        )
+        if isinstance(history_messages, list):
+            for message in reversed(history_messages):
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "").strip().lower()
+                if role != "user":
+                    break
+
+                state = AgentLoop._turn_state_of_message(message)
+                if state == _TURN_STATE_INTERRUPTED:
+                    interrupted_request = self._truncate_request_for_prompt(
+                        str(message.get("content") or "").strip()
+                    )
+                    notice = (
+                        "The immediately previous user request was interrupted before completion.\n"
+                        f"[INTERRUPTED PREVIOUS REQUEST]: {interrupted_request}\n"
+                        "Resolve it against the newest user message as follows:\n"
+                        "- If the newest user message is itself a standalone actionable request, "
+                        "treat it as replacing the interrupted request.\n"
+                        "- If the newest user message only adds constraints or details to the "
+                        "interrupted request, continue the interrupted request with the new "
+                        "constraints applied.\n"
+                        "- Do not execute both as separate tasks unless the newest user message "
+                        "explicitly asks for both."
+                    )
+                elif state == _TURN_STATE_SUPERSEDED:
+                    notice = (
+                        "A previous unfinished user request was superseded by a newer request "
+                        "and is no longer pending. Execute only the newest user request unless "
+                        "it explicitly asks to resume the earlier one."
+                    )
+                break
+
+        self._recent_turn_notice = notice
+
     def _persist_user_turn_to_session(
         self,
         message: str,
@@ -1603,9 +1724,12 @@ class AgentLoop:
             self._session.add_message(
                 "user",
                 _strip_attachment_context(message, attachments or []),
+                turn_id=uuid.uuid4().hex,
+                turn_state=_TURN_STATE_PENDING,
+                turn_state_updated_at=datetime.now().isoformat(),
                 **AgentLoop._session_message_save_kwargs(media, attachments),
             )
-            self.sessions.save(self._session)
+            AgentLoop._persist_session_if_possible(self)
         except Exception as exc:
             logger.warning(f"Failed to persist user turn: {exc}")
 
@@ -1910,6 +2034,13 @@ class AgentLoop:
                     final_content = _extracted
 
             final_content = self._filter_execution_steps(final_content)
+        except asyncio.CancelledError:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
+            raise
         except Exception as e:
             import traceback
             logger.error(
@@ -1928,9 +2059,13 @@ class AgentLoop:
 
         # Save to session
         try:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_COMPLETED,
+            )
             self._persist_turn_tool_trace(_pre_turn_memory_index)
             self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
+            AgentLoop._persist_session_if_possible(self)
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
@@ -3728,6 +3863,11 @@ class AgentLoop:
         except asyncio.CancelledError:
             stream_cancelled = True
             logger.warning("Streaming cancelled")
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
             raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
@@ -3749,16 +3889,26 @@ class AgentLoop:
                     await asyncio.wait_for(bg_task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
+            if not stream_completed and not stream_cancelled:
+                AgentLoop._mark_latest_user_turn_state(
+                    self,
+                    _TURN_STATE_INTERRUPTED,
+                    reason="task_cancelled",
+                )
 
         # Save to session only if we got actual content
         if full_content and stream_completed and not stream_cancelled:
             try:
+                AgentLoop._mark_latest_user_turn_state(
+                    self,
+                    _TURN_STATE_COMPLETED,
+                )
                 # Persist intermediate tool-call artifacts generated while
                 # streaming so they remain searchable even after runtime
                 # context compaction.
                 self._persist_turn_tool_trace(_pre_turn_memory_index)
                 self._session.add_message("assistant", full_content)
-                self.sessions.save(self._session)
+                AgentLoop._persist_session_if_possible(self)
             except Exception as e:
                 logger.warning(f"Failed to save session after streaming: {e}")
 
@@ -3878,6 +4028,13 @@ class AgentLoop:
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
 
+        except asyncio.CancelledError:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
+            raise
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             raise
@@ -3891,12 +4048,16 @@ class AgentLoop:
 
         # Save to session
         try:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_COMPLETED,
+            )
             # Persist intermediate tool-call artifacts (tool results and the
             # assistant messages that called them) so they remain searchable
             # even after runtime context compaction.
             self._persist_turn_tool_trace(_pre_turn_memory_index)
             self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
+            AgentLoop._persist_session_if_possible(self)
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
@@ -4339,6 +4500,12 @@ class AgentLoop:
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
         )
+        recent_turn_notice = getattr(self, "_recent_turn_notice", None)
+        if isinstance(recent_turn_notice, str) and recent_turn_notice.strip():
+            prompt = (
+                f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
+                + prompt
+            )
         output_requirements = self._extract_output_contract_for_prompt(message)
         if output_requirements:
             prompt += output_requirements
@@ -4358,6 +4525,12 @@ class AgentLoop:
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n"
         )
+        recent_turn_notice = getattr(self, "_recent_turn_notice", None)
+        if isinstance(recent_turn_notice, str) and recent_turn_notice.strip():
+            prompt = (
+                f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
+                + prompt
+            )
         output_requirements = self._extract_output_contract_for_prompt(message)
         if output_requirements:
             prompt += output_requirements

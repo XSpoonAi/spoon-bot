@@ -483,6 +483,29 @@ class TestAgentLoopStream:
         assert "Execute only the newest user request." in prompt
         assert "stale tool sequence" in prompt
 
+    def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
+        """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+        loop._recent_turn_notice = (
+            "The immediately previous user request was interrupted before completion.\n"
+            "[INTERRUPTED PREVIOUS REQUEST]: Continue next game and choose C\n"
+            "Resolve it against the newest user message as follows:\n"
+            "- If the newest user message is itself a standalone actionable request, treat it as replacing the interrupted request.\n"
+            "- If the newest user message only adds constraints or details to the interrupted request, continue the interrupted request with the new constraints applied.\n"
+            "- Do not execute both as separate tasks unless the newest user message explicitly asks for both."
+        )
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "Continue next game and choose A")
+
+        assert "[PREVIOUS TURN STATUS]:" in prompt
+        assert "[INTERRUPTED PREVIOUS REQUEST]: Continue next game and choose C" in prompt
+        assert "standalone actionable request" in prompt
+        assert "Do not execute both as separate tasks" in prompt
+
     def test_build_request_context_prompt_skips_extra_tail_block_for_short_requests(self):
         """Short requests are already preserved whole and do not need an extra tail block."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1748,7 +1771,8 @@ class TestAgentLoopStream:
         assert chunks[-1]["type"] == "done"
         assert "error" in chunks[-1]["metadata"]
 
-        agent._session.add_message.assert_called_once_with("user", "test")
+        user_call = agent._session.add_message.call_args_list[0]
+        assert user_call.args[:2] == ("user", "test")
         agent.sessions.save.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1788,7 +1812,8 @@ class TestAgentLoopStream:
             chunks.append(chunk)
 
         # Verify session was saved
-        agent._session.add_message.assert_any_call("user", "test message")
+        user_call = agent._session.add_message.call_args_list[0]
+        assert user_call.args[:2] == ("user", "test message")
         agent._session.add_message.assert_any_call("assistant", "hello")
         assert agent.sessions.save.call_count == 2
 
@@ -1796,6 +1821,7 @@ class TestAgentLoopStream:
     async def test_stream_close_cancels_background_run_and_skips_session_save(self):
         """Closing the stream should stop the background run and avoid persisting stale output."""
         from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.session.manager import Session
 
         run_cancelled = asyncio.Event()
 
@@ -1815,8 +1841,7 @@ class TestAgentLoopStream:
         agent._agent.run = mock_run
         agent._agent.add_message = AsyncMock()
         agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
+        agent._session = Session(session_key="cancelled_stream")
         agent.sessions = MagicMock()
         agent.sessions.save = MagicMock()
         agent.memory = MagicMock()
@@ -1840,8 +1865,12 @@ class TestAgentLoopStream:
         await stream.aclose()
         await asyncio.wait_for(run_cancelled.wait(), timeout=1.0)
 
-        agent._session.add_message.assert_called_once_with("user", "test message")
-        agent.sessions.save.assert_called_once()
+        assert len(agent._session.messages) == 1
+        assert agent._session.messages[0]["role"] == "user"
+        assert agent._session.messages[0]["content"] == "test message"
+        assert agent._session.messages[0]["turn_state"] == "interrupted"
+        assert agent._session.messages[0]["turn_state_reason"] == "task_cancelled"
+        assert agent.sessions.save.call_count >= 2
 
     @pytest.mark.asyncio
     async def test_install_anti_loop_tracker_does_not_stack_previous_request_prompt(self):
