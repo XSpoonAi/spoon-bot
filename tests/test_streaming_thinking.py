@@ -547,8 +547,8 @@ class TestAgentLoopStream:
         assert "[... middle omitted to save tokens; preserve latest tail instructions ...]" in prompt
         assert "reply with exactly: final_ok" in prompt.lower()
         assert "Do not summarize." in prompt
-        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
-        assert "[LATEST REQUEST ENDING]:" in prompt
+        assert "[AUTHORITATIVE REQUEST ENDING]" not in prompt
+        assert "[LATEST REQUEST ENDING]:" not in prompt
 
     def test_build_request_context_prompt_marks_latest_turn_authoritative(self):
         """Thinking scaffolding should explicitly supersede unfinished prior plans."""
@@ -587,43 +587,8 @@ class TestAgentLoopStream:
         assert "standalone actionable request" in prompt
         assert "Do not execute both as separate tasks" in prompt
 
-    def test_build_request_context_prompt_adds_structured_scope_guidance_for_short_requests(self):
-        """Short requests should still get a structured reply-scope contract."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop.workspace = Path("/workspace")
-        loop._extract_env_for_prompt = MagicMock(return_value="")
-
-        prompt = AgentLoop._build_request_context_prompt(loop, "Return FINAL_OK")
-
-        assert "[REQUEST CONTRACT]:" in prompt
-        assert "[AUTHORITATIVE USER MESSAGE]:" in prompt
-        assert "[LATEST USER MESSAGE]: Return FINAL_OK" in prompt
-        assert "When uncertain, return less, not more." in prompt
-
-    def test_build_request_context_prompt_keeps_non_english_tail_constraints(self):
-        """Long non-English requests should preserve their tail verbatim without keyword matching."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop.workspace = Path("/workspace")
-        loop._extract_env_for_prompt = MagicMock(return_value="")
-
-        message = (
-            "Revisa el repositorio con cuidado. "
-            + ("contexto intermedio " * 40)
-            + "Al terminar, responde solo con FINAL_OK y no hagas resumen."
-        )
-
-        prompt = AgentLoop._build_request_context_prompt(loop, message)
-
-        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
-        assert "responde solo con final_ok" in prompt.lower()
-        assert "no hagas resumen" in prompt.lower()
-
-    def test_build_request_context_prompt_preserves_numbered_chinese_transfer_tail(self):
-        """Dirty-log numbered Chinese requests must remain the authoritative newest task."""
+    def test_build_request_context_prompt_keeps_latest_request_tail_without_contract_routing(self):
+        """Long requests keep the latest tail verbatim without prompt-derived contracts."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
@@ -643,65 +608,9 @@ class TestAgentLoopStream:
         prompt = AgentLoop._build_request_context_prompt(loop, message)
 
         assert "[TURN PRIORITY]:" in prompt
-        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
+        assert "[REQUEST CONTRACT]:" not in prompt
+        assert "[PREVIOUS ASSISTANT OFFER]:" not in prompt
         assert transfer_tail in prompt
-        assert "Do not answer a different question." in prompt
-        assert "replace it with a recap" in prompt
-
-    def test_build_request_context_prompt_interprets_selection_only_follow_up_from_prior_offer(self):
-        """A bare numeric follow-up should map to the immediately previous assistant offer only."""
-        from spoon_bot.agent.loop import AgentLoop
-        from spoon_bot.session.manager import Session
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop.workspace = Path("/workspace")
-        loop._extract_env_for_prompt = MagicMock(return_value="")
-        loop._session = Session(session_key="persisted")
-        loop._session.add_message(
-            "assistant",
-            "1. Transfer all GAS\n2. Generate a balance script\n3. Join the next game",
-            selection_options=[
-                "Transfer all GAS",
-                "Generate a balance script",
-                "Join the next game",
-            ],
-            message_kind="assistant_offer",
-        )
-
-        prompt = AgentLoop._build_request_context_prompt(loop, "1")
-
-        assert "[PREVIOUS ASSISTANT OFFER]:" in prompt
-        assert "[USER SELECTION]: 1" in prompt
-        assert "[SELECTED OPTION]: 1. Transfer all GAS" in prompt
-        assert "Do not revive unrelated earlier tasks" in prompt
-
-    def test_history_rehydrate_scope_selection_only_requires_prior_offer(self):
-        """Bare numeric follow-ups should not rehydrate recent assistant prose unless it was an offer."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        no_offer_history = [
-            {"role": "assistant", "content": "OK", "message_kind": "assistant_reply"},
-            {"role": "user", "content": "2"},
-        ]
-        offer_history = [
-            {
-                "role": "assistant",
-                "content": "1. A\n2. B",
-                "message_kind": "assistant_offer",
-                "selection_options": ["A", "B"],
-            },
-            {"role": "user", "content": "2"},
-        ]
-
-        assert (
-            AgentLoop._history_rehydrate_scope("2", history_messages=no_offer_history)
-            == "minimal"
-        )
-        assert (
-            AgentLoop._history_rehydrate_scope("2", history_messages=offer_history)
-            == "recent"
-        )
-
     def test_build_step_prompt_marks_latest_turn_authoritative(self):
         """Per-step prompts should make the newest user task override prior execution plans."""
         from spoon_bot.agent.loop import AgentLoop
@@ -716,154 +625,21 @@ class TestAgentLoopStream:
         assert "Execute only the newest user request." in prompt
         assert "[USER REQUEST]: Fix the bug now." in prompt
 
-    def test_finalize_response_content_parameterizes_skeleton_literals_and_drops_forbidden_lines(self):
-        """Strict skeleton replies should keep only code and replace invented environment literals."""
+    def test_finalize_response_content_only_filters_execution_steps(self):
+        """Finalization should not rewrite output based on prompt keywords."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
-        loop._agent = MagicMock()
-        loop._agent.memory = MagicMock()
-        loop._agent.memory.messages = []
-
-        message = (
-            "只做最新这句：生成一个 Python 脚本骨架，用于查询 NeoX 测试网上指定地址的 NEO 和 GAS 余额。"
-            "不要转账，不要总结游戏，不要提钱包现状，不要其他内容。"
-        )
-        dirty = (
-            "当前钱包现状：GAS=0.2785\n"
-            "```python\n"
-            "RPC_URL = \"https://neoxt4seed1.ngd.network:443\"\n"
-            "TARGET_ADDRESS = \"NiNmXL8FjEUEs1nfX9uHFBNaenxDHJtmuB\"\n"
-            "TOKEN_HASH = \"0xd2a4cff31913016155e38e474a2c06d08be276cf\"\n"
-            "print('balance')\n"
-            "```\n"
-            "不要再管游戏总结。"
-        )
-
-        contract = AgentLoop._derive_request_contract(message)
-        cleaned = AgentLoop._finalize_response_content(
-            loop,
-            message,
-            dirty,
-            turn_memory_start_index=0,
-        )
-
-        assert contract["strict_reply_only"] is True
-        assert contract["wants_code_skeleton"] is True
-        assert "钱包现状" not in cleaned
-        assert "游戏总结" not in cleaned
-        assert "neoxt4seed1" not in cleaned
-        assert "NiNmXL8FjEUEs1nfX9uHFBNaenxDHJtmuB" not in cleaned
-        assert "0xd2a4cff31913016155e38e474a2c06d08be276cf" not in cleaned
-        assert "YOUR_RPC_URL" in cleaned
-        assert "YOUR_ADDRESS" in cleaned
-        assert "YOUR_HEX_VALUE" in cleaned
-        assert cleaned.startswith("```python")
-
-    def test_finalize_response_content_extracts_filename_and_shebang_only(self):
-        """Filename + shebang only requests should drop prose and code body."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop._agent = MagicMock()
-        loop._agent.memory = MagicMock()
-        loop._agent.memory.messages = []
-
-        message = "只返回这个脚本的文件名和 shebang，不要其他内容。"
-        dirty = (
-            "下面是结果：\n"
-            "filename: query_neox_balances.py\n"
-            "```python\n"
-            "#!/usr/bin/env python3\n"
-            "import os\n"
-            "print('hello')\n"
-            "```\n"
-            "其余说明省略。"
-        )
+        content = "Step 1: Observed output of cmd: ignored\n\nActual answer"
 
         cleaned = AgentLoop._finalize_response_content(
             loop,
-            message,
-            dirty,
+            "只回答 OK",
+            content,
             turn_memory_start_index=0,
         )
 
-        assert cleaned == "query_neox_balances.py\n#!/usr/bin/env python3"
-
-    def test_finalize_response_content_strips_meta_and_compresses_strict_short_reply(self):
-        """Strict short replies should drop meta narration and honor a hard char budget."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop._agent = MagicMock()
-        loop._agent.memory = MagicMock()
-        loop._agent.memory.messages = []
-
-        message = "不要脚本了，只告诉我上海今天天气，最多10个字，不要其他内容。"
-        dirty = (
-            "I need to get weather information for Shanghai today. "
-            "Let me check what tools are available for weather data."
-            "上海今天多云，13-22度。"
-        )
-
-        cleaned = AgentLoop._finalize_response_content(
-            loop,
-            message,
-            dirty,
-            turn_memory_start_index=0,
-        )
-
-        contract = AgentLoop._derive_request_contract(message)
-
-        assert contract["expects_code_output"] is False
-        assert cleaned == "上海多云13-22度"
-
-    def test_finalize_response_content_keeps_only_numbered_menu_lines(self):
-        """Numbered-menu-only requests should drop intro prose and preserve only options."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop._agent = MagicMock()
-        loop._agent.memory = MagicMock()
-        loop._agent.memory.messages = []
-
-        message = "把下面三项只列成编号菜单，不要执行：1. A 2. B 3. C"
-        dirty = "根据您的要求，以下是编号菜单：\n\n1. A\n2. B\n3. C"
-
-        cleaned = AgentLoop._finalize_response_content(
-            loop,
-            message,
-            dirty,
-            turn_memory_start_index=0,
-        )
-
-        assert cleaned == "1. A\n2. B\n3. C"
-
-    def test_finalize_response_content_honors_exact_literal_reply_contract(self):
-        """Literal-only reply requests should override stale nearby content."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop._agent = MagicMock()
-        loop._agent.memory = MagicMock()
-        loop._agent.memory.messages = []
-
-        message = "只回答 OK"
-        dirty = "上海今天多云13-22度"
-
-        cleaned = AgentLoop._finalize_response_content(
-            loop,
-            message,
-            dirty,
-            turn_memory_start_index=0,
-        )
-
-        contract = AgentLoop._derive_request_contract(message)
-
-        assert contract["strict_reply_only"] is True
-        assert contract["exact_literal_output"] == "OK"
-        assert cleaned == "OK"
-
+        assert cleaned == "Actual answer"
     def test_prepare_agent_for_new_turn_clears_stale_runtime_state(self):
         """A new turn should not inherit unfinished runtime state from the prior task."""
         from spoon_bot.agent.loop import AgentLoop
@@ -2056,13 +1832,10 @@ class TestAgentLoopStream:
         done_chunks = [c for c in remaining_chunks if c["type"] == "done"]
 
         assert len(content_chunks) == 1
-        assert content_chunks[0]["metadata"]["buffered"] is True
-        assert "钱包现状" not in content_chunks[0]["delta"]
-        assert "neoxt4seed1" not in content_chunks[0]["delta"]
-        assert "YOUR_RPC_URL" in content_chunks[0]["delta"]
-        assert "YOUR_ADDRESS" in content_chunks[0]["delta"]
+        assert "buffered" not in content_chunks[0]["metadata"]
+        assert content_chunks[0]["delta"] == raw_reply
         assert len(done_chunks) == 1
-        assert done_chunks[0]["metadata"]["content"] == content_chunks[0]["delta"]
+        assert done_chunks[0]["metadata"]["content"] == raw_reply
 
     @pytest.mark.asyncio
     async def test_stream_error_handling(self):

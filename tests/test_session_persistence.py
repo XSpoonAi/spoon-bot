@@ -442,7 +442,7 @@ class TestAgentLoopSessionHydration:
         )
 
     @pytest.mark.asyncio
-    async def test_runtime_history_rehydrates_structured_assistant_offers(self, tmp_dir: Path):
+    async def test_runtime_history_skips_stale_assistant_prose_by_default(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
 
@@ -458,29 +458,13 @@ class TestAgentLoopSessionHydration:
         loop._session.add_message(
             "assistant",
             "1. Transfer all GAS\n2. Generate a balance script\n3. Join the next game",
-            selection_options=[
-                "Transfer all GAS",
-                "Generate a balance script",
-                "Join the next game",
-            ],
-            message_kind="assistant_offer",
+            message_kind="assistant_reply",
         )
 
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
-        assert injected == 2
-        assert loop._agent.calls == [
-            ("user", "What can you do next?", {}),
-            (
-                "assistant",
-                "[previous assistant offer retained only for explicit follow-up selection]\n"
-                "1. Transfer all GAS\n"
-                "2. Generate a balance script\n"
-                "3. Join the next game",
-                {},
-            ),
-        ]
-
+        assert injected == 1
+        assert loop._agent.calls == [("user", "What can you do next?", {})]
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
