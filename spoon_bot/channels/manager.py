@@ -1074,6 +1074,14 @@ class ChannelManager:
                     "reply_to": message.message_id,
                     "attachments": attachments,
                 }
+                set_subagent_context = getattr(agent, "set_subagent_context", None)
+                if callable(set_subagent_context):
+                    set_subagent_context(
+                        session_key=session_key,
+                        channel=message.channel,
+                        metadata=message.metadata.copy(),
+                        reply_to=message.message_id,
+                    )
                 if reasoning_effort:
                     process_kwargs["reasoning_effort"] = reasoning_effort
                 if thinking_enabled:

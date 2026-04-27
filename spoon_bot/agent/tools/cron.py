@@ -1005,12 +1005,10 @@ class CronTool(Tool):
             return job.conversation_scope.session_key == current_session_key
 
         if binding is None:
-            if (
-                current_session_key
-                and job.target_mode in {"session", "current"}
-                and job.session_key == current_session_key
-            ):
+            if not current_session_key:
                 return True
+            if job.target_mode in {"session", "current"}:
+                return job.session_key == current_session_key
             return True
 
         if job.delivery is not None:

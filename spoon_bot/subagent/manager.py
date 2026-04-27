@@ -231,6 +231,7 @@ class SubagentManager:
             effective.tool_profile = default_tool_profile
 
         effective.thinking_level = normalize_thinking_level(effective.thinking_level)
+        effective.auto_route = False
 
         return effective
 
@@ -774,7 +775,7 @@ class SubagentManager:
         text = cls._strip_sender_prefix(message)
         patterns = [
             re.compile(
-                r"^(?:请|帮我|麻烦你|请你)?创建(?:一个|个)?(?:专门的|持久的)?\s*(?:subagent|sub agent|子代理)\s*(?:来|用于|负责|专门处理|专门做)?(?P<body>.+)$",
+                r"^(?:(?:请|帮我|麻烦你|请你)\s*)*创建(?:一个|个)?(?:专门的|持久的|持久)?\s*(?:subagent|sub agent|子代理)\s*(?P<body>.+)$",
                 re.IGNORECASE,
             ),
             re.compile(
@@ -786,7 +787,11 @@ class SubagentManager:
             match = pattern.match(text)
             if not match:
                 continue
-            body = match.group("body").strip().strip("。.!? ")
+            body = match.group("body").strip()
+            body = re.sub(r"^[,，:：;\s-]+", "", body)
+            body = re.sub(r"^(?:专门|主要|以后|今后)\s*", "", body, flags=re.IGNORECASE)
+            body = re.sub(r"^(?:来|用来|用于|负责)\s*", "", body, flags=re.IGNORECASE)
+            body = body.strip().strip("。.!? ")
             if not body:
                 return None
             profile = cls._infer_persistent_subagent_profile(body)
@@ -1537,73 +1542,8 @@ class SubagentManager:
         return record
 
     def find_best_auto_route_specialist(self, task: str) -> dict[str, Any] | None:
-        """Return the best persistent subagent profile for *task*, or None."""
-        candidates: list[dict[str, Any]] = []
-        profiles: dict[str, PersistentSubagentProfile] = dict(self._persistent_profiles)
-        for record in self.registry.list_all():
-            agent_name = self._record_agent_name(record)
-            if (
-                agent_name
-                and agent_name not in profiles
-                and self._record_spawn_mode(record) == SpawnMode.SESSION
-                and record.config.auto_route
-            ):
-                profiles[agent_name] = PersistentSubagentProfile.from_subagent_config(
-                    name=agent_name,
-                    config=record.config,
-                    created_at=record.created_at,
-                    last_active_at=record.completed_at or record.started_at or record.created_at,
-                    last_run_agent_id=record.agent_id,
-                    last_run_state=record.state.value,
-                    session_key=record.session_key,
-                )
-
-        for profile in profiles.values():
-            if not profile.auto_route:
-                continue
-            score, strong_signal, reasons = self._score_specialist_match(
-                message=task,
-                profile=profile,
-            )
-            if score <= 0:
-                continue
-            candidates.append({
-                "profile": profile,
-                "agent_name": profile.name,
-                "score": score,
-                "strong_signal": strong_signal,
-                "reasons": reasons,
-            })
-
-        if not candidates:
-            return None
-
-        candidates.sort(
-            key=lambda item: (
-                item["score"],
-                len(item["reasons"]),
-                item["profile"].created_at,
-            ),
-            reverse=True,
-        )
-        best = candidates[0]
-        if not best["strong_signal"] or best["score"] < 7:
-            return None
-        if len(candidates) > 1 and candidates[1]["score"] >= best["score"] - 2:
-            logger.info(
-                "Persistent specialist routing skipped due to ambiguous match: "
-                f"{best['agent_name']} score={best['score']} vs "
-                f"{candidates[1]['agent_name']} score={candidates[1]['score']}"
-            )
-            return None
-
-        return {
-            "agent_name": best["agent_name"],
-            "score": best["score"],
-            "reasons": best["reasons"],
-            "specialization": best["profile"].specialization,
-            "profile": best["profile"],
-        }
+        """Prompt-based persistent subagent auto-routing is disabled."""
+        return None
 
     def create_persistent_subagent(
         self,
@@ -1618,7 +1558,7 @@ class SubagentManager:
         cfg = (config.model_copy(deep=True) if config else SubagentConfig())
         cfg.thinking_level = normalize_thinking_level(cfg.thinking_level)
         cfg.spawn_mode = SpawnMode.SESSION
-        cfg.auto_route = True if config is None else cfg.auto_route
+        cfg.auto_route = False
         cfg.specialization = cfg.specialization or profile["specialization"]
         if config is None or cfg.tool_profile == "core":
             cfg.tool_profile = profile["tool_profile"]

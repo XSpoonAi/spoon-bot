@@ -300,6 +300,7 @@ class FileSessionStore(SessionStore):
     def save_session(self, session: Session) -> None:
         path = self._path(session.session_key)
         try:
+            self._dir.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 for msg in session.messages:
                     fh.write(json.dumps(msg, ensure_ascii=False) + "\n")

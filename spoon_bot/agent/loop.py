@@ -1,4 +1,4 @@
-﻿"""
+"""
 Agent loop: the core processing engine using spoon-core SDK.
 
 This module provides the main agent interface, integrating spoon-core's
@@ -88,6 +88,7 @@ from spoon_bot.agent.tools.history_search import SearchHistoryTool
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_owner,
     build_tool_owner_key,
+    clear_captured_tool_outputs,
     capture_tool_outputs,
     consume_captured_tool_output,
     normalize_tool_arguments,
@@ -1301,7 +1302,57 @@ class AgentLoop:
                 f"{len(unique_refs)} already-known ref(s)"
             )
 
-    async def _sync_runtime_history_from_session(self) -> int:
+    @staticmethod
+    def _message_token_count(message: str) -> int:
+        """Approximate token count for lightweight history-scope decisions."""
+        return len(re.findall(r"[0-9A-Za-z\u4e00-\u9fff]+", message or ""))
+
+    @classmethod
+    def _history_rehydrate_scope(
+        cls,
+        upcoming_message: str | None,
+        *,
+        history_messages: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Choose how much prior session history should enter the runtime context."""
+        normalized = (upcoming_message or "").strip()
+        if not normalized:
+            return "full"
+        if cls._is_selection_only_message(normalized):
+            previous_assistant = cls._latest_previous_assistant_message_from_history(
+                history_messages
+            )
+            if cls._assistant_selection_options_from_message(previous_assistant):
+                return "recent"
+            return "minimal"
+        if len(normalized) <= 24 or cls._message_token_count(normalized) <= 3:
+            return "recent"
+        return "minimal"
+
+    @staticmethod
+    def _recent_history_start_index(history_messages: list[dict[str, Any]], *, user_turns: int) -> int:
+        """Return the index where the last N user turns begin."""
+        user_indices = [
+            index
+            for index, message in enumerate(history_messages)
+            if isinstance(message, dict)
+            and str(message.get("role") or "").strip().lower() == "user"
+            and AgentLoop._turn_state_of_message(message) not in {
+                _TURN_STATE_INTERRUPTED,
+                _TURN_STATE_SUPERSEDED,
+            }
+        ]
+        if not user_indices:
+            return 0
+        if len(user_indices) <= user_turns:
+            return user_indices[0]
+        return user_indices[-user_turns]
+
+    async def _sync_runtime_history_from_session(
+        self,
+        *,
+        upcoming_message: str | None = None,
+    ) -> int:
         """Sync persisted session history into spoon-core runtime memory."""
         if not self._agent:
             return 0
@@ -1322,6 +1373,18 @@ class AgentLoop:
             if hasattr(self._session, "get_messages")
             else self._session.get_history()
         )
+        if not isinstance(history_messages, list):
+            history_messages = []
+
+        rehydrate_scope = AgentLoop._history_rehydrate_scope(
+            upcoming_message,
+            history_messages=history_messages,
+        )
+        if rehydrate_scope == "minimal":
+            history_messages = []
+        elif rehydrate_scope == "recent":
+            start_index = AgentLoop._recent_history_start_index(history_messages, user_turns=1)
+            history_messages = history_messages[start_index:]
 
         try:
             from spoon_ai.schema import Function as _CoreFunction  # noqa: F401
@@ -1379,7 +1442,19 @@ class AgentLoop:
             }:
                 continue
 
-            content = msg.get("content", "")
+            assistant_tool_calls = None
+            if role == "assistant":
+                assistant_tool_calls = _rehydrate_tool_calls(msg.get("tool_calls"))
+                if assistant_tool_calls is None:
+                    assistant_rehydrated = AgentLoop._rehydrate_assistant_reply_content(msg)
+                    if not assistant_rehydrated:
+                        continue
+                    content = assistant_rehydrated
+                else:
+                    content = msg.get("content", "")
+            else:
+                content = msg.get("content", "")
+
             if not isinstance(content, str):
                 try:
                     content = json.dumps(content, ensure_ascii=False)
@@ -1424,9 +1499,8 @@ class AgentLoop:
                 if tool_name:
                     extra_kwargs["tool_name"] = str(tool_name)
             elif role == "assistant":
-                rehydrated = _rehydrate_tool_calls(msg.get("tool_calls"))
-                if rehydrated:
-                    extra_kwargs["tool_calls"] = rehydrated
+                if assistant_tool_calls:
+                    extra_kwargs["tool_calls"] = assistant_tool_calls
 
             try:
                 await self._agent.add_message(role, content, **extra_kwargs)
@@ -1439,7 +1513,7 @@ class AgentLoop:
 
         return injected_count
 
-    async def _prepare_request_context(self) -> None:
+    async def _prepare_request_context(self, upcoming_message: str | None = None) -> None:
         """Prepare request context by injecting persisted history into runtime memory.
 
         Persisted history (``self._session.messages``) is the authoritative
@@ -1451,7 +1525,20 @@ class AgentLoop:
         """
         self._refresh_recent_turn_notice()
         trimmed_count = self._trim_context_if_needed()
-        injected_count = await self._sync_runtime_history_from_session()
+        session_history = (
+            self._session.get_messages()
+            if hasattr(self._session, "get_messages")
+            else self._session.get_history()
+        )
+        if not isinstance(session_history, list):
+            session_history = []
+        rehydrate_scope = AgentLoop._history_rehydrate_scope(
+            upcoming_message,
+            history_messages=session_history,
+        )
+        injected_count = await self._sync_runtime_history_from_session(
+            upcoming_message=upcoming_message
+        )
 
         # Repair tool-call ordering after history injection - session storage
         # may not preserve tool_call_id metadata, producing orphaned tool
@@ -1494,7 +1581,7 @@ class AgentLoop:
             f"Session context prepared: session={self.session_key}, "
             f"injected_messages={injected_count}, "
             f"runtime_tokens~{runtime_tokens}, session_tokens~{session_tokens}, "
-            f"trimmed_messages={trimmed_count}"
+            f"trimmed_messages={trimmed_count}, rehydrate_scope={rehydrate_scope}"
             + (f", repaired_tool_order={repaired}" if repaired else "")
             + (f", compressed_actions={compressed}" if compressed else "")
         )
@@ -1635,6 +1722,397 @@ class AgentLoop:
         return text_content
 
     @staticmethod
+    def _selection_token_value(message: str) -> int | None:
+        """Return the selected ordinal when the newest user message is selection-only."""
+        normalized = (message or "").strip()
+        if not normalized:
+            return None
+
+        compact = re.sub(r"\s+", "", normalized)
+        match = re.fullmatch(r"[\(\[（【]?(\d{1,2})[\]\)）】]?[\.、:：-]?", compact)
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _is_selection_only_message(cls, message: str) -> bool:
+        """True when the newest user message only selects a prior enumerated option."""
+        return cls._selection_token_value(message) is not None
+
+    @staticmethod
+    def _strip_display_formatting(text: str) -> str:
+        """Remove lightweight markdown formatting from persisted assistant options."""
+        cleaned = (text or "").strip()
+        replacements = (
+            (r"`([^`]+)`", r"\1"),
+            (r"\*\*([^*]+)\*\*", r"\1"),
+            (r"__([^_]+)__", r"\1"),
+            (r"\*([^*]+)\*", r"\1"),
+            (r"_([^_]+)_", r"\1"),
+        )
+        for pattern, replacement in replacements:
+            cleaned = re.sub(pattern, replacement, cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @classmethod
+    def _extract_selection_options_from_text(
+        cls,
+        content: str,
+        *,
+        max_options: int = 8,
+    ) -> list[str]:
+        """Extract numbered option lines from an assistant reply."""
+        normalized = (content or "").replace("\r\n", "\n")
+        if not normalized.strip():
+            return []
+
+        options_by_index: dict[int, str] = {}
+        for raw_line in normalized.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.match(r"^(\d{1,2})\s*[\.\)、:：-]?\s*(.+?)\s*$", line)
+            if match is None:
+                continue
+            index = int(match.group(1))
+            option_text = cls._strip_display_formatting(match.group(2))
+            if not option_text:
+                continue
+            if index < 1 or index > max_options:
+                continue
+            options_by_index.setdefault(index, option_text)
+
+        if len(options_by_index) < 2 or 1 not in options_by_index:
+            return []
+
+        ordered_indices = sorted(options_by_index)
+        expected_indices = list(range(1, ordered_indices[-1] + 1))
+        if ordered_indices != expected_indices:
+            return []
+        return [options_by_index[index] for index in ordered_indices]
+
+    @staticmethod
+    def _request_prefers_minimal_output(message: str) -> bool:
+        """Return True when the newest request asks for a narrow literal output shape."""
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+        patterns = (
+            r"\bonly return\b",
+            r"\breturn only\b",
+            r"\bonly output\b",
+            r"\bonly say\b",
+            r"\breply only\b",
+            r"\bjust return\b",
+            r"\bno other content\b",
+            r"\bnothing else\b",
+            r"只返回",
+            r"仅返回",
+            r"只输出",
+            r"仅输出",
+            r"只回答",
+            r"仅回答",
+            r"只说",
+            r"仅说",
+            r"不要其他内容",
+            r"别的都不要",
+            r"不要多余",
+        )
+        return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+    @staticmethod
+    def _has_non_negated_token(message: str, tokens: tuple[str, ...]) -> bool:
+        """Return True when any token appears outside an explicit negative context."""
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+        for token in tokens:
+            escaped = re.escape(token.lower())
+            for match in re.finditer(escaped, normalized):
+                prefix = normalized[max(0, match.start() - 16):match.start()]
+                if re.search(
+                    r"(?:不要|别|不需要|不用|不是|without|no|not|don't|do not)\s*$",
+                    prefix,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+                return True
+        return False
+
+    @classmethod
+    def _request_wants_code_response(cls, message: str) -> bool:
+        """Return True when the newest request is asking for code or a script."""
+        tokens = (
+            "script",
+            "code",
+            "python",
+            "javascript",
+            "typescript",
+            "bash",
+            "shell script",
+            "脚本",
+            "代码",
+            "程序",
+            "shebang",
+            "#!",
+        )
+        return cls._has_non_negated_token(message, tokens)
+
+    @classmethod
+    def _request_wants_code_skeleton(cls, message: str) -> bool:
+        """Return True when the newest request explicitly asks for a code skeleton/template."""
+        tokens = (
+            "skeleton",
+            "scaffold",
+            "template",
+            "stub",
+            "boilerplate",
+            "骨架",
+            "模板",
+            "框架",
+        )
+        return cls._has_non_negated_token(message, tokens)
+
+    @classmethod
+    def _request_requires_filename_and_shebang_only(cls, message: str) -> bool:
+        """Return True when the user asks for only filename + shebang."""
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+        has_filename = any(token in normalized for token in ("filename", "file name", "文件名"))
+        has_shebang = "shebang" in normalized or "#!" in message
+        return has_filename and has_shebang and cls._request_prefers_minimal_output(message)
+
+    @staticmethod
+    def _request_wants_numbered_menu(message: str) -> bool:
+        """Return True when the user asks for a numbered menu/list only."""
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return False
+
+        has_menu_shape = any(
+            token in normalized
+            for token in (
+                "numbered menu",
+                "numbered list",
+                "menu",
+                "菜单",
+                "编号",
+                "选项",
+                "列成",
+            )
+        )
+        has_only_list_guard = any(
+            token in normalized
+            for token in (
+                "only list",
+                "just list",
+                "do not execute",
+                "don't execute",
+                "不要执行",
+                "别执行",
+                "只列",
+                "仅列",
+            )
+        )
+        has_enumerated_examples = (
+            re.search(r"(?:^|[\s:：])1[\.\)、:：-]?\s*", normalized) is not None
+            and re.search(r"(?:^|[\s:：])2[\.\)、:：-]?\s*", normalized) is not None
+        )
+        return has_menu_shape and (has_only_list_guard or has_enumerated_examples)
+
+    @staticmethod
+    def _request_max_output_chars(message: str) -> int | None:
+        """Extract a hard character budget from the newest user message when present."""
+        normalized = (message or "").strip().lower()
+        if not normalized:
+            return None
+
+        patterns = (
+            r"(?:最多|不超过|不多于|至多)\s*(\d{1,3})\s*(?:个)?(?:字|字符)",
+            r"(?:at most|no more than|within)\s*(\d{1,3})\s*(?:characters|chars?)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match is None:
+                continue
+            try:
+                value = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= value <= 500:
+                return value
+        return None
+
+    @staticmethod
+    def _extract_exact_reply_literal(message: str) -> str | None:
+        """Extract a short literal-only reply target such as `OK` when explicitly requested."""
+        normalized = (message or "").strip()
+        if not normalized:
+            return None
+
+        patterns = (
+            r"^\s*(?:请\s*)?(?:只回答|仅回答|只返回|仅返回|只输出|仅输出|只说|仅说)\s*[\"'`“”‘’]?([A-Za-z0-9_.:-]{1,32})[\"'`“”‘’]?\s*(?:[,，。.!！?？]\s*(?:不要其他内容|别的都不要))?\s*$",
+            r"^\s*(?:reply|answer|return|output)\s+only(?:\s+with)?\s+[\"'`]?([A-Za-z0-9_.:-]{1,32})[\"'`]?\s*(?:[,.;!?]\s*(?:nothing else|no other content))?\s*$",
+            r"^\s*(?:only say|just return)\s+[\"'`]?([A-Za-z0-9_.:-]{1,32})[\"'`]?\s*$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match is None:
+                continue
+            literal = match.group(1).strip().strip("`\"'“”‘’")
+            if literal:
+                return literal
+        return None
+
+    @classmethod
+    def _extract_forbidden_output_terms(
+        cls,
+        message: str,
+        *,
+        max_terms: int = 8,
+    ) -> list[str]:
+        """Extract explicit "do not mention/include" targets from the newest request."""
+        normalized = (message or "").replace("\r\n", "\n")
+        if not normalized.strip():
+            return []
+
+        raw_terms = re.findall(r"不要([^，。；;!\n]+)", normalized)
+        raw_terms.extend(
+            re.findall(r"(?:do not|don't)\s+([^,.;!\n]+)", normalized, flags=re.IGNORECASE)
+        )
+
+        cleaned_terms: list[str] = []
+        generic_terms = {
+            "其他内容",
+            "多余内容",
+            "other content",
+            "anything else",
+            "extra content",
+            "解释",
+            "说明",
+            "summary",
+        }
+
+        for raw in raw_terms:
+            term = cls._strip_display_formatting(str(raw))
+            term = re.sub(r"^(?:再|继续)\s*", "", term, flags=re.IGNORECASE)
+            term = re.sub(
+                r"^(?:提|说|写|包含|输出|返回|总结|执行|mention|include|return|output|"
+                r"summarize|talk about|write)\s*",
+                "",
+                term,
+                flags=re.IGNORECASE,
+            )
+            term = term.strip(" :：-")
+            if not term:
+                continue
+            if term.lower() in generic_terms:
+                continue
+            if term not in cleaned_terms:
+                cleaned_terms.append(term)
+            if len(cleaned_terms) >= max_terms:
+                break
+
+        return cleaned_terms
+
+    @classmethod
+    def _derive_request_contract(cls, message: str) -> dict[str, Any]:
+        """Build a structured per-turn scope contract for the newest user request."""
+        return {
+            "version": 3,
+            "selection_only": cls._is_selection_only_message(message),
+            "strict_reply_only": cls._request_prefers_minimal_output(message),
+            "expects_code_output": cls._request_wants_code_response(message),
+            "wants_code_skeleton": cls._request_wants_code_skeleton(message),
+            "filename_and_shebang_only": cls._request_requires_filename_and_shebang_only(
+                message
+            ),
+            "wants_numbered_menu": cls._request_wants_numbered_menu(message),
+            "max_output_chars": cls._request_max_output_chars(message),
+            "exact_literal_output": cls._extract_exact_reply_literal(message),
+            "forbidden_terms": cls._extract_forbidden_output_terms(message),
+            "authoritative_source": "newest_user_message",
+            "prior_assistant_synthesis": "explicit_reference_only",
+            "prior_tool_facts": "explicit_reference_or_current_turn_evidence",
+            "parameterize_unverified_literals": True,
+            "ambiguity_policy": "prefer_less_output",
+        }
+
+    @classmethod
+    def _assistant_session_save_kwargs(cls, content: str) -> dict[str, Any]:
+        """Persist assistant replies with lightweight structure for later turns."""
+        options = cls._extract_selection_options_from_text(content)
+        save_kwargs: dict[str, Any] = {"message_kind": "assistant_reply"}
+        if len(options) >= 2:
+            save_kwargs["message_kind"] = "assistant_offer"
+            save_kwargs["selection_options"] = options
+        return save_kwargs
+
+    @classmethod
+    def _assistant_selection_options_from_message(cls, message: Any) -> list[str]:
+        """Resolve stored or inferred selection options from a persisted assistant turn."""
+        if not isinstance(message, dict):
+            return []
+        raw = message.get("selection_options")
+        if isinstance(raw, list):
+            options = [str(item).strip() for item in raw if str(item).strip()]
+            if len(options) >= 2:
+                return options
+        return cls._extract_selection_options_from_text(str(message.get("content") or ""))
+
+    @classmethod
+    def _rehydrate_assistant_reply_content(cls, message: Any) -> str | None:
+        """Return a compact assistant replay payload or skip non-authoritative prose."""
+        options = cls._assistant_selection_options_from_message(message)
+        if len(options) < 2:
+            return None
+        rendered = "\n".join(
+            f"{index}. {option}"
+            for index, option in enumerate(options, start=1)
+        )
+        return (
+            "[previous assistant offer retained only for explicit follow-up selection]\n"
+            f"{rendered}"
+        )
+
+    @staticmethod
+    def _latest_previous_assistant_message_from_history(
+        messages: list[dict[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        """Return the assistant reply immediately preceding the current user turn."""
+        if not isinstance(messages, list):
+            return None
+
+        saw_current_user = False
+        latest_assistant: dict[str, Any] | None = None
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role == "assistant" and latest_assistant is None:
+                latest_assistant = message
+            if not saw_current_user:
+                if role == "user":
+                    saw_current_user = True
+                continue
+            if role == "assistant":
+                return message
+            if role == "user":
+                break
+        return latest_assistant
+
+    @classmethod
+    def _latest_previous_assistant_message(cls, session: Any) -> dict[str, Any] | None:
+        """Return the assistant reply immediately preceding the current user turn."""
+        return cls._latest_previous_assistant_message_from_history(
+            getattr(session, "messages", None)
+        )
+
+    @staticmethod
     def _session_message_save_kwargs(
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
@@ -1772,6 +2250,7 @@ class AgentLoop:
                 turn_id=uuid.uuid4().hex,
                 turn_state=_TURN_STATE_PENDING,
                 turn_state_updated_at=datetime.now().isoformat(),
+                request_contract=AgentLoop._derive_request_contract(message),
                 **AgentLoop._session_message_save_kwargs(media, attachments),
             )
             AgentLoop._persist_session_if_possible(self)
@@ -1837,8 +2316,9 @@ class AgentLoop:
     def _should_skip_specialist_auto_route(self, message: str) -> bool:
         """Return True when the current message should not be auto-routed."""
         stripped = message.lstrip()
+        session_key = str(getattr(self, "session_key", "") or "")
         return (
-            self.session_key.startswith("subagent-")
+            session_key.startswith("subagent-")
             or stripped.startswith("[Sub-agent Completed]")
         )
 
@@ -1849,21 +2329,24 @@ class AgentLoop:
         """Create a persistent subagent from a natural-language user request."""
         if self._should_skip_specialist_auto_route(message):
             return None
-        parsed = self._subagent_manager.parse_persistent_subagent_request(message)
+        manager = getattr(self, "_subagent_manager", None)
+        if manager is None:
+            return None
+        parsed = manager.parse_persistent_subagent_request(message)
         if parsed is None:
             return None
 
-        profile = self._subagent_manager.create_persistent_subagent(
+        profile = manager.create_persistent_subagent(
             description=parsed["specialization"],
         )
         keywords = ", ".join(profile.match_keywords[:8]) or "(none)"
         response = (
             f"Persistent subagent `{profile.name}` created.\n"
             f"Specialization: {profile.specialization}\n"
-            f"Auto-route: {'ON' if profile.auto_route else 'OFF'}\n"
+            "Auto-route: OFF\n"
             f"Tool profile: {profile.tool_profile}\n"
             f"Keywords: {keywords}\n\n"
-            "Future matching requests will be routed to this subagent automatically."
+            "Future requests will stay on the main agent unless you explicitly invoke this subagent."
         )
         return response
 
@@ -1875,7 +2358,11 @@ class AgentLoop:
         if self._should_skip_specialist_auto_route(message):
             return None
 
-        matched = self._subagent_manager.find_best_auto_route_specialist(message)
+        manager = getattr(self, "_subagent_manager", None)
+        if manager is None:
+            return None
+
+        matched = manager.find_best_auto_route_specialist(message)
         if matched is None:
             return None
 
@@ -1886,21 +2373,21 @@ class AgentLoop:
             f"(score={matched['score']}; {reason_text})"
         )
 
-        current_channel = getattr(self._subagent_manager, "_current_spawner_channel", None)
-        current_metadata = getattr(self._subagent_manager, "_current_spawner_metadata", {})
-        current_reply_to = getattr(self._subagent_manager, "_current_spawner_reply_to", None)
-        record = await self._subagent_manager.dispatch_persistent_subagent(
+        current_channel = getattr(manager, "_current_spawner_channel", None)
+        current_metadata = getattr(manager, "_current_spawner_metadata", {})
+        current_reply_to = getattr(manager, "_current_spawner_reply_to", None)
+        record = await manager.dispatch_persistent_subagent(
             agent_name=agent_name,
             task=message,
-            spawner_session_key=self.session_key,
+            spawner_session_key=getattr(self, "session_key", "default"),
             spawner_channel=current_channel,
             spawner_metadata=current_metadata,
             spawner_reply_to=current_reply_to,
         )
         wait_timeout = float(record.config.timeout_seconds or 300)
-        results = await self._subagent_manager.collect_results(
+        results = await manager.collect_results(
             timeout=wait_timeout,
-            spawner_session_key=self.session_key,
+            spawner_session_key=getattr(self, "session_key", "default"),
             agent_id=record.agent_id,
             run_id=record.run_id,
         )
@@ -1953,11 +2440,7 @@ class AgentLoop:
         message: str,
     ) -> tuple[str, str | None] | None:
         """Backward-compatible wrapper without source metadata."""
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if routed is None:
-            return None
-        response, note, _source = routed
-        return response, note
+        return None
 
     def _current_tool_owner_key(self, session_key: str | None = None) -> str:
         """Resolve a user-scoped ownership key for background tool jobs."""
@@ -2094,7 +2577,10 @@ class AgentLoop:
     ) -> Any:
         """Retry once after deliberate runtime compaction on context overflow."""
         try:
-            return await retry_runner(label=label, **run_kwargs)
+            result = await retry_runner(label=label, **run_kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
         except Exception as exc:
             if not is_context_overflow_error(exc):
                 raise
@@ -2124,7 +2610,10 @@ class AgentLoop:
             )
 
             self._reset_agent_state_for_retry()
-            return await retry_runner(label=f"{label}:overflow_retry", **run_kwargs)
+            result = await retry_runner(label=f"{label}:overflow_retry", **run_kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
 
     def _runtime_compaction_trigger_budget(self) -> int:
         """Return the runtime token budget that should trigger preflight compaction."""
@@ -2196,19 +2685,6 @@ class AgentLoop:
             self._persist_turn(message, created)
             return created
 
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if isinstance(routed, tuple) and len(routed) == 3:
-            routed_content, _route_note, route_source = routed
-            AgentLoop._set_last_response_source(self, route_source)
-            self._persist_turn(message, routed_content)
-            if self._auto_commit and self._git:
-                try:
-                    if self._git.has_changes():
-                        self._git.commit(message)
-                except Exception as e:
-                    logger.warning(f"Failed to auto-commit: {e}")
-            return routed_content
-
         # Refresh memory context
         try:
             memory_context = self.memory.get_memory_context()
@@ -2218,9 +2694,10 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        await self._prepare_request_context(message)
 
         self._prepare_agent_for_new_turn()
+        authoritative_message = message
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
@@ -2235,11 +2712,13 @@ class AgentLoop:
 
         AgentLoop._persist_user_turn_to_session(
             self,
-            message,
+            authoritative_message,
             media=media,
             attachments=attachments,
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+        original_system_prompt: str | None = None
+        original_base_system_prompt: object = _MISSING
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -2248,6 +2727,13 @@ class AgentLoop:
 
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
+        original_system_prompt, original_base_system_prompt = (
+            AgentLoop._apply_request_context_to_system_prompt(
+                self,
+                message,
+                thinking=False,
+            )
+        )
         await self._agent.add_message("user", runtime_message)
 
         retry_runner = AgentLoop._resolve_retry_runner(self)
@@ -2286,7 +2772,12 @@ class AgentLoop:
                 if _extracted:
                     final_content = _extracted
 
-            final_content = self._filter_execution_steps(final_content)
+            final_content = AgentLoop._finalize_response_content(
+                self,
+                authoritative_message,
+                final_content,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
         except asyncio.CancelledError:
             AgentLoop._mark_latest_user_turn_state(
                 self,
@@ -2303,6 +2794,11 @@ class AgentLoop:
         finally:
             # Always ensure agent is back in IDLE state after processing
             self._restore_agent_think()
+            AgentLoop._restore_request_context_system_prompt(
+                self,
+                original_system_prompt,
+                original_base_system_prompt,
+            )
             if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
                 logger.warning(
                     f"Post-run cleanup: resetting agent from {self._agent.state} to IDLE"
@@ -2316,7 +2812,11 @@ class AgentLoop:
                 _TURN_STATE_COMPLETED,
             )
             self._persist_turn_tool_trace(_pre_turn_memory_index)
-            self._session.add_message("assistant", final_content)
+            self._session.add_message(
+                "assistant",
+                final_content,
+                **AgentLoop._assistant_session_save_kwargs(final_content),
+            )
             AgentLoop._persist_session_if_possible(self)
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
@@ -2887,6 +3387,28 @@ class AgentLoop:
         insert_at = 1 if messages else 0
         messages.insert(insert_at, marker)
 
+    @staticmethod
+    def _is_history_compaction_marker(msg: Any) -> bool:
+        """True when *msg* is the runtime-only history-compacted marker."""
+        role = AgentLoop._message_role_value(msg)
+        if role != "user":
+            return False
+        content = getattr(msg, "content", None)
+        return isinstance(content, str) and content.startswith("[history-compacted]")
+
+    def _latest_real_user_message_index(self, messages: list[Any]) -> int | None:
+        """Return the latest user-authored message that must survive compaction intact."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if self._message_role_value(message) != "user":
+                continue
+            if self._is_next_step_user_msg(message):
+                continue
+            if self._is_history_compaction_marker(message):
+                continue
+            return index
+        return None
+
     def _compress_runtime_context(
         self,
         *,
@@ -2900,7 +3422,7 @@ class AgentLoop:
         2. Truncate ALL older message content (tool results, assistant, user).
         3. If still over budget, drop entire old message rounds.
 
-        Trigger: estimated tokens > 50 % of context_window.
+        Trigger: estimated tokens > the active runtime compaction budget.
         """
         if not self._agent or not hasattr(self._agent, 'memory'):
             return 0
@@ -2911,9 +3433,9 @@ class AgentLoop:
             return normalized
 
         estimated = self._estimate_runtime_tokens()
-        budget = int(self.context_window * 0.50)
+        budget = budget_tokens if budget_tokens is not None else self._runtime_compaction_trigger_budget()
 
-        if estimated <= budget:
+        if not force and estimated <= budget:
             return normalized
 
         logger.warning(
@@ -2940,28 +3462,58 @@ class AgentLoop:
         if indices_to_remove:
             logger.info(f"Phase 1: removed {len(indices_to_remove)} old next_step_prompt messages")
 
-        # Phase 2: Truncate content of ALL messages except the first and last 6.
+        protected_user_index = self._latest_real_user_message_index(messages)
+
+        # Phase 2: Compact older messages except the first and last 6.
         keep_tail = min(6, len(messages))
         max_content = 300
         for i in range(1, max(1, len(messages) - keep_tail)):
+            if protected_user_index is not None and i == protected_user_index:
+                continue
             msg = messages[i]
             original_content = getattr(msg, "content", None)
-            compressed_content = self._compress_message_content(original_content, max_content)
+            compressed_content = self._compact_runtime_message_content(msg, max_content)
             if compressed_content != original_content:
                 msg.content = compressed_content
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
+        #
+        # *Segment-aware* drop: we only cut along user-turn boundaries so a
+        # drop never splits an ``assistant(tool_calls) -> tool(result)``
+        # chain. Partial splits would leak through as orphaned tool
+        # messages and the LLM provider would reject the whole request.
+        # The persisted session store is untouched, so anything dropped
+        # here remains reachable via ``search_history``.
         estimated = self._estimate_runtime_tokens()
+        dropped_in_phase3 = 0
         if estimated > budget and len(messages) > 12:
             keep_head = 1
             keep_tail_drop = min(8, len(messages) - 1)
-            droppable = len(messages) - keep_head - keep_tail_drop
+            tail_start = len(messages) - keep_tail_drop
+            if protected_user_index is not None:
+                tail_start = min(tail_start, protected_user_index)
+            droppable = max(0, tail_start - keep_head)
             if droppable > 4:
-                drop_count = droppable // 2
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
-                logger.info(f"Phase 3: dropped {drop_count} oldest messages")
+                desired = droppable // 2
+                snap_end = self._snap_drop_end_to_turn_boundary(
+                    messages, keep_head, keep_head + desired
+                )
+                actual_drop = max(0, snap_end - keep_head)
+                if actual_drop > 0:
+                    del messages[keep_head:keep_head + actual_drop]
+                    compressed += actual_drop
+                    dropped_in_phase3 = actual_drop
+                    logger.info(
+                        f"Phase 3: dropped {actual_drop} oldest messages "
+                        f"(segment-snapped from desired {desired})"
+                    )
+
+        # Phase 3b: Insert a compaction marker so the model knows prior
+        # turns are recoverable via ``search_history``. The marker is
+        # runtime-only; it never touches the persisted session.
+        if dropped_in_phase3 > 0:
+            self._insert_compaction_marker(messages, dropped_in_phase3)
 
         # Phase 4: Repair tool_use/tool_result pairing broken by message deletion.
         compressed += self._repair_tool_pairing(messages)
@@ -2988,22 +3540,37 @@ class AgentLoop:
         if len(messages) <= 4:
             return compressed
 
-        # Truncate ALL messages to 150 chars
-        for msg in messages:
+        protected_user_index = self._latest_real_user_message_index(messages)
+
+        # Compact older messages aggressively while preserving the latest real user turn.
+        for index, msg in enumerate(messages):
+            if protected_user_index is not None and index == protected_user_index:
+                continue
             original_content = getattr(msg, "content", None)
-            compressed_content = self._compress_message_content(original_content, 150)
+            compressed_content = self._compact_runtime_message_content(msg, 150)
             if compressed_content != original_content:
                 msg.content = compressed_content
                 compressed += 1
 
-        # Drop all but first + last 6 messages
+        # Drop all but first + last 6 messages (segment-aware)
+        dropped = 0
         if len(messages) > 8:
             keep_head = 1
             keep_tail = min(6, len(messages) - 1)
-            drop_count = len(messages) - keep_head - keep_tail
-            if drop_count > 0:
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
+            desired_end = len(messages) - keep_tail
+            if protected_user_index is not None:
+                desired_end = min(desired_end, protected_user_index)
+            snap_end = self._snap_drop_end_to_turn_boundary(
+                messages, keep_head, desired_end
+            )
+            actual_drop = max(0, snap_end - keep_head)
+            if actual_drop > 0:
+                del messages[keep_head:keep_head + actual_drop]
+                compressed += actual_drop
+                dropped = actual_drop
+
+        if dropped > 0:
+            self._insert_compaction_marker(messages, dropped)
 
         # Repair tool pairing broken by message deletion
         compressed += self._repair_tool_pairing(messages)
@@ -3429,6 +3996,412 @@ class AgentLoop:
         return result.strip()
 
     @staticmethod
+    def _should_buffer_stream_content(request_contract: dict[str, Any] | None) -> bool:
+        """Return True when stream content should be validated before emission."""
+        if not isinstance(request_contract, dict):
+            return False
+        return bool(
+            request_contract.get("strict_reply_only")
+            or request_contract.get("wants_code_skeleton")
+            or request_contract.get("filename_and_shebang_only")
+            or request_contract.get("forbidden_terms")
+        )
+
+    def _extract_turn_tool_evidence_text(self, start_index: int) -> str:
+        """Collect current-turn tool outputs for output-contract verification."""
+        if not isinstance(start_index, int) or start_index < 0:
+            return ""
+
+        evidence_parts: list[str] = []
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if start_index > len(messages):
+            start_index = len(messages)
+
+        for msg in messages[start_index:]:
+            if AgentLoop._stream_message_role(msg) != "tool":
+                continue
+            payload = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if payload in (None, ""):
+                payload = AgentLoop._stream_message_attr(msg, "content", "")
+            if isinstance(payload, str) and payload.strip():
+                evidence_parts.append(payload.strip())
+            elif payload not in (None, ""):
+                evidence_parts.append(str(payload))
+
+        return "\n".join(evidence_parts)
+
+    def _extract_turn_write_file_artifacts(self, start_index: int) -> list[dict[str, str]]:
+        """Collect write_file payloads produced in the current turn."""
+        if not isinstance(start_index, int) or start_index < 0:
+            return []
+
+        artifacts: list[dict[str, str]] = []
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if start_index > len(messages):
+            start_index = len(messages)
+
+        for msg in messages[start_index:]:
+            if AgentLoop._stream_message_role(msg) != "assistant":
+                continue
+
+            raw_tool_calls = AgentLoop._stream_message_attr(msg, "tool_calls", None)
+            if not isinstance(raw_tool_calls, list):
+                continue
+
+            for tool_call in raw_tool_calls:
+                if isinstance(tool_call, dict):
+                    function = tool_call.get("function", {})
+                    name = (
+                        function.get("name", "")
+                        if isinstance(function, dict)
+                        else getattr(function, "name", "")
+                    )
+                    arguments = (
+                        function.get("arguments", "")
+                        if isinstance(function, dict)
+                        else getattr(function, "arguments", "")
+                    )
+                else:
+                    function = getattr(tool_call, "function", None)
+                    name = getattr(function, "name", "") if function else ""
+                    arguments = getattr(function, "arguments", "") if function else ""
+
+                if name != "write_file":
+                    continue
+
+                try:
+                    payload = json.loads(arguments or "{}") if isinstance(arguments, str) else {}
+                except Exception:
+                    continue
+
+                path = str(payload.get("path") or "").strip()
+                content = payload.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                artifacts.append({
+                    "path": path,
+                    "content": content,
+                })
+
+        return artifacts
+
+    @staticmethod
+    def _looks_like_code_line(line: str) -> bool:
+        """Heuristic for extracting code-centric replies from mixed prose."""
+        stripped = (line or "").strip()
+        if not stripped:
+            return False
+        return bool(
+            re.match(
+                r"^(#!|from\b|import\b|def\b|class\b|async def\b|if __name__ == |"
+                r"for\b|while\b|with\b|try:|except\b|return\b|print\(|"
+                r"[A-Za-z_][A-Za-z0-9_]*\s*=)",
+                stripped,
+            )
+        )
+
+    @classmethod
+    def _content_looks_like_code(cls, content: str) -> bool:
+        """Return True when the provided text already looks like code."""
+        normalized = (content or "").strip()
+        if not normalized:
+            return False
+        if "```" in normalized:
+            return True
+        return any(cls._looks_like_code_line(line) for line in normalized.splitlines()[:20])
+
+    @staticmethod
+    def _code_fence_language_for_path(path: str) -> str:
+        """Infer a fenced-code language hint from a file extension."""
+        suffix = Path(path or "").suffix.lower()
+        mapping = {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".tsx": "tsx",
+            ".jsx": "jsx",
+            ".sh": "bash",
+            ".rb": "ruby",
+            ".go": "go",
+            ".rs": "rust",
+            ".java": "java",
+            ".kt": "kotlin",
+            ".php": "php",
+            ".ps1": "powershell",
+        }
+        return mapping.get(suffix, "")
+
+    @classmethod
+    def _extract_code_focused_content(cls, content: str) -> str:
+        """Keep only the code-centric portion when the user asked for code output."""
+        normalized = (content or "").strip()
+        if not normalized:
+            return normalized
+
+        match = re.search(r"```([^\n`]*)\n(.*?)```", normalized, flags=re.DOTALL)
+        if match is not None:
+            language = match.group(1).strip()
+            body = match.group(2).strip("\n")
+            fence = f"```{language}".rstrip()
+            return f"{fence}\n{body}\n```".strip()
+
+        lines = normalized.splitlines()
+        for index, line in enumerate(lines):
+            if cls._looks_like_code_line(line):
+                return "\n".join(lines[index:]).strip()
+
+        return normalized
+
+    @staticmethod
+    def _extract_filename_and_shebang_only(content: str) -> str:
+        """Keep only the filename and shebang when the user asked for those lines only."""
+        normalized = re.sub(r"```[^\n]*\n|\n```", "\n", (content or "").strip())
+        if not normalized:
+            return normalized
+
+        filename: str | None = None
+        shebang: str | None = None
+        for raw_line in normalized.splitlines():
+            line = raw_line.strip().strip("`")
+            if not line:
+                continue
+            if shebang is None and line.startswith("#!"):
+                shebang = line
+            if filename is None:
+                match = re.search(
+                    r"(?:file\s*name|filename|文件名)\s*[:：]?\s*([\w.-]+\.[A-Za-z0-9]{1,8})",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                if match is not None:
+                    filename = match.group(1)
+                elif re.fullmatch(r"[\w.-]+\.[A-Za-z0-9]{1,8}", line):
+                    filename = line
+            if filename and shebang:
+                break
+
+        selected = [item for item in (filename, shebang) if item]
+        return "\n".join(selected) if selected else normalized
+
+    @classmethod
+    def _extract_numbered_menu_only(cls, content: str) -> str:
+        """Keep only enumerated menu lines when the user asked for a numbered menu."""
+        normalized = (content or "").strip()
+        if not normalized:
+            return normalized
+
+        options = cls._extract_selection_options_from_text(normalized, max_options=12)
+        if not options:
+            return normalized
+        return "\n".join(
+            f"{index}. {option}"
+            for index, option in enumerate(options, start=1)
+        )
+
+    @staticmethod
+    def _remove_forbidden_term_lines(content: str, forbidden_terms: list[str]) -> str:
+        """Drop lines that explicitly violate user-provided "do not mention" terms."""
+        if not content or not forbidden_terms:
+            return content or ""
+
+        lines = content.splitlines()
+        filtered = [
+            line
+            for line in lines
+            if not any(term and term in line for term in forbidden_terms)
+        ]
+        if not any(line.strip() for line in filtered):
+            return content.strip()
+        return "\n".join(filtered).strip()
+
+    @staticmethod
+    def _parameterize_unverified_literals(content: str, *, allowed_text: str) -> str:
+        """Replace invented environment-specific literals with placeholders."""
+        if not content:
+            return content or ""
+
+        allowed = allowed_text or ""
+
+        def _replace(
+            pattern: str,
+            placeholder_resolver: Callable[[str], str],
+            text: str,
+        ) -> str:
+            def _inner(match: re.Match[str]) -> str:
+                literal = match.group(0)
+                if literal in allowed:
+                    return literal
+                return placeholder_resolver(literal)
+
+            return re.sub(pattern, _inner, text)
+
+        parameterized = content
+        parameterized = _replace(
+            r"https?://[^\s'\"`]+",
+            lambda literal: (
+                "YOUR_RPC_URL"
+                if re.search(r"(rpc|seed|node)", literal, flags=re.IGNORECASE)
+                else "YOUR_URL"
+            ),
+            parameterized,
+        )
+        parameterized = _replace(
+            r"0x[a-fA-F0-9]{40,66}",
+            lambda _literal: "YOUR_HEX_VALUE",
+            parameterized,
+        )
+        parameterized = _replace(
+            r"\b[AN][1-9A-HJ-NP-Za-km-z]{25,34}\b",
+            lambda _literal: "YOUR_ADDRESS",
+            parameterized,
+        )
+        return parameterized
+
+    @staticmethod
+    def _strip_leading_meta_reply_units(content: str) -> str:
+        """Remove leading assistant planning/meta prose from strict final replies."""
+        normalized = (content or "").strip()
+        if not normalized:
+            return normalized
+
+        patterns = (
+            r"^(?:i|we)\s+(?:need|should|will|can|have to|am going to)\b[^.!?\n]*[.!?]\s*",
+            r"^let me\b[^.!?\n]*[.!?]\s*",
+            r"^(?:based on|according to)\b[^.!?\n]*[.!?]\s*",
+            r"^根据(?:您)?的要求[^。！？\n]*[：:]\s*",
+            r"^以下是[^。！？\n]*[：:]\s*",
+            r"^让我(?:先)?[^。！？\n]*[。！？]?\s*",
+            r"^我(?:先|来|需要|会|正在)(?:查看|检查|获取|搜索|查询|列出|生成|写|创建|读取|安装|激活|确认|处理|看一下)[^。！？\n]*[。！？]?\s*",
+            r"^先(?:查看|检查|获取|搜索|查询|列出|生成|写|创建|读取|安装|激活|确认|处理|看一下)[^。！？\n]*[。！？]?\s*",
+        )
+
+        stripped = normalized
+        changed = True
+        while changed and stripped:
+            changed = False
+            for pattern in patterns:
+                updated = re.sub(pattern, "", stripped, count=1, flags=re.IGNORECASE)
+                if updated != stripped:
+                    stripped = updated.lstrip()
+                    changed = True
+                    break
+
+        return stripped or normalized
+
+    @staticmethod
+    def _compress_minimal_reply(content: str, *, max_chars: int | None) -> str:
+        """Best-effort compression for strict literal replies without task-specific rules."""
+        normalized = (content or "").strip()
+        if not normalized or max_chars is None or max_chars <= 0:
+            return normalized
+        if len(normalized) <= max_chars:
+            return normalized
+
+        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+        for line in lines:
+            if len(line) <= max_chars:
+                return line
+
+        sentence_candidates = [
+            segment.strip()
+            for segment in re.findall(r"[^。！？!?\.]+[。！？!?\.]?", normalized)
+            if segment.strip()
+        ]
+        for sentence in sentence_candidates:
+            if len(sentence) <= max_chars:
+                return sentence
+
+        compact = re.sub(r"\s+", "", normalized)
+        compact = re.sub(r"[，,。.!！?？:：；;]+", "", compact)
+        compact = re.sub(r"(今天|今日|现在|目前|today|currently|rightnow)", "", compact, flags=re.IGNORECASE)
+        if len(compact) <= max_chars:
+            return compact
+        return compact[:max_chars].strip()
+
+    def _finalize_response_content(
+        self,
+        message: str,
+        content: str,
+        *,
+        turn_memory_start_index: int,
+    ) -> str:
+        """Apply execution-step filtering plus request-contract-aware output cleanup."""
+        final_content = AgentLoop._filter_execution_steps(self, content)
+        if not final_content:
+            return final_content
+
+        contract = AgentLoop._derive_request_contract(message)
+        tool_evidence_text = AgentLoop._extract_turn_tool_evidence_text(
+            self,
+            turn_memory_start_index,
+        )
+        write_file_artifacts = AgentLoop._extract_turn_write_file_artifacts(
+            self,
+            turn_memory_start_index,
+        )
+
+        if contract.get("filename_and_shebang_only"):
+            candidate_text = final_content
+            if write_file_artifacts:
+                latest_artifact = write_file_artifacts[-1]
+                candidate_text = "\n".join(
+                    item
+                    for item in (
+                        latest_artifact.get("path", ""),
+                        latest_artifact.get("content", ""),
+                        tool_evidence_text,
+                        final_content,
+                    )
+                    if item
+                )
+            elif tool_evidence_text:
+                candidate_text = f"{tool_evidence_text}\n{final_content}"
+            return AgentLoop._extract_filename_and_shebang_only(candidate_text)
+
+        exact_literal_output = str(contract.get("exact_literal_output") or "").strip()
+        if exact_literal_output:
+            return exact_literal_output
+
+        if contract.get("wants_numbered_menu"):
+            final_content = AgentLoop._strip_leading_meta_reply_units(final_content)
+            final_content = AgentLoop._extract_numbered_menu_only(final_content)
+
+        if contract.get("strict_reply_only") and contract.get("expects_code_output"):
+            final_content = AgentLoop._extract_code_focused_content(final_content)
+        elif contract.get("strict_reply_only"):
+            final_content = AgentLoop._strip_leading_meta_reply_units(final_content)
+
+        forbidden_terms = contract.get("forbidden_terms") or []
+        if forbidden_terms:
+            final_content = AgentLoop._remove_forbidden_term_lines(
+                final_content,
+                [str(term) for term in forbidden_terms if str(term).strip()],
+            )
+
+        if contract.get("wants_code_skeleton"):
+            if not AgentLoop._content_looks_like_code(final_content) and write_file_artifacts:
+                latest_artifact = write_file_artifacts[-1]
+                final_content = latest_artifact.get("content", final_content)
+                if final_content and "```" not in final_content:
+                    language = AgentLoop._code_fence_language_for_path(
+                        latest_artifact.get("path", "")
+                    )
+                    fence = f"```{language}".rstrip()
+                    final_content = f"{fence}\n{final_content.strip()}\n```".strip()
+            final_content = AgentLoop._extract_code_focused_content(final_content)
+            final_content = AgentLoop._parameterize_unverified_literals(
+                final_content,
+                allowed_text=f"{message}\n{tool_evidence_text}",
+            )
+        elif contract.get("strict_reply_only"):
+            final_content = AgentLoop._compress_minimal_reply(
+                final_content,
+                max_chars=contract.get("max_output_chars"),
+            )
+
+        return final_content.strip()
+
+    @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
         """Read a message field from either dict or object runtime payloads."""
         if isinstance(message, dict):
@@ -3606,6 +4579,9 @@ class AgentLoop:
         self._reset_reasoning_capture()
         AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
+        authoritative_message = message
+        request_contract = AgentLoop._derive_request_contract(authoritative_message)
+        buffer_stream_content = AgentLoop._should_buffer_stream_content(request_contract)
 
         current_session_key = getattr(self, "session_key", "default")
         self.set_subagent_context(
@@ -3634,28 +4610,6 @@ class AgentLoop:
                 self._persist_turn(message, full_content)
             return
 
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if isinstance(routed, tuple) and len(routed) == 3:
-            routed_content, _route_note, current_source = routed
-            AgentLoop._set_last_response_source(self, current_source)
-            full_content = routed_content or ""
-            if full_content:
-                yield {
-                    "type": "content",
-                    "delta": full_content,
-                    "metadata": {"auto_routed_to_subagent": True},
-                    "source": current_source,
-                }
-            yield {
-                "type": "done",
-                "delta": "",
-                "metadata": {"content": full_content},
-                "source": current_source,
-            }
-            if full_content:
-                self._persist_turn(message, full_content)
-            return
-
         # Refresh memory context
         bg_task: asyncio.Task | None = None
 
@@ -3678,8 +4632,9 @@ class AgentLoop:
         capture_manager = None
 
         # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        await self._prepare_request_context(message)
         self._prepare_agent_for_new_turn()
+        authoritative_message = message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -3690,7 +4645,7 @@ class AgentLoop:
             message = runtime_message
         AgentLoop._persist_user_turn_to_session(
             self,
-            message,
+            authoritative_message,
             media=media,
             attachments=attachments,
         )
@@ -3731,6 +4686,7 @@ class AgentLoop:
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
+                    retry_runner = AgentLoop._resolve_retry_runner(self)
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
@@ -3744,9 +4700,11 @@ class AgentLoop:
                         while not self._agent.output_queue.empty():
                             self._agent.output_queue.get_nowait()
 
-                    result = await self._run_agent_with_retry(
+                    result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                        self,
                         label="stream",
-                        pre_retry_cleanup=_drain_queue,
+                        retry_runner=retry_runner,
+                        pre_overflow_retry_cleanup=_drain_queue,
                         **run_kwargs,
                     )
                     if hasattr(result, "content"):
@@ -4006,6 +4964,8 @@ class AgentLoop:
                             if saw_tool_call:
                                 saw_content_after_tool_call = True
                             full_content += delta
+                            if buffer_stream_content:
+                                continue
                         yield _decorate_stream_event(event)
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
@@ -4058,11 +5018,29 @@ class AgentLoop:
                     full_content = run_result_text
                     fallback_reason = "run_result_no_chunks"
                 if fallback_delta:
-                    yield _decorate_stream_event({
-                        "type": "content",
-                        "delta": fallback_delta,
-                        "metadata": {"fallback": fallback_reason},
-                    })
+                    if not buffer_stream_content:
+                        yield _decorate_stream_event({
+                            "type": "content",
+                            "delta": fallback_delta,
+                            "metadata": {"fallback": fallback_reason},
+                        })
+
+            final_content = AgentLoop._finalize_response_content(
+                self,
+                authoritative_message,
+                full_content,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
+            if buffer_stream_content and final_content:
+                yield _decorate_stream_event({
+                    "type": "content",
+                    "delta": final_content,
+                    "metadata": {
+                        "buffered": True,
+                        "validated": True,
+                    },
+                })
+            full_content = final_content
 
             # Emit done
             stream_completed = True
@@ -4100,7 +5078,11 @@ class AgentLoop:
             }
         finally:
             if capture_manager is not None:
-                capture_manager.__exit__(None, None, None)
+                try:
+                    capture_manager.__exit__(None, None, None)
+                except ValueError as exc:
+                    logger.debug(f"Tool output capture context cleanup skipped: {exc}")
+                    clear_captured_tool_outputs(tool_output_capture_scope)
             self._restore_agent_think()
             AgentLoop._restore_request_context_system_prompt(
                 self,
@@ -4110,7 +5092,8 @@ class AgentLoop:
             if bg_task is not None and not bg_task.done():
                 bg_task.cancel()
                 try:
-                    await asyncio.wait_for(bg_task, timeout=5.0)
+                    cleanup_timeout = 30.0 if stream_cancelled else 5.0
+                    await asyncio.wait_for(bg_task, timeout=cleanup_timeout)
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
             if not stream_completed and not stream_cancelled:
@@ -4130,7 +5113,11 @@ class AgentLoop:
                 # streaming so they remain searchable even after runtime
                 # context compaction.
                 self._persist_turn_tool_trace(_pre_turn_memory_index)
-                self._session.add_message("assistant", full_content)
+                self._session.add_message(
+                    "assistant",
+                    full_content,
+                    **AgentLoop._assistant_session_save_kwargs(full_content),
+                )
                 AgentLoop._persist_session_if_possible(self)
             except Exception as e:
                 logger.warning(f"Failed to save session after streaming: {e}")
@@ -4193,19 +5180,6 @@ class AgentLoop:
             self._persist_turn(message, created)
             return created, "Created persistent subagent from natural-language request."
 
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if isinstance(routed, tuple) and len(routed) == 3:
-            routed_content, route_note, route_source = routed
-            AgentLoop._set_last_response_source(self, route_source)
-            self._persist_turn(message, routed_content)
-            if self._auto_commit and self._git:
-                try:
-                    if self._git.has_changes():
-                        self._git.commit(message)
-                except Exception as e:
-                    logger.warning(f"Failed to auto-commit: {e}")
-            return routed_content, route_note
-
         # Refresh memory context
         try:
             memory_context = self.memory.get_memory_context()
@@ -4215,8 +5189,9 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        await self._prepare_request_context(message)
         self._prepare_agent_for_new_turn()
+        authoritative_message = message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -4227,7 +5202,7 @@ class AgentLoop:
             message = runtime_message
         AgentLoop._persist_user_turn_to_session(
             self,
-            message,
+            authoritative_message,
             media=media,
             attachments=attachments,
         )
@@ -4278,6 +5253,12 @@ class AgentLoop:
                 )
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
+            final_content = AgentLoop._finalize_response_content(
+                self,
+                authoritative_message,
+                final_content,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
 
         except asyncio.CancelledError:
             AgentLoop._mark_latest_user_turn_state(
@@ -4306,7 +5287,11 @@ class AgentLoop:
             # assistant messages that called them) so they remain searchable
             # even after runtime context compaction.
             self._persist_turn_tool_trace(_pre_turn_memory_index)
-            self._session.add_message("assistant", final_content)
+            self._session.add_message(
+                "assistant",
+                final_content,
+                **AgentLoop._assistant_session_save_kwargs(final_content),
+            )
             AgentLoop._persist_session_if_possible(self)
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
@@ -4740,7 +5725,7 @@ class AgentLoop:
         Injects env vars so they survive short-term memory pruning.
         The anti-loop tracker dynamically appends progress info.
         """
-        _truncated = message[:300] + ("..." if len(message) > 300 else "")
+        _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
         prompt = (
             "[TURN PRIORITY]: Execute only the newest user request. "
@@ -4756,6 +5741,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        assistant_offer_notice = self._build_recent_assistant_offer_notice(message)
+        if assistant_offer_notice:
+            prompt = assistant_offer_notice + prompt
         output_requirements = self._extract_output_contract_for_prompt(message)
         if output_requirements:
             prompt += output_requirements
@@ -4766,7 +5754,7 @@ class AgentLoop:
 
     def _build_request_context_prompt(self, message: str) -> str:
         """Build the compact request context block used for thinking runs."""
-        _truncated = message[:300] + ("..." if len(message) > 300 else "")
+        _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
         prompt = (
             "[TURN PRIORITY]: Execute only the newest user request. "
@@ -4781,6 +5769,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        assistant_offer_notice = self._build_recent_assistant_offer_notice(message)
+        if assistant_offer_notice:
+            prompt = assistant_offer_notice + prompt
         output_requirements = self._extract_output_contract_for_prompt(message)
         if output_requirements:
             prompt += output_requirements
@@ -4789,6 +5780,106 @@ class AgentLoop:
             prompt += env_section
         return prompt
 
+    @staticmethod
+    def _truncate_request_for_prompt(
+        message: str,
+        *,
+        head_chars: int = 220,
+        tail_chars: int = 180,
+    ) -> str:
+        """Keep both the head and tail of the latest request for prompt scaffolding."""
+        normalized = (message or "").strip()
+        if len(normalized) <= head_chars + tail_chars + 24:
+            return normalized
+        head = normalized[:head_chars].rstrip()
+        tail = normalized[-tail_chars:].lstrip()
+        return (
+            f"{head}\n"
+            "[... middle omitted to save tokens; preserve latest tail instructions ...]\n"
+            f"{tail}"
+        )
+
+    @staticmethod
+    def _extract_output_contract_for_prompt(
+        message: str,
+        *,
+        full_request_chars: int = 420,
+        tail_chars: int = 240,
+    ) -> str:
+        """Preserve the latest request ending without language-specific intent matching.
+
+        We avoid keyword heuristics here. Compression failures often happen
+        because the *tail* of a long request carries the final delivery rule,
+        regardless of language.  For longer requests, surface that tail
+        verbatim so the model can continue execution and finish in the
+        requested format without relying on English/Chinese phrase lists.
+        """
+        normalized = (message or "").strip()
+        if not normalized:
+            return ""
+
+        contract = AgentLoop._derive_request_contract(normalized)
+        contract_json = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+        guidance = (
+            "\n[REQUEST CONTRACT]: "
+            f"{contract_json}\n"
+            "[REPLY SCOPE]: Ground the final answer in the newest user message and current-turn tool evidence. "
+            "Treat older assistant-written summaries, menus, and example values as non-authoritative working notes "
+            "unless the newest user explicitly selects or references them. "
+            "Reuse earlier tool facts only when the newest user explicitly references them or you re-fetch them now. "
+            "Do not prepend greetings, status recaps, menus, or capability lists unless the newest user explicitly asks for them. "
+            "When generating code, parameterize environment-specific literals instead of inventing concrete runtime values from prior turns. "
+            "If the newest user asks for a skeleton or template, prefer placeholders over concrete URLs, addresses, hashes, IDs, balances, or sample secrets unless they were supplied by the newest user or fetched in the current turn. "
+            "If the newest user asks to return only specific lines or fields, emit only those lines or fields and nothing else. "
+            "If the newest user constrains output shape or brevity, comply literally. When uncertain, return less, not more.\n"
+        )
+
+        if len(normalized) <= full_request_chars:
+            return (
+                guidance
+                + "[AUTHORITATIVE USER MESSAGE]: The block below is copied verbatim from the newest user message. "
+                "It overrides earlier assistant guesses, stale summaries, and unrelated context.\n"
+                f"[LATEST USER MESSAGE]: {normalized}\n"
+            )
+
+        tail_snippet = normalized[-tail_chars:]
+        return (
+            guidance
+            + "[AUTHORITATIVE REQUEST ENDING]: "
+            "The block below is copied verbatim from the newest user message. "
+            "It may contain the exact completion contract in any language. "
+            "It overrides earlier assistant guesses, stale summaries, and unrelated context. "
+            "Do not answer a different question. Do not translate it away, soften it, or replace it with a recap. "
+            "Your final answer must satisfy this block exactly.\n"
+            f"[LATEST REQUEST ENDING]: {tail_snippet}\n"
+        )
+
+    def _build_recent_assistant_offer_notice(self, message: str) -> str:
+        """Interpret bare numeric follow-ups against the immediate prior assistant offer."""
+        selection = AgentLoop._selection_token_value(message)
+        if selection is None:
+            return ""
+
+        previous_assistant = AgentLoop._latest_previous_assistant_message(
+            getattr(self, "_session", None)
+        )
+        options = AgentLoop._assistant_selection_options_from_message(previous_assistant)
+        if len(options) < 2 or selection > len(options):
+            return ""
+
+        rendered_options = "\n".join(
+            f"{index}. {option}"
+            for index, option in enumerate(options, start=1)
+        )
+        return (
+            "[PREVIOUS ASSISTANT OFFER]: The immediately previous assistant reply contained selectable options.\n"
+            f"[USER SELECTION]: {selection}\n"
+            "Interpret the newest user message as selecting exactly one option from that offer. "
+            "Execute only the selected option. Do not revive unrelated earlier tasks or the rest of the menu.\n"
+            f"[SELECTED OPTION]: {selection}. {options[selection - 1]}\n"
+            f"[AVAILABLE OPTIONS]:\n{rendered_options}\n"
+        )
+
     def _apply_request_context_to_system_prompt(
         self,
         message: str,
@@ -4796,7 +5887,7 @@ class AgentLoop:
         thinking: bool,
     ) -> tuple[str | None, object]:
         """Temporarily append active request context to the agent system prompt."""
-        if not thinking or not getattr(self, "_agent", None):
+        if not getattr(self, "_agent", None):
             return None, _MISSING
 
         current_prompt = getattr(self._agent, "system_prompt", None)

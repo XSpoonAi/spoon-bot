@@ -31,7 +31,7 @@ class ShellSecurityError(Exception):
     pass
 
 
-from spoon_bot.utils.privacy import SCRUBBED_ENV_VARS
+from spoon_bot.utils.privacy import SCRUBBED_ENV_VARS, is_sensitive_env_var
 
 
 def _scrub_env(env: dict[str, str]) -> dict[str, str]:
@@ -43,6 +43,9 @@ def _scrub_env(env: dict[str, str]) -> dict[str, str]:
     """
     for key in SCRUBBED_ENV_VARS:
         env.pop(key, None)
+    for key in list(env.keys()):
+        if is_sensitive_env_var(key):
+            env.pop(key, None)
     return env
 
 

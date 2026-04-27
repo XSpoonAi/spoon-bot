@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +138,11 @@ class TestFileSessionStore:
         assert loaded.session_key == "test-session"
         assert len(loaded.messages) == 2
         assert loaded.metadata["language"] == "en"
+
+    def test_save_recreates_deleted_sessions_dir(self, file_store: FileSessionStore):
+        shutil.rmtree(file_store._dir)
+        file_store.save_session(_sample_session())
+        assert file_store.load_session("test-session") is not None
 
     def test_load_nonexistent(self, file_store: FileSessionStore):
         assert file_store.load_session("nonexistent") is None
@@ -398,7 +404,7 @@ def _assert_multimodal_user_call(
 
 class TestAgentLoopSessionHydration:
     @pytest.mark.asyncio
-    async def test_runtime_history_injected_from_persisted_session(self, tmp_dir: Path):
+    async def test_runtime_history_skips_plain_assistant_replies_by_default(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
 
@@ -424,7 +430,7 @@ class TestAgentLoopSessionHydration:
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
         assert loop._agent.memory.cleared is True
-        assert injected == 2
+        assert injected == 1
         _assert_multimodal_user_call(
             loop._agent.calls[0],
             expected_text=(
@@ -434,7 +440,46 @@ class TestAgentLoopSessionHydration:
                 f"Use these attached workspace files as the primary source of truth for this request."
             ),
         )
-        assert loop._agent.calls[1] == ("assistant", "Okay, I will remember your name is Alice.", {})
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_rehydrates_structured_assistant_offers(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message("user", "What can you do next?")
+        loop._session.add_message(
+            "assistant",
+            "1. Transfer all GAS\n2. Generate a balance script\n3. Join the next game",
+            selection_options=[
+                "Transfer all GAS",
+                "Generate a balance script",
+                "Join the next game",
+            ],
+            message_kind="assistant_offer",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert injected == 2
+        assert loop._agent.calls == [
+            ("user", "What can you do next?", {}),
+            (
+                "assistant",
+                "[previous assistant offer retained only for explicit follow-up selection]\n"
+                "1. Transfer all GAS\n"
+                "2. Generate a balance script\n"
+                "3. Join the next game",
+                {},
+            ),
+        ]
 
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
@@ -495,10 +540,9 @@ class TestAgentLoopSessionHydration:
 
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
-        assert injected == 2
+        assert injected == 1
         assert loop._agent.calls == [
             ("user", "Completed request", {}),
-            ("assistant", "Completed answer", {}),
         ]
 
     def test_strip_attachment_context_recovers_original_user_text(self):
