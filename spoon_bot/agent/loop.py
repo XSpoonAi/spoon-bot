@@ -1,4 +1,4 @@
-﻿"""
+"""
 Agent loop: the core processing engine using spoon-core SDK.
 
 This module provides the main agent interface, integrating spoon-core's
@@ -13,7 +13,9 @@ import inspect
 import json
 import logging as stdlib_logging
 import re
+import uuid
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
 
@@ -86,6 +88,7 @@ from spoon_bot.agent.tools.history_search import SearchHistoryTool
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_owner,
     build_tool_owner_key,
+    clear_captured_tool_outputs,
     capture_tool_outputs,
     consume_captured_tool_output,
     normalize_tool_arguments,
@@ -145,6 +148,10 @@ _ATTACHMENT_ONLY_PLACEHOLDER = (
 )
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
 _MISSING = object()
+_TURN_STATE_PENDING = "pending"
+_TURN_STATE_COMPLETED = "completed"
+_TURN_STATE_INTERRUPTED = "interrupted"
+_TURN_STATE_SUPERSEDED = "superseded"
 _WALLET_REQUIRED_TOOLS: frozenset[str] = frozenset({
     "balance_check",
     "transfer",
@@ -475,6 +482,10 @@ class AgentLoop:
         self._mcp_tools: list[MCPTool] = []
         self._latest_reasoning_excerpt: str | None = None
         self._pending_reasoning_chunks: list[str] = []
+        self._pending_runtime_notices: list[dict[str, Any]] = []
+        # Track which invalid persisted attachment/media refs we've already
+        # warned about per session, so history sync doesn't spam identical
+        # warnings on every user turn. Keyed by session_key -> set of refs.
         self._warned_invalid_attachment_refs: dict[str, set[str]] = {}
         self._warned_invalid_media_refs: dict[str, set[str]] = {}
 
@@ -1291,7 +1302,50 @@ class AgentLoop:
                 f"{len(unique_refs)} already-known ref(s)"
             )
 
-    async def _sync_runtime_history_from_session(self) -> int:
+    @staticmethod
+    def _message_token_count(message: str) -> int:
+        """Approximate token count for lightweight history-scope decisions."""
+        return len(re.findall(r"[0-9A-Za-z\u4e00-\u9fff]+", message or ""))
+
+    @classmethod
+    def _history_rehydrate_scope(
+        cls,
+        upcoming_message: str | None,
+        *,
+        history_messages: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Choose how much prior session history should enter the runtime context."""
+        normalized = (upcoming_message or "").strip()
+        if not normalized:
+            return "full"
+        if len(normalized) <= 24 or cls._message_token_count(normalized) <= 3:
+            return "recent"
+        return "minimal"
+
+    @staticmethod
+    def _recent_history_start_index(history_messages: list[dict[str, Any]], *, user_turns: int) -> int:
+        """Return the index where the last N user turns begin."""
+        user_indices = [
+            index
+            for index, message in enumerate(history_messages)
+            if isinstance(message, dict)
+            and str(message.get("role") or "").strip().lower() == "user"
+            and AgentLoop._turn_state_of_message(message) not in {
+                _TURN_STATE_INTERRUPTED,
+                _TURN_STATE_SUPERSEDED,
+            }
+        ]
+        if not user_indices:
+            return 0
+        if len(user_indices) <= user_turns:
+            return user_indices[0]
+        return user_indices[-user_turns]
+
+    async def _sync_runtime_history_from_session(
+        self,
+        *,
+        upcoming_message: str | None = None,
+    ) -> int:
         """Sync persisted session history into spoon-core runtime memory."""
         if not self._agent:
             return 0
@@ -1312,6 +1366,18 @@ class AgentLoop:
             if hasattr(self._session, "get_messages")
             else self._session.get_history()
         )
+        if not isinstance(history_messages, list):
+            history_messages = []
+
+        rehydrate_scope = AgentLoop._history_rehydrate_scope(
+            upcoming_message,
+            history_messages=history_messages,
+        )
+        if rehydrate_scope == "minimal":
+            history_messages = []
+        elif rehydrate_scope == "recent":
+            start_index = AgentLoop._recent_history_start_index(history_messages, user_turns=1)
+            history_messages = history_messages[start_index:]
 
         try:
             from spoon_ai.schema import Function as _CoreFunction  # noqa: F401
@@ -1363,8 +1429,19 @@ class AgentLoop:
             role = str(msg.get("role", "")).strip().lower()
             if role not in {"user", "assistant", "tool"}:
                 continue
+            if role == "user" and AgentLoop._turn_state_of_message(msg) in {
+                _TURN_STATE_INTERRUPTED,
+                _TURN_STATE_SUPERSEDED,
+            }:
+                continue
 
+            assistant_tool_calls = None
+            if role == "assistant":
+                assistant_tool_calls = _rehydrate_tool_calls(msg.get("tool_calls"))
+                if assistant_tool_calls is None:
+                    continue
             content = msg.get("content", "")
+
             if not isinstance(content, str):
                 try:
                     content = json.dumps(content, ensure_ascii=False)
@@ -1409,9 +1486,8 @@ class AgentLoop:
                 if tool_name:
                     extra_kwargs["tool_name"] = str(tool_name)
             elif role == "assistant":
-                rehydrated = _rehydrate_tool_calls(msg.get("tool_calls"))
-                if rehydrated:
-                    extra_kwargs["tool_calls"] = rehydrated
+                if assistant_tool_calls:
+                    extra_kwargs["tool_calls"] = assistant_tool_calls
 
             try:
                 await self._agent.add_message(role, content, **extra_kwargs)
@@ -1424,10 +1500,32 @@ class AgentLoop:
 
         return injected_count
 
-    async def _prepare_request_context(self) -> None:
-        """Prepare request context by trimming and injecting session history."""
+    async def _prepare_request_context(self, upcoming_message: str | None = None) -> None:
+        """Prepare request context by injecting persisted history into runtime memory.
+
+        Persisted history (``self._session.messages``) is the authoritative
+        store and is never trimmed here — see :meth:`_trim_context_if_needed`.
+        Runtime memory is rebuilt from the persisted transcript for the next
+        provider request. If that rebuilt runtime context is already close to
+        the configured ``context_window``, older runtime-only history is
+        compacted before the provider call starts.
+        """
+        self._refresh_recent_turn_notice()
         trimmed_count = self._trim_context_if_needed()
-        injected_count = await self._sync_runtime_history_from_session()
+        session_history = (
+            self._session.get_messages()
+            if hasattr(self._session, "get_messages")
+            else self._session.get_history()
+        )
+        if not isinstance(session_history, list):
+            session_history = []
+        rehydrate_scope = AgentLoop._history_rehydrate_scope(
+            upcoming_message,
+            history_messages=session_history,
+        )
+        injected_count = await self._sync_runtime_history_from_session(
+            upcoming_message=upcoming_message
+        )
 
         # Repair tool-call ordering after history injection - session storage
         # may not preserve tool_call_id metadata, producing orphaned tool
@@ -1440,7 +1538,8 @@ class AgentLoop:
                 repaired = self._normalize_runtime_tool_context(messages_ref)
 
         compressed = 0
-        runtime_tokens = self._estimate_runtime_tokens()
+        runtime_tokens_before = self._estimate_runtime_tokens()
+        runtime_tokens = runtime_tokens_before
         trigger_budget = self._runtime_compaction_trigger_budget()
         if isinstance(messages_ref, list) and messages_ref and runtime_tokens > trigger_budget:
             try:
@@ -1453,13 +1552,23 @@ class AgentLoop:
             if runtime_tokens > trigger_budget and compressed == 0:
                 compressed = self._force_compress_runtime_context()
             runtime_tokens = self._estimate_runtime_tokens()
+            if compressed:
+                AgentLoop._queue_runtime_notice(
+                    self,
+                    kind="runtime_compaction",
+                    stage="preflight",
+                    compressed_actions=compressed,
+                    estimated_tokens_before=runtime_tokens_before,
+                    estimated_tokens_after=runtime_tokens,
+                    trigger_budget=trigger_budget,
+                )
         session_tokens = self._estimate_token_count()
 
         logger.info(
             f"Session context prepared: session={self.session_key}, "
             f"injected_messages={injected_count}, "
             f"runtime_tokens~{runtime_tokens}, session_tokens~{session_tokens}, "
-            f"trimmed_messages={trimmed_count}"
+            f"trimmed_messages={trimmed_count}, rehydrate_scope={rehydrate_scope}"
             + (f", repaired_tool_order={repaired}" if repaired else "")
             + (f", compressed_actions={compressed}" if compressed else "")
         )
@@ -1599,6 +1708,11 @@ class AgentLoop:
             return self.context._build_user_content(text_content, media)
         return text_content
 
+    @classmethod
+    def _assistant_session_save_kwargs(cls, content: str) -> dict[str, Any]:
+        """Persist assistant replies without prompt-derived routing metadata."""
+        return {"message_kind": "assistant_reply"}
+
     @staticmethod
     def _session_message_save_kwargs(
         media: list[str] | None = None,
@@ -1614,6 +1728,115 @@ class AgentLoop:
             ]
         return save_kwargs
 
+    @staticmethod
+    def _turn_state_of_message(message: Any) -> str:
+        """Normalize persisted turn state metadata for user messages."""
+        if not isinstance(message, dict):
+            return ""
+        return str(message.get("turn_state") or "").strip().lower()
+
+    @staticmethod
+    def _update_session_user_turn_state(
+        session: Any,
+        state: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update the latest unresolved user turn in persisted session history."""
+        messages = getattr(session, "messages", None)
+        if not isinstance(messages, list):
+            return None
+
+        terminal_states = {_TURN_STATE_COMPLETED, _TURN_STATE_INTERRUPTED, _TURN_STATE_SUPERSEDED}
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("role") or "").strip().lower() != "user":
+                continue
+
+            current_state = AgentLoop._turn_state_of_message(message)
+            if current_state in terminal_states:
+                continue
+
+            message["turn_state"] = state
+            message["turn_state_updated_at"] = datetime.now().isoformat()
+            if reason:
+                message["turn_state_reason"] = reason
+            elif "turn_state_reason" in message:
+                message.pop("turn_state_reason", None)
+            return message
+        return None
+
+    @staticmethod
+    def _persist_session_if_possible(self) -> None:
+        """Persist the current session when the manager is available."""
+        try:
+            self.sessions.save(self._session)
+        except Exception as exc:
+            logger.warning(f"Failed to save session: {exc}")
+
+    @staticmethod
+    def _mark_latest_user_turn_state(
+        self,
+        state: str,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """Mark the latest unresolved user turn as completed/interrupted/superseded."""
+        message = AgentLoop._update_session_user_turn_state(
+            getattr(self, "_session", None),
+            state,
+            reason=reason,
+        )
+        if message is None:
+            return False
+        AgentLoop._persist_session_if_possible(self)
+        return True
+
+    def _refresh_recent_turn_notice(self) -> None:
+        """Expose immediate prior interruption/supersede state to the next prompt."""
+        notice: str | None = None
+        session = getattr(self, "_session", None)
+        history_messages = (
+            session.get_messages()
+            if session is not None and hasattr(session, "get_messages")
+            else getattr(session, "messages", [])
+        )
+        if isinstance(history_messages, list):
+            for message in reversed(history_messages):
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "").strip().lower()
+                if role != "user":
+                    break
+
+                state = AgentLoop._turn_state_of_message(message)
+                if state == _TURN_STATE_INTERRUPTED:
+                    interrupted_request = self._truncate_request_for_prompt(
+                        str(message.get("content") or "").strip()
+                    )
+                    notice = (
+                        "The immediately previous user request was interrupted before completion.\n"
+                        f"[INTERRUPTED PREVIOUS REQUEST]: {interrupted_request}\n"
+                        "Resolve it against the newest user message as follows:\n"
+                        "- If the newest user message is itself a standalone actionable request, "
+                        "treat it as replacing the interrupted request.\n"
+                        "- If the newest user message only adds constraints or details to the "
+                        "interrupted request, continue the interrupted request with the new "
+                        "constraints applied.\n"
+                        "- Do not execute both as separate tasks unless the newest user message "
+                        "explicitly asks for both."
+                    )
+                elif state == _TURN_STATE_SUPERSEDED:
+                    notice = (
+                        "A previous unfinished user request was superseded by a newer request "
+                        "and is no longer pending. Execute only the newest user request unless "
+                        "it explicitly asks to resume the earlier one."
+                    )
+                break
+
+        self._recent_turn_notice = notice
+
     def _persist_user_turn_to_session(
         self,
         message: str,
@@ -1625,9 +1848,12 @@ class AgentLoop:
             self._session.add_message(
                 "user",
                 _strip_attachment_context(message, attachments or []),
+                turn_id=uuid.uuid4().hex,
+                turn_state=_TURN_STATE_PENDING,
+                turn_state_updated_at=datetime.now().isoformat(),
                 **AgentLoop._session_message_save_kwargs(media, attachments),
             )
-            self.sessions.save(self._session)
+            AgentLoop._persist_session_if_possible(self)
         except Exception as exc:
             logger.warning(f"Failed to persist user turn: {exc}")
 
@@ -1690,8 +1916,9 @@ class AgentLoop:
     def _should_skip_specialist_auto_route(self, message: str) -> bool:
         """Return True when the current message should not be auto-routed."""
         stripped = message.lstrip()
+        session_key = str(getattr(self, "session_key", "") or "")
         return (
-            self.session_key.startswith("subagent-")
+            session_key.startswith("subagent-")
             or stripped.startswith("[Sub-agent Completed]")
         )
 
@@ -1699,119 +1926,20 @@ class AgentLoop:
         self,
         message: str,
     ) -> str | None:
-        """Create a persistent subagent from a natural-language user request."""
-        if self._should_skip_specialist_auto_route(message):
-            return None
-        parsed = self._subagent_manager.parse_persistent_subagent_request(message)
-        if parsed is None:
-            return None
-
-        profile = self._subagent_manager.create_persistent_subagent(
-            description=parsed["specialization"],
-        )
-        keywords = ", ".join(profile.match_keywords[:8]) or "(none)"
-        response = (
-            f"Persistent subagent `{profile.name}` created.\n"
-            f"Specialization: {profile.specialization}\n"
-            f"Auto-route: {'ON' if profile.auto_route else 'OFF'}\n"
-            f"Tool profile: {profile.tool_profile}\n"
-            f"Keywords: {keywords}\n\n"
-            "Future matching requests will be routed to this subagent automatically."
-        )
-        return response
-
+        """Do not auto-create subagents from prompt text."""
+        return None
     async def _maybe_route_to_persistent_specialist_result(
         self,
         message: str,
-    ) -> tuple[str, str | None, dict[str, Any]] | None:
-        """Attempt to route a matching top-level request to a persistent subagent."""
-        if self._should_skip_specialist_auto_route(message):
-            return None
-
-        matched = self._subagent_manager.find_best_auto_route_specialist(message)
-        if matched is None:
-            return None
-
-        agent_name = matched["agent_name"]
-        reason_text = ", ".join(matched["reasons"]) or "high-confidence subagent match"
-        logger.info(
-            f"Auto-routing request to persistent subagent {agent_name!r} "
-            f"(score={matched['score']}; {reason_text})"
-        )
-
-        current_channel = getattr(self._subagent_manager, "_current_spawner_channel", None)
-        current_metadata = getattr(self._subagent_manager, "_current_spawner_metadata", {})
-        current_reply_to = getattr(self._subagent_manager, "_current_spawner_reply_to", None)
-        record = await self._subagent_manager.dispatch_persistent_subagent(
-            agent_name=agent_name,
-            task=message,
-            spawner_session_key=self.session_key,
-            spawner_channel=current_channel,
-            spawner_metadata=current_metadata,
-            spawner_reply_to=current_reply_to,
-        )
-        wait_timeout = float(record.config.timeout_seconds or 300)
-        results = await self._subagent_manager.collect_results(
-            timeout=wait_timeout,
-            spawner_session_key=self.session_key,
-            agent_id=record.agent_id,
-            run_id=record.run_id,
-        )
-        if not results:
-            response = (
-                f"Auto-routed to subagent `{agent_name}`, but it did not finish "
-                f"within {int(wait_timeout)}s."
-            )
-            note = (
-                f"Auto-routed to persistent subagent {agent_name} "
-                f"(score={matched['score']}; {reason_text})."
-            )
-            return (
-                response,
-                note,
-                self._build_response_source(
-                    source_type="subagent",
-                    subagent_id=record.agent_id,
-                    subagent_name=agent_name,
-                ),
-            )
-
-        result = results[-1]
-        source = self._build_response_source(
-            source_type="subagent",
-            subagent_id=result.agent_id or record.agent_id,
-            subagent_name=agent_name,
-        )
-        if result.state == SubagentState.COMPLETED:
-            result_text = self._filter_execution_steps(result.result or "(no output)")
-            response = f"Subagent `{agent_name}` handled this request.\n\n{result_text}"
-        elif result.state == SubagentState.FAILED:
-            response = (
-                f"Subagent `{agent_name}` failed while handling this request.\n\n"
-                f"{result.error or '(no error message)'}"
-            )
-        elif result.state == SubagentState.CANCELLED:
-            response = f"Subagent `{agent_name}` was cancelled before finishing."
-        else:
-            response = result.result or result.error or f"Subagent `{agent_name}` returned no output."
-
-        note = (
-            f"Auto-routed to persistent subagent {agent_name} "
-            f"(score={matched['score']}; {reason_text})."
-        )
-        return response, note, source
-
+    ) -> tuple[str, str | None, dict[str, Any] | None] | None:
+        """Prompt-based persistent subagent routing is disabled."""
+        return None
     async def _maybe_route_to_persistent_specialist(
         self,
         message: str,
     ) -> tuple[str, str | None] | None:
-        """Backward-compatible wrapper without source metadata."""
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if routed is None:
-            return None
-        response, note, _source = routed
-        return response, note
-
+        """Backward-compatible no-op; prompt routing is disabled."""
+        return None
     def _current_tool_owner_key(self, session_key: str | None = None) -> str:
         """Resolve a user-scoped ownership key for background tool jobs."""
         return build_tool_owner_key(
@@ -1892,6 +2020,37 @@ class AgentLoop:
         if hasattr(self._agent, "_shutdown_event") and self._agent._shutdown_event.is_set():
             self._agent._shutdown_event.clear()
 
+    def _prepare_agent_for_new_turn(self) -> None:
+        """Clear transient execution state so the newest prompt owns the next run."""
+        self._pre_injected_skill_name = None
+
+        if hasattr(self._agent, "state") and self._agent.state != AgentState.IDLE:
+            logger.warning(
+                f"Agent {getattr(self._agent, 'name', 'runtime')} was in "
+                f"{self._agent.state} state before a new turn; resetting to IDLE"
+            )
+            self._agent.state = AgentState.IDLE
+
+        if hasattr(self._agent, "current_step"):
+            try:
+                self._agent.current_step = 0
+            except Exception:
+                pass
+
+        if hasattr(self._agent, "_shutdown_event") and self._agent._shutdown_event.is_set():
+            logger.info("Clearing previous shutdown signal before processing a new turn")
+            self._agent._shutdown_event.clear()
+
+        if hasattr(self._agent, "tool_calls"):
+            try:
+                tool_calls = getattr(self._agent, "tool_calls")
+                if hasattr(tool_calls, "clear"):
+                    tool_calls.clear()
+                elif tool_calls:
+                    self._agent.tool_calls = []
+            except Exception:
+                pass
+
     def _compress_runtime_context_for_overflow_retry(self) -> int:
         """Compress runtime context only after an explicit overflow signal."""
         compressed = 0
@@ -1916,7 +2075,10 @@ class AgentLoop:
     ) -> Any:
         """Retry once after deliberate runtime compaction on context overflow."""
         try:
-            return await retry_runner(label=label, **run_kwargs)
+            result = await retry_runner(label=label, **run_kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
         except Exception as exc:
             if not is_context_overflow_error(exc):
                 raise
@@ -1935,8 +2097,21 @@ class AgentLoop:
             if compressed <= 0:
                 raise
 
+            AgentLoop._queue_runtime_notice(
+                self,
+                kind="runtime_compaction",
+                stage="overflow_retry",
+                compressed_actions=compressed,
+                estimated_tokens_before=getattr(exc, "estimated_tokens", None),
+                trigger_budget=getattr(exc, "max_tokens", None),
+                error_type=type(exc).__name__,
+            )
+
             self._reset_agent_state_for_retry()
-            return await retry_runner(label=f"{label}:overflow_retry", **run_kwargs)
+            result = await retry_runner(label=f"{label}:overflow_retry", **run_kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
 
     def _runtime_compaction_trigger_budget(self) -> int:
         """Return the runtime token budget that should trigger preflight compaction."""
@@ -1997,6 +2172,7 @@ class AgentLoop:
             reply_to=reply_to,
         )
         logger.info(f"Processing message: {message[:100]}...")
+        AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
 
         # Reset per-request state
@@ -2007,19 +2183,6 @@ class AgentLoop:
             self._persist_turn(message, created)
             return created
 
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if isinstance(routed, tuple) and len(routed) == 3:
-            routed_content, _route_note, route_source = routed
-            AgentLoop._set_last_response_source(self, route_source)
-            self._persist_turn(message, routed_content)
-            if self._auto_commit and self._git:
-                try:
-                    if self._git.has_changes():
-                        self._git.commit(message)
-                except Exception as e:
-                    logger.warning(f"Failed to auto-commit: {e}")
-            return routed_content
-
         # Refresh memory context
         try:
             memory_context = self.memory.get_memory_context()
@@ -2029,21 +2192,10 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        await self._prepare_request_context(message)
 
-        # Defensive: reset agent state if stuck from a previous run
-        if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
-            logger.warning(
-                f"Agent {self._agent.name} was in {self._agent.state} state, "
-                f"resetting to IDLE before processing"
-            )
-            self._agent.state = AgentState.IDLE
-            self._agent.current_step = 0
-
-        # Clear shutdown flag so the agent loop can run
-        if hasattr(self._agent, '_shutdown_event') and self._agent._shutdown_event.is_set():
-            logger.info("Clearing previous shutdown signal before processing")
-            self._agent._shutdown_event.clear()
+        self._prepare_agent_for_new_turn()
+        authoritative_message = message
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
@@ -2058,11 +2210,13 @@ class AgentLoop:
 
         AgentLoop._persist_user_turn_to_session(
             self,
-            message,
+            authoritative_message,
             media=media,
             attachments=attachments,
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+        original_system_prompt: str | None = None
+        original_base_system_prompt: object = _MISSING
 
         # Build a minimal per-step prompt with the user's request for context.
         # The anti-loop tracker will dynamically append progress info.
@@ -2071,6 +2225,13 @@ class AgentLoop:
 
         # Install anti-loop tracker to prevent repeated tool calls
         self._install_anti_loop_tracker(_base_prompt)
+        original_system_prompt, original_base_system_prompt = (
+            AgentLoop._apply_request_context_to_system_prompt(
+                self,
+                message,
+                thinking=False,
+            )
+        )
         await self._agent.add_message("user", runtime_message)
 
         retry_runner = AgentLoop._resolve_retry_runner(self)
@@ -2109,7 +2270,19 @@ class AgentLoop:
                 if _extracted:
                     final_content = _extracted
 
-            final_content = self._filter_execution_steps(final_content)
+            final_content = AgentLoop._finalize_response_content(
+                self,
+                authoritative_message,
+                final_content,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
+        except asyncio.CancelledError:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
+            raise
         except Exception as e:
             import traceback
             logger.error(
@@ -2119,6 +2292,11 @@ class AgentLoop:
         finally:
             # Always ensure agent is back in IDLE state after processing
             self._restore_agent_think()
+            AgentLoop._restore_request_context_system_prompt(
+                self,
+                original_system_prompt,
+                original_base_system_prompt,
+            )
             if hasattr(self._agent, 'state') and self._agent.state != AgentState.IDLE:
                 logger.warning(
                     f"Post-run cleanup: resetting agent from {self._agent.state} to IDLE"
@@ -2127,9 +2305,17 @@ class AgentLoop:
                 self._agent.current_step = 0
 
         try:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_COMPLETED,
+            )
             self._persist_turn_tool_trace(_pre_turn_memory_index)
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
+            self._session.add_message(
+                "assistant",
+                final_content,
+                **AgentLoop._assistant_session_save_kwargs(final_content),
+            )
+            AgentLoop._persist_session_if_possible(self)
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
@@ -2283,6 +2469,56 @@ class AgentLoop:
         if isinstance(content, list):
             return cls._multimodal_content_summary(content, max_chars)
         return content
+
+    @classmethod
+    def _compact_runtime_message_content(cls, message: Any, max_chars: int) -> Any:
+        """Compact older runtime messages without preserving stale assistant authority."""
+        role = cls._message_role_value(message)
+        content = getattr(message, "content", None)
+
+        if role == "assistant":
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if tool_calls:
+                if not content:
+                    return content
+                return (
+                    "[assistant tool-call turn compacted; exact tool arguments/results "
+                    "are recoverable via search_history]"
+                )
+            if content in (None, ""):
+                return content
+            if isinstance(content, list):
+                return (
+                    "[assistant multimodal reply compacted; earlier assistant analysis may be stale. "
+                    "Prioritize the latest user request and current tool evidence. "
+                    "Use search_history to recover exact earlier user/tool facts; search assistant replies "
+                    "only when their literal wording is explicitly needed.]"
+                )
+            return (
+                "[assistant reply compacted; earlier assistant analysis/conclusions may be stale. "
+                "Prioritize the latest user request and current tool evidence. "
+                "Use search_history to recover exact earlier user/tool facts; search assistant replies "
+                "only when their literal wording is explicitly needed.]"
+            )
+
+        if role == "tool":
+            compressed = cls._compress_message_content(content, max_chars)
+            if compressed == content:
+                return content
+            if isinstance(compressed, str):
+                tool_name = getattr(message, "name", None) or "tool"
+                return f"[{tool_name} result compacted]\n{compressed}"
+            return compressed
+
+        if role == "user":
+            compressed = cls._compress_message_content(content, max_chars)
+            if compressed == content:
+                return content
+            if isinstance(compressed, str):
+                return f"[earlier user message compacted]\n{compressed}"
+            return compressed
+
+        return cls._compress_message_content(content, max_chars)
 
     @classmethod
     def _message_content_char_count(cls, content: Any) -> int:
@@ -2566,7 +2802,117 @@ class AgentLoop:
             return role == "tool"
         return False
 
-    def _compress_runtime_context(self) -> int:
+    @classmethod
+    def _snap_drop_end_to_turn_boundary(
+        cls, messages: list, keep_head: int, desired_end: int
+    ) -> int:
+        """Return an index <= desired_end that sits on a safe boundary.
+
+        A *safe* drop boundary is a position ``k`` where:
+          * ``messages[k]`` is ``role="user"`` (start of the next turn), OR
+          * ``messages[k]`` is ``role="assistant"`` with no ``tool_calls`` and
+            not followed immediately by a ``role="tool"`` message (i.e. the
+            tool chain that the previous assistant opened is fully settled
+            at the end of index ``k - 1``).
+
+        Snapping ensures we never split an assistant(tool_calls) → tool(result)
+        pair, which would leak orphans the provider rejects.  If no boundary
+        is found, we fall back to ``keep_head`` (i.e. drop nothing) so the
+        safety invariant wins over the token-budget target.
+        """
+        if desired_end <= keep_head:
+            return keep_head
+        end = min(desired_end, len(messages))
+
+        def _role(i: int) -> str | None:
+            if i < 0 or i >= len(messages):
+                return None
+            return cls._message_role_value(messages[i])
+
+        def _has_tool_calls(i: int) -> bool:
+            if i < 0 or i >= len(messages):
+                return False
+            tc = getattr(messages[i], "tool_calls", None)
+            return bool(tc)
+
+        # Walk backwards from desired_end looking for a clean cut.  The cut
+        # index k means "delete messages[keep_head:k]", so messages[k]
+        # becomes the new first non-head message.
+        for k in range(end, keep_head, -1):
+            role = _role(k)
+            if role == "user":
+                return k
+            if role == "assistant" and not _has_tool_calls(k):
+                if _role(k + 1) != "tool":
+                    return k
+        return keep_head
+
+    def _insert_compaction_marker(self, messages: list, dropped: int) -> None:
+        """Insert a runtime-only marker telling the model history was trimmed.
+
+        The marker is a ``role="user"`` system-style message that documents
+        how many prior messages were removed from runtime memory and points
+        the model at the :class:`SearchHistoryTool` as the recovery path.
+        It is **not** persisted to the session store — the store still holds
+        the full transcript — so adding the marker is idempotent across
+        turns.
+        """
+        if not self._agent or not hasattr(self._agent, "memory"):
+            return
+        try:
+            from spoon_ai.schema import Message, Role  # lazy import
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        marker_text = (
+            "[history-compacted] "
+            f"{dropped} older message(s) (including any tool-call/result pairs) "
+            "were removed from this turn's in-memory context to fit the token "
+            "budget. The persisted session transcript was NOT cleared. The "
+            "latest real user request remains authoritative. Earlier assistant "
+            "analysis/conclusions in compacted history may be tentative or "
+            "stale, so do not treat them as current instructions. If you need "
+            "an exact earlier tool result, tool argument, image description, "
+            "or user statement, call the `search_history` tool (scope='current'). "
+            "Plain earlier assistant replies are omitted there by default; "
+            "search them explicitly only when their literal wording matters."
+        )
+        try:
+            marker = Message(role=Role.USER, content=marker_text)
+        except Exception:
+            return
+
+        insert_at = 1 if messages else 0
+        messages.insert(insert_at, marker)
+
+    @staticmethod
+    def _is_history_compaction_marker(msg: Any) -> bool:
+        """True when *msg* is the runtime-only history-compacted marker."""
+        role = AgentLoop._message_role_value(msg)
+        if role != "user":
+            return False
+        content = getattr(msg, "content", None)
+        return isinstance(content, str) and content.startswith("[history-compacted]")
+
+    def _latest_real_user_message_index(self, messages: list[Any]) -> int | None:
+        """Return the latest user-authored message that must survive compaction intact."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if self._message_role_value(message) != "user":
+                continue
+            if self._is_next_step_user_msg(message):
+                continue
+            if self._is_history_compaction_marker(message):
+                continue
+            return index
+        return None
+
+    def _compress_runtime_context(
+        self,
+        *,
+        force: bool = False,
+        budget_tokens: int | None = None,
+    ) -> int:
         """Proactively compress the agent's runtime context.
 
         Strategy (inspired by Openclaw's context engine):
@@ -2574,7 +2920,7 @@ class AgentLoop:
         2. Truncate ALL older message content (tool results, assistant, user).
         3. If still over budget, drop entire old message rounds.
 
-        Trigger: estimated tokens > 50 % of context_window.
+        Trigger: estimated tokens > the active runtime compaction budget.
         """
         if not self._agent or not hasattr(self._agent, 'memory'):
             return 0
@@ -2585,9 +2931,9 @@ class AgentLoop:
             return normalized
 
         estimated = self._estimate_runtime_tokens()
-        budget = int(self.context_window * 0.50)
+        budget = budget_tokens if budget_tokens is not None else self._runtime_compaction_trigger_budget()
 
-        if estimated <= budget:
+        if not force and estimated <= budget:
             return normalized
 
         logger.warning(
@@ -2614,28 +2960,58 @@ class AgentLoop:
         if indices_to_remove:
             logger.info(f"Phase 1: removed {len(indices_to_remove)} old next_step_prompt messages")
 
-        # Phase 2: Truncate content of ALL messages except the first and last 6.
+        protected_user_index = self._latest_real_user_message_index(messages)
+
+        # Phase 2: Compact older messages except the first and last 6.
         keep_tail = min(6, len(messages))
         max_content = 300
         for i in range(1, max(1, len(messages) - keep_tail)):
+            if protected_user_index is not None and i == protected_user_index:
+                continue
             msg = messages[i]
             original_content = getattr(msg, "content", None)
-            compressed_content = self._compress_message_content(original_content, max_content)
+            compressed_content = self._compact_runtime_message_content(msg, max_content)
             if compressed_content != original_content:
                 msg.content = compressed_content
                 compressed += 1
 
         # Phase 3: If still over budget, drop oldest rounds (keep first + last 8).
+        #
+        # *Segment-aware* drop: we only cut along user-turn boundaries so a
+        # drop never splits an ``assistant(tool_calls) -> tool(result)``
+        # chain. Partial splits would leak through as orphaned tool
+        # messages and the LLM provider would reject the whole request.
+        # The persisted session store is untouched, so anything dropped
+        # here remains reachable via ``search_history``.
         estimated = self._estimate_runtime_tokens()
+        dropped_in_phase3 = 0
         if estimated > budget and len(messages) > 12:
             keep_head = 1
             keep_tail_drop = min(8, len(messages) - 1)
-            droppable = len(messages) - keep_head - keep_tail_drop
+            tail_start = len(messages) - keep_tail_drop
+            if protected_user_index is not None:
+                tail_start = min(tail_start, protected_user_index)
+            droppable = max(0, tail_start - keep_head)
             if droppable > 4:
-                drop_count = droppable // 2
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
-                logger.info(f"Phase 3: dropped {drop_count} oldest messages")
+                desired = droppable // 2
+                snap_end = self._snap_drop_end_to_turn_boundary(
+                    messages, keep_head, keep_head + desired
+                )
+                actual_drop = max(0, snap_end - keep_head)
+                if actual_drop > 0:
+                    del messages[keep_head:keep_head + actual_drop]
+                    compressed += actual_drop
+                    dropped_in_phase3 = actual_drop
+                    logger.info(
+                        f"Phase 3: dropped {actual_drop} oldest messages "
+                        f"(segment-snapped from desired {desired})"
+                    )
+
+        # Phase 3b: Insert a compaction marker so the model knows prior
+        # turns are recoverable via ``search_history``. The marker is
+        # runtime-only; it never touches the persisted session.
+        if dropped_in_phase3 > 0:
+            self._insert_compaction_marker(messages, dropped_in_phase3)
 
         # Phase 4: Repair tool_use/tool_result pairing broken by message deletion.
         compressed += self._repair_tool_pairing(messages)
@@ -2662,22 +3038,37 @@ class AgentLoop:
         if len(messages) <= 4:
             return compressed
 
-        # Truncate ALL messages to 150 chars
-        for msg in messages:
+        protected_user_index = self._latest_real_user_message_index(messages)
+
+        # Compact older messages aggressively while preserving the latest real user turn.
+        for index, msg in enumerate(messages):
+            if protected_user_index is not None and index == protected_user_index:
+                continue
             original_content = getattr(msg, "content", None)
-            compressed_content = self._compress_message_content(original_content, 150)
+            compressed_content = self._compact_runtime_message_content(msg, 150)
             if compressed_content != original_content:
                 msg.content = compressed_content
                 compressed += 1
 
-        # Drop all but first + last 6 messages
+        # Drop all but first + last 6 messages (segment-aware)
+        dropped = 0
         if len(messages) > 8:
             keep_head = 1
             keep_tail = min(6, len(messages) - 1)
-            drop_count = len(messages) - keep_head - keep_tail
-            if drop_count > 0:
-                del messages[keep_head:keep_head + drop_count]
-                compressed += drop_count
+            desired_end = len(messages) - keep_tail
+            if protected_user_index is not None:
+                desired_end = min(desired_end, protected_user_index)
+            snap_end = self._snap_drop_end_to_turn_boundary(
+                messages, keep_head, desired_end
+            )
+            actual_drop = max(0, snap_end - keep_head)
+            if actual_drop > 0:
+                del messages[keep_head:keep_head + actual_drop]
+                compressed += actual_drop
+                dropped = actual_drop
+
+        if dropped > 0:
+            self._insert_compaction_marker(messages, dropped)
 
         # Repair tool pairing broken by message deletion
         compressed += self._repair_tool_pairing(messages)
@@ -2921,6 +3312,66 @@ class AgentLoop:
         self._latest_reasoning_excerpt = None
         self._pending_reasoning_chunks = []
 
+    def _reset_runtime_notices(self) -> None:
+        """Reset request-scoped runtime notices surfaced to clients."""
+        self._pending_runtime_notices = []
+
+    def _queue_runtime_notice(self, **notice: Any) -> None:
+        """Queue a request-scoped runtime notice for later streaming."""
+        pending = getattr(self, "_pending_runtime_notices", None)
+        if not isinstance(pending, list):
+            pending = []
+            self._pending_runtime_notices = pending
+        payload = {
+            key: value
+            for key, value in notice.items()
+            if value is not None
+        }
+        if payload:
+            pending.append(payload)
+
+    def _drain_runtime_notices(self) -> list[dict[str, Any]]:
+        """Return queued runtime notices and clear the request buffer."""
+        pending = getattr(self, "_pending_runtime_notices", None)
+        if not isinstance(pending, list):
+            self._pending_runtime_notices = []
+            return []
+        notices = [item for item in pending if isinstance(item, dict)]
+        self._pending_runtime_notices = []
+        return notices
+
+    @staticmethod
+    def _runtime_notice_to_stream_event(
+        notice: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Convert an internal runtime notice into a stream event."""
+        if not isinstance(notice, dict):
+            return None
+
+        kind = str(notice.get("kind") or "").strip().lower()
+        if kind != "runtime_compaction":
+            return None
+
+        stage = str(notice.get("stage") or "").strip().lower()
+        if stage == "overflow_retry":
+            delta = (
+                "Context window exceeded. Earlier history was compacted and the "
+                "agent resumed the latest request."
+            )
+        else:
+            delta = (
+                "Context window near limit. Earlier history was compacted before "
+                "continuing the latest request."
+            )
+
+        metadata = dict(notice)
+        metadata.setdefault("visible", True)
+        return {
+            "type": "notice",
+            "delta": delta,
+            "metadata": metadata,
+        }
+
     def _capture_reasoning_text(self, text: str | None) -> str | None:
         """Store a reasoning excerpt so gateway transports can reuse it."""
         normalized = str(text or "").strip()
@@ -3042,6 +3493,15 @@ class AgentLoop:
         result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
         return result.strip()
 
+    def _finalize_response_content(
+        self,
+        message: str,
+        content: str,
+        *,
+        turn_memory_start_index: int,
+    ) -> str:
+        """Apply generic execution-step filtering without prompt-derived routing."""
+        return AgentLoop._filter_execution_steps(self, content)
     @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
         """Read a message field from either dict or object runtime payloads."""
@@ -3095,11 +3555,14 @@ class AgentLoop:
         if full_result:
             merged["result"] = full_result
             merged["content"] = full_result
+            merged["output"] = full_result
             merged["full_result"] = full_result
             merged["full_content"] = full_result
+            merged["full_output"] = full_result
         if summary_result:
             merged.setdefault("model_result", summary_result)
             merged.setdefault("model_content", summary_result)
+            merged.setdefault("model_output", summary_result)
         if full_result and summary_result and full_result != summary_result:
             merged["result_truncated_for_model"] = True
         return merged
@@ -3204,7 +3667,7 @@ class AgentLoop:
 
         Yields:
             Dicts with keys:
-              type:     "content" | "thinking" | "tool_call" | "tool_result" | "done"
+              type:     "content" | "thinking" | "tool_call" | "tool_result" | "notice" | "done"
               delta:    Incremental text (may be empty for non-text events)
               metadata: Extra context (tool name, args, step number, etc.)
               source:   Machine-readable producer metadata for this output
@@ -3215,7 +3678,10 @@ class AgentLoop:
         current_source = AgentLoop._set_last_response_source(self)
         logger.info(f"Streaming message: {message[:100]}...")
         self._reset_reasoning_capture()
+        AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
+        authoritative_message = message
+        buffer_stream_content = False
 
         current_session_key = getattr(self, "session_key", "default")
         self.set_subagent_context(
@@ -3244,28 +3710,6 @@ class AgentLoop:
                 self._persist_turn(message, full_content)
             return
 
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if isinstance(routed, tuple) and len(routed) == 3:
-            routed_content, _route_note, current_source = routed
-            AgentLoop._set_last_response_source(self, current_source)
-            full_content = routed_content or ""
-            if full_content:
-                yield {
-                    "type": "content",
-                    "delta": full_content,
-                    "metadata": {"auto_routed_to_subagent": True},
-                    "source": current_source,
-                }
-            yield {
-                "type": "done",
-                "delta": "",
-                "metadata": {"content": full_content},
-                "source": current_source,
-            }
-            if full_content:
-                self._persist_turn(message, full_content)
-            return
-
         # Refresh memory context
         bg_task: asyncio.Task | None = None
 
@@ -3288,7 +3732,9 @@ class AgentLoop:
         capture_manager = None
 
         # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        await self._prepare_request_context(message)
+        self._prepare_agent_for_new_turn()
+        authoritative_message = message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -3299,7 +3745,7 @@ class AgentLoop:
             message = runtime_message
         AgentLoop._persist_user_turn_to_session(
             self,
-            message,
+            authoritative_message,
             media=media,
             attachments=attachments,
         )
@@ -3340,6 +3786,7 @@ class AgentLoop:
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
                 try:
+                    retry_runner = AgentLoop._resolve_retry_runner(self)
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
@@ -3353,9 +3800,11 @@ class AgentLoop:
                         while not self._agent.output_queue.empty():
                             self._agent.output_queue.get_nowait()
 
-                    result = await self._run_agent_with_retry(
+                    result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                        self,
                         label="stream",
-                        pre_retry_cleanup=_drain_queue,
+                        retry_runner=retry_runner,
+                        pre_overflow_retry_cleanup=_drain_queue,
                         **run_kwargs,
                     )
                     if hasattr(result, "content"):
@@ -3396,12 +3845,12 @@ class AgentLoop:
                 nonlocal stream_segment_index, current_stream_segment_type
 
                 event_type = str(event.get("type") or "")
-                if event_type not in {"thinking", "content", "tool_call", "tool_result"}:
+                if event_type not in {"thinking", "content", "tool_call", "tool_result", "notice"}:
                     return event
 
                 metadata = dict(event.get("metadata") or {})
                 starts_new_segment = (
-                    event_type in {"tool_call", "tool_result"}
+                    event_type in {"tool_call", "tool_result", "notice"}
                     or current_stream_segment_type != event_type
                 )
                 if starts_new_segment:
@@ -3410,7 +3859,7 @@ class AgentLoop:
                 metadata.setdefault("segment_start", starts_new_segment)
                 metadata.setdefault("segment_type", event_type)
 
-                if event_type in {"tool_call", "tool_result"}:
+                if event_type in {"tool_call", "tool_result", "notice"}:
                     current_stream_segment_type = None
                 else:
                     current_stream_segment_type = event_type
@@ -3421,8 +3870,22 @@ class AgentLoop:
                     "source": event.get("source", current_source),
                 }
 
+            def _drain_runtime_notice_events() -> list[dict[str, Any]]:
+                events: list[dict[str, Any]] = []
+                for notice in AgentLoop._drain_runtime_notices(self):
+                    event = AgentLoop._runtime_notice_to_stream_event(notice)
+                    if event is not None:
+                        events.append(_decorate_stream_event(event))
+                return events
+
+            for event in _drain_runtime_notice_events():
+                yield event
+
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
             while not (td.is_set() and oq.empty()):
+                for event in _drain_runtime_notice_events():
+                    yield event
+
                 tool_result_events, stream_tool_result_index = (
                     AgentLoop._collect_stream_tool_result_events(
                         self,
@@ -3601,6 +4064,8 @@ class AgentLoop:
                             if saw_tool_call:
                                 saw_content_after_tool_call = True
                             full_content += delta
+                            if buffer_stream_content:
+                                continue
                         yield _decorate_stream_event(event)
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
@@ -3623,6 +4088,8 @@ class AgentLoop:
             )
             for event in tool_result_events:
                 yield _decorate_stream_event(event)
+            for event in _drain_runtime_notice_events():
+                yield event
 
             fallback_after_tool_only_preamble = (
                 saw_tool_call
@@ -3651,11 +4118,29 @@ class AgentLoop:
                     full_content = run_result_text
                     fallback_reason = "run_result_no_chunks"
                 if fallback_delta:
-                    yield _decorate_stream_event({
-                        "type": "content",
-                        "delta": fallback_delta,
-                        "metadata": {"fallback": fallback_reason},
-                    })
+                    if not buffer_stream_content:
+                        yield _decorate_stream_event({
+                            "type": "content",
+                            "delta": fallback_delta,
+                            "metadata": {"fallback": fallback_reason},
+                        })
+
+            final_content = AgentLoop._finalize_response_content(
+                self,
+                authoritative_message,
+                full_content,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
+            if buffer_stream_content and final_content:
+                yield _decorate_stream_event({
+                    "type": "content",
+                    "delta": final_content,
+                    "metadata": {
+                        "buffered": True,
+                        "validated": True,
+                    },
+                })
+            full_content = final_content
 
             # Emit done
             stream_completed = True
@@ -3669,6 +4154,11 @@ class AgentLoop:
         except asyncio.CancelledError:
             stream_cancelled = True
             logger.warning("Streaming cancelled")
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
             raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
@@ -3688,7 +4178,11 @@ class AgentLoop:
             }
         finally:
             if capture_manager is not None:
-                capture_manager.__exit__(None, None, None)
+                try:
+                    capture_manager.__exit__(None, None, None)
+                except ValueError as exc:
+                    logger.debug(f"Tool output capture context cleanup skipped: {exc}")
+                    clear_captured_tool_outputs(tool_output_capture_scope)
             self._restore_agent_think()
             AgentLoop._restore_request_context_system_prompt(
                 self,
@@ -3698,15 +4192,33 @@ class AgentLoop:
             if bg_task is not None and not bg_task.done():
                 bg_task.cancel()
                 try:
-                    await asyncio.wait_for(bg_task, timeout=5.0)
+                    cleanup_timeout = 30.0 if stream_cancelled else 5.0
+                    await asyncio.wait_for(bg_task, timeout=cleanup_timeout)
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
+            if not stream_completed and not stream_cancelled:
+                AgentLoop._mark_latest_user_turn_state(
+                    self,
+                    _TURN_STATE_INTERRUPTED,
+                    reason="task_cancelled",
+                )
 
         if full_content and stream_completed and not stream_cancelled:
             try:
+                AgentLoop._mark_latest_user_turn_state(
+                    self,
+                    _TURN_STATE_COMPLETED,
+                )
+                # Persist intermediate tool-call artifacts generated while
+                # streaming so they remain searchable even after runtime
+                # context compaction.
                 self._persist_turn_tool_trace(_pre_turn_memory_index)
-                self._session.add_message("assistant", full_content)
-                self.sessions.save(self._session)
+                self._session.add_message(
+                    "assistant",
+                    full_content,
+                    **AgentLoop._assistant_session_save_kwargs(full_content),
+                )
+                AgentLoop._persist_session_if_possible(self)
             except Exception as e:
                 logger.warning(f"Failed to save session after streaming: {e}")
 
@@ -3758,6 +4270,7 @@ class AgentLoop:
         )
         logger.info(f"Processing message (with thinking): {message[:100]}...")
         self._reset_reasoning_capture()
+        AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
@@ -3766,19 +4279,6 @@ class AgentLoop:
         if isinstance(created, str):
             self._persist_turn(message, created)
             return created, "Created persistent subagent from natural-language request."
-
-        routed = await self._maybe_route_to_persistent_specialist_result(message)
-        if isinstance(routed, tuple) and len(routed) == 3:
-            routed_content, route_note, route_source = routed
-            AgentLoop._set_last_response_source(self, route_source)
-            self._persist_turn(message, routed_content)
-            if self._auto_commit and self._git:
-                try:
-                    if self._git.has_changes():
-                        self._git.commit(message)
-                except Exception as e:
-                    logger.warning(f"Failed to auto-commit: {e}")
-            return routed_content, route_note
 
         # Refresh memory context
         try:
@@ -3789,7 +4289,9 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         # Trim and inject persisted history into runtime memory
-        await self._prepare_request_context()
+        await self._prepare_request_context(message)
+        self._prepare_agent_for_new_turn()
+        authoritative_message = message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -3800,7 +4302,7 @@ class AgentLoop:
             message = runtime_message
         AgentLoop._persist_user_turn_to_session(
             self,
-            message,
+            authoritative_message,
             media=media,
             attachments=attachments,
         )
@@ -3851,7 +4353,20 @@ class AgentLoop:
                 )
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
+            final_content = AgentLoop._finalize_response_content(
+                self,
+                authoritative_message,
+                final_content,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
 
+        except asyncio.CancelledError:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
+            raise
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
             raise
@@ -3864,9 +4379,20 @@ class AgentLoop:
             )
 
         try:
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_COMPLETED,
+            )
+            # Persist intermediate tool-call artifacts (tool results and the
+            # assistant messages that called them) so they remain searchable
+            # even after runtime context compaction.
             self._persist_turn_tool_trace(_pre_turn_memory_index)
-            self._session.add_message("assistant", final_content)
-            self.sessions.save(self._session)
+            self._session.add_message(
+                "assistant",
+                final_content,
+                **AgentLoop._assistant_session_save_kwargs(final_content),
+            )
+            AgentLoop._persist_session_if_possible(self)
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
@@ -4299,13 +4825,22 @@ class AgentLoop:
         Injects env vars so they survive short-term memory pruning.
         The anti-loop tracker dynamically appends progress info.
         """
-        _truncated = message[:300] + ("..." if len(message) > 300 else "")
+        _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
         prompt = (
+            "[TURN PRIORITY]: Execute only the newest user request. "
+            "Any unfinished plan, stale tool sequence, or previous task assumption is superseded "
+            "unless the newest user message explicitly says to continue it.\n"
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
         )
+        recent_turn_notice = getattr(self, "_recent_turn_notice", None)
+        if isinstance(recent_turn_notice, str) and recent_turn_notice.strip():
+            prompt = (
+                f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
+                + prompt
+            )
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -4313,16 +4848,44 @@ class AgentLoop:
 
     def _build_request_context_prompt(self, message: str) -> str:
         """Build the compact request context block used for thinking runs."""
-        _truncated = message[:300] + ("..." if len(message) > 300 else "")
+        _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
         prompt = (
+            "[TURN PRIORITY]: Execute only the newest user request. "
+            "Any unfinished plan, stale tool sequence, or previous task assumption is superseded "
+            "unless the newest user message explicitly says to continue it.\n"
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n"
         )
+        recent_turn_notice = getattr(self, "_recent_turn_notice", None)
+        if isinstance(recent_turn_notice, str) and recent_turn_notice.strip():
+            prompt = (
+                f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
+                + prompt
+            )
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
         return prompt
+
+    @staticmethod
+    def _truncate_request_for_prompt(
+        message: str,
+        *,
+        head_chars: int = 220,
+        tail_chars: int = 180,
+    ) -> str:
+        """Keep both the head and tail of the latest request for prompt scaffolding."""
+        normalized = (message or "").strip()
+        if len(normalized) <= head_chars + tail_chars + 24:
+            return normalized
+        head = normalized[:head_chars].rstrip()
+        tail = normalized[-tail_chars:].lstrip()
+        return (
+            f"{head}\n"
+            "[... middle omitted to save tokens; preserve latest tail instructions ...]\n"
+            f"{tail}"
+        )
 
     def _apply_request_context_to_system_prompt(
         self,
@@ -4331,7 +4894,7 @@ class AgentLoop:
         thinking: bool,
     ) -> tuple[str | None, object]:
         """Temporarily append active request context to the agent system prompt."""
-        if not thinking or not getattr(self, "_agent", None):
+        if not getattr(self, "_agent", None):
             return None, _MISSING
 
         current_prompt = getattr(self._agent, "system_prompt", None)

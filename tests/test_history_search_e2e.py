@@ -299,6 +299,37 @@ def phase_builtin_tool(mgr: SessionManager) -> None:
         f"tool_call_id not surfaced in hit; got {payload}",
     )
 
+    # Assistant tool-call traces remain searchable by default because they
+    # encode earlier tool arguments / call-site evidence.
+    out = asyncio.run(tool.execute(query="ETH price USD", include_extras=True))
+    payload = json.loads(out)
+    _assert(
+        "tool.default-keeps.assistant-tool-trace",
+        payload["total"] >= 1
+        and any(h["role"] == "assistant" and h["tool_calls"] for h in payload["hits"]),
+        f"expected assistant tool-call trace, got {payload}",
+    )
+
+    # Plain assistant narrative replies are omitted by default to avoid
+    # reviving stale plans after compaction.
+    out = asyncio.run(tool.execute(query="currently trading around"))
+    payload = json.loads(out)
+    _assert(
+        "tool.default-omits.assistant-reply",
+        payload["total"] == 0
+        and "roles=['assistant']" in payload.get("note", ""),
+        f"plain assistant reply should be omitted by default; got {payload}",
+    )
+
+    out = asyncio.run(tool.execute(query="currently trading around", roles=["assistant"]))
+    payload = json.loads(out)
+    _assert(
+        "tool.roles.assistant-explicit",
+        payload["total"] >= 1
+        and all(h["role"] == "assistant" for h in payload["hits"]),
+        f"explicit assistant role filter should restore assistant replies; got {payload}",
+    )
+
     # Roles filter, current scope
     out = asyncio.run(tool.execute(query="coingecko", roles=["tool"]))
     payload = json.loads(out)

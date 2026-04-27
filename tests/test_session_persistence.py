@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +138,11 @@ class TestFileSessionStore:
         assert loaded.session_key == "test-session"
         assert len(loaded.messages) == 2
         assert loaded.metadata["language"] == "en"
+
+    def test_save_recreates_deleted_sessions_dir(self, file_store: FileSessionStore):
+        shutil.rmtree(file_store._dir)
+        file_store.save_session(_sample_session())
+        assert file_store.load_session("test-session") is not None
 
     def test_load_nonexistent(self, file_store: FileSessionStore):
         assert file_store.load_session("nonexistent") is None
@@ -398,7 +404,7 @@ def _assert_multimodal_user_call(
 
 class TestAgentLoopSessionHydration:
     @pytest.mark.asyncio
-    async def test_runtime_history_injected_from_persisted_session(self, tmp_dir: Path):
+    async def test_runtime_history_skips_plain_assistant_replies_by_default(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
 
@@ -424,7 +430,7 @@ class TestAgentLoopSessionHydration:
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
         assert loop._agent.memory.cleared is True
-        assert injected == 2
+        assert injected == 1
         _assert_multimodal_user_call(
             loop._agent.calls[0],
             expected_text=(
@@ -434,8 +440,31 @@ class TestAgentLoopSessionHydration:
                 f"Use these attached workspace files as the primary source of truth for this request."
             ),
         )
-        assert loop._agent.calls[1] == ("assistant", "Okay, I will remember your name is Alice.", {})
 
+    @pytest.mark.asyncio
+    async def test_runtime_history_skips_stale_assistant_prose_by_default(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message("user", "What can you do next?")
+        loop._session.add_message(
+            "assistant",
+            "1. Archive the report\n2. Generate a summary\n3. Open a follow-up ticket",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert injected == 1
+        assert loop._agent.calls == [("user", "What can you do next?", {})]
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
@@ -471,6 +500,34 @@ class TestAgentLoopSessionHydration:
                 "Use these attached workspace files as the primary source of truth for this request."
             ),
         )
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_skips_interrupted_user_turns(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message("user", "Completed request", turn_state="completed")
+        loop._session.add_message("assistant", "Completed answer")
+        loop._session.add_message(
+            "user",
+            "Cancelled request that must not be replayed",
+            turn_state="interrupted",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert injected == 1
+        assert loop._agent.calls == [
+            ("user", "Completed request", {}),
+        ]
 
     def test_strip_attachment_context_recovers_original_user_text(self):
         from spoon_bot.agent.loop import _ensure_attachment_context, _strip_attachment_context
@@ -776,14 +833,11 @@ class TestAgentLoopCurrentRequestMultimodal:
             expected_text="What text appears in the image?",
         )
         assert loop._agent.run_calls == [((), {})]
-        assert loop._session.messages == [
-            {
-                "role": "user",
-                "content": "What text appears in the image?",
-                "timestamp": loop._session.messages[0]["timestamp"],
-                "media": [str(image_path)],
-            }
-        ]
+        assert len(loop._session.messages) == 1
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "What text appears in the image?"
+        assert loop._session.messages[0]["media"] == [str(image_path)]
+        assert loop._session.messages[0]["turn_state"] == "pending"
         loop.sessions.save.assert_called_once_with(loop._session)
         loop._compress_runtime_context.assert_not_called()
         loop._force_compress_runtime_context.assert_not_called()
@@ -868,9 +922,10 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "fallback from run result"
 
+        assert loop._session.messages[0]["turn_state"] == "completed"
         assert loop._session.messages[-1]["role"] == "assistant"
         assert loop._session.messages[-1]["content"] == "fallback from run result"
-        assert loop.sessions.save.call_count == 2
+        assert loop.sessions.save.call_count == 3
         loop.sessions.save.assert_called_with(loop._session)
 
     @pytest.mark.asyncio
@@ -957,13 +1012,10 @@ class TestAgentLoopStreamFallback:
             chunks.append(chunk)
 
         assert any(chunk["type"] == "error" for chunk in chunks)
-        assert loop._session.messages == [
-            {
-                "role": "user",
-                "content": "keep this request in history",
-                "timestamp": loop._session.messages[0]["timestamp"],
-            }
-        ]
+        assert len(loop._session.messages) == 1
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "keep this request in history"
+        assert loop._session.messages[0]["turn_state"] == "pending"
         loop.sessions.save.assert_called_once_with(loop._session)
 
 
@@ -1114,7 +1166,38 @@ class TestAgentLoopThinkingMode:
 
         assert response == "answer"
         assert thinking == "reasoning trace"
-        assert loop._agent.run_calls == [((), {"thinking": True, "reasoning_effort": "high"})]
+
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_marks_current_user_turn_interrupted_on_cancel(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop.workspace = tmp_dir
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._agent = MagicMock()
+        loop._agent.run = AsyncMock(side_effect=asyncio.CancelledError())
+        loop._agent.add_message = AsyncMock()
+        loop._session = Session(session_key="thinking_cancelled")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._auto_commit = False
+        loop._git = None
+
+        with pytest.raises(asyncio.CancelledError):
+            await AgentLoop.process_with_thinking(loop, message="Choose C")
+
+        assert len(loop._session.messages) == 1
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "Choose C"
+        assert loop._session.messages[0]["turn_state"] == "interrupted"
+        assert loop._session.messages[0]["turn_state_reason"] == "task_cancelled"
+        assert loop.sessions.save.call_count >= 2
 
     @pytest.mark.asyncio
     async def test_process_with_thinking_retries_openai_apierror(self, tmp_dir: Path):

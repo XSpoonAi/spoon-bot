@@ -14,6 +14,18 @@ SCRUBBED_ENV_VARS: frozenset[str] = frozenset({
     "MNEMONIC",
 })
 
+_SENSITIVE_ENV_NAME_RE = re.compile(
+    r'(?:^|_)(?:API[_-]?KEY|ACCESS[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|SECRET|PASSWORD|'
+    r'PASSWD|MNEMONIC|PRIVATE[_-]?KEY|CREDENTIAL|PASSPHRASE)(?:_|$)',
+    re.IGNORECASE,
+)
+
+
+def is_sensitive_env_var(name: str) -> bool:
+    """Return True when an environment variable name likely contains a secret."""
+    normalized = str(name or "").strip()
+    return bool(normalized and _SENSITIVE_ENV_NAME_RE.search(normalized))
+
 _SENSITIVE_VAR_RE = re.compile(
     r'^(\s*(?:export\s+)?'
     r'(?:\w*(?:PRIVATE_KEY|SECRET_KEY|SECRET|API_KEY|ACCESS_KEY|AUTH_TOKEN'

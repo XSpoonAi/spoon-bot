@@ -462,7 +462,10 @@ class WebSocketHandler:
         self._chat_lock = asyncio.Lock()
         self._concurrent_request_slots = asyncio.Semaphore(_CONCURRENT_REQUEST_LIMIT)
         self._concurrent_tasks: set[asyncio.Task] = set()
-        agent = get_agent()
+        try:
+            agent = get_agent()
+        except RuntimeError:
+            agent = None
         workspace = Path(getattr(agent, "workspace", Path.home() / ".spoon-bot" / "workspace"))
         yolo_mode = bool(getattr(agent, "yolo_mode", False))
         self._sandbox_id = _runtime_sandbox_id()
@@ -639,7 +642,7 @@ class WebSocketHandler:
                         ):
                             check_budget("stream", config.budget.stream_timeout_ms, span.elapsed_ms)
                             if self._cancel_requested:
-                                break
+                                raise asyncio.CancelledError
 
                             chunk_type = chunk_data.get("type", "content")
                             # Support both "delta" and "content" keys (#10)
@@ -699,6 +702,40 @@ class WebSocketHandler:
                             else:
                                 if chunk_type == "content" and delta:
                                     full_content += delta
+                                elif (
+                                    chunk_type == "tool_result"
+                                    and not delta
+                                    and isinstance(metadata, dict)
+                                ):
+                                    tool_output = (
+                                        metadata.get("output")
+                                        or metadata.get("result")
+                                        or metadata.get("content")
+                                        or metadata.get("full_output")
+                                        or metadata.get("full_result")
+                                    )
+                                    if tool_output not in (None, ""):
+                                        delta = (
+                                            tool_output
+                                            if isinstance(tool_output, str)
+                                            else str(tool_output)
+                                        )
+                                if chunk_type == "tool_result" and isinstance(metadata, dict):
+                                    tool_output = (
+                                        metadata.get("output")
+                                        or metadata.get("result")
+                                        or metadata.get("content")
+                                        or metadata.get("full_output")
+                                        or metadata.get("full_result")
+                                    )
+                                    if tool_output not in (None, ""):
+                                        if isinstance(tool_output, str):
+                                            normalized_output = tool_output
+                                        else:
+                                            normalized_output = str(tool_output)
+                                        metadata.setdefault("output", normalized_output)
+                                        metadata.setdefault("result", normalized_output)
+                                        metadata.setdefault("content", normalized_output)
 
                                 # Send stream chunk event (even for non-content types like tool_call)
                                 if delta or chunk_type != "content":
@@ -823,7 +860,7 @@ class WebSocketHandler:
 
         return {"cancelled": True, "task_id": task_id, "task_interrupted": cancelled}
 
-    async def _cancel_current_task_for_cleanup(self, timeout: float = 2.0) -> bool:
+    async def _cancel_current_task_for_cleanup(self, timeout: float = 35.0) -> bool:
         """Cancel and await the current background chat task."""
         task = self._current_task
         if task is None:

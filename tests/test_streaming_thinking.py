@@ -508,6 +508,26 @@ class TestAgentLoopStream:
         assert loop._agent.system_prompt == "base system"
         assert loop._agent._original_system_prompt == "base original"
 
+    def test_apply_request_context_to_system_prompt_also_augments_non_thinking_runs(self):
+        """Non-thinking runs should receive the same active request context guardrails."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = MagicMock()
+        loop._agent.system_prompt = "base system"
+        loop._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: keep only latest")
+
+        original_prompt, original_base_prompt = AgentLoop._apply_request_context_to_system_prompt(
+            loop,
+            "keep only latest",
+            thinking=False,
+        )
+
+        assert original_prompt == "base system"
+        assert original_base_prompt is not None
+        assert "## Active Request Context" in loop._agent.system_prompt
+        assert "[USER REQUEST]: keep only latest" in loop._agent.system_prompt
+
     def test_build_request_context_prompt_preserves_tail_output_constraints(self):
         """Compact request scaffolding must keep the latest request ending verbatim."""
         from spoon_bot.agent.loop import AgentLoop
@@ -527,40 +547,122 @@ class TestAgentLoopStream:
         assert "[... middle omitted to save tokens; preserve latest tail instructions ...]" in prompt
         assert "reply with exactly: final_ok" in prompt.lower()
         assert "Do not summarize." in prompt
-        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
-        assert "[LATEST REQUEST ENDING]:" in prompt
-
-    def test_build_request_context_prompt_skips_extra_tail_block_for_short_requests(self):
-        """Short requests are already preserved whole and do not need an extra tail block."""
-        from spoon_bot.agent.loop import AgentLoop
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop.workspace = Path("/workspace")
-        loop._extract_env_for_prompt = MagicMock(return_value="")
-
-        prompt = AgentLoop._build_request_context_prompt(loop, "Return FINAL_OK")
-
         assert "[AUTHORITATIVE REQUEST ENDING]" not in prompt
+        assert "[LATEST REQUEST ENDING]:" not in prompt
 
-    def test_build_request_context_prompt_keeps_non_english_tail_constraints(self):
-        """Long non-English requests should preserve their tail verbatim without keyword matching."""
+    def test_build_request_context_prompt_marks_latest_turn_authoritative(self):
+        """Thinking scaffolding should explicitly supersede unfinished prior plans."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
         loop.workspace = Path("/workspace")
         loop._extract_env_for_prompt = MagicMock(return_value="")
 
+        prompt = AgentLoop._build_request_context_prompt(loop, "Handle only this newest request.")
+
+        assert "[TURN PRIORITY]:" in prompt
+        assert "Execute only the newest user request." in prompt
+        assert "stale tool sequence" in prompt
+
+    def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
+        """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+        loop._recent_turn_notice = (
+            "The immediately previous user request was interrupted before completion.\n"
+            "[INTERRUPTED PREVIOUS REQUEST]: Continue the report export with profile C\n"
+            "Resolve it against the newest user message as follows:\n"
+            "- If the newest user message is itself a standalone actionable request, treat it as replacing the interrupted request.\n"
+            "- If the newest user message only adds constraints or details to the interrupted request, continue the interrupted request with the new constraints applied.\n"
+            "- Do not execute both as separate tasks unless the newest user message explicitly asks for both."
+        )
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "Continue the report export with profile A")
+
+        assert "[PREVIOUS TURN STATUS]:" in prompt
+        assert "[INTERRUPTED PREVIOUS REQUEST]: Continue the report export with profile C" in prompt
+        assert "standalone actionable request" in prompt
+        assert "Do not execute both as separate tasks" in prompt
+
+    def test_build_request_context_prompt_keeps_latest_request_tail_without_contract_routing(self):
+        """Long requests keep the latest tail verbatim without prompt-derived contracts."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        transfer_tail = (
+            "1. Finalize the audit checklist for workspace PROJECT-123"
+        )
         message = (
-            "Revisa el repositorio con cuidado. "
-            + ("contexto intermedio " * 40)
-            + "Al terminar, responde solo con FINAL_OK y no hagas resumen."
+            "Do not continue the earlier status records or overview."
+            + ("stale context " * 80)
+            + transfer_tail
         )
 
         prompt = AgentLoop._build_request_context_prompt(loop, message)
 
-        assert "[AUTHORITATIVE REQUEST ENDING]" in prompt
-        assert "responde solo con final_ok" in prompt.lower()
-        assert "no hagas resumen" in prompt.lower()
+        assert "[TURN PRIORITY]:" in prompt
+        assert "[REQUEST CONTRACT]:" not in prompt
+        assert "[PREVIOUS ASSISTANT OFFER]:" not in prompt
+        assert transfer_tail in prompt
+    def test_build_step_prompt_marks_latest_turn_authoritative(self):
+        """Per-step prompts should make the newest user task override prior execution plans."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_step_prompt(loop, "Fix the bug now.")
+
+        assert "[TURN PRIORITY]:" in prompt
+        assert "Execute only the newest user request." in prompt
+        assert "[USER REQUEST]: Fix the bug now." in prompt
+
+    def test_finalize_response_content_only_filters_execution_steps(self):
+        """Finalization should not rewrite output based on prompt keywords."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = "Step 1: Observed output of cmd: ignored\n\nActual answer"
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Reply with OK",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "Actual answer"
+    def test_prepare_agent_for_new_turn_clears_stale_runtime_state(self):
+        """A new turn should not inherit unfinished runtime state from the prior task."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        shutdown_event = asyncio.Event()
+        shutdown_event.set()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._pre_injected_skill_name = "document-review-agent"
+        loop._agent = MagicMock()
+        loop._agent.name = "sandbox"
+        loop._agent.state = "thinking"
+        loop._agent.current_step = 7
+        loop._agent._shutdown_event = shutdown_event
+        loop._agent.tool_calls = [{"name": "shell"}]
+
+        AgentLoop._prepare_agent_for_new_turn(loop)
+
+        assert loop._pre_injected_skill_name is None
+        normalized_state = getattr(loop._agent.state, "value", loop._agent.state)
+        assert str(normalized_state).lower() == "idle"
+        assert loop._agent.current_step == 0
+        assert loop._agent.tool_calls == []
+        assert shutdown_event.is_set() is False
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
@@ -594,6 +696,71 @@ class TestAgentLoopStream:
         assert content_chunks[1]["delta"] == " World"
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Hello World"
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_compaction_notice_and_continues_latest_request_after_overflow_retry(self):
+        """Overflow recovery should surface a notice, then continue with the latest task output."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.exceptions import ContextOverflowError
+
+        class _Result:
+            content = "Latest task executed."
+
+        attempts = 0
+
+        async def mock_retry_runner(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ContextOverflowError(estimated_tokens=450_000, max_tokens=400_000)
+            await agent._agent.output_queue.put({"content": "Latest task executed."})
+            return _Result()
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = AsyncMock()
+        agent._agent.add_message = AsyncMock()
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._select_next_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=False)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent._compress_runtime_context_for_overflow_retry = MagicMock(return_value=7)
+        agent._reset_agent_state_for_retry = MagicMock()
+        agent._run_agent_with_retry = AsyncMock(side_effect=mock_retry_runner)
+        agent._current_tool_owner_key = MagicMock(return_value="ws:test")
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="execute only the newest request"):
+            chunks.append(chunk)
+
+        notice_chunks = [c for c in chunks if c["type"] == "notice"]
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert attempts == 2
+        assert len(notice_chunks) == 1
+        assert notice_chunks[0]["metadata"]["kind"] == "runtime_compaction"
+        assert notice_chunks[0]["metadata"]["stage"] == "overflow_retry"
+        assert notice_chunks[0]["metadata"]["compressed_actions"] == 7
+        assert "resumed the latest request" in notice_chunks[0]["delta"]
+        assert "".join(chunk["delta"] for chunk in content_chunks) == "Latest task executed."
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "Latest task executed."
 
     @pytest.mark.asyncio
     async def test_stream_handles_string_chunks(self):
@@ -664,11 +831,10 @@ class TestAgentLoopStream:
             media=media,
             attachments=attachments,
         )
-        agent._persist_turn.assert_called_once_with(
-            "test",
+        agent._session.add_message.assert_any_call(
+            "assistant",
             "hello",
-            media=media,
-            attachments=attachments,
+            message_kind="assistant_reply",
         )
 
     @pytest.mark.asyncio
@@ -907,10 +1073,10 @@ class TestAgentLoopStream:
         tool_call.function.arguments = '{"path":"."}'
 
         async def mock_run(**kwargs):
-            await agent._agent.output_queue.put({"content": "我将检查当前工作区。"})
+            await agent._agent.output_queue.put({"content": "I will inspect the current workspace."})
             await asyncio.sleep(0.12)
             await agent._agent.output_queue.put({"tool_calls": [tool_call]})
-            await agent._agent.output_queue.put({"content": "检查完成。"})
+            await agent._agent.output_queue.put({"content": "Inspection complete."})
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
@@ -1496,7 +1662,7 @@ class TestAgentLoopStream:
         from spoon_bot.agent.loop import AgentLoop
 
         async def mock_run(**kwargs):
-            await agent._agent.output_queue.put({"content": "直接给答案"})
+            await agent._agent.output_queue.put({"content": "Direct answer"})
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
@@ -1530,10 +1696,10 @@ class TestAgentLoopStream:
         content_chunks = [c for c in chunks if c["type"] == "content"]
         assert thinking_chunks == []
         assert len(content_chunks) == 1
-        assert content_chunks[0]["delta"] == "直接给答案"
+        assert content_chunks[0]["delta"] == "Direct answer"
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert len(done_chunks) == 1
-        assert done_chunks[0]["metadata"]["content"] == "直接给答案"
+        assert done_chunks[0]["metadata"]["content"] == "Direct answer"
 
     @pytest.mark.asyncio
     async def test_stream_without_tool_call_emits_first_content_before_run_finishes(self):
@@ -1589,6 +1755,88 @@ class TestAgentLoopStream:
         assert done_chunks[0]["metadata"]["content"] == "chunk-1 chunk-2"
 
     @pytest.mark.asyncio
+    async def test_stream_buffers_strict_content_until_validated(self):
+        """Strict reply contracts should keep tool events live but delay assistant text until validated."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"pwd"}'
+
+        release_run = asyncio.Event()
+        raw_reply = (
+            "Current service configuration follows.\n"
+            "```python\n"
+            "RPC_URL = \"https://neoxt4seed1.ngd.network:443\"\n"
+            "TARGET_ADDRESS = \"NiNmXL8FjEUEs1nfX9uHFBNaenxDHJtmuB\"\n"
+            "print('status')\n"
+            "```"
+        )
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await agent._agent.output_queue.put({"content": raw_reply})
+            await asyncio.wait_for(release_run.wait(), timeout=0.4)
+            result = MagicMock(spec=["content"])
+            result.content = raw_reply
+            return result
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+        agent._current_tool_owner_key = MagicMock(return_value="ws:test")
+
+        stream_iter = AgentLoop.stream(
+            agent,
+            message=(
+                "Only do the newest request: generate a Python script skeleton that queries the status for a specified resource ID."
+                "Do not mention the prior service configuration or add other content."
+            ),
+            thinking=True,
+        )
+
+        first_chunk = await asyncio.wait_for(anext(stream_iter), timeout=0.2)
+        assert first_chunk["type"] == "tool_call"
+        assert first_chunk["metadata"]["name"] == "shell"
+
+        await asyncio.sleep(0.15)
+        assert agent._agent.task_done.is_set() is False
+
+        release_run.set()
+        remaining_chunks = [chunk async for chunk in stream_iter]
+        content_chunks = [c for c in remaining_chunks if c["type"] == "content"]
+        done_chunks = [c for c in remaining_chunks if c["type"] == "done"]
+
+        assert len(content_chunks) == 1
+        assert "buffered" not in content_chunks[0]["metadata"]
+        assert content_chunks[0]["delta"] == raw_reply
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == raw_reply
+
+    @pytest.mark.asyncio
     async def test_stream_error_handling(self):
         """stream() should catch errors and emit done with error metadata."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1623,7 +1871,8 @@ class TestAgentLoopStream:
         assert chunks[-1]["type"] == "done"
         assert chunks[-1]["metadata"]["content"] == ""
 
-        agent._session.add_message.assert_called_once_with("user", "test")
+        user_call = agent._session.add_message.call_args_list[0]
+        assert user_call.args[:2] == ("user", "test")
         agent.sessions.save.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1638,14 +1887,20 @@ class TestAgentLoopStream:
             chunks.append(chunk)
 
         # Verify session was saved
-        agent._session.add_message.assert_any_call("user", "test message")
-        agent._session.add_message.assert_any_call("assistant", "hello")
+        user_call = agent._session.add_message.call_args_list[0]
+        assert user_call.args[:2] == ("user", "test message")
+        agent._session.add_message.assert_any_call(
+            "assistant",
+            "hello",
+            message_kind="assistant_reply",
+        )
         assert agent.sessions.save.call_count == 2
 
     @pytest.mark.asyncio
     async def test_stream_close_cancels_background_run_and_skips_session_save(self):
         """Closing the stream should stop the background run and avoid persisting stale output."""
         from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.session.manager import Session
 
         run_cancelled = asyncio.Event()
 
@@ -1665,8 +1920,7 @@ class TestAgentLoopStream:
         agent._agent.run = mock_run
         agent._agent.add_message = AsyncMock()
         agent._agent.state = "idle"
-        agent._session = MagicMock()
-        agent._session.add_message = MagicMock()
+        agent._session = Session(session_key="cancelled_stream")
         agent.sessions = MagicMock()
         agent.sessions.save = MagicMock()
         agent.memory = MagicMock()
@@ -1690,8 +1944,12 @@ class TestAgentLoopStream:
         await stream.aclose()
         await asyncio.wait_for(run_cancelled.wait(), timeout=1.0)
 
-        agent._session.add_message.assert_called_once_with("user", "test message")
-        agent.sessions.save.assert_called_once()
+        assert len(agent._session.messages) == 1
+        assert agent._session.messages[0]["role"] == "user"
+        assert agent._session.messages[0]["content"] == "test message"
+        assert agent._session.messages[0]["turn_state"] == "interrupted"
+        assert agent._session.messages[0]["turn_state_reason"] == "task_cancelled"
+        assert agent.sessions.save.call_count >= 2
 
     @pytest.mark.asyncio
     async def test_install_anti_loop_tracker_does_not_stack_previous_request_prompt(self):
@@ -1730,7 +1988,6 @@ class TestAgentLoopStream:
         await agent._agent.think()
 
         assert seen_prompts[-1] == "prompt two"
-        agent._compress_runtime_context.assert_not_called()
 
 
 @pytest.mark.requires_spoon_core
@@ -1787,6 +2044,7 @@ class TestAgentLoopProcessWithThinking:
 
         mock_inner_agent = MagicMock()
         mock_inner_agent.add_message = AsyncMock()
+        mock_inner_agent.run = AsyncMock(return_value=result)
         mock_inner_agent.state = "idle"
 
         agent = self._make_process_with_thinking_agent(mock_inner_agent)

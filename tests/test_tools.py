@@ -40,6 +40,39 @@ class TestShellTool:
         assert "hello" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_sensitive_env_vars_not_exposed_to_shell(self, shell_tool, monkeypatch):
+        """Shell subprocesses must not inherit secret-bearing env vars."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-secret")
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-secret")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-secret")
+        monkeypatch.setenv("PRIVATE_KEY", "0x" + "11" * 32)
+        monkeypatch.setenv("SPOON_BOT_DEFAULT_PROVIDER", "openrouter")
+
+        from spoon_bot.agent.tools.shell import _scrub_env
+
+        result_env = _scrub_env(dict(os.environ))
+        result = "\n".join(
+            f"{key}={result_env.get(key, '')}"
+            for key in (
+                "OPENROUTER_API_KEY",
+                "TAVILY_API_KEY",
+                "TELEGRAM_BOT_TOKEN",
+                "PRIVATE_KEY",
+                "SPOON_BOT_DEFAULT_PROVIDER",
+            )
+        )
+
+        assert "OPENROUTER_API_KEY=" in result
+        assert "TAVILY_API_KEY=" in result
+        assert "TELEGRAM_BOT_TOKEN=" in result
+        assert "PRIVATE_KEY=" in result
+        assert "OPENROUTER_API_KEY=sk-or-v1-secret" not in result
+        assert "TAVILY_API_KEY=tvly-secret" not in result
+        assert "TELEGRAM_BOT_TOKEN=telegram-secret" not in result
+        assert "PRIVATE_KEY=0x" not in result
+        assert "SPOON_BOT_DEFAULT_PROVIDER=openrouter" in result
+
+    @pytest.mark.asyncio
     async def test_dangerous_command_blocked(self, shell_tool):
         """Test that dangerous commands are blocked."""
         result = await shell_tool.execute("rm -rf /")
