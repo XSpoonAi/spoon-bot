@@ -457,7 +457,7 @@ class TestAgentLoopSessionHydration:
         loop._session.add_message("user", "What can you do next?")
         loop._session.add_message(
             "assistant",
-            "1. Transfer all GAS\n2. Generate a balance script\n3. Join the next game",
+            "1. Archive the report\n2. Generate a summary\n3. Open a follow-up ticket",
             message_kind="assistant_reply",
         )
 

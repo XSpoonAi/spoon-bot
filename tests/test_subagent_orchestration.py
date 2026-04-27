@@ -939,39 +939,32 @@ def test_subagent_manager_disables_prompt_based_auto_route_specialist(workspace_
     assert match is None
 
 
-def test_subagent_manager_parses_natural_language_creation_request(workspace_dir):
+def test_subagent_manager_does_not_parse_natural_language_creation_request(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
     )
 
     parsed = manager.parse_persistent_subagent_request(
-        "帮我创建一个 subagent 来总结今天的新闻"
+        "create a persistent subagent for weekly report review"
     )
 
-    assert parsed is not None
-    assert parsed["suggested_name"] == "news-subagent"
-    assert parsed["specialization"] == "总结今天的新闻"
-    assert "今天的新闻" in parsed["match_keywords"]
+    assert parsed is None
 
 
-def test_subagent_manager_parses_common_chinese_creation_request_variant(workspace_dir):
+def test_subagent_manager_does_not_parse_polite_creation_request_variant(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
     )
 
     parsed = manager.parse_persistent_subagent_request(
-        "请帮我创建一个持久 subagent，专门总结当前仓库的 README 和 docs 文档。"
+        "please create a persistent subagent for repository documentation summaries"
     )
 
-    assert parsed is not None
-    assert parsed["suggested_name"] == "readme-docs-subagent"
-    assert parsed["specialization"] == "总结当前仓库的 README 和 docs 文档"
-    assert "总结当前仓库的 README 和 docs 文档" in parsed["match_keywords"]
+    assert parsed is None
 
 
-@pytest.mark.xfail(reason="legacy mojibake fixture; covered by stable profile tests below")
 def test_subagent_manager_create_persistent_subagent_from_description(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
@@ -979,16 +972,14 @@ def test_subagent_manager_create_persistent_subagent_from_description(workspace_
     )
 
     record = manager.create_persistent_subagent(
-        description="总结今天的新闻",
+        description="summarize weekly engineering status reports",
     )
 
-    assert record.agent_name == "news-subagent"
-    assert record.spawn_mode == SpawnMode.SESSION
-    assert record.state == SubagentState.COMPLETED
-    assert record.config.auto_route is False
-    assert record.config.tool_profile == "research"
-    assert record.config.specialization == "总结今天的新闻"
-    assert "今天的新闻" in record.config.match_keywords
+    assert record.name == "summarize-weekly-subagent"
+    assert record.auto_route is False
+    assert record.tool_profile == "coding"
+    assert record.specialization == "summarize weekly engineering status reports"
+    assert record.match_keywords == ["summarize weekly engineering status reports"]
 
 
 def test_subagent_manager_skips_ambiguous_auto_route_specialist_match(workspace_dir):
@@ -1106,21 +1097,20 @@ async def test_telegram_subagent_spawn_sets_specialist_metadata():
     assert config.match_keywords == ["login", "password reset"]
 
 
-def test_subagent_manager_parses_creation_request_with_sender_prefix_english(workspace_dir):
+def test_subagent_manager_does_not_parse_creation_request_with_sender_prefix(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
     )
 
     parsed = manager.parse_persistent_subagent_request(
-        "[Alice]: Create a persistent subagent to summarize today's news"
+        "[Alice]: Create a persistent subagent for weekly report review"
     )
 
-    assert parsed is not None
-    assert parsed["suggested_name"] == "news-subagent"
+    assert parsed is None
 
 
-def test_subagent_manager_creates_research_profile_from_english_description(workspace_dir):
+def test_subagent_manager_creates_generic_profile_from_english_description(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
@@ -1130,63 +1120,9 @@ def test_subagent_manager_creates_research_profile_from_english_description(work
         description="handle literature search, paper discovery, paper summaries, and research material collection",
     )
 
-    assert profile.name == "academic-research-subagent"
-    assert profile.auto_route is False
-    assert profile.tool_profile == "research"
-    assert "paper search" in profile.match_keywords
-
-
-def test_subagent_manager_matches_research_profile_for_related_request(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    manager.create_persistent_subagent(
-        description="handle literature search, paper discovery, paper summaries, and research material collection",
-        agent_name="academic-research-subagent",
-    )
-
-    match = manager.find_best_auto_route_specialist(
-        "Please find representative papers on multi-agent systems and provide a brief summary."
-    )
-
-    assert match is None
-
-
-def test_subagent_manager_does_not_prompt_route_any_request(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    manager.create_persistent_subagent(
-        description="总结当前仓库的 README 和 docs 文档",
-        agent_name="readme-docs-subagent",
-    )
-
-    summary_match = manager.find_best_auto_route_specialist(
-        "请总结当前仓库 README 的核心功能，只要 3 条。"
-    )
-    cron_match = manager.find_best_auto_route_specialist(
-        "请帮我创建一个 corn 定时任务：每 5 分钟检查当前工作区的 README.md 是否存在，并在当前会话里回复 README_OK。"
-    )
-
-    assert summary_match is None
-    assert cron_match is None
-
-
-def test_subagent_manager_creates_research_profile_from_chinese_description(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-
-    profile = manager.create_persistent_subagent(
-        description="\u4eca\u540e\u4e13\u95e8\u5904\u7406\u6587\u732e\u67e5\u8be2\u3001\u8bba\u6587\u68c0\u7d22\u3001\u8bba\u6587\u6458\u8981\u6574\u7406\u548c\u7814\u7a76\u8d44\u6599\u6536\u96c6\u76f8\u5173\u4efb\u52a1",
-    )
-
-    assert profile.name == "academic-research-subagent"
-    assert profile.tool_profile == "research"
-    assert "\u6587\u732e\u67e5\u8be2" in profile.match_keywords
+    assert profile.name == "handle-literature-subagent"
+    assert profile.tool_profile == "coding"
+    assert profile.match_keywords == ["handle literature search, paper discovery, paper summaries, and research material collection"]
 
 
 @pytest.mark.asyncio
@@ -1265,13 +1201,13 @@ def test_subagent_manager_does_not_route_from_persistent_profile_without_runtime
         workspace=workspace_dir,
     )
     manager.create_persistent_subagent(
-        description="专门处理文献查询、论文检索、论文摘要整理和研究资料收集",
+        description="handle literature search, paper discovery, paper summaries, and research material collection",
         agent_name="academic-research-subagent",
         config=SubagentConfig(
             tool_profile="research",
             auto_route=True,
-            specialization="专门处理文献查询、论文检索、论文摘要整理和研究资料收集",
-            match_keywords=["文献查询", "论文检索", "论文摘要", "研究资料", "学术研究"],
+            specialization="handle literature search, paper discovery, paper summaries, and research material collection",
+            match_keywords=["literature search", "paper discovery", "paper summaries", "research material"],
         ),
     )
 
@@ -1280,7 +1216,7 @@ def test_subagent_manager_does_not_route_from_persistent_profile_without_runtime
         workspace=workspace_dir,
     )
     match = reloaded.find_best_auto_route_specialist(
-        "帮我查一下多智能体系统方向最近的代表性论文，并做一个简要总结。"
+        "Find representative papers on multi-agent systems and provide a brief summary."
     )
 
     assert match is None

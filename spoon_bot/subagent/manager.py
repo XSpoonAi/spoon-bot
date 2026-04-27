@@ -529,360 +529,44 @@ class SubagentManager:
 
     @classmethod
     def _infer_persistent_subagent_profile(cls, description: str) -> dict[str, Any]:
-        """Infer a persistent subagent profile from a natural-language description."""
-        raw = description.strip().strip("。.!? ")
-        normalized = cls._normalize_text(raw)
-        keywords = [raw]
-        match_examples = [raw]
-        tool_profile = "coding"
-        suggested_name = "subagent"
+        """Build a generic profile for explicit persistent subagent creation.
 
-        if any(token in normalized for token in ["新闻", "news", "headline", "热点"]):
-            suggested_name = "news-subagent"
-            tool_profile = "research"
-            keywords.extend([
-                "今天的新闻",
-                "今日新闻",
-                "新闻摘要",
-                "科技热点",
-                "国际热点",
-                "daily news",
-                "news summary",
-            ])
-            system_prompt = (
-                "You are a persistent news sub-agent. Your responsibility is to "
-                "summarize current news and produce concise, structured digests. "
-                "Prioritize fresh information, especially technology and international topics "
-                "when the request asks for them."
-            )
-        elif any(token in normalized for token in ["认证", "登录", "password", "authentication", "login"]):
-            suggested_name = "auth-subagent"
-            tool_profile = "coding"
-            keywords.extend([
-                "登录失败",
-                "密码重置",
-                "authentication",
-                "login issue",
-                "password reset",
-            ])
-            system_prompt = (
-                "You are a persistent authentication sub-agent. Handle login, "
-                "password reset, and account recovery work directly."
-            )
-        elif any(token in normalized for token in ["docker", "部署", "deploy", "kubernetes", "ci/cd"]):
-            suggested_name = "deploy-subagent"
-            tool_profile = "coding"
-            keywords.extend([
-                "部署",
-                "Docker",
-                "CI/CD",
-                "deployment",
-            ])
-            system_prompt = (
-                "You are a persistent deployment sub-agent. Handle Docker, CI/CD, "
-                "and deployment configuration requests."
-            )
-        else:
-            ascii_tokens = re.findall(r"[a-z0-9_]{3,}", normalized)
-            if ascii_tokens:
-                suggested_name = "-".join(ascii_tokens[:2]) + "-subagent"
-            system_prompt = (
-                "You are a persistent sub-agent dedicated to a specific class of tasks. "
-                f"Your specialization is: {raw}. Handle future matching requests directly."
-            )
-
-        deduped_keywords: list[str] = []
-        seen: set[str] = set()
-        for keyword in keywords:
-            stripped = keyword.strip()
-            if not stripped:
-                continue
-            marker = stripped.lower()
-            if marker in seen:
-                continue
-            seen.add(marker)
-            deduped_keywords.append(stripped)
-
-        return {
-            "suggested_name": suggested_name,
-            "specialization": raw,
-            "tool_profile": tool_profile,
-            "system_prompt": system_prompt,
-            "match_keywords": deduped_keywords,
-            "match_examples": match_examples,
-        }
-
-    @classmethod
-    def _infer_persistent_subagent_profile(cls, description: str) -> dict[str, Any]:
-        """Infer a persistent subagent profile from natural-language intent.
-
-        This duplicate definition intentionally overrides the older heuristic
-        above. It uses ASCII-safe unicode escapes for Chinese trigger words so
-        the matching logic remains stable regardless of console encoding.
+        This method intentionally avoids semantic prompt classification. The
+        caller may provide explicit config fields when a specialized profile is
+        required; arbitrary user prose is not used for routing decisions.
         """
-        raw = description.strip().strip("。.!? ")
+        raw = description.strip().strip(".!? ")
         normalized = cls._normalize_text(raw)
-        keywords = [raw]
-        match_examples = [raw]
-        tool_profile = "coding"
-        suggested_name = "subagent"
-
-        news_terms = [
-            "news",
-            "headline",
-            "daily news",
-            "news summary",
-            "today's news",
-            "today news",
-            "\u65b0\u95fb",
-            "\u70ed\u70b9",
-        ]
-        auth_terms = [
-            "authentication",
-            "login",
-            "password",
-            "\u8ba4\u8bc1",
-            "\u767b\u5f55",
-            "\u5bc6\u7801",
-        ]
-        literature_terms = [
-            "literature",
-            "paper",
-            "papers",
-            "research paper",
-            "academic research",
-            "scholar",
-            "\u6587\u732e",
-            "\u8bba\u6587",
-            "\u5b66\u672f",
-            "\u7814\u7a76\u8d44\u6599",
-        ]
-        deploy_terms = [
-            "docker",
-            "deploy",
-            "deployment",
-            "kubernetes",
-            "ci/cd",
-            "\u90e8\u7f72",
-        ]
-
-        if any(term in normalized for term in news_terms):
-            suggested_name = "news-subagent"
-            tool_profile = "research"
-            keywords.extend([
-                "\u4eca\u5929\u7684\u65b0\u95fb",
-                "\u4eca\u65e5\u65b0\u95fb",
-                "\u65b0\u95fb\u6458\u8981",
-                "\u79d1\u6280\u70ed\u70b9",
-                "\u56fd\u9645\u70ed\u70b9",
-                "daily news",
-                "news summary",
-            ])
-            system_prompt = (
-                "You are a persistent news sub-agent. Your responsibility is to "
-                "summarize current news and produce concise, structured digests. "
-                "Prioritize fresh information, especially technology and "
-                "international topics when the request asks for them."
-            )
-        elif any(term in normalized for term in auth_terms):
-            suggested_name = "auth-subagent"
-            tool_profile = "coding"
-            keywords.extend([
-                "\u767b\u5f55\u5931\u8d25",
-                "\u5bc6\u7801\u91cd\u7f6e",
-                "authentication",
-                "login issue",
-                "password reset",
-            ])
-            system_prompt = (
-                "You are a persistent authentication sub-agent. Handle login, "
-                "password reset, and account recovery work directly."
-            )
-        elif any(term in normalized for term in literature_terms):
-            suggested_name = "academic-research-subagent"
-            tool_profile = "research"
-            keywords.extend([
-                "\u6587\u732e\u67e5\u8be2",
-                "\u8bba\u6587\u68c0\u7d22",
-                "\u8bba\u6587\u6458\u8981",
-                "\u7814\u7a76\u8d44\u6599",
-                "\u5b66\u672f\u7814\u7a76",
-                "\u6587\u732e\u7efc\u8ff0",
-                "\u671f\u520a\u8bba\u6587",
-                "\u5b66\u672f\u6570\u636e\u5e93",
-                "\u8bba\u6587\u603b\u7ed3",
-                "paper",
-                "papers",
-                "research",
-                "literature",
-                "summary",
-                "literature search",
-                "paper search",
-                "paper summary",
-            ])
-            system_prompt = (
-                "You are a persistent academic research sub-agent. Handle "
-                "literature search, paper discovery, paper summaries, "
-                "research background synthesis, and reference collection."
-            )
-        elif any(term in normalized for term in deploy_terms):
-            suggested_name = "deploy-subagent"
-            tool_profile = "coding"
-            keywords.extend([
-                "\u90e8\u7f72",
-                "Docker",
-                "CI/CD",
-                "deployment",
-            ])
-            system_prompt = (
-                "You are a persistent deployment sub-agent. Handle Docker, "
-                "CI/CD, and deployment configuration requests."
-            )
-        else:
-            ascii_tokens = re.findall(r"[a-z0-9_]{3,}", normalized)
-            if ascii_tokens:
-                suggested_name = "-".join(ascii_tokens[:2]) + "-subagent"
-            system_prompt = (
-                "You are a persistent sub-agent dedicated to a specific class "
-                f"of tasks. Your specialization is: {raw}. Handle future "
-                "matching requests directly."
-            )
-
-        deduped_keywords: list[str] = []
-        seen: set[str] = set()
-        for keyword in keywords:
-            stripped = keyword.strip()
-            if not stripped:
-                continue
-            marker = stripped.lower()
-            if marker in seen:
-                continue
-            seen.add(marker)
-            deduped_keywords.append(stripped)
+        ascii_tokens = re.findall(r"[a-z0-9_]{3,}", normalized)
+        suggested_name = "-".join(ascii_tokens[:2]) + "-subagent" if ascii_tokens else "subagent"
+        specialization = raw or "persistent subagent"
+        system_prompt = (
+            "You are a persistent sub-agent dedicated to an explicitly configured "
+            f"class of tasks. Your specialization is: {specialization}."
+        )
 
         return {
             "suggested_name": suggested_name,
-            "specialization": raw,
-            "tool_profile": tool_profile,
+            "specialization": specialization,
+            "tool_profile": "coding",
             "system_prompt": system_prompt,
-            "match_keywords": deduped_keywords,
-            "match_examples": match_examples,
+            "match_keywords": [specialization],
+            "match_examples": [specialization],
         }
 
     @classmethod
     def parse_persistent_subagent_request(cls, message: str) -> dict[str, Any] | None:
-        """Parse a natural-language request to create a persistent subagent."""
-        text = cls._strip_sender_prefix(message)
-        patterns = [
-            re.compile(
-                r"^(?:(?:请|帮我|麻烦你|请你)\s*)*创建(?:一个|个)?(?:专门的|持久的|持久)?\s*(?:subagent|sub agent|子代理)\s*(?P<body>.+)$",
-                re.IGNORECASE,
-            ),
-            re.compile(
-                r"^(?:please\s+)?create\s+(?:me\s+)?(?:a\s+)?(?:persistent\s+)?(?:subagent|sub agent)\s+(?:to|for)\s+(?P<body>.+)$",
-                re.IGNORECASE,
-            ),
-        ]
-        for pattern in patterns:
-            match = pattern.match(text)
-            if not match:
-                continue
-            body = match.group("body").strip()
-            body = re.sub(r"^[,，:：;\s-]+", "", body)
-            body = re.sub(r"^(?:专门|主要|以后|今后)\s*", "", body, flags=re.IGNORECASE)
-            body = re.sub(r"^(?:来|用来|用于|负责)\s*", "", body, flags=re.IGNORECASE)
-            body = body.strip().strip("。.!? ")
-            if not body:
-                return None
-            profile = cls._infer_persistent_subagent_profile(body)
-            profile["source_message"] = text
-            return profile
+        """Natural-language subagent creation is intentionally disabled.
+
+        Persistent subagents must be created through explicit tool/API calls or
+        built-in skill guidance. Runtime prompt parsing here would reintroduce
+        prompt-derived routing.
+        """
         return None
 
     @staticmethod
-    def _strip_sender_prefix(text: str) -> str:
-        """Remove leading chat-style sender prefixes like ``[Name]:``."""
-        return re.sub(r"^\s*\[[^\]]+\]:\s*", "", text, count=1).strip()
-
-    @staticmethod
     def _normalize_text(text: str) -> str:
-        return re.sub(r"\s+", " ", SubagentManager._strip_sender_prefix(text).lower()).strip()
-
-    @classmethod
-    def _tokenize_text(cls, text: str) -> set[str]:
-        normalized = cls._normalize_text(text)
-        tokens = {
-            token
-            for token in re.findall(r"[a-z0-9_]{3,}", normalized)
-        }
-        for segment in re.findall(r"[\u4e00-\u9fff]+", normalized):
-            if len(segment) <= 4:
-                tokens.add(segment)
-            for n in (2, 3, 4):
-                if len(segment) < n:
-                    continue
-                for idx in range(len(segment) - n + 1):
-                    tokens.add(segment[idx:idx + n])
-        return tokens
-
-    @classmethod
-    def _score_specialist_match(
-        cls,
-        *,
-        message: str,
-        profile: PersistentSubagentProfile,
-    ) -> tuple[int, bool, list[str]]:
-        """Score how strongly a user message matches a persistent subagent profile."""
-        normalized = cls._normalize_text(message)
-        message_tokens = cls._tokenize_text(message)
-        score = 0
-        strong_signal = False
-        reasons: list[str] = []
-
-        agent_name = profile.name.strip().lower()
-        if agent_name and agent_name in normalized:
-            score += 12
-            strong_signal = True
-            reasons.append(f"name:{agent_name}")
-
-        for keyword in profile.match_keywords:
-            kw = keyword.strip().lower()
-            if not kw:
-                continue
-            if kw in normalized:
-                score += 6
-                strong_signal = True
-                reasons.append(f"keyword:{kw}")
-                continue
-
-            kw_tokens = cls._tokenize_text(kw)
-            if not kw_tokens:
-                continue
-            overlap = kw_tokens & message_tokens
-            contains_cjk = bool(re.search(r"[\u4e00-\u9fff]", kw))
-            required_overlap = 1 if contains_cjk else (2 if len(kw_tokens) > 1 else 1)
-            if len(overlap) >= required_overlap:
-                score += 5 if contains_cjk else 4
-                strong_signal = True
-                reasons.append(f"keyword_tokens:{kw}")
-
-        specialization = (profile.specialization or "").strip()
-        if specialization:
-            spec_tokens = cls._tokenize_text(specialization)
-            overlap = sorted(spec_tokens & message_tokens)
-            if overlap:
-                score += min(5, len(overlap))
-                reasons.append(f"specialization:{','.join(overlap[:4])}")
-
-        for example in profile.match_examples:
-            overlap = cls._tokenize_text(example) & message_tokens
-            contains_cjk = bool(re.search(r"[\u4e00-\u9fff]", example))
-            if len(overlap) >= (1 if contains_cjk else 2):
-                score += 3 if contains_cjk else 2
-                reasons.append("example")
-                break
-
-        return score, strong_signal, reasons
+        return re.sub(r"\s+", " ", text.lower()).strip()
 
     def _persist_session_agent_state(self, agent_id: str) -> None:
         """Persist agent.json metadata for a session-mode agent if present."""

@@ -573,17 +573,17 @@ class TestAgentLoopStream:
         loop._extract_env_for_prompt = MagicMock(return_value="")
         loop._recent_turn_notice = (
             "The immediately previous user request was interrupted before completion.\n"
-            "[INTERRUPTED PREVIOUS REQUEST]: Continue next game and choose C\n"
+            "[INTERRUPTED PREVIOUS REQUEST]: Continue the report export with profile C\n"
             "Resolve it against the newest user message as follows:\n"
             "- If the newest user message is itself a standalone actionable request, treat it as replacing the interrupted request.\n"
             "- If the newest user message only adds constraints or details to the interrupted request, continue the interrupted request with the new constraints applied.\n"
             "- Do not execute both as separate tasks unless the newest user message explicitly asks for both."
         )
 
-        prompt = AgentLoop._build_request_context_prompt(loop, "Continue next game and choose A")
+        prompt = AgentLoop._build_request_context_prompt(loop, "Continue the report export with profile A")
 
         assert "[PREVIOUS TURN STATUS]:" in prompt
-        assert "[INTERRUPTED PREVIOUS REQUEST]: Continue next game and choose C" in prompt
+        assert "[INTERRUPTED PREVIOUS REQUEST]: Continue the report export with profile C" in prompt
         assert "standalone actionable request" in prompt
         assert "Do not execute both as separate tasks" in prompt
 
@@ -596,12 +596,11 @@ class TestAgentLoopStream:
         loop._extract_env_for_prompt = MagicMock(return_value="")
 
         transfer_tail = (
-            "1、 将全部 GAS 转到 "
-            "0xd0545425d37f32be0c86a02e9932cd2de636ab8c测试网"
+            "1. Finalize the audit checklist for workspace PROJECT-123"
         )
         message = (
-            "前面那些游戏记录和状态概览都不要继续执行。"
-            + ("污染上下文 " * 80)
+            "Do not continue the earlier status records or overview."
+            + ("stale context " * 80)
             + transfer_tail
         )
 
@@ -634,7 +633,7 @@ class TestAgentLoopStream:
 
         cleaned = AgentLoop._finalize_response_content(
             loop,
-            "只回答 OK",
+            "Reply with OK",
             content,
             turn_memory_start_index=0,
         )
@@ -648,7 +647,7 @@ class TestAgentLoopStream:
         shutdown_event.set()
 
         loop = AgentLoop.__new__(AgentLoop)
-        loop._pre_injected_skill_name = "joker-game-agent"
+        loop._pre_injected_skill_name = "document-review-agent"
         loop._agent = MagicMock()
         loop._agent.name = "sandbox"
         loop._agent.state = "thinking"
@@ -1074,10 +1073,10 @@ class TestAgentLoopStream:
         tool_call.function.arguments = '{"path":"."}'
 
         async def mock_run(**kwargs):
-            await agent._agent.output_queue.put({"content": "我将检查当前工作区。"})
+            await agent._agent.output_queue.put({"content": "I will inspect the current workspace."})
             await asyncio.sleep(0.12)
             await agent._agent.output_queue.put({"tool_calls": [tool_call]})
-            await agent._agent.output_queue.put({"content": "检查完成。"})
+            await agent._agent.output_queue.put({"content": "Inspection complete."})
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
@@ -1663,7 +1662,7 @@ class TestAgentLoopStream:
         from spoon_bot.agent.loop import AgentLoop
 
         async def mock_run(**kwargs):
-            await agent._agent.output_queue.put({"content": "直接给答案"})
+            await agent._agent.output_queue.put({"content": "Direct answer"})
 
         agent = MagicMock(spec=AgentLoop)
         agent._initialized = True
@@ -1697,10 +1696,10 @@ class TestAgentLoopStream:
         content_chunks = [c for c in chunks if c["type"] == "content"]
         assert thinking_chunks == []
         assert len(content_chunks) == 1
-        assert content_chunks[0]["delta"] == "直接给答案"
+        assert content_chunks[0]["delta"] == "Direct answer"
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert len(done_chunks) == 1
-        assert done_chunks[0]["metadata"]["content"] == "直接给答案"
+        assert done_chunks[0]["metadata"]["content"] == "Direct answer"
 
     @pytest.mark.asyncio
     async def test_stream_without_tool_call_emits_first_content_before_run_finishes(self):
@@ -1768,11 +1767,11 @@ class TestAgentLoopStream:
 
         release_run = asyncio.Event()
         raw_reply = (
-            "当前钱包现状如下。\n"
+            "Current service configuration follows.\n"
             "```python\n"
             "RPC_URL = \"https://neoxt4seed1.ngd.network:443\"\n"
             "TARGET_ADDRESS = \"NiNmXL8FjEUEs1nfX9uHFBNaenxDHJtmuB\"\n"
-            "print('balance')\n"
+            "print('status')\n"
             "```"
         )
 
@@ -1813,8 +1812,8 @@ class TestAgentLoopStream:
         stream_iter = AgentLoop.stream(
             agent,
             message=(
-                "只做最新这句：生成一个 Python 脚本骨架，用于查询 NeoX 测试网上指定地址的 NEO 和 GAS 余额。"
-                "不要提钱包现状，不要其他内容。"
+                "Only do the newest request: generate a Python script skeleton that queries the status for a specified resource ID."
+                "Do not mention the prior service configuration or add other content."
             ),
             thinking=True,
         )

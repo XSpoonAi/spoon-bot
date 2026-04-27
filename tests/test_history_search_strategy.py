@@ -34,14 +34,14 @@ def test_scope_all_low_signal_query_prefers_current_session(tmp_path: Path) -> N
         mgr,
         "current-session",
         "user",
-        "我之前玩了几把游戏",
+        "What reports did I generate earlier?",
         timestamp="2026-04-24T09:00:00",
     )
     _append_message(
         mgr,
         "current-session",
         "tool",
-        "JOINED game=402 spot=A agentId=427",
+        "REPORT_CREATED id=402 format=pdf owner=agent-427",
         timestamp="2026-04-24T09:01:00",
         name="shell",
     )
@@ -49,13 +49,13 @@ def test_scope_all_low_signal_query_prefers_current_session(tmp_path: Path) -> N
         mgr,
         "archived-session",
         "tool",
-        "Usage: game list, game status, game context, game snapshot",
+        "Usage: report list, report status, report export",
         timestamp="2026-04-01T08:00:00",
         name="shell",
     )
 
     tool = SearchHistoryTool(mgr, default_session_key="current-session")
-    payload = json.loads(asyncio.run(tool.execute(query="game", scope="all")))
+    payload = json.loads(asyncio.run(tool.execute(query="report", scope="all")))
 
     assert payload["requested_scope"] == "all"
     assert payload["scope"] == "session"
@@ -72,7 +72,7 @@ def test_low_signal_current_hits_are_sorted_newest_first(tmp_path: Path) -> None
         mgr,
         "current-session",
         "tool",
-        "Usage: game list, game status, game context, game snapshot",
+        "Usage: report list, report status, report export",
         timestamp="2026-04-24T08:00:00",
         name="shell",
     )
@@ -80,7 +80,7 @@ def test_low_signal_current_hits_are_sorted_newest_first(tmp_path: Path) -> None
         mgr,
         "current-session",
         "tool",
-        "JOINED game=402 spot=A agentId=427",
+        "REPORT_CREATED id=402 format=pdf owner=agent-427",
         timestamp="2026-04-24T09:10:00",
         name="shell",
     )
@@ -88,7 +88,7 @@ def test_low_signal_current_hits_are_sorted_newest_first(tmp_path: Path) -> None
         mgr,
         "current-session",
         "tool",
-        "SETTLEMENT game=402 result=WIN rank=1/4 spot=A",
+        "REPORT_SENT id=402 status=complete recipient=team-a",
         timestamp="2026-04-24T09:20:00",
         name="shell",
     )
@@ -96,19 +96,19 @@ def test_low_signal_current_hits_are_sorted_newest_first(tmp_path: Path) -> None
         mgr,
         "archived-session",
         "tool",
-        "game.js game-status game snapshot game mechanics",
+        "report.py report-status report export report metadata",
         timestamp="2026-03-20T07:00:00",
         name="shell",
     )
 
     tool = SearchHistoryTool(mgr, default_session_key="current-session")
-    payload = json.loads(asyncio.run(tool.execute(query="game", scope="all", limit=3)))
+    payload = json.loads(asyncio.run(tool.execute(query="report", scope="all", limit=3)))
     contents = [hit["content"] for hit in payload["hits"]]
 
     assert payload["session_key"] == "current-session"
-    assert contents[0].startswith("SETTLEMENT game=402")
-    assert contents[1].startswith("JOINED game=402")
-    assert contents[2].startswith("Usage: game list")
+    assert contents[0].startswith("REPORT_SENT id=402")
+    assert contents[1].startswith("REPORT_CREATED id=402")
+    assert contents[2].startswith("Usage: report list")
 
 
 def test_specific_cross_session_query_still_searches_all_sessions(tmp_path: Path) -> None:
@@ -117,7 +117,7 @@ def test_specific_cross_session_query_still_searches_all_sessions(tmp_path: Path
         mgr,
         "current-session",
         "tool",
-        "SETTLEMENT game=402 result=WIN rank=1/4 spot=A",
+        "REPORT_SENT id=402 status=complete recipient=team-a",
         timestamp="2026-04-24T09:20:00",
         name="shell",
     )
@@ -125,14 +125,14 @@ def test_specific_cross_session_query_still_searches_all_sessions(tmp_path: Path
         mgr,
         "archived-session",
         "tool",
-        "SETTLEMENT game=288 result=WIN rank=1/4 spot=A",
+        "REPORT_SENT id=288 status=complete recipient=team-b",
         timestamp="2026-04-01T08:00:00",
         name="shell",
     )
 
     tool = SearchHistoryTool(mgr, default_session_key="current-session")
     payload = json.loads(
-        asyncio.run(tool.execute(query="SETTLEMENT game=", scope="all", limit=5))
+        asyncio.run(tool.execute(query="REPORT_SENT id=", scope="all", limit=5))
     )
 
     assert payload["scope"] == "all"
