@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -824,6 +825,7 @@ class ShellTool(Tool):
                 env["HOMEDRIVE"] = home_path[:2]
                 env["HOMEPATH"] = home_path[2:] or "\\"
             bash = self._find_bash()
+            process_group_kwargs = self._process_group_kwargs()
             if bash:
                 env["HOME"] = self._windows_home_to_bash(home_path)
                 command = self._convert_win_paths_to_posix(command)
@@ -835,6 +837,7 @@ class ShellTool(Tool):
                     stdin=subprocess.DEVNULL,
                     cwd=cwd,
                     env=env,
+                    **process_group_kwargs,
                 )
             env["HOME"] = home_path.replace("\\", "/")
             return subprocess.Popen(
@@ -845,6 +848,7 @@ class ShellTool(Tool):
                 shell=True,
                 cwd=cwd,
                 env=env,
+                **process_group_kwargs,
             )
 
         if self.use_shell:
@@ -857,6 +861,7 @@ class ShellTool(Tool):
                 stdin=subprocess.DEVNULL,
                 cwd=cwd,
                 env=env,
+                **self._process_group_kwargs(),
             )
 
         args = self._parse_command_args(command)
@@ -869,7 +874,16 @@ class ShellTool(Tool):
             stdin=subprocess.DEVNULL,
             cwd=cwd,
             env=env,
+            **self._process_group_kwargs(),
         )
+
+    @staticmethod
+    def _process_group_kwargs() -> dict[str, Any]:
+        """Create subprocesses in an isolated group so cancellation can kill children."""
+        if sys.platform == "win32":
+            flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            return {"creationflags": flag} if flag else {}
+        return {"start_new_session": True}
 
     @staticmethod
     def _get_process_returncode(process: Any) -> int | None:
@@ -886,6 +900,85 @@ class ShellTool(Tool):
         if asyncio.iscoroutinefunction(wait):
             return await wait()
         return await asyncio.to_thread(wait)
+
+    async def _terminate_process_tree(
+        self,
+        process: Any,
+        *,
+        grace_seconds: float = 5.0,
+    ) -> None:
+        """Terminate a subprocess and its children when a shell run is cancelled."""
+        if self._get_process_returncode(process) is not None:
+            return
+
+        pid = getattr(process, "pid", None)
+        if sys.platform == "win32" and pid:
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=grace_seconds,
+                )
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        else:
+            if pid and hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except Exception:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+
+            try:
+                await asyncio.wait_for(self._wait_for_process(process), timeout=grace_seconds)
+                return
+            except asyncio.TimeoutError:
+                if pid and hasattr(os, "killpg"):
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+
+        try:
+            await asyncio.wait_for(self._wait_for_process(process), timeout=grace_seconds)
+        except Exception:
+            pass
+
+    async def _terminate_background_job(
+        self,
+        job: _BackgroundShellJob,
+        *,
+        status: str,
+    ) -> None:
+        await self._terminate_process_tree(job.process)
+        for stream_task in (job.stdout_task, job.stderr_task):
+            if not stream_task.done():
+                stream_task.cancel()
+        await asyncio.gather(job.stdout_task, job.stderr_task, return_exceptions=True)
+        await self._refresh_background_job(job)
+        job.status = status
+        job.finished_at = time.time()
 
     async def _start_background_job(
         self,
@@ -1041,15 +1134,11 @@ class ShellTool(Tool):
 
         if action == "terminate_job":
             if self._get_process_returncode(job.process) is None:
-                job.process.terminate()
-                try:
-                    await asyncio.wait_for(self._wait_for_process(job.process), timeout=5.0)
-                except asyncio.TimeoutError:
-                    job.process.kill()
-                    await self._wait_for_process(job.process)
-            await self._refresh_background_job(job)
-            job.status = "terminated"
-            job.finished_at = time.time()
+                await self._terminate_background_job(job, status="terminated")
+            else:
+                await self._refresh_background_job(job)
+                job.status = "terminated"
+                job.finished_at = time.time()
             full_body = self._build_output_result(
                 job.stdout_text,
                 job.stderr_text,
@@ -1148,6 +1237,11 @@ class ShellTool(Tool):
                     timeout_seconds=effective_timeout,
                     tail_chars=tail_chars,
                 )
+            except asyncio.CancelledError:
+                await self._terminate_background_job(job, status="cancelled")
+                _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
+                self._prune_background_jobs(owner_key=owner_key)
+                raise
         except FileNotFoundError as e:
             return f"Error: Command or file not found: {e}"
         except PermissionError:

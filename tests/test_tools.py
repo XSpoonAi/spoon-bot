@@ -287,6 +287,63 @@ class TestShellTool:
         assert "done" in result.lower()
         assert job.job_id not in _SHELL_BACKGROUND_JOBS
 
+    @pytest.mark.asyncio
+    async def test_foreground_cancellation_terminates_job(self, shell_tool):
+        """Cancelling a foreground shell tool call must not leave the process running."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        started = asyncio.Event()
+        terminated = asyncio.Event()
+
+        class _FakeProcess:
+            returncode = None
+            pid = None
+
+            async def wait(self):
+                started.set()
+                while self.returncode is None:
+                    await asyncio.sleep(0.01)
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+                terminated.set()
+
+            def kill(self):
+                self.returncode = -9
+                terminated.set()
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        stdout_task = asyncio.create_task(asyncio.sleep(60))
+        stderr_task = asyncio.create_task(asyncio.sleep(60))
+        job = _BackgroundShellJob(
+            job_id="sh_cancelled",
+            command="sleep 60",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="started",
+        )
+
+        async def _fake_start_background_job(*args, **kwargs):
+            _SHELL_BACKGROUND_JOBS[job.job_id] = job
+            return job
+
+        with patch.object(shell_tool, "_start_background_job", AsyncMock(side_effect=_fake_start_background_job)):
+            task = asyncio.create_task(shell_tool.execute("sleep 60", timeout=60))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert terminated.is_set()
+        assert job.status == "cancelled"
+        assert job.job_id not in _SHELL_BACKGROUND_JOBS
+        assert stdout_task.done()
+        assert stderr_task.done()
+
     def test_windows_shell_uses_user_home_env(self, monkeypatch):
         """Windows bash execution should preserve the user's home path."""
         from spoon_bot.agent.tools.shell import ShellTool
