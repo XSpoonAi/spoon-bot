@@ -84,7 +84,7 @@ class ContextBuilder:
         self._skills_summary = summary
 
     def set_skill_context(self, context: str) -> None:
-        """Set active skill context to inject into system prompt."""
+        """Set skill context to inject into system prompt."""
         self._skill_context = context
 
     def build_system_prompt(self) -> str:

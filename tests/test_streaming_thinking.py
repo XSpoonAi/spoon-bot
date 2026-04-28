@@ -668,7 +668,7 @@ class TestAgentLoopStream:
         assert loop._agent.tool_calls == []
         assert shutdown_event.is_set() is False
 
-    def test_pre_injected_skill_records_sanitized_active_skill_context(self, tmp_path):
+    def test_pre_injected_skill_records_sanitized_invoked_skill_context(self, tmp_path):
         """Skill continuity metadata should come from discovered skill files."""
         from spoon_bot.agent.loop import AgentLoop
 
@@ -711,17 +711,17 @@ Follow the report workflow.
         )
         assert loop._pre_injected_skill_context["organized"] is True
         save_kwargs = AgentLoop._session_message_save_kwargs(
-            active_skill=loop._pre_injected_skill_context,
+            invoked_skill=loop._pre_injected_skill_context,
         )
-        assert save_kwargs["active_skill"] == {
+        assert save_kwargs["invoked_skills"] == [{
             "name": "report-builder",
             "location": "skills/report-builder/SKILL.md",
             "workspace_relative_path": "skills/report-builder/",
             "organized": True,
             "source": "skill_match",
-        }
+        }]
 
-    def test_recent_active_skill_prompt_hint_does_not_rehydrate_old_task_text(self, tmp_path):
+    def test_recent_invoked_skill_prompt_hint_does_not_rehydrate_old_task_text(self, tmp_path):
         """Continuity should expose only bounded skill identity, not old prompt content."""
         from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.session.manager import Session
@@ -744,7 +744,7 @@ when_to_use: Use when the user asks to assemble or continue report packets.
             "user",
             "Use the report builder and include internal-only source notes.",
             turn_state="completed",
-            active_skill={"name": "report-builder"},
+            invoked_skills=[{"name": "report-builder"}],
         )
         session.add_message("assistant", "Report packet created.")
 
@@ -756,33 +756,33 @@ when_to_use: Use when the user asks to assemble or continue report packets.
         loop._pre_injected_skill_context = None
         loop._extract_env_for_prompt = MagicMock(return_value="")
 
-        AgentLoop._refresh_recent_active_skill_context(loop)
+        AgentLoop._refresh_recent_invoked_skill_contexts(loop)
         prompt = AgentLoop._build_request_context_prompt(
             loop,
             "Continue with the latest item.",
         )
 
-        assert "[RECENT ACTIVE SKILL]: `report-builder`" in prompt
+        assert "[RECENT INVOKED SKILL]: `report-builder`" in prompt
         assert "skills/report-builder/SKILL.md" in prompt
         assert "internal-only source notes" not in prompt
 
-        runtime_message = AgentLoop._append_recent_active_skill_context(
+        runtime_message = AgentLoop._append_recent_invoked_skill_context(
             loop,
             "Continue with the latest item.",
         )
-        assert "[RECENT ACTIVE SKILL]: `report-builder`" in runtime_message
+        assert "[RECENT INVOKED SKILL]: `report-builder`" in runtime_message
         assert "internal-only source notes" not in runtime_message
 
-    def test_recent_active_skill_hint_is_suppressed_when_current_turn_preloads_skill(self, tmp_path):
+    def test_recent_invoked_skill_hint_is_suppressed_when_current_turn_preloads_skill(self, tmp_path):
         """A direct skill match should own the turn instead of mixing prior skill hints."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
         loop.workspace = tmp_path / "workspace"
-        loop._recent_active_skill_context = {
+        loop._recent_invoked_skill_contexts = [{
             "name": "report-builder",
             "location": "skills/report-builder/SKILL.md",
-        }
+        }]
         loop._pre_injected_skill_context = {
             "name": "invoice-builder",
             "location": "skills/invoice-builder/SKILL.md",
@@ -791,7 +791,111 @@ when_to_use: Use when the user asks to assemble or continue report packets.
 
         prompt = AgentLoop._build_step_prompt(loop, "Use invoice builder now.")
 
-        assert "[RECENT ACTIVE SKILL]" not in prompt
+        assert "[RECENT INVOKED SKILL]" not in prompt
+
+    def test_recent_invoked_skill_context_keeps_multiple_skill_anchors(self, tmp_path):
+        """Continuity should keep a bounded newest-first skill stack, not one slot."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.session.manager import Session
+
+        workspace = tmp_path / "workspace"
+        skills_root = workspace / "skills"
+        for skill_name in ("report-builder", "invoice-auditor"):
+            skill_dir = skills_root / skill_name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"""---
+description: Handle {skill_name} workflows
+when_to_use: Use for {skill_name} tasks.
+---
+# {skill_name}
+""",
+                encoding="utf-8",
+            )
+
+        session = Session(session_key="multi-continuity")
+        session.add_message(
+            "user",
+            "Create the report packet with confidential source notes.",
+            turn_state="completed",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+        session.add_message("assistant", "Report packet created.")
+        session.add_message("user", "What date is today?", turn_state="completed")
+        session.add_message("assistant", "2026-04-28.")
+        session.add_message(
+            "user",
+            "Audit the invoice bundle.",
+            turn_state="completed",
+            invoked_skills=[{"name": "invoice-auditor"}],
+        )
+        session.add_message("assistant", "Invoice audit completed.")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [skills_root]
+        loop._touched_paths = set()
+        loop._session = session
+        loop._pre_injected_skill_context = None
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        AgentLoop._refresh_recent_invoked_skill_contexts(loop)
+
+        assert [ctx["name"] for ctx in loop._recent_invoked_skill_contexts] == [
+            "invoice-auditor",
+            "report-builder",
+        ]
+        prompt = AgentLoop._build_request_context_prompt(loop, "Continue the earlier task.")
+
+        assert "[RECENT INVOKED SKILLS]" in prompt
+        assert prompt.index("`invoice-auditor`") < prompt.index("`report-builder`")
+        assert "skills/invoice-auditor/SKILL.md" in prompt
+        assert "skills/report-builder/SKILL.md" in prompt
+        assert "confidential source notes" not in prompt
+        assert "What date is today?" not in prompt
+
+    def test_recent_invoked_skill_context_skips_interrupted_and_stale_skills(self, tmp_path):
+        """Only completed skill turns resolvable in the current catalog should survive."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.session.manager import Session
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "report-builder"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Report Builder\n", encoding="utf-8")
+
+        session = Session(session_key="filtered-continuity")
+        session.add_message(
+            "user",
+            "Use the removed skill.",
+            turn_state="completed",
+            invoked_skills=[{"name": "removed-skill"}],
+        )
+        session.add_message("assistant", "Removed skill result.")
+        session.add_message(
+            "user",
+            "Start the report builder but interrupt it.",
+            turn_state="interrupted",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+        session.add_message("assistant", "Partial report.")
+        session.add_message(
+            "user",
+            "Use the report builder again.",
+            turn_state="completed",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+        loop._session = session
+        loop._pre_injected_skill_context = None
+
+        contexts = AgentLoop._find_recent_invoked_skill_contexts(loop)
+
+        assert [ctx["name"] for ctx in contexts] == ["report-builder"]
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):

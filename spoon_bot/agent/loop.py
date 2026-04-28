@@ -638,7 +638,7 @@ class AgentLoop:
         # current turn. Persisted as bounded continuity metadata, not routing.
         self._pre_injected_skill_name: str | None = None
         self._pre_injected_skill_context: dict[str, Any] | None = None
-        self._recent_active_skill_context: dict[str, Any] | None = None
+        self._recent_invoked_skill_contexts: list[dict[str, Any]] = []
 
         # Conditional activation - file paths touched during this session.
         # Skills declaring ``paths`` frontmatter are dormant until a touched
@@ -1551,7 +1551,7 @@ class AgentLoop:
         compacted before the provider call starts.
         """
         self._refresh_recent_turn_notice()
-        self._refresh_recent_active_skill_context()
+        self._refresh_recent_invoked_skill_contexts()
         trimmed_count = self._trim_context_if_needed()
         session = getattr(self, "_session", None)
         if session is None:
@@ -1790,10 +1790,25 @@ class AgentLoop:
         return {"message_kind": "assistant_reply"}
 
     @staticmethod
+    def _session_skill_metadata(skill: dict[str, Any]) -> dict[str, Any] | None:
+        """Return sanitized skill metadata safe to persist in session history."""
+        if not isinstance(skill, dict) or not skill.get("name"):
+            return None
+        return {
+            "name": str(skill.get("name")),
+            "location": str(skill.get("location") or ""),
+            "workspace_relative_path": str(
+                skill.get("workspace_relative_path") or ""
+            ),
+            "organized": bool(skill.get("organized", True)),
+            "source": str(skill.get("source") or "skill_match"),
+        }
+
+    @staticmethod
     def _session_message_save_kwargs(
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
-        active_skill: dict[str, Any] | None = None,
+        invoked_skill: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build optional persisted-session metadata for a user turn."""
         save_kwargs: dict[str, Any] = {}
@@ -1803,16 +1818,9 @@ class AgentLoop:
             save_kwargs["attachments"] = [
                 dict(item) for item in attachments if isinstance(item, dict)
             ]
-        if isinstance(active_skill, dict) and active_skill.get("name"):
-            save_kwargs["active_skill"] = {
-                "name": str(active_skill.get("name")),
-                "location": str(active_skill.get("location") or ""),
-                "workspace_relative_path": str(
-                    active_skill.get("workspace_relative_path") or ""
-                ),
-                "organized": bool(active_skill.get("organized", True)),
-                "source": "skill_match",
-            }
+        skill_meta = AgentLoop._session_skill_metadata(invoked_skill or {})
+        if skill_meta:
+            save_kwargs["invoked_skills"] = [dict(skill_meta)]
         return save_kwargs
 
     @staticmethod
@@ -1924,21 +1932,30 @@ class AgentLoop:
 
         self._recent_turn_notice = notice
 
-    def _refresh_recent_active_skill_context(self) -> None:
-        """Expose the last completed skill-backed turn as bounded continuity context."""
-        self._recent_active_skill_context = self._find_recent_active_skill_context()
+    def _refresh_recent_invoked_skill_contexts(self) -> None:
+        """Expose recent completed skill-backed turns as bounded continuity context."""
+        self._recent_invoked_skill_contexts = self._find_recent_invoked_skill_contexts()
 
-    def _find_recent_active_skill_context(
+    @staticmethod
+    def _iter_message_invoked_skill_refs(message: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return invoked skill references persisted on a session message."""
+        invoked = message.get("invoked_skills")
+        if isinstance(invoked, list):
+            return [item for item in invoked if isinstance(item, dict)]
+        return []
+
+    def _find_recent_invoked_skill_contexts(
         self,
         *,
-        max_user_turns: int = 6,
-    ) -> dict[str, Any] | None:
-        """Return recent active skill metadata without rehydrating old task history.
+        max_user_turns: int = 12,
+        max_skills: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Return recent skill metadata without rehydrating old task history.
 
         The session transcript can be long and noisy.  For follow-up requests we
-        keep only the most recent skill identity, then resolve it against the
-        current skill catalog so imported or stale session data cannot inject an
-        arbitrary path/prompt.
+        keep a small newest-first set of skill identities, then resolve each
+        against the current skill catalog so imported or stale session data
+        cannot inject an arbitrary path/prompt.
         """
         session = getattr(self, "_session", None)
         history_messages = (
@@ -1947,8 +1964,10 @@ class AgentLoop:
             else getattr(session, "messages", [])
         )
         if not isinstance(history_messages, list):
-            return None
+            return []
 
+        contexts: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
         user_turns_seen = 0
         for message in reversed(history_messages):
             if not isinstance(message, dict):
@@ -1959,55 +1978,83 @@ class AgentLoop:
 
             user_turns_seen += 1
             if user_turns_seen > max_user_turns:
-                return None
+                break
 
             state = AgentLoop._turn_state_of_message(message)
             if state in {_TURN_STATE_INTERRUPTED, _TURN_STATE_SUPERSEDED}:
                 continue
 
-            active_skill = message.get("active_skill")
-            if not isinstance(active_skill, dict):
-                continue
+            for skill in AgentLoop._iter_message_invoked_skill_refs(message):
+                skill_name = str(skill.get("name") or "").strip()
+                if not skill_name or skill_name in seen_names:
+                    continue
 
-            skill_name = str(active_skill.get("name") or "").strip()
-            if not skill_name:
-                continue
+                context = self._resolve_skill_context_by_name(skill_name)
+                if context is None:
+                    continue
 
-            context = self._resolve_skill_context_by_name(skill_name)
-            if context is not None:
-                return context
+                timestamp = str(message.get("timestamp") or "").strip()
+                if timestamp:
+                    context = {**context, "last_used_at": timestamp}
+                contexts.append(context)
+                seen_names.add(skill_name)
+                if len(contexts) >= max_skills:
+                    return contexts
 
-        return None
+        return contexts
 
-    def _recent_active_skill_notice_for_prompt(self) -> str | None:
-        """Format recent active skill context for prompts without forcing routing."""
+    def _recent_invoked_skill_notice_for_prompt(self) -> str | None:
+        """Format recent invoked skill contexts for prompts without forcing routing."""
         if getattr(self, "_pre_injected_skill_context", None):
             return None
 
-        context = getattr(self, "_recent_active_skill_context", None)
-        if not isinstance(context, dict):
+        contexts = getattr(self, "_recent_invoked_skill_contexts", None)
+        if not isinstance(contexts, list):
+            contexts = []
+        contexts = [ctx for ctx in contexts if isinstance(ctx, dict)]
+        if not contexts:
             return None
 
-        name = str(context.get("name") or "").strip()
-        location = str(context.get("location") or "").strip()
-        if not name or not location:
+        normalized: list[tuple[str, str]] = []
+        for context in contexts:
+            name = str(context.get("name") or "").strip()
+            location = str(context.get("location") or "").strip()
+            if name and location:
+                normalized.append((name, location))
+
+        if not normalized:
             return None
 
-        return (
-            f"[RECENT ACTIVE SKILL]: `{name}` was used by a recent completed "
-            f"turn in this session. SKILL.md location: `{location}`.\n"
+        continuity_rule = (
             "This is continuity context only, not an instruction to use that skill. "
             "If the newest request is standalone or asks for different work, ignore it. "
             "If the newest request is an underspecified continuation, correction, "
-            "revision, retry, or status/update check of that recent skill-backed task, "
-            "read that SKILL.md and proceed. Prefer this recent skill context over "
-            "generic runtime/status tools when the newest request does not name a "
-            "different target."
+            "revision, retry, or status/update check of a recent skill-backed task, "
+            "read the matching SKILL.md and proceed. If the current request refers to "
+            "an older task and these anchors are insufficient, use conversation "
+            "history search instead of guessing. Do not execute prior tasks unless "
+            "the newest request asks to continue them."
         )
 
-    def _append_recent_active_skill_context(self, message: str) -> str:
+        if len(normalized) == 1:
+            name, location = normalized[0]
+            return (
+                f"[RECENT INVOKED SKILL]: `{name}` was used by a recent completed "
+                f"turn in this session. SKILL.md location: `{location}`.\n"
+                f"{continuity_rule}"
+            )
+
+        lines = [
+            "[RECENT INVOKED SKILLS]: Recent skill-backed task anchors in this session, newest first:",
+        ]
+        for index, (name, location) in enumerate(normalized, start=1):
+            lines.append(f"{index}. `{name}` - SKILL.md location: `{location}`")
+        lines.append(continuity_rule)
+        return "\n".join(lines)
+
+    def _append_recent_invoked_skill_context(self, message: str) -> str:
         """Append bounded continuity context to the current runtime user message."""
-        notice = self._recent_active_skill_notice_for_prompt()
+        notice = self._recent_invoked_skill_notice_for_prompt()
         if not isinstance(notice, str) or not notice.strip():
             return message
         return f"{message}\n\n---\n{notice.strip()}\n---"
@@ -2017,7 +2064,7 @@ class AgentLoop:
         message: str,
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
-        active_skill: dict[str, Any] | None = None,
+        invoked_skill: dict[str, Any] | None = None,
     ) -> None:
         """Persist the current user turn before the model run starts."""
         try:
@@ -2030,7 +2077,7 @@ class AgentLoop:
                 **AgentLoop._session_message_save_kwargs(
                     media,
                     attachments,
-                    active_skill=active_skill,
+                    invoked_skill=invoked_skill,
                 ),
             )
             AgentLoop._persist_session_if_possible(self)
@@ -2380,7 +2427,7 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
-        _continuity_message = self._append_recent_active_skill_context(message)
+        _continuity_message = self._append_recent_invoked_skill_context(message)
         if isinstance(_continuity_message, str):
             message = _continuity_message
         runtime_message = self._build_runtime_message_content(
@@ -2397,7 +2444,7 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
-            active_skill=getattr(self, "_pre_injected_skill_context", None),
+            invoked_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
         original_system_prompt: str | None = None
@@ -3928,7 +3975,7 @@ class AgentLoop:
         _skill_injected_message = self._pre_inject_matched_skill(message)
         if isinstance(_skill_injected_message, str):
             message = _skill_injected_message
-        _continuity_message = self._append_recent_active_skill_context(message)
+        _continuity_message = self._append_recent_invoked_skill_context(message)
         if isinstance(_continuity_message, str):
             message = _continuity_message
         runtime_message = self._build_runtime_message_content(
@@ -3944,7 +3991,7 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
-            active_skill=getattr(self, "_pre_injected_skill_context", None),
+            invoked_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
@@ -4499,7 +4546,7 @@ class AgentLoop:
         _skill_injected_message = self._pre_inject_matched_skill(message)
         if isinstance(_skill_injected_message, str):
             message = _skill_injected_message
-        _continuity_message = self._append_recent_active_skill_context(message)
+        _continuity_message = self._append_recent_invoked_skill_context(message)
         if isinstance(_continuity_message, str):
             message = _continuity_message
         runtime_message = self._build_runtime_message_content(
@@ -4515,7 +4562,7 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
-            active_skill=getattr(self, "_pre_injected_skill_context", None),
+            invoked_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
@@ -5094,9 +5141,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
-        active_skill_notice = self._recent_active_skill_notice_for_prompt()
-        if isinstance(active_skill_notice, str) and active_skill_notice.strip():
-            prompt = f"{active_skill_notice.strip()}\n" + prompt
+        invoked_skill_notice = self._recent_invoked_skill_notice_for_prompt()
+        if isinstance(invoked_skill_notice, str) and invoked_skill_notice.strip():
+            prompt = f"{invoked_skill_notice.strip()}\n" + prompt
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -5122,9 +5169,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
-        active_skill_notice = self._recent_active_skill_notice_for_prompt()
-        if isinstance(active_skill_notice, str) and active_skill_notice.strip():
-            prompt = f"{active_skill_notice.strip()}\n" + prompt
+        invoked_skill_notice = self._recent_invoked_skill_notice_for_prompt()
+        if isinstance(invoked_skill_notice, str) and invoked_skill_notice.strip():
+            prompt = f"{invoked_skill_notice.strip()}\n" + prompt
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
