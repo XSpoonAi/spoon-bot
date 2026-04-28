@@ -71,7 +71,7 @@ except ImportError as e:
     )
 
 # Import spoon-bot native tools and components
-from spoon_bot.agent.context import ContextBuilder
+from spoon_bot.agent.context import ContextBuilder, format_current_datetime_context
 from spoon_bot.agent.tools.registry import (
     CORE_TOOLS,
     ToolRegistry,
@@ -351,6 +351,7 @@ class AgentLoop:
     DEFAULT_NEXT_STEP_PROMPT = (
         "Continue working on the user's latest request. "
         "Treat the latest real user request as authoritative, even if earlier history was compacted. "
+        "Prior conversation is reference only; do not continue, finish, or repair an earlier task unless the latest request explicitly asks for that. "
         "Do NOT repeat previous actions. Do NOT fabricate output. "
         "Make autonomous choices when input is needed. "
         "Do NOT summarize prior work unless the user explicitly asked for a summary. "
@@ -494,7 +495,7 @@ class AgentLoop:
         self.tools = ToolRegistry()
         self._cron_service = None
 
-        if self.yolo_mode:
+        if getattr(self, "yolo_mode", False):
             logger.info(f"YOLO mode enabled - operating directly in: {self.workspace}")
 
         # Session persistence - configurable backend
@@ -633,8 +634,11 @@ class AgentLoop:
         self._stop_requested = False
         self._last_response_source = self._build_response_source()
 
-        # Tracks the skill name injected by _pre_inject_matched_skill()
+        # Tracks the skill injected by _pre_inject_matched_skill() for the
+        # current turn. Persisted as bounded continuity metadata, not routing.
         self._pre_injected_skill_name: str | None = None
+        self._pre_injected_skill_context: dict[str, Any] | None = None
+        self._recent_active_skill_context: dict[str, Any] | None = None
 
         # Conditional activation - file paths touched during this session.
         # Skills declaring ``paths`` frontmatter are dormant until a touched
@@ -891,7 +895,7 @@ class AgentLoop:
 
         # Keep the agent's per-step timeout aligned with the effective shell ceiling
         # so long-running commands are not cancelled prematurely by the outer loop.
-        effective_ceiling = max(self.shell_timeout, self.shell_max_timeout)
+        effective_ceiling = max(self.shell_timeout, getattr(self, "shell_max_timeout", DEFAULT_SHELL_MAX_TIMEOUT))
         self._agent._default_timeout = max(300.0, float(effective_ceiling))
 
         self._initialized = True
@@ -923,7 +927,7 @@ class AgentLoop:
         # compose multi-step ops and use $(), ${}, and backtick expressions.
         self.tools.register(ShellTool(
             timeout=self.shell_timeout,
-            max_timeout=self.shell_max_timeout,
+            max_timeout=getattr(self, "shell_max_timeout", DEFAULT_SHELL_MAX_TIMEOUT),
             max_output=self.max_output,
             working_dir=str(self.workspace),
             allow_chaining=True,
@@ -938,7 +942,7 @@ class AgentLoop:
         # In YOLO mode the workspace IS the user's directory, so we add its
         # parents as extra read paths to let the agent navigate freely.
         _extra_read: list[Path] = [Path.home()]
-        if self.yolo_mode:
+        if getattr(self, "yolo_mode", False):
             _extra_read.extend(p for p in self.workspace.parents if p != Path.home())
 
         _file_tools = [
@@ -980,18 +984,20 @@ class AgentLoop:
         spawn_tool = SubagentTool(manager=getattr(self, "_subagent_manager", None))
         self.tools.register(spawn_tool)
 
-        def _current_session_key() -> str | None:
-            sess = self._session
-            return sess.session_key if sess is not None else None
+        if hasattr(self, "sessions"):
+            def _current_session_key() -> str | None:
+                sess = getattr(self, "_session", None)
+                return sess.session_key if sess is not None else None
 
-        self._history_search_tool = SearchHistoryTool(
-            self.sessions,
-            default_session_key=(
-                self._session.session_key if self._session is not None else None
-            ),
-            session_key_resolver=_current_session_key,
-        )
-        self.tools.register(self._history_search_tool)
+            current_session = getattr(self, "_session", None)
+            self._history_search_tool = SearchHistoryTool(
+                self.sessions,
+                default_session_key=(
+                    current_session.session_key if current_session is not None else None
+                ),
+                session_key_resolver=_current_session_key,
+            )
+            self.tools.register(self._history_search_tool)
 
         # Web tools
         self.tools.register(WebSearchTool())
@@ -1318,8 +1324,12 @@ class AgentLoop:
         normalized = (upcoming_message or "").strip()
         if not normalized:
             return "full"
-        if len(normalized) <= 24 or cls._message_token_count(normalized) <= 3:
-            return "recent"
+
+        # Runtime history is intentionally isolated by default. Persisted session
+        # history remains searchable/observable, but the active agent loop should
+        # not inherit unfinished tool chains or prior-task intent for a new user
+        # turn. This mirrors a Claude Code-style active-request boundary without
+        # using prompt-text routing.
         return "minimal"
 
     @staticmethod
@@ -1340,6 +1350,35 @@ class AgentLoop:
         if len(user_indices) <= user_turns:
             return user_indices[0]
         return user_indices[-user_turns]
+
+    @staticmethod
+    def _filter_rehydratable_history(
+        history_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Drop interrupted/superseded turn fragments from runtime rehydration."""
+        filtered: list[dict[str, Any]] = []
+        skipping_aborted_turn = False
+
+        for message in history_messages:
+            if not isinstance(message, dict):
+                continue
+
+            role = str(message.get("role") or "").strip().lower()
+            if role == "user":
+                turn_state = AgentLoop._turn_state_of_message(message)
+                if turn_state in {_TURN_STATE_INTERRUPTED, _TURN_STATE_SUPERSEDED}:
+                    skipping_aborted_turn = True
+                    continue
+                skipping_aborted_turn = False
+                filtered.append(message)
+                continue
+
+            if skipping_aborted_turn and role in {"assistant", "tool"}:
+                continue
+
+            filtered.append(message)
+
+        return filtered
 
     async def _sync_runtime_history_from_session(
         self,
@@ -1368,6 +1407,7 @@ class AgentLoop:
         )
         if not isinstance(history_messages, list):
             history_messages = []
+        history_messages = AgentLoop._filter_rehydratable_history(history_messages)
 
         rehydrate_scope = AgentLoop._history_rehydrate_scope(
             upcoming_message,
@@ -1511,14 +1551,20 @@ class AgentLoop:
         compacted before the provider call starts.
         """
         self._refresh_recent_turn_notice()
+        self._refresh_recent_active_skill_context()
         trimmed_count = self._trim_context_if_needed()
-        session_history = (
-            self._session.get_messages()
-            if hasattr(self._session, "get_messages")
-            else self._session.get_history()
-        )
+        session = getattr(self, "_session", None)
+        if session is None:
+            session_history = []
+        else:
+            session_history = (
+                session.get_messages()
+                if hasattr(session, "get_messages")
+                else session.get_history()
+            )
         if not isinstance(session_history, list):
             session_history = []
+        session_history = AgentLoop._filter_rehydratable_history(session_history)
         rehydrate_scope = AgentLoop._history_rehydrate_scope(
             upcoming_message,
             history_messages=session_history,
@@ -1579,6 +1625,36 @@ class AgentLoop:
             return len(AgentLoop._get_runtime_memory_messages(self))
         except Exception:
             return 0
+
+    @staticmethod
+    def _truncate_runtime_memory(self, start_index: int) -> None:
+        """Remove runtime-only messages appended by an aborted turn."""
+        if not isinstance(start_index, int) or start_index < 0:
+            return
+        try:
+            messages = AgentLoop._get_runtime_memory_messages(self)
+        except Exception:
+            return
+        if isinstance(messages, list) and start_index < len(messages):
+            del messages[start_index:]
+
+    @staticmethod
+    def _drain_agent_output_queue(self) -> None:
+        """Discard queued stream chunks from an interrupted run."""
+        agent = getattr(self, "_agent", None)
+        output_queue = getattr(agent, "output_queue", None)
+        if output_queue is None or not hasattr(output_queue, "empty"):
+            return
+        while True:
+            try:
+                if output_queue.empty():
+                    break
+                if hasattr(output_queue, "get_nowait"):
+                    output_queue.get_nowait()
+                else:
+                    break
+            except Exception:
+                break
 
     def _capture_turn_tool_trace(self, start_index: int) -> list[dict[str, Any]]:
         """Capture tool-call artifacts added since ``start_index``."""
@@ -1717,6 +1793,7 @@ class AgentLoop:
     def _session_message_save_kwargs(
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        active_skill: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build optional persisted-session metadata for a user turn."""
         save_kwargs: dict[str, Any] = {}
@@ -1726,6 +1803,16 @@ class AgentLoop:
             save_kwargs["attachments"] = [
                 dict(item) for item in attachments if isinstance(item, dict)
             ]
+        if isinstance(active_skill, dict) and active_skill.get("name"):
+            save_kwargs["active_skill"] = {
+                "name": str(active_skill.get("name")),
+                "location": str(active_skill.get("location") or ""),
+                "workspace_relative_path": str(
+                    active_skill.get("workspace_relative_path") or ""
+                ),
+                "organized": bool(active_skill.get("organized", True)),
+                "source": "skill_match",
+            }
         return save_kwargs
 
     @staticmethod
@@ -1837,11 +1924,100 @@ class AgentLoop:
 
         self._recent_turn_notice = notice
 
+    def _refresh_recent_active_skill_context(self) -> None:
+        """Expose the last completed skill-backed turn as bounded continuity context."""
+        self._recent_active_skill_context = self._find_recent_active_skill_context()
+
+    def _find_recent_active_skill_context(
+        self,
+        *,
+        max_user_turns: int = 6,
+    ) -> dict[str, Any] | None:
+        """Return recent active skill metadata without rehydrating old task history.
+
+        The session transcript can be long and noisy.  For follow-up requests we
+        keep only the most recent skill identity, then resolve it against the
+        current skill catalog so imported or stale session data cannot inject an
+        arbitrary path/prompt.
+        """
+        session = getattr(self, "_session", None)
+        history_messages = (
+            session.get_messages()
+            if session is not None and hasattr(session, "get_messages")
+            else getattr(session, "messages", [])
+        )
+        if not isinstance(history_messages, list):
+            return None
+
+        user_turns_seen = 0
+        for message in reversed(history_messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role != "user":
+                continue
+
+            user_turns_seen += 1
+            if user_turns_seen > max_user_turns:
+                return None
+
+            state = AgentLoop._turn_state_of_message(message)
+            if state in {_TURN_STATE_INTERRUPTED, _TURN_STATE_SUPERSEDED}:
+                continue
+
+            active_skill = message.get("active_skill")
+            if not isinstance(active_skill, dict):
+                continue
+
+            skill_name = str(active_skill.get("name") or "").strip()
+            if not skill_name:
+                continue
+
+            context = self._resolve_skill_context_by_name(skill_name)
+            if context is not None:
+                return context
+
+        return None
+
+    def _recent_active_skill_notice_for_prompt(self) -> str | None:
+        """Format recent active skill context for prompts without forcing routing."""
+        if getattr(self, "_pre_injected_skill_context", None):
+            return None
+
+        context = getattr(self, "_recent_active_skill_context", None)
+        if not isinstance(context, dict):
+            return None
+
+        name = str(context.get("name") or "").strip()
+        location = str(context.get("location") or "").strip()
+        if not name or not location:
+            return None
+
+        return (
+            f"[RECENT ACTIVE SKILL]: `{name}` was used by a recent completed "
+            f"turn in this session. SKILL.md location: `{location}`.\n"
+            "This is continuity context only, not an instruction to use that skill. "
+            "If the newest request is standalone or asks for different work, ignore it. "
+            "If the newest request is an underspecified continuation, correction, "
+            "revision, retry, or status/update check of that recent skill-backed task, "
+            "read that SKILL.md and proceed. Prefer this recent skill context over "
+            "generic runtime/status tools when the newest request does not name a "
+            "different target."
+        )
+
+    def _append_recent_active_skill_context(self, message: str) -> str:
+        """Append bounded continuity context to the current runtime user message."""
+        notice = self._recent_active_skill_notice_for_prompt()
+        if not isinstance(notice, str) or not notice.strip():
+            return message
+        return f"{message}\n\n---\n{notice.strip()}\n---"
+
     def _persist_user_turn_to_session(
         self,
         message: str,
         media: list[str] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        active_skill: dict[str, Any] | None = None,
     ) -> None:
         """Persist the current user turn before the model run starts."""
         try:
@@ -1851,7 +2027,11 @@ class AgentLoop:
                 turn_id=uuid.uuid4().hex,
                 turn_state=_TURN_STATE_PENDING,
                 turn_state_updated_at=datetime.now().isoformat(),
-                **AgentLoop._session_message_save_kwargs(media, attachments),
+                **AgentLoop._session_message_save_kwargs(
+                    media,
+                    attachments,
+                    active_skill=active_skill,
+                ),
             )
             AgentLoop._persist_session_if_possible(self)
         except Exception as exc:
@@ -2023,6 +2203,7 @@ class AgentLoop:
     def _prepare_agent_for_new_turn(self) -> None:
         """Clear transient execution state so the newest prompt owns the next run."""
         self._pre_injected_skill_name = None
+        self._pre_injected_skill_context = None
 
         if hasattr(self._agent, "state") and self._agent.state != AgentState.IDLE:
             logger.warning(
@@ -2199,6 +2380,9 @@ class AgentLoop:
 
         # Pre-inject matched skill content into the message
         message = self._pre_inject_matched_skill(message)
+        _continuity_message = self._append_recent_active_skill_context(message)
+        if isinstance(_continuity_message, str):
+            message = _continuity_message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -2213,6 +2397,7 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
+            active_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
         original_system_prompt: str | None = None
@@ -3735,6 +3920,17 @@ class AgentLoop:
         await self._prepare_request_context(message)
         self._prepare_agent_for_new_turn()
         authoritative_message = message
+
+        # Keep streaming behavior aligned with process(): if a user request
+        # naturally matches an installed skill, load that SKILL.md into the
+        # current turn before the model decides which tools to call. This is a
+        # generic skill-selection mechanism, not prompt-text routing.
+        _skill_injected_message = self._pre_inject_matched_skill(message)
+        if isinstance(_skill_injected_message, str):
+            message = _skill_injected_message
+        _continuity_message = self._append_recent_active_skill_context(message)
+        if isinstance(_continuity_message, str):
+            message = _continuity_message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -3748,6 +3944,7 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
+            active_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
@@ -3915,7 +4112,9 @@ class AgentLoop:
                     continue
                 except asyncio.CancelledError:
                     logger.warning("Streaming cancelled")
-                    break
+                    AgentLoop._drain_agent_output_queue(self)
+                    AgentLoop._truncate_runtime_memory(self, _pre_turn_memory_index)
+                    raise
                 except Exception as e:
                     logger.warning(f"Queue get error: {type(e).__name__}: {e}")
                     continue
@@ -4154,6 +4353,8 @@ class AgentLoop:
         except asyncio.CancelledError:
             stream_cancelled = True
             logger.warning("Streaming cancelled")
+            AgentLoop._drain_agent_output_queue(self)
+            AgentLoop._truncate_runtime_memory(self, _pre_turn_memory_index)
             AgentLoop._mark_latest_user_turn_state(
                 self,
                 _TURN_STATE_INTERRUPTED,
@@ -4192,7 +4393,7 @@ class AgentLoop:
             if bg_task is not None and not bg_task.done():
                 bg_task.cancel()
                 try:
-                    cleanup_timeout = 30.0 if stream_cancelled else 5.0
+                    cleanup_timeout = 2.0 if stream_cancelled else 5.0
                     await asyncio.wait_for(bg_task, timeout=cleanup_timeout)
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
@@ -4292,6 +4493,15 @@ class AgentLoop:
         await self._prepare_request_context(message)
         self._prepare_agent_for_new_turn()
         authoritative_message = message
+
+        # Keep thinking behavior aligned with process()/stream(): skill
+        # preloading is driven by generic skill metadata, not prompt routing.
+        _skill_injected_message = self._pre_inject_matched_skill(message)
+        if isinstance(_skill_injected_message, str):
+            message = _skill_injected_message
+        _continuity_message = self._append_recent_active_skill_context(message)
+        if isinstance(_continuity_message, str):
+            message = _continuity_message
         runtime_message = self._build_runtime_message_content(
             "user",
             message,
@@ -4305,6 +4515,7 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
+            active_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
@@ -4713,6 +4924,46 @@ class AgentLoop:
 
         return candidates
 
+    def _build_skill_context(
+        self,
+        skill_name: str,
+        skill_dir: Path,
+        *,
+        is_organized: bool,
+    ) -> dict[str, Any]:
+        """Build sanitized skill metadata suitable for session persistence."""
+        import re as _re
+        import sys as _sys
+
+        base_dir = str(skill_dir).replace("\\", "/")
+        if _sys.platform == "win32":
+            base_dir = _re.sub(r"^([A-Za-z]):", lambda m: f"/{m.group(1).lower()}", base_dir)
+
+        skill_rel = f"skills/{skill_name}" if is_organized else skill_name
+        return {
+            "name": skill_name,
+            "base_dir": base_dir,
+            "workspace_relative_path": f"{skill_rel}/",
+            "location": f"{skill_rel}/SKILL.md",
+            "organized": bool(is_organized),
+        }
+
+    def _resolve_skill_context_by_name(self, skill_name: str) -> dict[str, Any] | None:
+        """Resolve a persisted skill name against the current skill catalog."""
+        try:
+            candidates = self._iter_skill_candidates(include_dormant=True)
+        except Exception:
+            return None
+
+        for name, skill_dir, _skill_md, is_organized in candidates:
+            if name == skill_name:
+                return self._build_skill_context(
+                    name,
+                    skill_dir,
+                    is_organized=is_organized,
+                )
+        return None
+
     def _pre_inject_matched_skill(self, message: str) -> str:
         """Match user message to an installed skill and prepend SKILL.md content.
 
@@ -4726,7 +4977,7 @@ class AgentLoop:
         (unorganized).  When an unorganized skill matches, the injection
         includes a note asking the agent to move it into ``skills/`` first.
         """
-        import re as _re, sys as _sys
+        import re as _re
 
         candidates = self._iter_skill_candidates()
         if not candidates:
@@ -4775,21 +5026,20 @@ class AgentLoop:
         except Exception:
             return message
 
-        base_dir = str(skill_dir).replace("\\", "/")
-        if _sys.platform == "win32":
-            base_dir = _re.sub(r'^([A-Za-z]):', lambda m: f'/{m.group(1).lower()}', base_dir)
-
         ws_posix = self._workspace_posix_path()
-
-        if is_organized:
-            skill_rel = f"skills/{skill_name}"
-        else:
-            skill_rel = skill_name
+        skill_context = self._build_skill_context(
+            skill_name,
+            skill_dir,
+            is_organized=is_organized,
+        )
+        base_dir = str(skill_context["base_dir"])
+        skill_rel = str(skill_context["workspace_relative_path"]).rstrip("/")
 
         content = content.replace("${SKILL_DIR}", f"{ws_posix}/{skill_rel}")
         content = content.replace("$SKILL_DIR", f"{ws_posix}/{skill_rel}")
 
         self._pre_injected_skill_name = skill_name
+        self._pre_injected_skill_context = skill_context
 
         organize_note = ""
         if not is_organized:
@@ -4831,6 +5081,9 @@ class AgentLoop:
             "[TURN PRIORITY]: Execute only the newest user request. "
             "Any unfinished plan, stale tool sequence, or previous task assumption is superseded "
             "unless the newest user message explicitly says to continue it.\n"
+            "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
+            "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
@@ -4841,6 +5094,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        active_skill_notice = self._recent_active_skill_notice_for_prompt()
+        if isinstance(active_skill_notice, str) and active_skill_notice.strip():
+            prompt = f"{active_skill_notice.strip()}\n" + prompt
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -4854,6 +5110,9 @@ class AgentLoop:
             "[TURN PRIORITY]: Execute only the newest user request. "
             "Any unfinished plan, stale tool sequence, or previous task assumption is superseded "
             "unless the newest user message explicitly says to continue it.\n"
+            "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
+            "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n"
         )
@@ -4863,6 +5122,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        active_skill_notice = self._recent_active_skill_notice_for_prompt()
+        if isinstance(active_skill_notice, str) and active_skill_notice.strip():
+            prompt = f"{active_skill_notice.strip()}\n" + prompt
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -5047,7 +5309,8 @@ class AgentLoop:
         mapping - the LLM reads tool descriptions and decides for itself.
         """
         lines: list[str] = [
-            "\n\n## Inactive Tools (activate on demand)\n\n"
+            "\n\n## Dynamically Loadable Tools\n\n"
+            "Prefer specialized tools over broad search when a matching tool exists.\n\n"
             "Call `activate_tool(action='activate', tool_name='<name>')` to load any of these. "
             "Activate what you need BEFORE answering.\n"
         ]
@@ -5130,6 +5393,105 @@ class AgentLoop:
                 logger.info(f"Removed tool '{name}' from running agent")
 
         return True
+
+
+    def get_skill_catalog(self) -> list[dict[str, Any]]:
+        """Return structured metadata for skills visible to this agent.
+
+        This is an observability/catalog surface only. It does not route user
+        prompts or decide when a skill should execute.
+        """
+        catalog: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        try:
+            candidates = self._iter_skill_candidates(include_dormant=True)
+        except Exception as exc:
+            return [{"error": str(exc), "status": "failed"}]
+
+        active: set[str] = set()
+        if self._skill_manager is not None:
+            try:
+                active = set(self._skill_manager.list())
+            except Exception:
+                active = set()
+
+        workspace_skills = (self.workspace / "skills").resolve()
+        user_skill_roots = {Path(p).expanduser().resolve() for p in self._user_skill_paths}
+        bundled_root = (Path(__file__).resolve().parent.parent.parent / "workspace" / "skills").resolve()
+
+        for name, skill_dir, skill_md, is_organized in candidates:
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                resolved_dir = skill_dir.resolve()
+            except Exception:
+                resolved_dir = skill_dir
+            source = "workspace"
+            if resolved_dir == bundled_root or bundled_root in resolved_dir.parents:
+                source = "bundled"
+            elif any(resolved_dir == root or root in resolved_dir.parents for root in user_skill_roots):
+                source = "configured"
+            elif not (resolved_dir == workspace_skills or workspace_skills in resolved_dir.parents):
+                source = "workspace-root"
+
+            fm = self._parse_skill_frontmatter(skill_md)
+            skill_paths = fm.get("paths", [])
+            status = "available"
+            if not is_organized:
+                status = "unorganized"
+            elif isinstance(skill_paths, list) and skill_paths and not self._skill_paths_match(
+                skill_paths, self._touched_paths, self.workspace,
+            ):
+                status = "dormant"
+
+            catalog.append({
+                "name": name,
+                "description": fm.get("description") or name,
+                "when_to_use": fm.get("when_to_use") or "",
+                "paths": skill_paths if isinstance(skill_paths, list) else [],
+                "source": source,
+                "status": status,
+                "active": name in active,
+                "base_dir": str(skill_dir),
+                "skill_md": str(skill_md),
+                "organized": bool(is_organized),
+            })
+        return catalog
+
+    def get_mcp_catalog(self) -> list[dict[str, Any]]:
+        """Return structured metadata for configured MCP servers and loaded tools."""
+        loaded_by_server: dict[str, list[str]] = {}
+        for tool in self._mcp_tools:
+            config = getattr(tool, "mcp_config", {}) or {}
+            server_name = getattr(tool, "server_name", None) or getattr(tool, "mcp_server_name", None)
+            if not server_name:
+                server_name = str(getattr(tool, "name", "unknown")).split("__", 1)[0]
+            loaded_by_server.setdefault(str(server_name), []).append(str(getattr(tool, "name", "unknown")))
+
+        catalog: list[dict[str, Any]] = []
+        for name, config in self._mcp_config.items():
+            transport = config.get("transport") or ("stdio" if config.get("command") else "unknown")
+            loaded_tools = loaded_by_server.get(name, [])
+            catalog.append({
+                "name": name,
+                "transport": transport,
+                "command": config.get("command"),
+                "url": config.get("url"),
+                "status": "loaded" if loaded_tools else "configured",
+                "tool_count": len(loaded_tools),
+                "tools": loaded_tools,
+            })
+        for server_name, tools in loaded_by_server.items():
+            if server_name not in self._mcp_config:
+                catalog.append({
+                    "name": server_name,
+                    "transport": "unknown",
+                    "status": "loaded",
+                    "tool_count": len(tools),
+                    "tools": tools,
+                })
+        return catalog
 
     def get_available_tools(self) -> list[dict[str, Any]]:
         """

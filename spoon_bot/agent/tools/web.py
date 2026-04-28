@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import html as _html
 import json as _json
 import os
+import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from loguru import logger
@@ -52,13 +54,15 @@ def get_configured_web_search_provider(preferred: str | None = None) -> str | No
     candidates: list[str] = []
     if preferred_provider:
         candidates.append(preferred_provider)
-    candidates.extend(["tavily", "brave"])
+    candidates.extend(["duckduckgo", "brave", "tavily"])
 
     seen: set[str] = set()
     for provider in candidates:
         if provider in seen:
             continue
         seen.add(provider)
+        if provider == "duckduckgo":
+            return provider
         if _get_web_search_api_key(provider):
             return provider
     return None
@@ -69,11 +73,7 @@ def describe_web_search_capability(preferred: str | None = None) -> tuple[bool, 
     provider = get_configured_web_search_provider(preferred)
     if provider is not None:
         return True, f"Configured web_search provider: {provider}"
-    return (
-        False,
-        "No web_search provider is configured. Set TAVILY_API_KEY, "
-        "BRAVE_SEARCH_API_KEY/BRAVE_API_KEY, or disable live web retrieval for this task.",
-    )
+    return False, "No web_search provider is configured."
 
 
 def _get_web_search_api_key(provider: str) -> str | None:
@@ -90,8 +90,7 @@ class WebSearchTool(Tool):
     """
     Tool to search the web for information.
 
-    Supports multiple search providers.  Tavily is the recommended default
-    because it returns structured results out of the box.
+    Supports multiple search providers. DuckDuckGo is the default because it works without an API key.
     """
 
     SUPPORTED_PROVIDERS = frozenset({
@@ -106,7 +105,7 @@ class WebSearchTool(Tool):
         # DuckDuckGo doesn't require an API key for basic search
     }
 
-    def __init__(self, default_provider: str = "tavily", max_results: int = 5):
+    def __init__(self, default_provider: str = "duckduckgo", max_results: int = 5):
         self._default_provider = default_provider
         self._max_results = max_results
 
@@ -176,6 +175,8 @@ class WebSearchTool(Tool):
             return await self._search_tavily(query, max_results, topic, time_range)
         if provider == "brave":
             return await self._search_brave(query, max_results, topic, time_range)
+        if provider == "duckduckgo":
+            return await self._search_duckduckgo(query, max_results, topic, time_range)
 
         # Fallback: stub for other providers (can be implemented later)
         return await self._search_stub(query, provider, max_results, time_range)
@@ -254,6 +255,100 @@ class WebSearchTool(Tool):
 
         return "\n".join(parts)
 
+
+    async def _search_duckduckgo(
+        self,
+        query: str,
+        max_results: int,
+        topic: str | None,
+        time_range: str | None,
+    ) -> str:
+        """Search DuckDuckGo's lightweight HTML endpoint without an API key."""
+        search_query = query
+        if topic == "news":
+            search_query = f"{query} news"
+        if time_range:
+            search_query = f"{search_query} {time_range}"
+
+        try:
+            client = _get_http_client()
+            resp = await client.get(
+                "https://duckduckgo.com/html/",
+                params={"q": search_query},
+                headers={
+                    "User-Agent": WebFetchTool.DEFAULT_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,text/plain,*/*",
+                },
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            html = resp.text
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"DuckDuckGo search error: {exc.response.status_code} {exc.response.text[:300]}")
+            return f"Error: DuckDuckGo search failed ({exc.response.status_code})"
+        except Exception as exc:
+            logger.error(f"DuckDuckGo request error: {exc}")
+            return f"Error: Web search failed — {exc}"
+
+        results = self._parse_duckduckgo_html(html, max_results)
+        if not results:
+            return "No results found."
+
+        parts = [f"**Search results ({len(results)}):**\n"]
+        for i, item in enumerate(results, 1):
+            parts.append(
+                f"{i}. **{item['title']}**\n"
+                f"   {item['url']}\n"
+                f"   {item['snippet']}\n"
+            )
+        return "\n".join(parts)
+
+    @staticmethod
+    def _parse_duckduckgo_html(html: str, max_results: int) -> list[dict[str, str]]:
+        """Extract title, URL, and snippet from DuckDuckGo HTML results."""
+        results: list[dict[str, str]] = []
+        result_pattern = re.compile(
+            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        snippet_pattern = re.compile(
+            r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(?P<snippet>.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        snippets = list(snippet_pattern.finditer(html))
+        for idx, match in enumerate(result_pattern.finditer(html)):
+            title = WebSearchTool._clean_html(match.group("title"))
+            url = WebSearchTool._normalize_duckduckgo_url(match.group("href"))
+            snippet = ""
+            if idx < len(snippets):
+                snippet = WebSearchTool._clean_html(snippets[idx].group("snippet"))
+            if title or url:
+                results.append({
+                    "title": title or url or "Untitled",
+                    "url": url,
+                    "snippet": snippet,
+                })
+            if len(results) >= max_results:
+                break
+        return results
+
+    @staticmethod
+    def _clean_html(value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", value or "")
+        text = _html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _normalize_duckduckgo_url(value: str) -> str:
+        text = _html.unescape(value or "").strip()
+        parsed = urlparse(text)
+        if parsed.path == "/l/" or parsed.netloc.endswith("duckduckgo.com"):
+            uddg = parse_qs(parsed.query).get("uddg", [""])[0]
+            if uddg:
+                return unquote(uddg)
+        return text
+
+
     async def _search_brave(
         self,
         query: str,
@@ -330,7 +425,7 @@ class WebSearchTool(Tool):
         env_var = self._ENV_VAR_MAP.get(provider, "")
         return (
             f"Error: Provider '{provider}' is not yet implemented. "
-            f"Use 'tavily' (default) instead.\n"
+            f"Use 'duckduckgo' (default) instead.\n"
             f"Or set {env_var} to configure this provider."
         )
 

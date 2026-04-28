@@ -121,3 +121,15 @@ class TestYoloContextBuilder:
         ctx = ContextBuilder(tmp_path, yolo_mode=False)
         prompt = ctx.build_system_prompt()
         assert "YOLO MODE ACTIVE" not in prompt
+
+    def test_system_prompt_includes_current_datetime_context(self, tmp_path):
+        from spoon_bot.agent.context import ContextBuilder
+
+        ctx = ContextBuilder(tmp_path)
+        prompt = ctx.build_system_prompt()
+
+        assert "Current date:" in prompt
+        assert "Current time:" in prompt
+        assert "Current weekday:" in prompt
+        assert "Current timezone:" in prompt
+        assert "Current ISO timestamp:" in prompt

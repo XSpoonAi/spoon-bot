@@ -712,9 +712,12 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
     Callers (cli.py, server.py, core.py) should use this function instead of
     reading environment variables themselves.
 
-    Resolution priority:  **YAML > env vars**  (no built-in defaults for
-    user-facing settings like model/provider).  Callers may overlay CLI args
-    on top of the returned dict.
+    Resolution priority:  **YAML > env vars** for stable agent settings
+    (model/provider/etc.; no built-in defaults).  ``SPOON_BOT_WORKSPACE_PATH``
+    is a runtime deployment override and intentionally wins over YAML so a
+    gateway process can be launched against an explicit workspace without
+    editing a checked-in config file.  Callers may overlay CLI args on top of
+    the returned dict.
 
     Supported fields::
 
@@ -796,6 +799,14 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
                         resolved[field] = val
                     logger.debug(f"Agent config: {field} from env var {var}")
                     break
+
+    # ``workspace`` is the one deployment-scoped override.  A repo-level
+    # config.yaml often carries a default workspace for local use, but gateway
+    # and test processes must be able to pin a separate workspace at startup.
+    workspace_override = os.environ.get("SPOON_BOT_WORKSPACE_PATH")
+    if workspace_override:
+        resolved["workspace"] = workspace_override
+        logger.debug("Agent config: workspace overridden by SPOON_BOT_WORKSPACE_PATH")
 
     # ------------------------------------------------------------------
     # 3. Resolve base_url from provider-specific env vars

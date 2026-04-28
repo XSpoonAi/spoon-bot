@@ -9,7 +9,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **OS-native**: Built-in shell/filesystem tools as priority
 - **Memory-first**: Four-layer memory system (file + semantic search via memsearch + short-term + checkpointer)
 - **Session Persistence**: Pluggable backends — JSONL files (default), SQLite, or PostgreSQL
-- **Web Search**: Built-in Tavily/Brave integration for real-time information retrieval
+- **Web Search**: Built-in DuckDuckGo/Tavily/Brave integration for real-time information retrieval
 - **Self-managing**: Self-configuration, self-upgrade, memory management tools
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem with dynamic tool activation
@@ -492,12 +492,13 @@ When enabled, the `memory` tool's `search` action automatically uses semantic se
 
 ## Web Search
 
-spoon-bot includes a built-in web search tool powered by Tavily. The agent autonomously decides when to search the web for real-time information.
+spoon-bot includes a built-in web search tool that uses DuckDuckGo by default, with Tavily and Brave available when configured. The agent autonomously decides when to search the web for real-time information.
 
 ### Setup
 
 ```bash
-# Get a free API key at https://tavily.com (1,000 free credits/month)
+# DuckDuckGo search works by default without an API key.
+# Optional: get a Tavily API key at https://tavily.com for Tavily search.
 export TAVILY_API_KEY=tvly-your-key
 ```
 
@@ -557,7 +558,7 @@ The agent includes its context budget in the system prompt, allowing it to adjus
 │  └── list_dir        List directory contents                     │
 ├──────────────────────────────────────────────────────────────────┤
 │  Web & Search Tools                                              │
-│  ├── web_search      Tavily-powered real-time web search         │
+│  ├── web_search      DuckDuckGo default real-time web search         │
 │  └── web_fetch       Fetch and parse web page content            │
 ├──────────────────────────────────────────────────────────────────┤
 │  Self-Management Tools                                           │
@@ -942,7 +943,7 @@ ruff check spoon_bot/
 | `DEEPSEEK_API_KEY` | — | DeepSeek API key |
 | `GEMINI_API_KEY` | — | Google Gemini API key |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key |
-| `TAVILY_API_KEY` | — | Tavily web search API key |
+| `TAVILY_API_KEY` | — | Optional Tavily web search API key |
 | `BRAVE_SEARCH_API_KEY` | — | Brave Search API key |
 | `BRAVE_API_KEY` | — | Alias for `BRAVE_SEARCH_API_KEY` |
 | `OPENAI_EMBEDDING_API_KEY` | — | Embedding provider API key (falls back to `OPENAI_API_KEY`) |

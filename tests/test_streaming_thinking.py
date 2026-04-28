@@ -544,6 +544,8 @@ class TestAgentLoopStream:
 
         prompt = AgentLoop._build_request_context_prompt(loop, message)
 
+        assert "[CURRENT DATE]:" in prompt
+        assert "[CURRENT TIMEZONE]:" in prompt
         assert "[... middle omitted to save tokens; preserve latest tail instructions ...]" in prompt
         assert "reply with exactly: final_ok" in prompt.lower()
         assert "Do not summarize." in prompt
@@ -648,6 +650,7 @@ class TestAgentLoopStream:
 
         loop = AgentLoop.__new__(AgentLoop)
         loop._pre_injected_skill_name = "document-review-agent"
+        loop._pre_injected_skill_context = {"name": "document-review-agent"}
         loop._agent = MagicMock()
         loop._agent.name = "sandbox"
         loop._agent.state = "thinking"
@@ -658,11 +661,137 @@ class TestAgentLoopStream:
         AgentLoop._prepare_agent_for_new_turn(loop)
 
         assert loop._pre_injected_skill_name is None
+        assert loop._pre_injected_skill_context is None
         normalized_state = getattr(loop._agent.state, "value", loop._agent.state)
         assert str(normalized_state).lower() == "idle"
         assert loop._agent.current_step == 0
         assert loop._agent.tool_calls == []
         assert shutdown_event.is_set() is False
+
+    def test_pre_injected_skill_records_sanitized_active_skill_context(self, tmp_path):
+        """Skill continuity metadata should come from discovered skill files."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "report-builder"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description: Build report packets from workspace data
+when_to_use: Use when the user asks to assemble or continue report packets.
+---
+# Report Builder
+Follow the report workflow.
+""",
+            encoding="utf-8",
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+        loop._pre_injected_skill_name = None
+        loop._pre_injected_skill_context = None
+
+        injected = AgentLoop._pre_inject_matched_skill(
+            loop,
+            "Please use the report builder for the quarterly packet.",
+        )
+
+        assert "[PRE-LOADED SKILL: report-builder]" in injected
+        assert loop._pre_injected_skill_context["name"] == "report-builder"
+        assert loop._pre_injected_skill_context["base_dir"].endswith(
+            "/workspace/skills/report-builder"
+        )
+        assert loop._pre_injected_skill_context["workspace_relative_path"] == (
+            "skills/report-builder/"
+        )
+        assert loop._pre_injected_skill_context["location"] == (
+            "skills/report-builder/SKILL.md"
+        )
+        assert loop._pre_injected_skill_context["organized"] is True
+        save_kwargs = AgentLoop._session_message_save_kwargs(
+            active_skill=loop._pre_injected_skill_context,
+        )
+        assert save_kwargs["active_skill"] == {
+            "name": "report-builder",
+            "location": "skills/report-builder/SKILL.md",
+            "workspace_relative_path": "skills/report-builder/",
+            "organized": True,
+            "source": "skill_match",
+        }
+
+    def test_recent_active_skill_prompt_hint_does_not_rehydrate_old_task_text(self, tmp_path):
+        """Continuity should expose only bounded skill identity, not old prompt content."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.session.manager import Session
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "report-builder"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description: Build report packets from workspace data
+when_to_use: Use when the user asks to assemble or continue report packets.
+---
+# Report Builder
+""",
+            encoding="utf-8",
+        )
+
+        session = Session(session_key="continuity")
+        session.add_message(
+            "user",
+            "Use the report builder and include internal-only source notes.",
+            turn_state="completed",
+            active_skill={"name": "report-builder"},
+        )
+        session.add_message("assistant", "Report packet created.")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+        loop._session = session
+        loop._pre_injected_skill_context = None
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        AgentLoop._refresh_recent_active_skill_context(loop)
+        prompt = AgentLoop._build_request_context_prompt(
+            loop,
+            "Continue with the latest item.",
+        )
+
+        assert "[RECENT ACTIVE SKILL]: `report-builder`" in prompt
+        assert "skills/report-builder/SKILL.md" in prompt
+        assert "internal-only source notes" not in prompt
+
+        runtime_message = AgentLoop._append_recent_active_skill_context(
+            loop,
+            "Continue with the latest item.",
+        )
+        assert "[RECENT ACTIVE SKILL]: `report-builder`" in runtime_message
+        assert "internal-only source notes" not in runtime_message
+
+    def test_recent_active_skill_hint_is_suppressed_when_current_turn_preloads_skill(self, tmp_path):
+        """A direct skill match should own the turn instead of mixing prior skill hints."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_path / "workspace"
+        loop._recent_active_skill_context = {
+            "name": "report-builder",
+            "location": "skills/report-builder/SKILL.md",
+        }
+        loop._pre_injected_skill_context = {
+            "name": "invoice-builder",
+            "location": "skills/invoice-builder/SKILL.md",
+        }
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_step_prompt(loop, "Use invoice builder now.")
+
+        assert "[RECENT ACTIVE SKILL]" not in prompt
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):

@@ -4,11 +4,49 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+
+def current_datetime_context() -> dict[str, str]:
+    """Return the current local and UTC time facts for prompt context."""
+    local_now = datetime.now().astimezone()
+    utc_now = local_now.astimezone(timezone.utc)
+    offset = local_now.strftime("%z")
+    offset_text = f"{offset[:3]}:{offset[3:]}" if offset else "unknown"
+    return {
+        "date": local_now.strftime("%Y-%m-%d"),
+        "time": local_now.strftime("%H:%M:%S"),
+        "weekday": local_now.strftime("%A"),
+        "timezone": f"{local_now.tzname() or 'local'} (UTC{offset_text})",
+        "iso": local_now.isoformat(timespec="seconds"),
+        "utc_iso": utc_now.isoformat(timespec="seconds"),
+    }
+
+
+def format_current_datetime_context(*, bracketed: bool = False) -> str:
+    """Format current date/time facts for system or per-turn prompts."""
+    facts = current_datetime_context()
+    if bracketed:
+        return "\n".join([
+            f"[CURRENT DATE]: {facts['date']}",
+            f"[CURRENT TIME]: {facts['time']}",
+            f"[CURRENT WEEKDAY]: {facts['weekday']}",
+            f"[CURRENT TIMEZONE]: {facts['timezone']}",
+            f"[CURRENT ISO TIMESTAMP]: {facts['iso']}",
+            f"[CURRENT UTC TIMESTAMP]: {facts['utc_iso']}",
+        ])
+    return "\n".join([
+        f"Current date: {facts['date']}",
+        f"Current time: {facts['time']}",
+        f"Current weekday: {facts['weekday']}",
+        f"Current timezone: {facts['timezone']}",
+        f"Current ISO timestamp: {facts['iso']}",
+        f"Current UTC timestamp: {facts['utc_iso']}",
+    ])
 
 
 class ContextBuilder:
@@ -84,7 +122,7 @@ class ContextBuilder:
         """Get the core identity section."""
         import sys
         import re
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        now_context = format_current_datetime_context()
 
         # Build workspace path in two forms:
         # - display_path: native OS form for readability
@@ -112,7 +150,7 @@ class ContextBuilder:
         return f"""# spoon-bot
 
 You are spoon-bot, an AI agent that completes tasks by calling tools.
-Current time: {now}
+{now_context}
 Workspace: {display_path}
 {yolo_banner}
 ## Core Behavior — ALWAYS USE TOOLS

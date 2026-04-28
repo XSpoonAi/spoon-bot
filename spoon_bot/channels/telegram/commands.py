@@ -636,7 +636,9 @@ class CommandHandlers:
             elif token == "--cleanup" and i + 1 < len(args):
                 cleanup = args[i + 1]; i += 2
             elif token == "--auto-route":
-                auto_route = True; i += 1
+                # Prompt-derived specialist routing is disabled globally. Keep
+                # the flag accepted for compatibility, but do not enable it.
+                auto_route = False; i += 1
             elif token == "--specialization":
                 values: list[str] = []
                 j = i + 1

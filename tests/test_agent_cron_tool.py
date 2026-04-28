@@ -143,7 +143,7 @@ async def test_cron_tool_create_preview_and_confirm_uses_current_chat_binding(tm
 
 
 @pytest.mark.asyncio
-async def test_cron_tool_live_info_preview_warns_when_search_provider_missing(tmp_path, monkeypatch):
+async def test_cron_tool_live_info_preview_uses_default_duckduckgo_provider(tmp_path, monkeypatch):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
@@ -160,8 +160,7 @@ async def test_cron_tool_live_info_preview_warns_when_search_provider_missing(tm
         schedule_kind="every",
         every_seconds=300,
     )
-    assert "Capability warning:" in preview
-    assert "No web_search provider is configured" in preview
+    assert "Capability warning:" not in preview
 
     created = await tool.execute(action="create", confirm=True)
     assert "Created scheduled task successfully" in created

@@ -144,6 +144,22 @@ def _normalize_attachment_refs(raw: Any) -> list[dict[str, Any]]:
     return attachments
 
 
+
+
+def _fallback_empty_agent_response(*, had_error: bool, stream: bool) -> str:
+    """Return a user-visible fallback when the agent produced no final text."""
+    if had_error:
+        return (
+            "The agent did not produce a final answer after a tool/runtime error. "
+            "Check the preceding error event or tool output for details."
+        )
+    mode = "streaming" if stream else "non-streaming"
+    return (
+        f"The agent completed the {mode} turn but produced an empty final response. "
+        "Please retry; this empty response was preserved as an execution error instead of being hidden."
+    )
+
+
 def _validate_media_paths(media: list[str]) -> list[str]:
     """Reject media paths that are missing or outside the sandbox workspace."""
     invalid = [path for path in media if _resolve_workspace_file(path) is None]
@@ -394,13 +410,17 @@ async def websocket_endpoint(
                     # loop stays free to process cancel / status requests.
                     if message.method in ("agent.chat", ClientMethod.CHAT_SEND.value):
                         _req = message  # capture for closure
+                        await handler._interrupt_active_chat(manager, conn_id, reason="superseded")
+                        generation = handler._begin_chat_request(_req.id)
 
                         async def _run_chat(req: WSRequest = _req) -> None:
                             try:
-                                result = await handler._handle_chat(req.params)
+                                result = await handler._handle_chat(req.params, generation=generation)
                                 await manager.send_message(
                                     conn_id, WSResponse(id=req.id, result=result),
                                 )
+                            except asyncio.CancelledError:
+                                pass
                             except Exception as exc:
                                 logger.error(f"Chat error: {exc}")
                                 await manager.send_message(
@@ -408,7 +428,10 @@ async def websocket_endpoint(
                                     WSError(id=req.id, code="HANDLER_ERROR", message=str(exc)),
                                 )
                             finally:
-                                handler._current_task = None
+                                if handler._current_generation == generation:
+                                    handler._current_task = None
+                                    handler._current_request_id = None
+                                    handler._current_task_id = None
 
                         handler._current_task = asyncio.create_task(_run_chat())
 
@@ -457,7 +480,9 @@ class WebSocketHandler:
         self.session_id = session_id or connection_id
         self._cancel_requested = False
         self._current_task_id: str | None = None
+        self._current_request_id: str | None = None
         self._current_task: asyncio.Task | None = None
+        self._current_generation = 0
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._chat_lock = asyncio.Lock()
         self._concurrent_request_slots = asyncio.Semaphore(_CONCURRENT_REQUEST_LIMIT)
@@ -573,12 +598,59 @@ class WebSocketHandler:
 
     # ========== Chat ==========
 
-    async def _handle_chat(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle chat.send / agent.chat — serialized to prevent state races."""
-        async with self._chat_lock:
-            return await self._execute_chat(params)
+    def _begin_chat_request(self, request_id: str | None = None) -> int:
+        """Start a new chat generation; only this generation may emit output."""
+        self._current_generation += 1
+        self._current_request_id = request_id
+        self._cancel_requested = False
+        return self._current_generation
 
-    async def _execute_chat(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _raise_if_stale_chat(self, generation: int) -> None:
+        if generation != self._current_generation:
+            raise asyncio.CancelledError
+
+    async def _interrupt_active_chat(
+        self,
+        manager,
+        connection_id: str,
+        *,
+        reason: str,
+        timeout: float = 2.0,
+    ) -> bool:
+        """Interrupt the active chat run without interpreting the new prompt text."""
+        task = self._current_task
+        if task is None or task.done():
+            return False
+
+        request_id = self._current_request_id
+        self._current_generation += 1
+        self._cancel_requested = True
+        cancelled = await self._cancel_current_task_for_cleanup(timeout=timeout)
+        if request_id:
+            await manager.send_message(
+                connection_id,
+                WSError(
+                    id=request_id,
+                    code="REQUEST_INTERRUPTED",
+                    message=f"Chat request interrupted: {reason}.",
+                ),
+            )
+        return cancelled
+
+    async def _handle_chat(
+        self,
+        params: dict[str, Any],
+        *,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Handle chat.send / agent.chat — serialized to prevent state races."""
+        if generation is None:
+            generation = self._begin_chat_request()
+        async with self._chat_lock:
+            self._raise_if_stale_chat(generation)
+            return await self._execute_chat(params, generation=generation)
+
+    async def _execute_chat(self, params: dict[str, Any], *, generation: int) -> dict[str, Any]:
         """Execute chat request — uses the global AgentLoop."""
         agent = get_agent()
         manager = get_connection_manager()
@@ -606,6 +678,7 @@ class WebSocketHandler:
         task_id = f"task_{uuid4().hex[:8]}"
         trace_id = new_trace_id()
         span = TimerSpan("ws_chat")
+        self._raise_if_stale_chat(generation)
         self._current_task_id = task_id
         self._cancel_requested = False
         had_error = False
@@ -619,6 +692,7 @@ class WebSocketHandler:
                     # Switch agent session to the requested session_key (#11)
                     _switch_agent_session(agent, session_key)
 
+                    self._raise_if_stale_chat(generation)
                     # Emit thinking event
                     await manager.send_message(
                         self.connection_id,
@@ -641,6 +715,7 @@ class WebSocketHandler:
                             reasoning_effort=reasoning_effort,
                         ):
                             check_budget("stream", config.budget.stream_timeout_ms, span.elapsed_ms)
+                            self._raise_if_stale_chat(generation)
                             if self._cancel_requested:
                                 raise asyncio.CancelledError
 
@@ -683,6 +758,22 @@ class WebSocketHandler:
                                             "type": "content",
                                             "delta": done_content,
                                             "metadata": {"fallback": "done_metadata_content"},
+                                            "trace_id": trace_id,
+                                            "source": source,
+                                        }),
+                                    )
+                                if not str(full_content or "").strip():
+                                    full_content = _fallback_empty_agent_response(
+                                        had_error=had_error,
+                                        stream=True,
+                                    )
+                                    await manager.send_message(
+                                        self.connection_id,
+                                        WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
+                                            "task_id": task_id,
+                                            "type": "content",
+                                            "delta": full_content,
+                                            "metadata": {"fallback": "empty_final_response"},
                                             "trace_id": trace_id,
                                             "source": source,
                                         }),
@@ -771,6 +862,13 @@ class WebSocketHandler:
                             thinking_content = None
                         check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
+            self._raise_if_stale_chat(generation)
+            if not str(response or "").strip():
+                response = _fallback_empty_agent_response(
+                    had_error=had_error,
+                    stream=bool(stream),
+                )
+
             response_source = _get_agent_response_source(agent)
             # Emit complete event
             span.stop()
@@ -848,7 +946,8 @@ class WebSocketHandler:
             )
             raise
         finally:
-            self._current_task_id = None
+            if generation == self._current_generation:
+                self._current_task_id = None
 
     async def _handle_cancel(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle cancel request (#13) — cancels both stream and non-stream."""
@@ -868,6 +967,7 @@ class WebSocketHandler:
 
         if task.done():
             self._current_task = None
+            self._current_request_id = None
             return False
 
         task.cancel()
@@ -882,6 +982,7 @@ class WebSocketHandler:
             )
         finally:
             self._current_task = None
+            self._current_request_id = None
 
         return True
 
