@@ -105,9 +105,13 @@ from spoon_bot.agent.tools.cron import CronTool
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
 from spoon_bot.config import (
     AgentLoopConfig,
+    DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
     DEFAULT_MAX_OUTPUT,
+    DEFAULT_PROVIDER_SILENCE_TIMEOUT,
+    DEFAULT_PROVIDER_TOTAL_TIMEOUT,
     DEFAULT_SHELL_MAX_TIMEOUT,
     DEFAULT_SHELL_TIMEOUT,
+    DEFAULT_TOOL_FOLLOWUP_TIMEOUT,
     MemSearchConfig,
     resolve_context_window,
     validate_agent_loop_params,
@@ -455,19 +459,19 @@ class AgentLoop:
         self.max_output = self._config.max_output
         self.provider_silence_timeout = self._float_env(
             "SPOON_BOT_PROVIDER_SILENCE_TIMEOUT",
-            150.0,
+            DEFAULT_PROVIDER_SILENCE_TIMEOUT,
         )
         self.provider_total_timeout = self._float_env(
             "SPOON_BOT_PROVIDER_TOTAL_TIMEOUT",
-            180.0,
+            DEFAULT_PROVIDER_TOTAL_TIMEOUT,
         )
         self.tool_followup_timeout = self._float_env(
             "SPOON_BOT_TOOL_FOLLOWUP_TIMEOUT",
-            90.0,
+            DEFAULT_TOOL_FOLLOWUP_TIMEOUT,
         )
         self.max_stream_tool_results_without_content = self._int_env(
             "SPOON_BOT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT",
-            48,
+            DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
         )
         self.session_key = self._config.session_key
         self.user_id = "anonymous"
@@ -4545,18 +4549,30 @@ class AgentLoop:
             stream_started_at = time.monotonic()
             last_tool_progress_at = stream_started_at
             provider_silence_timeout = float(
-                getattr(self, "provider_silence_timeout", 150.0) or 150.0
+                getattr(self, "provider_silence_timeout", DEFAULT_PROVIDER_SILENCE_TIMEOUT)
+                or DEFAULT_PROVIDER_SILENCE_TIMEOUT
             )
             provider_total_timeout = float(
-                getattr(self, "provider_total_timeout", 180.0) or 180.0
+                getattr(self, "provider_total_timeout", DEFAULT_PROVIDER_TOTAL_TIMEOUT)
+                or DEFAULT_PROVIDER_TOTAL_TIMEOUT
             )
             tool_followup_timeout = max(
                 0.1,
-                float(getattr(self, "tool_followup_timeout", 90.0) or 90.0),
+                float(
+                    getattr(self, "tool_followup_timeout", DEFAULT_TOOL_FOLLOWUP_TIMEOUT)
+                    or DEFAULT_TOOL_FOLLOWUP_TIMEOUT
+                ),
             )
             max_tool_results_without_content = max(
                 1,
-                int(getattr(self, "max_stream_tool_results_without_content", 48) or 48),
+                int(
+                    getattr(
+                        self,
+                        "max_stream_tool_results_without_content",
+                        DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
+                    )
+                    or DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT
+                ),
             )
 
             def _record_tool_result_events(events: list[dict[str, Any]]) -> None:
