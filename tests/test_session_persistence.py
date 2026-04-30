@@ -399,7 +399,12 @@ def _assert_multimodal_user_call(
     assert content[0]["type"] == "image_url"
     assert content[0]["image_url"]["url"].endswith(expected_data_url_suffix)
     assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert content[-1] == {"type": "text", "text": expected_text}
+    assert content[-1]["type"] == "text"
+    actual_text = content[-1]["text"]
+    if actual_text == expected_text:
+        return
+    assert "[USER REQUEST]:" in actual_text
+    assert actual_text.endswith(expected_text)
 
 
 class TestAgentLoopSessionHydration:
@@ -528,6 +533,157 @@ class TestAgentLoopSessionHydration:
         assert loop._agent.calls == [
             ("user", "Completed request", {}),
         ]
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_does_not_rehydrate_recent_skill_turn_for_new_request(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="recent-followup")
+        loop._session.add_message(
+            "user",
+            "Use the report skill.",
+            turn_state="completed",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+        loop._session.add_message(
+            "assistant",
+            "Report skill is ready. Say start when you want me to continue.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="start",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_keeps_recent_plain_replies_out_of_runtime_memory(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="recent-context")
+        loop._session.add_message(
+            "user",
+            "What is the weather in Paris today?",
+            turn_state="completed",
+        )
+        loop._session.add_message(
+            "assistant",
+            "Paris is mild today.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="What about yesterday?",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_recent_followup_skips_prior_tool_trace(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="recent-context-tool-trace")
+        loop._session.add_message(
+            "user",
+            "What is the weather in Paris today?",
+            turn_state="completed",
+        )
+        loop._session.add_message(
+            "assistant",
+            "",
+            message_kind="tool_trace",
+            tool_calls=[
+                {
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": "{\"url\":\"https://example.test/weather\"}",
+                    },
+                }
+            ],
+        )
+        loop._session.add_message(
+            "tool",
+            "large weather provider payload" * 200,
+            tool_call_id="call_weather",
+            name="web_fetch",
+        )
+        loop._session.add_message(
+            "assistant",
+            "Paris is mild today.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="What about yesterday?",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_keeps_long_standalone_request_isolated(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="standalone-after-skill")
+        loop._session.add_message(
+            "user",
+            "Use the report skill.",
+            turn_state="completed",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+        loop._session.add_message(
+            "assistant",
+            "Report skill is ready.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="Create a Python script that queries a JSON API and writes a CSV file.",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
 
     def test_strip_attachment_context_recovers_original_user_text(self):
         from spoon_bot.agent.loop import _ensure_attachment_context, _strip_attachment_context
@@ -714,7 +870,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -759,7 +914,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -812,7 +966,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -868,7 +1021,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None

@@ -97,7 +97,11 @@ class ReadFileTool(Tool):
     ) -> str:
         """Read file contents with path traversal protection."""
         try:
-            result = validate_read_path(path, workspace=self._workspace)
+            result = (
+                self._validator.validate_read_path(path)
+                if self._validator is not None
+                else validate_read_path(path, workspace=self._workspace)
+            )
             if not result.valid:
                 return f"Security Error: {result.error}"
 
@@ -460,7 +464,11 @@ class ListDirTool(Tool):
         """List directory contents with path traversal protection."""
         try:
             # Validate the path
-            result = validate_directory_path(path, workspace=self._workspace)
+            result = (
+                self._validator.validate_directory_path(path)
+                if self._validator is not None
+                else validate_directory_path(path, workspace=self._workspace)
+            )
             if not result.valid:
                 return f"Security Error: {result.error}"
 

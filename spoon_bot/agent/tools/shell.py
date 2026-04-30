@@ -696,6 +696,33 @@ class ShellTool(Tool):
         drive, rest = match.groups()
         return f"/{drive.lower()}/{rest}" if rest else f"/{drive.lower()}"
 
+    @staticmethod
+    def _posix_drive_path_to_windows(path: str) -> str:
+        """Convert Git-Bash-style /c/foo paths to Windows paths for cwd checks."""
+        normalized = path.replace("\\", "/")
+        match = re.match(r"^/([A-Za-z])(?:/(.*))?$", normalized)
+        if not match:
+            return path
+        drive, rest = match.groups()
+        if not rest:
+            return f"{drive.upper()}:\\"
+        rest_win = rest.replace("/", "\\")
+        return f"{drive.upper()}:\\{rest_win}"
+
+    def _resolve_working_dir(self, working_dir: str | None) -> str:
+        """Resolve command cwd, treating relative paths as workspace-relative."""
+        base_dir = str(self.working_dir or os.getcwd())
+        raw_dir = str(working_dir).strip() if working_dir is not None else ""
+        cwd = raw_dir or base_dir
+
+        if sys.platform == "win32":
+            cwd = self._posix_drive_path_to_windows(cwd)
+
+        if not os.path.isabs(cwd):
+            cwd = os.path.join(base_dir, cwd)
+
+        return os.path.abspath(os.path.expanduser(cwd))
+
     def _run_sync(
         self,
         command: str,
@@ -1206,7 +1233,7 @@ class ShellTool(Tool):
             safe_cmd = self.validator.sanitize_for_display(command)
             return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
 
-        cwd = working_dir or self.working_dir or os.getcwd()
+        cwd = self._resolve_working_dir(working_dir)
 
         # Verify working directory exists and is accessible
         if not os.path.isdir(cwd):

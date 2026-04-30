@@ -554,16 +554,6 @@ class SubagentManager:
             "match_examples": [specialization],
         }
 
-    @classmethod
-    def parse_persistent_subagent_request(cls, message: str) -> dict[str, Any] | None:
-        """Natural-language subagent creation is intentionally disabled.
-
-        Persistent subagents must be created through explicit tool/API calls or
-        built-in skill guidance. Runtime prompt parsing here would reintroduce
-        prompt-derived routing.
-        """
-        return None
-
     @staticmethod
     def _normalize_text(text: str) -> str:
         return re.sub(r"\s+", " ", text.lower()).strip()
@@ -1224,10 +1214,6 @@ class SubagentManager:
         self._start_background_run(record)
 
         return record
-
-    def find_best_auto_route_specialist(self, task: str) -> dict[str, Any] | None:
-        """Prompt-based persistent subagent auto-routing is disabled."""
-        return None
 
     def create_persistent_subagent(
         self,

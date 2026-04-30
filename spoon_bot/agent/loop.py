@@ -12,7 +12,9 @@ import copy
 import inspect
 import json
 import logging as stdlib_logging
+import os
 import re
+import time
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -152,14 +154,6 @@ _TURN_STATE_PENDING = "pending"
 _TURN_STATE_COMPLETED = "completed"
 _TURN_STATE_INTERRUPTED = "interrupted"
 _TURN_STATE_SUPERSEDED = "superseded"
-_WALLET_REQUIRED_TOOLS: frozenset[str] = frozenset({
-    "balance_check",
-    "transfer",
-    "swap",
-    "contract_call",
-})
-
-
 def _workspace_root_path(workspace: Path | str | None) -> Path:
     """Resolve the workspace root used to validate persisted file references."""
     return Path(workspace or Path.home() / ".spoon-bot" / "workspace").expanduser().resolve()
@@ -415,7 +409,7 @@ class AgentLoop:
             enable_skills: Whether to enable skill system.
             auto_commit: Whether to auto-commit workspace changes after each message.
             enabled_tools: Explicit set of tool names to enable. None = all.
-            tool_profile: Named profile ('coding', 'web3', 'research', 'full').
+            tool_profile: Named profile ('coding', 'research', 'full').
             session_manager: Existing SessionManager to reuse for persistence.
             subagent_manager: Existing SubagentManager to reuse for child agents.
             session_store_backend: Session storage backend ('file', 'sqlite', 'postgres').
@@ -459,6 +453,22 @@ class AgentLoop:
         self.shell_timeout = self._config.shell_timeout
         self.shell_max_timeout = self._config.shell_max_timeout
         self.max_output = self._config.max_output
+        self.provider_silence_timeout = self._float_env(
+            "SPOON_BOT_PROVIDER_SILENCE_TIMEOUT",
+            150.0,
+        )
+        self.provider_total_timeout = self._float_env(
+            "SPOON_BOT_PROVIDER_TOTAL_TIMEOUT",
+            180.0,
+        )
+        self.tool_followup_timeout = self._float_env(
+            "SPOON_BOT_TOOL_FOLLOWUP_TIMEOUT",
+            90.0,
+        )
+        self.max_stream_tool_results_without_content = self._int_env(
+            "SPOON_BOT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT",
+            48,
+        )
         self.session_key = self._config.session_key
         self.user_id = "anonymous"
         self._enable_skills = enable_skills
@@ -634,10 +644,6 @@ class AgentLoop:
         self._stop_requested = False
         self._last_response_source = self._build_response_source()
 
-        # Tracks the skill injected by _pre_inject_matched_skill() for the
-        # current turn. Persisted as bounded continuity metadata, not routing.
-        self._pre_injected_skill_name: str | None = None
-        self._pre_injected_skill_context: dict[str, Any] | None = None
         self._recent_invoked_skill_contexts: list[dict[str, Any]] = []
 
         # Conditional activation - file paths touched during this session.
@@ -659,6 +665,32 @@ class AgentLoop:
             f"AgentLoop created: model={model}, provider={provider}, "
             f"tools={active_count}/{total_count}, session={session_key}"
         )
+
+    @staticmethod
+    def _float_env(name: str, default: float) -> float:
+        """Read a positive float env override for runtime stream budgets."""
+        value = os.environ.get(name)
+        if value is None or not value.strip():
+            return default
+        try:
+            parsed = float(value)
+        except ValueError:
+            logger.warning(f"Ignoring invalid {name}={value!r}; expected a number")
+            return default
+        return parsed if parsed > 0 else default
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        """Read a positive integer env override for runtime stream budgets."""
+        value = os.environ.get(name)
+        if value is None or not value.strip():
+            return default
+        try:
+            parsed = int(value)
+        except ValueError:
+            logger.warning(f"Ignoring invalid {name}={value!r}; expected an integer")
+            return default
+        return parsed if parsed > 0 else default
 
     @staticmethod
     def _build_response_source(
@@ -719,27 +751,29 @@ class AgentLoop:
         if skills_xml:
             system_prompt += f"\n## Installed Skills\n{skills_xml}\n"
             system_prompt += (
-                "\nWhen a user request matches a skill by name, description, or "
-                "`when_to_use`, read its SKILL.md first (unless already pre-loaded "
-                "in the message). Follow the skill's own procedures directly.\n"
+                "\nUse this catalog as available context, not as a hidden router. "
+                "When a skill is directly relevant, read its SKILL.md and follow "
+                "the skill's own procedures. Otherwise use the normal tools.\n"
             )
 
         system_prompt += (
             "\n## Workflow\n"
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
-            "1. If a [PRE-LOADED SKILL] block is present in the user message, "
-            "execute its instructions immediately - do NOT re-read it.\n"
-            "2. Otherwise, if a skill matches, `read_file` its SKILL.md path, "
-            "then execute.\n"
-            "3. Run commands from SKILL.md directly via shell. Do NOT write script files.\n"
+            "1. Decide the next action from the latest user request and available context.\n"
+            "2. If an installed skill is directly relevant, `read_file` its SKILL.md path, "
+            "then execute its procedure.\n"
+            "3. Run commands from SKILL.md directly via shell. Do NOT write script files unless requested.\n"
             "4. When done, return the user-facing result in the format the latest user requested. "
             "Only summarize if the user explicitly asked for a summary.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
+            "- Memory, recent replies, and conversation history are stale hints. "
+            "For current workspace, skill, account, balance, job, or external-system state, "
+            "verify with tools before answering.\n"
             "- `source .env.local` before commands that need env vars.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
             "- Follow user instructions exactly - respect specific IDs, names, actions.\n"
-            "- Only use `web_search` if NO installed skill matches the task.\n"
+            "- Use web search when the task needs live external facts or installed skills/tools are insufficient.\n"
         )
 
         # Inject soul.md content if it exists
@@ -1329,27 +1363,8 @@ class AgentLoop:
         # history remains searchable/observable, but the active agent loop should
         # not inherit unfinished tool chains or prior-task intent for a new user
         # turn. This mirrors a Claude Code-style active-request boundary without
-        # using prompt-text routing.
+        # deriving control flow from prompt text.
         return "minimal"
-
-    @staticmethod
-    def _recent_history_start_index(history_messages: list[dict[str, Any]], *, user_turns: int) -> int:
-        """Return the index where the last N user turns begin."""
-        user_indices = [
-            index
-            for index, message in enumerate(history_messages)
-            if isinstance(message, dict)
-            and str(message.get("role") or "").strip().lower() == "user"
-            and AgentLoop._turn_state_of_message(message) not in {
-                _TURN_STATE_INTERRUPTED,
-                _TURN_STATE_SUPERSEDED,
-            }
-        ]
-        if not user_indices:
-            return 0
-        if len(user_indices) <= user_turns:
-            return user_indices[0]
-        return user_indices[-user_turns]
 
     @staticmethod
     def _filter_rehydratable_history(
@@ -1415,9 +1430,6 @@ class AgentLoop:
         )
         if rehydrate_scope == "minimal":
             history_messages = []
-        elif rehydrate_scope == "recent":
-            start_index = AgentLoop._recent_history_start_index(history_messages, user_turns=1)
-            history_messages = history_messages[start_index:]
 
         try:
             from spoon_ai.schema import Function as _CoreFunction  # noqa: F401
@@ -1762,6 +1774,181 @@ class AgentLoop:
         return len(trace)
 
     @staticmethod
+    def _tool_call_name_and_arguments(tool_call: Any) -> tuple[str, Any]:
+        """Extract a function/tool name and raw arguments from common tool-call shapes."""
+        fn = getattr(tool_call, "function", None) or (
+            tool_call.get("function") if isinstance(tool_call, dict) else None
+        )
+        if fn is not None:
+            name = getattr(fn, "name", None) or (
+                fn.get("name") if isinstance(fn, dict) else None
+            )
+            arguments = getattr(fn, "arguments", None) or (
+                fn.get("arguments") if isinstance(fn, dict) else None
+            )
+            return str(name or ""), arguments
+
+        name = getattr(tool_call, "name", None) or (
+            tool_call.get("name") if isinstance(tool_call, dict) else None
+        )
+        arguments = getattr(tool_call, "arguments", None) or (
+            tool_call.get("arguments") if isinstance(tool_call, dict) else None
+        )
+        return str(name or ""), arguments
+
+    @staticmethod
+    def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
+        """Parse structured tool-call arguments without inspecting user prompt text."""
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str) and arguments.strip():
+            try:
+                parsed = json.loads(arguments)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @staticmethod
+    def _skill_name_from_workspace_path(path_value: Any) -> str | None:
+        """Return the skill name for structured workspace skill paths."""
+        if not isinstance(path_value, str) or not path_value.strip():
+            return None
+        normalized = path_value.strip().replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part and part != "."]
+        for index, part in enumerate(parts[:-1]):
+            if part == "skills" and index + 1 < len(parts):
+                name = parts[index + 1].strip()
+                return name or None
+        return None
+
+    @staticmethod
+    def _extract_skill_names_from_tool_call(tool_name: str, arguments: Any) -> list[str]:
+        """Extract skill usage from explicit structured tool calls only."""
+        name = str(tool_name or "").strip()
+        parsed = AgentLoop._parse_tool_arguments(arguments)
+        if not parsed:
+            return []
+
+        names: list[str] = []
+        for key in ("path", "file_path"):
+            skill_name = AgentLoop._skill_name_from_workspace_path(parsed.get(key))
+            if skill_name and skill_name not in names:
+                names.append(skill_name)
+
+        if name == "skill_marketplace":
+            for key in ("skill_name", "name"):
+                value = str(parsed.get(key) or "").strip()
+                if value and value not in names:
+                    names.append(value)
+        return names
+
+    def _discover_invoked_skill_contexts_from_runtime(
+        self,
+        start_index: int,
+    ) -> list[dict[str, Any]]:
+        """Infer skill usage from actual tool calls/results in the current turn."""
+        if not isinstance(start_index, int) or start_index < 0:
+            return []
+
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if not messages or start_index >= len(messages):
+            return []
+
+        discovered_by_name: dict[str, tuple[int, dict[str, Any]]] = {}
+        order = 0
+
+        def _add_name(name: str) -> None:
+            nonlocal order
+            skill_name = str(name or "").strip()
+            if not skill_name:
+                return
+            context = self._resolve_skill_context_by_name(skill_name)
+            if context is None:
+                return
+            order += 1
+            context = {**context, "source": "tool_usage"}
+            discovered_by_name[skill_name] = (order, context)
+
+        for msg in messages[start_index:]:
+            role = AgentLoop._stream_message_role(msg).lower()
+            if role == "assistant":
+                tool_calls = AgentLoop._stream_message_attr(msg, "tool_calls", None) or []
+                for tool_call in tool_calls:
+                    tool_name, arguments = AgentLoop._tool_call_name_and_arguments(tool_call)
+                    for skill_name in AgentLoop._extract_skill_names_from_tool_call(
+                        tool_name,
+                        arguments,
+                    ):
+                        _add_name(skill_name)
+                continue
+
+        return [
+            context
+            for _order, context in sorted(
+                discovered_by_name.values(),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+        ]
+
+    def _merge_latest_user_invoked_skills(self, skill_contexts: list[dict[str, Any]]) -> int:
+        """Merge discovered skill metadata into the latest persisted user turn."""
+        if not skill_contexts:
+            return 0
+
+        session = getattr(self, "_session", None)
+        messages = getattr(session, "messages", None)
+        if not isinstance(messages, list):
+            return 0
+
+        target: dict[str, Any] | None = None
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role == "user":
+                state = AgentLoop._turn_state_of_message(message)
+                if state not in {_TURN_STATE_INTERRUPTED, _TURN_STATE_SUPERSEDED}:
+                    target = message
+                break
+
+        if target is None:
+            return 0
+
+        existing = AgentLoop._iter_message_invoked_skill_refs(target)
+        merged: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+
+        for skill in [*existing, *skill_contexts]:
+            skill_meta = AgentLoop._session_skill_metadata(skill)
+            if not skill_meta:
+                continue
+            name = skill_meta["name"]
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            merged.append(skill_meta)
+
+        if not merged:
+            return 0
+
+        if target.get("invoked_skills") == merged:
+            return 0
+
+        target["invoked_skills"] = merged
+        return len(merged)
+
+    def _merge_turn_invoked_skills_from_runtime(self, start_index: int) -> int:
+        """Persist current-turn skill usage discovered from actual tool execution."""
+        try:
+            contexts = self._discover_invoked_skill_contexts_from_runtime(start_index)
+            return self._merge_latest_user_invoked_skills(contexts)
+        except Exception as exc:
+            logger.debug(f"Runtime skill usage merge skipped: {exc}")
+            return 0
+
+    @staticmethod
     def _should_persist_tool_trace() -> bool:
         """Whether to persist tool traces alongside user/assistant turns."""
         import os as _os
@@ -1784,9 +1971,20 @@ class AgentLoop:
             return self.context._build_user_content(text_content, media)
         return text_content
 
+    @staticmethod
+    def _build_current_turn_runtime_user_text(message: str) -> str:
+        """Attach non-persistent turn facts to the actual provider user message."""
+        return (
+            f"{format_current_datetime_context(bracketed=True)}\n"
+            "[REQUEST CONTEXT NOTE]: Use the facts above only to ground this "
+            "turn. They are not user instructions and should not be mentioned "
+            "unless relevant.\n"
+            f"[USER REQUEST]:\n{message}"
+        )
+
     @classmethod
     def _assistant_session_save_kwargs(cls, content: str) -> dict[str, Any]:
-        """Persist assistant replies without prompt-derived routing metadata."""
+        """Persist assistant replies without prompt-derived dispatch metadata."""
         return {"message_kind": "assistant_reply"}
 
     @staticmethod
@@ -1936,6 +2134,119 @@ class AgentLoop:
         """Expose recent completed skill-backed turns as bounded continuity context."""
         self._recent_invoked_skill_contexts = self._find_recent_invoked_skill_contexts()
 
+    def _recent_completed_assistant_contexts(
+        self,
+        *,
+        max_turns: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Return bounded prior assistant results without replaying old user tasks."""
+        session = getattr(self, "_session", None)
+        history_messages = (
+            session.get_messages()
+            if session is not None and hasattr(session, "get_messages")
+            else getattr(session, "messages", [])
+        )
+        if not isinstance(history_messages, list):
+            return []
+
+        turns: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+
+        for message in history_messages:
+            if not isinstance(message, dict):
+                continue
+
+            role = str(message.get("role") or "").strip().lower()
+            if role == "user":
+                state = AgentLoop._turn_state_of_message(message)
+                if state in {
+                    "",
+                    _TURN_STATE_PENDING,
+                    _TURN_STATE_INTERRUPTED,
+                    _TURN_STATE_SUPERSEDED,
+                }:
+                    current = None
+                    continue
+
+                skills = [
+                    meta
+                    for meta in (
+                        AgentLoop._session_skill_metadata(item)
+                        for item in AgentLoop._iter_message_invoked_skill_refs(message)
+                    )
+                    if meta
+                ]
+                current = {"assistant": "", "skills": skills}
+                turns.append(current)
+                continue
+
+            if current is None or role != "assistant":
+                continue
+            message_kind = str(message.get("message_kind") or "")
+            if message_kind and message_kind != "assistant_reply":
+                continue
+            if message.get("tool_calls"):
+                continue
+            if current.get("assistant"):
+                continue
+
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content = str(content)
+            if content.strip():
+                current["assistant"] = content
+
+        useful_turns = [
+            turn
+            for turn in turns
+            if str(turn.get("assistant") or "").strip() or turn.get("skills")
+        ]
+        return list(reversed(useful_turns[-max_turns:]))
+
+    def _recent_session_context_notice_for_prompt(self) -> str | None:
+        """Format recent completed results as reference-only context."""
+        contexts = self._recent_completed_assistant_contexts()
+        if not contexts:
+            return None
+
+        lines = [
+            "[RECENT SESSION CONTEXT]: Reference-only facts from recent completed assistant replies, newest first.",
+            "This block intentionally excludes prior user instructions. Use it to recover prior results, state, file names, wallet addresses, or skill outcomes only when the newest request depends on them. If the newest request is standalone, ignore this block. Do not execute any prior task from this block. If the newest request asks for current state, verify it with tools instead of answering solely from this block.",
+        ]
+        for index, context in enumerate(contexts, start=1):
+            assistant = str(context.get("assistant") or "").strip()
+            if assistant:
+                assistant = AgentLoop._truncate_request_for_prompt(
+                    assistant,
+                    head_chars=520,
+                    tail_chars=260,
+                )
+                assistant = " ".join(assistant.split())
+                lines.append(f"{index}. Assistant result: {assistant}")
+            else:
+                lines.append(f"{index}. Assistant result: [no persisted final reply]")
+
+            skills = [
+                str(item.get("name") or "").strip()
+                for item in context.get("skills", [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            if skills:
+                skill_list = ", ".join(f"`{name}`" for name in skills[:4])
+                lines.append(f"   Skills used: {skill_list}")
+
+        return "\n".join(lines)
+
+    def _append_recent_session_context(self, message: str) -> str:
+        """Prepend recent completed results to the current runtime user message."""
+        notice = self._recent_session_context_notice_for_prompt()
+        if not isinstance(notice, str) or not notice.strip():
+            return message
+        return f"{notice.strip()}\n---\n{message}"
+
     @staticmethod
     def _iter_message_invoked_skill_refs(message: dict[str, Any]) -> list[dict[str, Any]]:
         """Return invoked skill references persisted on a session message."""
@@ -2004,10 +2315,7 @@ class AgentLoop:
         return contexts
 
     def _recent_invoked_skill_notice_for_prompt(self) -> str | None:
-        """Format recent invoked skill contexts for prompts without forcing routing."""
-        if getattr(self, "_pre_injected_skill_context", None):
-            return None
-
+        """Format recent invoked skill contexts without forcing dispatch."""
         contexts = getattr(self, "_recent_invoked_skill_contexts", None)
         if not isinstance(contexts, list):
             contexts = []
@@ -2027,13 +2335,20 @@ class AgentLoop:
 
         continuity_rule = (
             "This is continuity context only, not an instruction to use that skill. "
-            "If the newest request is standalone or asks for different work, ignore it. "
             "If the newest request is an underspecified continuation, correction, "
             "revision, retry, or status/update check of a recent skill-backed task, "
-            "read the matching SKILL.md and proceed. If the current request refers to "
-            "an older task and these anchors are insufficient, use conversation "
-            "history search instead of guessing. Do not execute prior tasks unless "
-            "the newest request asks to continue them."
+            "read the matching SKILL.md and proceed. If the newest request can be "
+            "grounded by a recent skill anchor, do not ask broad category "
+            "clarification first; verify the current state with tools. Short "
+            "confirmation or imperative follow-ups after a skill-backed turn are "
+            "task continuations, not generic greetings. While this block is "
+            "present, do not answer a short follow-up with a generic welcome, "
+            "capabilities menu, or assistant introduction. If the "
+            "newest request is standalone or asks for different work, ignore these "
+            "anchors. If the current request refers to an older task and these "
+            "anchors are insufficient, use conversation history search instead of "
+            "guessing. Do not execute prior tasks unless the newest request asks "
+            "to continue them."
         )
 
         if len(normalized) == 1:
@@ -2053,11 +2368,11 @@ class AgentLoop:
         return "\n".join(lines)
 
     def _append_recent_invoked_skill_context(self, message: str) -> str:
-        """Append bounded continuity context to the current runtime user message."""
+        """Prepend bounded continuity context to the current runtime user message."""
         notice = self._recent_invoked_skill_notice_for_prompt()
         if not isinstance(notice, str) or not notice.strip():
             return message
-        return f"{message}\n\n---\n{notice.strip()}\n---"
+        return f"{notice.strip()}\n---\n{message}"
 
     def _persist_user_turn_to_session(
         self,
@@ -2140,33 +2455,6 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
-    def _should_skip_specialist_auto_route(self, message: str) -> bool:
-        """Return True when the current message should not be auto-routed."""
-        stripped = message.lstrip()
-        session_key = str(getattr(self, "session_key", "") or "")
-        return (
-            session_key.startswith("subagent-")
-            or stripped.startswith("[Sub-agent Completed]")
-        )
-
-    def _maybe_create_persistent_subagent_from_request(
-        self,
-        message: str,
-    ) -> str | None:
-        """Do not auto-create subagents from prompt text."""
-        return None
-    async def _maybe_route_to_persistent_specialist_result(
-        self,
-        message: str,
-    ) -> tuple[str, str | None, dict[str, Any] | None] | None:
-        """Prompt-based persistent subagent routing is disabled."""
-        return None
-    async def _maybe_route_to_persistent_specialist(
-        self,
-        message: str,
-    ) -> tuple[str, str | None] | None:
-        """Backward-compatible no-op; prompt routing is disabled."""
-        return None
     def _current_tool_owner_key(self, session_key: str | None = None) -> str:
         """Resolve a user-scoped ownership key for background tool jobs."""
         return build_tool_owner_key(
@@ -2249,9 +2537,6 @@ class AgentLoop:
 
     def _prepare_agent_for_new_turn(self) -> None:
         """Clear transient execution state so the newest prompt owns the next run."""
-        self._pre_injected_skill_name = None
-        self._pre_injected_skill_context = None
-
         if hasattr(self._agent, "state") and self._agent.state != AgentState.IDLE:
             logger.warning(
                 f"Agent {getattr(self._agent, 'name', 'runtime')} was in "
@@ -2403,14 +2688,6 @@ class AgentLoop:
         AgentLoop._reset_runtime_notices(self)
         effective_reasoning_effort = reasoning_effort or getattr(self, "reasoning_effort", None)
 
-        # Reset per-request state
-        self._pre_injected_skill_name = None
-
-        created = self._maybe_create_persistent_subagent_from_request(message)
-        if isinstance(created, str):
-            self._persist_turn(message, created)
-            return created
-
         # Refresh memory context
         try:
             memory_context = self.memory.get_memory_context()
@@ -2425,14 +2702,16 @@ class AgentLoop:
         self._prepare_agent_for_new_turn()
         authoritative_message = message
 
-        # Pre-inject matched skill content into the message
-        message = self._pre_inject_matched_skill(message)
         _continuity_message = self._append_recent_invoked_skill_context(message)
         if isinstance(_continuity_message, str):
             message = _continuity_message
+        _session_context_message = self._append_recent_session_context(message)
+        if isinstance(_session_context_message, str):
+            message = _session_context_message
+        runtime_user_text = AgentLoop._build_current_turn_runtime_user_text(message)
         runtime_message = self._build_runtime_message_content(
             "user",
-            message,
+            runtime_user_text,
             media=media,
             attachments=attachments,
         )
@@ -2444,7 +2723,6 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
-            invoked_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
         original_system_prompt: str | None = None
@@ -2537,6 +2815,7 @@ class AgentLoop:
                 self._agent.current_step = 0
 
         try:
+            self._merge_turn_invoked_skills_from_runtime(_pre_turn_memory_index)
             AgentLoop._mark_latest_user_turn_state(
                 self,
                 _TURN_STATE_COMPLETED,
@@ -3725,6 +4004,82 @@ class AgentLoop:
         result = re.sub(r'\n{3,}', '\n\n', result)  # Replace 3+ newlines with 2
         return result.strip()
 
+    @staticmethod
+    def _looks_like_internal_scratchpad_text(text: str) -> bool:
+        """Return True for short provider-surfaced planning notes."""
+        compact = " ".join(str(text or "").strip().split())
+        if len(compact) < 12 or len(compact) > 500:
+            return False
+        ascii_chars = sum(1 for ch in compact if ord(ch) < 128)
+        if ascii_chars / max(len(compact), 1) < 0.70:
+            return False
+        return bool(re.search(
+            r"(?ix)"
+            r"\b("
+            r"need\s+(?:to|answer|respond|reply|summarize|mention|follow|continue|inspect|check|use|run|find|resolve|handle|tool)|"
+            r"i\s+(?:need|should|have\s+to)|"
+            r"we\s+(?:need|should|may|can)|"
+            r"user\s+(?:asks|asked|wants|requested|said)|"
+            r"let(?:'|’)s|likely|maybe"
+            r")\b",
+            compact,
+        )) or (
+            bool(re.search(r"(?i)\bneed\s+\S+", compact))
+            and bool(re.search(
+                r"(?i)\b(?:check|inspect|run|use|call|try|maybe|likely|let(?:'|’)s|tool|command)\b",
+                compact,
+            ))
+        )
+
+    @staticmethod
+    def _mask_user_visible_text(text: str) -> str:
+        """Mask secrets before content is streamed, persisted, or finalized."""
+        try:
+            from spoon_bot.utils.privacy import mask_secrets
+
+            return mask_secrets(str(text or ""))
+        except Exception:
+            return str(text or "")
+
+    @staticmethod
+    def _strip_leaked_scratchpad_prefix(content: str) -> str:
+        """Remove a short internal planning preamble from a final answer.
+
+        Some OpenAI-compatible providers can surface scratchpad-style text as a
+        normal content segment. This is output hygiene, not task routing: only
+        an initial, mostly-ASCII planning note is removed, and only when a
+        substantive answer remains.
+        """
+        text = str(content or "")
+        if not text.strip():
+            return text
+
+        def _strip_once(value: str) -> str:
+            for match in re.finditer(r"[\u4e00-\u9fff]", value[:800]):
+                if match.start() <= 0:
+                    continue
+                prefix = value[:match.start()]
+                suffix = value[match.start():]
+                if suffix.strip() and AgentLoop._looks_like_internal_scratchpad_text(prefix):
+                    return suffix.lstrip()
+
+            sentence_match = re.match(
+                r"^((?:[^\n.!?。！？]{1,240}[.!?]\s*){1,3})(\S[\s\S]*)$",
+                value,
+            )
+            if sentence_match:
+                prefix, suffix = sentence_match.group(1), sentence_match.group(2)
+                if suffix.strip() and AgentLoop._looks_like_internal_scratchpad_text(prefix):
+                    return suffix.lstrip()
+            return value
+
+        for _ in range(4):
+            stripped = _strip_once(text)
+            if stripped == text:
+                return text
+            text = stripped
+        return text
+
     def _finalize_response_content(
         self,
         message: str,
@@ -3732,8 +4087,10 @@ class AgentLoop:
         *,
         turn_memory_start_index: int,
     ) -> str:
-        """Apply generic execution-step filtering without prompt-derived routing."""
-        return AgentLoop._filter_execution_steps(self, content)
+        """Apply generic execution-step filtering without prompt-derived dispatch."""
+        filtered = AgentLoop._filter_execution_steps(self, content)
+        cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
+        return AgentLoop._mask_user_visible_text(cleaned)
     @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
         """Read a message field from either dict or object runtime payloads."""
@@ -3767,6 +4124,16 @@ class AgentLoop:
         return normalize_tool_arguments(arguments)
 
     @staticmethod
+    def _cap_stream_metadata_text(value: Any, *, limit: int = 200_000) -> tuple[str, bool, int]:
+        """Return a websocket-safe text payload plus truncation metadata."""
+        text = AgentLoop._stringify_stream_payload(value)
+        original_len = len(text)
+        if original_len <= limit:
+            return text, False, original_len
+        suffix = f"\n... (stream output truncated, {original_len - limit} more chars)"
+        return text[:limit] + suffix, True, original_len
+
+    @staticmethod
     def _merge_stream_tool_result_metadata(
         metadata: dict[str, Any],
         *,
@@ -3785,12 +4152,18 @@ class AgentLoop:
             full_result = captured_full
 
         if full_result:
-            merged["result"] = full_result
-            merged["content"] = full_result
-            merged["output"] = full_result
-            merged["full_result"] = full_result
-            merged["full_content"] = full_result
-            merged["full_output"] = full_result
+            stream_full_result, stream_truncated, stream_original_len = (
+                AgentLoop._cap_stream_metadata_text(full_result)
+            )
+            merged["result"] = stream_full_result
+            merged["content"] = stream_full_result
+            merged["output"] = stream_full_result
+            merged["full_result"] = stream_full_result
+            merged["full_content"] = stream_full_result
+            merged["full_output"] = stream_full_result
+            if stream_truncated:
+                merged["stream_output_truncated"] = True
+                merged["stream_output_original_chars"] = stream_original_len
         if summary_result:
             merged.setdefault("model_result", summary_result)
             merged.setdefault("model_content", summary_result)
@@ -3798,6 +4171,57 @@ class AgentLoop:
         if full_result and summary_result and full_result != summary_result:
             merged["result_truncated_for_model"] = True
         return merged
+
+    @staticmethod
+    def _stream_tool_result_event_summary(event: dict[str, Any], *, limit: int = 2400) -> str:
+        """Build a compact, user-visible summary from a structural tool result event."""
+        metadata = dict(event.get("metadata") or {})
+        tool_name = str(metadata.get("name") or metadata.get("tool") or "tool").strip() or "tool"
+        payload = (
+            metadata.get("model_result")
+            or metadata.get("model_output")
+            or metadata.get("model_content")
+            or metadata.get("output")
+            or metadata.get("result")
+            or metadata.get("content")
+            or metadata.get("full_output")
+            or metadata.get("full_result")
+            or event.get("delta")
+        )
+        text = AgentLoop._stringify_stream_payload(payload).strip()
+        text = AgentLoop._mask_user_visible_text(text)
+        if len(text) > limit:
+            text = text[:limit].rstrip() + "\n... (tool output truncated)"
+        if not text:
+            text = "completed without text output"
+        return f"Tool `{tool_name}` output:\n{text}"
+
+    @staticmethod
+    def _build_tool_loop_fallback_response(
+        tool_result_events: list[dict[str, Any]],
+        *,
+        reason: str,
+    ) -> str:
+        """Return a bounded final answer when a tool loop never yields final content."""
+        reason_text = (
+            "the agent kept running tools without producing a final answer"
+            if reason == "tool_followup_timeout"
+            else "the request reached the response time budget while tools were still active"
+        )
+        parts = [
+            f"The agent stopped the tool loop because {reason_text}.",
+            "Recent tool evidence:",
+        ]
+        summaries = [
+            AgentLoop._stream_tool_result_event_summary(event)
+            for event in tool_result_events[-3:]
+        ]
+        if summaries:
+            parts.extend(summaries)
+        else:
+            parts.append("No tool result text was captured before the stop condition.")
+        parts.append("Continue the task to let the agent proceed from this tool evidence.")
+        return "\n\n".join(parts)
 
     def _get_runtime_memory_messages(self) -> list[Any]:
         """Return runtime memory messages exposed by the active inner agent."""
@@ -3923,25 +4347,6 @@ class AgentLoop:
             reply_to=reply_to,
         )
 
-        created = self._maybe_create_persistent_subagent_from_request(message)
-        if isinstance(created, str):
-            if created:
-                full_content = created
-                yield {
-                    "type": "content",
-                    "delta": created,
-                    "metadata": {"persistent_subagent_created": True},
-                    "source": current_source,
-                }
-                yield {
-                    "type": "done",
-                    "delta": "",
-                    "metadata": {"content": full_content},
-                    "source": current_source,
-                }
-                self._persist_turn(message, full_content)
-            return
-
         # Refresh memory context
         bg_task: asyncio.Task | None = None
 
@@ -3953,6 +4358,10 @@ class AgentLoop:
             logger.warning(f"Failed to load memory context: {e}")
 
         full_content = ""
+        pre_tool_scratchpad_buffer = ""
+        pre_tool_scratchpad_events: list[dict[str, Any]] = []
+        post_tool_content_buffer = ""
+        post_tool_content_events: list[dict[str, Any]] = []
         saw_tool_call = False
         saw_content_after_tool_call = False
         stream_completed = False
@@ -3962,25 +4371,23 @@ class AgentLoop:
         original_base_system_prompt: object = _MISSING
         tool_output_capture_scope: str | None = None
         capture_manager = None
+        withheld_initial_content = False
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context(message)
         self._prepare_agent_for_new_turn()
         authoritative_message = message
 
-        # Keep streaming behavior aligned with process(): if a user request
-        # naturally matches an installed skill, load that SKILL.md into the
-        # current turn before the model decides which tools to call. This is a
-        # generic skill-selection mechanism, not prompt-text routing.
-        _skill_injected_message = self._pre_inject_matched_skill(message)
-        if isinstance(_skill_injected_message, str):
-            message = _skill_injected_message
         _continuity_message = self._append_recent_invoked_skill_context(message)
         if isinstance(_continuity_message, str):
             message = _continuity_message
+        _session_context_message = self._append_recent_session_context(message)
+        if isinstance(_session_context_message, str):
+            message = _session_context_message
+        runtime_user_text = AgentLoop._build_current_turn_runtime_user_text(message)
         runtime_message = self._build_runtime_message_content(
             "user",
-            message,
+            runtime_user_text,
             media=media,
             attachments=attachments,
         )
@@ -3991,7 +4398,6 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
-            invoked_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
@@ -4024,8 +4430,17 @@ class AgentLoop:
             stream_tool_result_index = len(AgentLoop._get_runtime_memory_messages(self))
             emitted_tool_result_ids: set[str] = set()
             tool_call_arguments_by_id: dict[str, str] = {}
+            recent_tool_result_events: list[dict[str, Any]] = []
+            stream_tool_result_count = 0
+            stream_tool_call_count = 0
             # 2. Start run() in background
             run_result_text = ""
+            provider_silence_retry_count = 0
+            max_provider_silence_retries = max(
+                0,
+                int(getattr(self, "provider_silence_retries", 1) or 0),
+            )
+            retry_reasoning_effort: str | None = None
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text
@@ -4034,11 +4449,12 @@ class AgentLoop:
                     run_kwargs: dict[str, Any] = {}
                     if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
                         run_kwargs["thinking"] = True
+                    run_reasoning_effort = retry_reasoning_effort or effective_reasoning_effort
                     if (
-                        effective_reasoning_effort
+                        run_reasoning_effort
                         and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
                     ):
-                        run_kwargs["reasoning_effort"] = effective_reasoning_effort
+                        run_kwargs["reasoning_effort"] = run_reasoning_effort
 
                     def _drain_queue() -> None:
                         while not self._agent.output_queue.empty():
@@ -4126,7 +4542,73 @@ class AgentLoop:
                 yield event
 
             logger.debug(f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}")
+            stream_started_at = time.monotonic()
+            last_tool_progress_at = stream_started_at
+            provider_silence_timeout = float(
+                getattr(self, "provider_silence_timeout", 150.0) or 150.0
+            )
+            provider_total_timeout = float(
+                getattr(self, "provider_total_timeout", 180.0) or 180.0
+            )
+            tool_followup_timeout = max(
+                0.1,
+                float(getattr(self, "tool_followup_timeout", 90.0) or 90.0),
+            )
+            max_tool_results_without_content = max(
+                1,
+                int(getattr(self, "max_stream_tool_results_without_content", 48) or 48),
+            )
+
+            def _record_tool_result_events(events: list[dict[str, Any]]) -> None:
+                nonlocal last_tool_progress_at, stream_tool_result_count
+                if not events:
+                    return
+                last_tool_progress_at = time.monotonic()
+                stream_tool_result_count += len(events)
+                recent_tool_result_events.extend(events)
+                del recent_tool_result_events[:-6]
+
+            def _stop_tool_loop(reason: str) -> None:
+                nonlocal run_result_text, pre_tool_scratchpad_events, pre_tool_scratchpad_buffer
+                nonlocal post_tool_content_events, post_tool_content_buffer
+                if recent_tool_result_events:
+                    run_result_text = AgentLoop._build_tool_loop_fallback_response(
+                        recent_tool_result_events,
+                        reason=reason,
+                    )
+                else:
+                    run_result_text = (
+                        "The task did not reach a final answer before the request "
+                        "timeout. Please retry or continue this task."
+                    )
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                pre_tool_scratchpad_events = []
+                pre_tool_scratchpad_buffer = ""
+                post_tool_content_events = []
+                post_tool_content_buffer = ""
+                try:
+                    td.set()
+                except Exception:
+                    pass
+
+            def _stop_if_total_timeout() -> bool:
+                now = time.monotonic()
+                if now - stream_started_at < provider_total_timeout:
+                    return False
+                if saw_tool_call and now - last_tool_progress_at < tool_followup_timeout:
+                    return False
+                logger.warning(
+                    "Provider/tool loop exceeded total stream timeout; "
+                    "returning a bounded fallback response."
+                )
+                _stop_tool_loop("total_timeout")
+                return True
+
             while not (td.is_set() and oq.empty()):
+                if _stop_if_total_timeout():
+                    break
+
                 for event in _drain_runtime_notice_events():
                     yield event
 
@@ -4139,8 +4621,28 @@ class AgentLoop:
                         tool_call_arguments_by_id=tool_call_arguments_by_id,
                     )
                 )
+                _record_tool_result_events(tool_result_events)
                 for event in tool_result_events:
                     yield _decorate_stream_event(event)
+                if _stop_if_total_timeout():
+                    break
+
+                if (
+                    saw_tool_call
+                    and not saw_content_after_tool_call
+                    and recent_tool_result_events
+                    and (
+                        stream_tool_result_count >= max_tool_results_without_content
+                        or time.monotonic() - last_tool_progress_at >= tool_followup_timeout
+                    )
+                ):
+                    logger.warning(
+                        "Stopping tool loop without final content after "
+                        f"{stream_tool_result_count} tool result(s) and "
+                        f"{stream_tool_call_count} tool call(s)."
+                    )
+                    _stop_tool_loop("tool_followup_timeout")
+                    break
 
                 # tracked_reasoning is inferred from assistant output logs and is
                 # not a reliable API thinking source. Clear it so it does not leak
@@ -4152,10 +4654,67 @@ class AgentLoop:
                     # Use oq.get() without timeout kwarg - works for both
                     # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
                     # handled by the outer asyncio.wait_for.
-                    chunk = await asyncio.wait_for(oq.get(), timeout=2.0)
+                    queue_poll_timeout = min(
+                        2.0,
+                        max(0.05, provider_silence_timeout),
+                    )
+                    chunk = await asyncio.wait_for(oq.get(), timeout=queue_poll_timeout)
                     chunk_count += 1
                     logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
                 except asyncio.TimeoutError:
+                    if (
+                        not td.is_set()
+                        and not saw_tool_call
+                        and not full_content
+                        and time.monotonic() - stream_started_at >= provider_silence_timeout
+                    ):
+                        if provider_silence_retry_count < max_provider_silence_retries:
+                            provider_silence_retry_count += 1
+                            logger.warning(
+                                "Provider produced no stream output before silence "
+                                "timeout; retrying the same turn once."
+                            )
+                            if bg_task is not None and not bg_task.done():
+                                bg_task.cancel()
+                                try:
+                                    await asyncio.wait_for(bg_task, timeout=2.0)
+                                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                                    pass
+                            AgentLoop._drain_agent_output_queue(self)
+                            run_result_text = ""
+                            pre_tool_scratchpad_events = []
+                            pre_tool_scratchpad_buffer = ""
+                            if (
+                                isinstance(effective_reasoning_effort, str)
+                                and effective_reasoning_effort.strip().lower() != "low"
+                            ):
+                                retry_reasoning_effort = "low"
+                            try:
+                                td.clear()
+                            except Exception:
+                                pass
+                            with bind_tool_owner(self._current_tool_owner_key()):
+                                bg_task = asyncio.create_task(_run_and_signal())
+                            await asyncio.sleep(0)
+                            stream_started_at = time.monotonic()
+                            continue
+                        run_result_text = (
+                            "The model provider did not produce a response before "
+                            "the request timeout. Please retry this request."
+                        )
+                        logger.warning(
+                            "Provider produced no stream output before silence timeout; "
+                            "returning a bounded fallback response."
+                        )
+                        if bg_task is not None and not bg_task.done():
+                            bg_task.cancel()
+                        pre_tool_scratchpad_events = []
+                        pre_tool_scratchpad_buffer = ""
+                        try:
+                            td.set()
+                        except Exception:
+                            pass
+                        break
                     continue
                 except asyncio.CancelledError:
                     logger.warning("Streaming cancelled")
@@ -4199,6 +4758,42 @@ class AgentLoop:
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
                         saw_tool_call = True
+                        stream_tool_call_count += len(chunk["tool_calls"])
+                        last_tool_progress_at = time.monotonic()
+                        if pre_tool_scratchpad_events:
+                            if thinking:
+                                for buffered in pre_tool_scratchpad_events:
+                                    buffered_metadata = dict(buffered.get("metadata") or {})
+                                    for key in ("segment_index", "segment_start", "segment_type"):
+                                        buffered_metadata.pop(key, None)
+                                    yield _decorate_stream_event({
+                                        "type": "thinking",
+                                        "delta": buffered.get("delta", ""),
+                                        "metadata": {
+                                            **buffered_metadata,
+                                            "phase": "pre_tool_scratchpad",
+                                            "source": buffered_metadata.get("source", "pre_tool_content"),
+                                        },
+                                    })
+                            pre_tool_scratchpad_events = []
+                            pre_tool_scratchpad_buffer = ""
+                        if post_tool_content_buffer:
+                            if thinking:
+                                for buffered in post_tool_content_events:
+                                    buffered_metadata = dict(buffered.get("metadata") or {})
+                                    for key in ("segment_index", "segment_start", "segment_type"):
+                                        buffered_metadata.pop(key, None)
+                                    yield _decorate_stream_event({
+                                        "type": "thinking",
+                                        "delta": buffered.get("delta", ""),
+                                        "metadata": {
+                                            **buffered_metadata,
+                                            "phase": "post_tool_preamble",
+                                            "source": buffered_metadata.get("source", "post_tool_content"),
+                                        },
+                                    })
+                            post_tool_content_events = []
+                            post_tool_content_buffer = ""
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
                             if isinstance(tc, dict):
@@ -4222,6 +4817,8 @@ class AgentLoop:
                                     "arguments": fn_args,
                                 },
                             })
+                        if _stop_if_total_timeout():
+                            break
                         continue
                     chunk_metadata = chunk.get("metadata")
                     if isinstance(chunk_metadata, dict):
@@ -4265,6 +4862,11 @@ class AgentLoop:
                             streamed_result=serialized_result,
                             captured_output=captured_output,
                         )
+                        _record_tool_result_events([{
+                            "type": "tool_result",
+                            "delta": delta,
+                            "metadata": metadata,
+                        }])
                     elif dict_type == "content":
                         chunk_type = "content"
                     # Support both "content" and "delta" keys (#10)
@@ -4286,6 +4888,8 @@ class AgentLoop:
                         "delta": delta,
                         "metadata": metadata,
                     })
+                    if _stop_if_total_timeout():
+                        break
                     continue
 
                 if delta:
@@ -4304,22 +4908,40 @@ class AgentLoop:
                                 "source": metadata.get("source", "phase_think"),
                             },
                         })
+                        if _stop_if_total_timeout():
+                            break
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
-                            if saw_tool_call:
-                                saw_content_after_tool_call = True
-                            full_content += delta
+                            if not saw_tool_call:
+                                if (
+                                    pre_tool_scratchpad_buffer
+                                    or AgentLoop._looks_like_internal_scratchpad_text(delta)
+                                ):
+                                    pre_tool_scratchpad_buffer += delta
+                                    pre_tool_scratchpad_events.append(event)
+                                    continue
+                                delta = AgentLoop._mask_user_visible_text(delta)
+                                if not delta:
+                                    continue
+                                full_content += delta
+                            else:
+                                post_tool_content_buffer += delta
+                                post_tool_content_events.append(event)
+                                continue
                             if buffer_stream_content:
                                 continue
+                            event["delta"] = delta
                         yield _decorate_stream_event(event)
+                        if _stop_if_total_timeout():
+                            break
 
             logger.debug(f"Stream loop exited: td={td.is_set()}, qempty={oq.empty()}, chunks_received={chunk_count}, full_content_len={len(full_content)}")
 
             # Ensure background task completes
             try:
                 await asyncio.wait_for(bg_task, timeout=5.0)
-            except (asyncio.TimeoutError, Exception):
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
 
             self._drain_reasoning_chunks()
@@ -4336,6 +4958,32 @@ class AgentLoop:
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
+
+            if pre_tool_scratchpad_buffer and not saw_tool_call:
+                full_content += AgentLoop._mask_user_visible_text(pre_tool_scratchpad_buffer)
+                withheld_initial_content = True
+                pre_tool_scratchpad_events = []
+                pre_tool_scratchpad_buffer = ""
+
+            if post_tool_content_buffer:
+                pending_content = AgentLoop._strip_leaked_scratchpad_prefix(
+                    post_tool_content_buffer
+                )
+                post_tool_content_events = []
+                post_tool_content_buffer = ""
+                if (
+                    pending_content.strip()
+                    and not AgentLoop._looks_like_internal_scratchpad_text(pending_content)
+                ):
+                    pending_content = AgentLoop._mask_user_visible_text(pending_content)
+                    saw_content_after_tool_call = True
+                    full_content += pending_content
+                    if not buffer_stream_content:
+                        yield _decorate_stream_event({
+                            "type": "content",
+                            "delta": pending_content,
+                            "metadata": {"validated": True},
+                        })
 
             fallback_after_tool_only_preamble = (
                 saw_tool_call
@@ -4363,6 +5011,12 @@ class AgentLoop:
                 else:
                     full_content = run_result_text
                     fallback_reason = "run_result_no_chunks"
+                sanitized_full_content = AgentLoop._strip_leaked_scratchpad_prefix(full_content)
+                if sanitized_full_content != full_content:
+                    full_content = sanitized_full_content
+                    fallback_delta = sanitized_full_content
+                full_content = AgentLoop._mask_user_visible_text(full_content)
+                fallback_delta = AgentLoop._mask_user_visible_text(fallback_delta)
                 if fallback_delta:
                     if not buffer_stream_content:
                         yield _decorate_stream_event({
@@ -4377,12 +5031,13 @@ class AgentLoop:
                 full_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
-            if buffer_stream_content and final_content:
+            if (buffer_stream_content or withheld_initial_content) and final_content:
                 yield _decorate_stream_event({
                     "type": "content",
                     "delta": final_content,
                     "metadata": {
-                        "buffered": True,
+                        "buffered": bool(buffer_stream_content),
+                        "withheld_initial_content": bool(withheld_initial_content),
                         "validated": True,
                     },
                 })
@@ -4453,6 +5108,7 @@ class AgentLoop:
 
         if full_content and stream_completed and not stream_cancelled:
             try:
+                self._merge_turn_invoked_skills_from_runtime(_pre_turn_memory_index)
                 AgentLoop._mark_latest_user_turn_state(
                     self,
                     _TURN_STATE_COMPLETED,
@@ -4523,11 +5179,6 @@ class AgentLoop:
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
 
-        created = self._maybe_create_persistent_subagent_from_request(message)
-        if isinstance(created, str):
-            self._persist_turn(message, created)
-            return created, "Created persistent subagent from natural-language request."
-
         # Refresh memory context
         try:
             memory_context = self.memory.get_memory_context()
@@ -4541,17 +5192,16 @@ class AgentLoop:
         self._prepare_agent_for_new_turn()
         authoritative_message = message
 
-        # Keep thinking behavior aligned with process()/stream(): skill
-        # preloading is driven by generic skill metadata, not prompt routing.
-        _skill_injected_message = self._pre_inject_matched_skill(message)
-        if isinstance(_skill_injected_message, str):
-            message = _skill_injected_message
         _continuity_message = self._append_recent_invoked_skill_context(message)
         if isinstance(_continuity_message, str):
             message = _continuity_message
+        _session_context_message = self._append_recent_session_context(message)
+        if isinstance(_session_context_message, str):
+            message = _session_context_message
+        runtime_user_text = AgentLoop._build_current_turn_runtime_user_text(message)
         runtime_message = self._build_runtime_message_content(
             "user",
-            message,
+            runtime_user_text,
             media=media,
             attachments=attachments,
         )
@@ -4562,7 +5212,6 @@ class AgentLoop:
             authoritative_message,
             media=media,
             attachments=attachments,
-            invoked_skill=getattr(self, "_pre_injected_skill_context", None),
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
@@ -4637,6 +5286,7 @@ class AgentLoop:
             )
 
         try:
+            self._merge_turn_invoked_skills_from_runtime(_pre_turn_memory_index)
             AgentLoop._mark_latest_user_turn_state(
                 self,
                 _TURN_STATE_COMPLETED,
@@ -4678,21 +5328,6 @@ class AgentLoop:
         "skills", "logs", "sessions", "memory",
         "channels", "wallet", ".git",
     })
-
-    # Common stop words filtered out during skill-matching token comparison
-    _SKILL_MATCH_STOP_WORDS = frozenset({
-        "when", "use", "this", "the", "for", "and", "with",
-        "that", "from", "needs", "need", "should", "also",
-        "through", "using", "codex", "claude", "agent",
-        "local", "based", "first", "only", "needed", "prefer", "logic",
-    })
-
-    # Scoring weights for _pre_inject_matched_skill (tune here, not inline)
-    _SCORE_NAME_TOKEN = 2
-    _SCORE_TRIGGER = 3
-    _SCORE_WHEN_TO_USE = 4
-    _SCORE_DESCRIPTION = 1
-    _SCORE_THRESHOLD = 2
 
     # ------------------------------------------------------------------
     # Conditional activation helpers
@@ -5011,110 +5646,6 @@ class AgentLoop:
                 )
         return None
 
-    def _pre_inject_matched_skill(self, message: str) -> str:
-        """Match user message to an installed skill and prepend SKILL.md content.
-
-        Scoring uses multiple signals inspired by Claude Code's skill matching:
-        - Skill name tokens (split on ``-`` / ``_``)
-        - YAML frontmatter ``description`` keywords
-        - ``when_to_use`` / ``whenToUse`` field (highest weight)
-        - ``triggers`` keyword list
-
-        Scans both ``workspace/skills/`` (organized) and the workspace root
-        (unorganized).  When an unorganized skill matches, the injection
-        includes a note asking the agent to move it into ``skills/`` first.
-        """
-        import re as _re
-
-        candidates = self._iter_skill_candidates()
-        if not candidates:
-            return message
-
-        msg_lower = message.lower()
-        best_skill = None
-        best_score = 0
-
-        for name, skill_dir, skill_md, is_organized in candidates:
-            score = 0
-
-            name_tokens = _re.split(r'[-_]', name)
-            for token in name_tokens:
-                if len(token) >= 3 and token.lower() in msg_lower:
-                    score += self._SCORE_NAME_TOKEN
-
-            fm = self._parse_skill_frontmatter(skill_md)
-
-            for t in fm["triggers"].split("|"):
-                if t and t.lower() in msg_lower:
-                    score += self._SCORE_TRIGGER
-
-            if fm["when_to_use"]:
-                wtu_tokens = _re.findall(r'[A-Za-z\u4e00-\u9fff]{2,}', fm["when_to_use"].lower())
-                for token in wtu_tokens:
-                    if token not in self._SKILL_MATCH_STOP_WORDS and token in msg_lower:
-                        score += self._SCORE_WHEN_TO_USE
-
-            if fm["description"]:
-                desc_tokens = _re.findall(r'[A-Za-z\u4e00-\u9fff]{3,}', fm["description"].lower())
-                for token in desc_tokens:
-                    if token not in self._SKILL_MATCH_STOP_WORDS and token in msg_lower:
-                        score += self._SCORE_DESCRIPTION
-
-            if score > best_score:
-                best_score = score
-                best_skill = (name, skill_dir, skill_md, is_organized)
-
-        if not best_skill or best_score < self._SCORE_THRESHOLD:
-            return message
-
-        skill_name, skill_dir, skill_path, is_organized = best_skill
-        try:
-            content = skill_path.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:
-            return message
-
-        ws_posix = self._workspace_posix_path()
-        skill_context = self._build_skill_context(
-            skill_name,
-            skill_dir,
-            is_organized=is_organized,
-        )
-        base_dir = str(skill_context["base_dir"])
-        skill_rel = str(skill_context["workspace_relative_path"]).rstrip("/")
-
-        content = content.replace("${SKILL_DIR}", f"{ws_posix}/{skill_rel}")
-        content = content.replace("$SKILL_DIR", f"{ws_posix}/{skill_rel}")
-
-        self._pre_injected_skill_name = skill_name
-        self._pre_injected_skill_context = skill_context
-
-        organize_note = ""
-        if not is_organized:
-            organize_note = (
-                f"\n鈿狅笍 ORGANIZE FIRST: This skill is at the workspace root, not in skills/.\n"
-                f"Before executing, move it:\n"
-                f"  mv {skill_name} skills/{skill_name}\n"
-                f"Then update your working paths to use skills/{skill_name}/ as the base.\n"
-            )
-
-        logger.info(
-            f"Pre-injected skill '{skill_name}' (score={best_score}, "
-            f"organized={is_organized}) into message"
-        )
-        return (
-            f"{message}\n\n"
-            f"---\n"
-            f"[PRE-LOADED SKILL: {skill_name}]\n"
-            f"Base directory: {base_dir}\n"
-            f"Workspace-relative path: {skill_rel}/\n"
-            f"{organize_note}\n"
-            f"The SKILL.md below is already loaded - follow its procedures directly. "
-            f"Do NOT call read_file on this skill. Do NOT search for alternatives. "
-            f"Start executing the skill's instructions immediately.\n\n"
-            f"{content}\n"
-            f"---"
-        )
-
     def _build_step_prompt(self, message: str) -> str:
         """Build a minimal per-step prompt from the user's request.
 
@@ -5141,6 +5672,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        recent_session_notice = self._recent_session_context_notice_for_prompt()
+        if isinstance(recent_session_notice, str) and recent_session_notice.strip():
+            prompt = f"{recent_session_notice.strip()}\n" + prompt
         invoked_skill_notice = self._recent_invoked_skill_notice_for_prompt()
         if isinstance(invoked_skill_notice, str) and invoked_skill_notice.strip():
             prompt = f"{invoked_skill_notice.strip()}\n" + prompt
@@ -5169,6 +5703,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        recent_session_notice = self._recent_session_context_notice_for_prompt()
+        if isinstance(recent_session_notice, str) and recent_session_notice.strip():
+            prompt = f"{recent_session_notice.strip()}\n" + prompt
         invoked_skill_notice = self._recent_invoked_skill_notice_for_prompt()
         if isinstance(invoked_skill_notice, str) and invoked_skill_notice.strip():
             prompt = f"{invoked_skill_notice.strip()}\n" + prompt
@@ -5770,7 +6307,7 @@ async def create_agent(
         enable_skills: Whether to enable skill system.
         auto_commit: Whether to auto-commit workspace changes after each message.
         enabled_tools: Explicit set of tool names to enable. None = core only.
-        tool_profile: Named profile ('core', 'coding', 'web3', 'research', 'full').
+        tool_profile: Named profile ('core', 'coding', 'research', 'full').
         yolo_mode: Operate directly in user's path without sandbox isolation.
         **kwargs: Additional arguments for AgentLoop.
 
@@ -5787,13 +6324,10 @@ async def create_agent(
         >>> # YOLO mode - work in /home/user/project directly
         >>> agent = await create_agent(yolo_mode=True, workspace="/home/user/project")
     """
-    wallet_required = bool(enabled_tools and _WALLET_REQUIRED_TOOLS.intersection(enabled_tools))
     try:
         ensure_wallet_runtime(workspace)
     except Exception:
-        if wallet_required:
-            raise
-        logger.warning("Wallet runtime bootstrap failed; continuing because no wallet-required tools are enabled")
+        logger.warning("Wallet runtime bootstrap failed; continuing without built-in wallet env")
         import os
 
         os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] = "0"

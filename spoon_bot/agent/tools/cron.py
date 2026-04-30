@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
-from spoon_bot.agent.tools.web import describe_web_search_capability
 from spoon_bot.channels.delivery import (
     DeliveryBinding,
     binding_from_session_key,
@@ -39,14 +38,6 @@ _PENDING_DRAFT_KEY = "cron_pending_draft"
 _LAST_JOB_KEY = "cron_last_job_id"
 _CURRENT_DRAFT_VERSION = 1
 _MUTATING_ACTIONS = {"create", "update", "delete"}
-_LIVE_INFO_KEYWORDS = (
-    "latest", "current", "today", "weather", "news", "headline", "price", "stock",
-    "market", "update", "updates", "summarize updates", "check website", "monitor", "fetch", "search",
-    "latest updates", "news digest", "web", "rss", "newsapi",
-    "最新", "当前", "今天", "天气", "新闻", "头条", "价格", "股价", "行情",
-    "摘要", "更新", "网页", "网站", "监控", "查询", "获取", "抓取", "检索",
-)
-_LIVE_INFO_ALLOWED_TOOLS = ["web_search", "web_fetch", "read_file", "list_dir"]
 _CRON_PAYLOAD_FIELDS = set(CronJobCreate.model_fields.keys())
 _CRON_PATCH_FIELDS = set(CronJobPatch.model_fields.keys())
 
@@ -108,9 +99,8 @@ class CronTool(Tool):
             "Discord channel when available. For create/update/delete, first call this tool "
             "with confirm=false to prepare a draft and show a confirmation summary; only "
             "call again with confirm=true after the user explicitly confirms. Do NOT use "
-            "shell commands to manage cron jobs. For news, weather, website checks, "
-            "or other live-data jobs, prefer isolated execution unless the user explicitly "
-            "asks to reuse the current chat context."
+            "shell commands to manage cron jobs. Prefer isolated execution unless the user "
+            "explicitly asks to reuse the current chat context."
         )
 
     @property
@@ -481,9 +471,6 @@ class CronTool(Tool):
             session_key=session_key,
         )
         allowed_tools = self._normalize_allowed_tools(raw.get("allowed_tools"))
-        capability_warning = self._build_capability_warning(prompt)
-        if allowed_tools is None and self._looks_like_live_info_task(prompt):
-            allowed_tools = list(_LIVE_INFO_ALLOWED_TOOLS)
 
         max_attempts = raw.get("max_attempts")
         backoff_seconds = raw.get("backoff_seconds")
@@ -502,14 +489,6 @@ class CronTool(Tool):
             "backoff_seconds": 0 if backoff_seconds is None else int(backoff_seconds),
             "enabled": bool(raw.get("enabled", True)),
         }
-        if capability_warning:
-            normalized["capability_warning"] = capability_warning
-        if target_mode == "current" and self._looks_like_live_info_task(prompt):
-            normalized["target_mode_warning"] = (
-                "This job looks like live/background work. current mode reuses the active "
-                "chat context and can drift; isolated mode is recommended unless the user "
-                "explicitly wants ongoing session context."
-            )
 
         missing: list[str] = []
         if not prompt:
@@ -629,18 +608,6 @@ class CronTool(Tool):
                 session_key=session_key_final,
             )
         )
-        prompt_to_report = str(normalized.get("prompt") or current_job.prompt)
-        capability_warning = self._build_capability_warning(prompt_to_report)
-        if capability_warning:
-            normalized["capability_warning"] = capability_warning
-        target_mode_to_report = str(normalized.get("target_mode") or current_job.target_mode)
-        if target_mode_to_report == "current" and self._looks_like_live_info_task(prompt_to_report):
-            normalized["target_mode_warning"] = (
-                "This job looks like live/background work. current mode reuses the active "
-                "chat context and can drift; isolated mode is recommended unless the user "
-                "explicitly wants ongoing session context."
-            )
-
         return normalized, []
 
     def _normalize_prompt(self, raw: dict[str, Any]) -> str | None:
@@ -674,20 +641,6 @@ class CronTool(Tool):
             normalized.append(text)
             seen.add(text)
         return normalized or None
-
-    def _looks_like_live_info_task(self, prompt: str | None) -> bool:
-        if not prompt:
-            return False
-        lowered = prompt.lower()
-        return any(keyword in lowered for keyword in _LIVE_INFO_KEYWORDS)
-
-    def _build_capability_warning(self, prompt: str | None) -> str | None:
-        if not self._looks_like_live_info_task(prompt):
-            return None
-        available, message = describe_web_search_capability()
-        if available:
-            return None
-        return message
 
     def _build_schedule(
         self,
@@ -858,10 +811,6 @@ class CronTool(Tool):
             lines.append(f"- Allowed tools: {', '.join(normalized['allowed_tools'])}")
         if normalized.get("enabled") is not None:
             lines.append(f"- Enabled: {normalized['enabled']}")
-        if normalized.get("capability_warning"):
-            lines.append(f"- Capability warning: {normalized['capability_warning']}")
-        if normalized.get("target_mode_warning"):
-            lines.append(f"- Target mode note: {normalized['target_mode_warning']}")
         lines.append("")
         lines.append(
             "Do not create/update/delete yet. Ask the user to confirm, then call this tool "

@@ -957,7 +957,13 @@ class WebSocketHandler:
         # Also cancel the asyncio task if running (#13)
         cancelled = await self._cancel_current_task_for_cleanup()
 
-        return {"cancelled": True, "task_id": task_id, "task_interrupted": cancelled}
+        content = "Task interrupted." if cancelled else "No active task to cancel."
+        return {
+            "cancelled": True,
+            "task_id": task_id,
+            "task_interrupted": cancelled,
+            "content": content,
+        }
 
     async def _cancel_current_task_for_cleanup(self, timeout: float = 35.0) -> bool:
         """Cancel and await the current background chat task."""

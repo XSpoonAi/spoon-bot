@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -444,8 +445,6 @@ class TestAgentLoopStream:
         agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
         agent._persist_turn = MagicMock()
         agent._current_tool_owner_key = MagicMock(return_value="user:test|session:default")
-        agent._maybe_create_persistent_subagent_from_request = MagicMock(return_value=None)
-        agent._maybe_route_to_persistent_specialist_result = AsyncMock(return_value=None)
         agent.set_subagent_context = MagicMock()
         return agent
 
@@ -626,7 +625,7 @@ class TestAgentLoopStream:
         assert "Execute only the newest user request." in prompt
         assert "[USER REQUEST]: Fix the bug now." in prompt
 
-    def test_finalize_response_content_only_filters_execution_steps(self):
+    def test_finalize_response_content_filters_execution_artifacts(self):
         """Finalization should not rewrite output based on prompt keywords."""
         from spoon_bot.agent.loop import AgentLoop
 
@@ -641,6 +640,132 @@ class TestAgentLoopStream:
         )
 
         assert cleaned == "Actual answer"
+
+    def test_finalize_response_content_strips_leaked_scratchpad_prefix(self):
+        """Internal planning notes should not be part of the user-facing answer."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "Need to inspect the generated file before answering. "
+            "Here is the result: the script queries balances only."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Explain the generated script",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "Here is the result: the script queries balances only."
+
+    def test_finalize_response_content_strips_mixed_prompt_reference_prefix(self):
+        """Quoted user text inside a scratchpad prefix should not defeat cleanup."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = "Need user said start continuation likely run. Done: one task completed."
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Start",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "Done: one task completed."
+
+    def test_finalize_response_content_strips_prefix_before_later_user_facing_text(self):
+        """Quoted user text should not be mistaken for the answer boundary."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            'Need "latest task" means continue with the recent task likely use tools.'
+            "Done: the task has been handled."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Continue",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "Done: the task has been handled."
+
+    def test_finalize_response_content_strips_need_respond_prefix(self):
+        """Lowercase response-planning prefixes should stay private."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = "need respond with uncertainty and keep concise.Result: yesterday was cloudy."
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "What about yesterday?",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "Result: yesterday was cloudy."
+
+    def test_finalize_response_content_strips_compact_tool_planning_prefix(self):
+        """Fragmented provider planning text should not survive final cleanup."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "Need a fresh workspace. maybe command takes --flag?"
+            "check status maybe switch active.let's run status."
+            "Completed: created the requested report."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Create the report",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "Completed: created the requested report."
+
+    def test_finalize_response_content_masks_private_key(self):
+        """User-visible final content must not expose raw EVM private keys."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "Created wallet. Private key: "
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Create a wallet",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in cleaned
+        assert "***masked_private_key***" in cleaned
+
+    def test_stream_tool_result_metadata_caps_large_payloads(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        merged = AgentLoop._merge_stream_tool_result_metadata(
+            {},
+            streamed_result="short",
+            captured_output=SimpleNamespace(
+                summary_output="short",
+                full_output="x" * 210_000,
+            ),
+        )
+
+        assert merged["stream_output_truncated"] is True
+        assert merged["stream_output_original_chars"] == 210_000
+        assert len(merged["full_output"]) < 201_000
     def test_prepare_agent_for_new_turn_clears_stale_runtime_state(self):
         """A new turn should not inherit unfinished runtime state from the prior task."""
         from spoon_bot.agent.loop import AgentLoop
@@ -649,8 +774,6 @@ class TestAgentLoopStream:
         shutdown_event.set()
 
         loop = AgentLoop.__new__(AgentLoop)
-        loop._pre_injected_skill_name = "document-review-agent"
-        loop._pre_injected_skill_context = {"name": "document-review-agent"}
         loop._agent = MagicMock()
         loop._agent.name = "sandbox"
         loop._agent.state = "thinking"
@@ -660,66 +783,18 @@ class TestAgentLoopStream:
 
         AgentLoop._prepare_agent_for_new_turn(loop)
 
-        assert loop._pre_injected_skill_name is None
-        assert loop._pre_injected_skill_context is None
         normalized_state = getattr(loop._agent.state, "value", loop._agent.state)
         assert str(normalized_state).lower() == "idle"
         assert loop._agent.current_step == 0
         assert loop._agent.tool_calls == []
         assert shutdown_event.is_set() is False
 
-    def test_pre_injected_skill_records_sanitized_invoked_skill_context(self, tmp_path):
-        """Skill continuity metadata should come from discovered skill files."""
+    def test_agent_loop_has_no_prompt_skill_preload_router(self):
+        """Skill loading must stay model/tool driven, not prompt-text routed."""
         from spoon_bot.agent.loop import AgentLoop
 
-        workspace = tmp_path / "workspace"
-        skill_dir = workspace / "skills" / "report-builder"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text(
-            """---
-description: Build report packets from workspace data
-when_to_use: Use when the user asks to assemble or continue report packets.
----
-# Report Builder
-Follow the report workflow.
-""",
-            encoding="utf-8",
-        )
-
-        loop = AgentLoop.__new__(AgentLoop)
-        loop.workspace = workspace
-        loop._skill_paths = [workspace / "skills"]
-        loop._touched_paths = set()
-        loop._pre_injected_skill_name = None
-        loop._pre_injected_skill_context = None
-
-        injected = AgentLoop._pre_inject_matched_skill(
-            loop,
-            "Please use the report builder for the quarterly packet.",
-        )
-
-        assert "[PRE-LOADED SKILL: report-builder]" in injected
-        assert loop._pre_injected_skill_context["name"] == "report-builder"
-        assert loop._pre_injected_skill_context["base_dir"].endswith(
-            "/workspace/skills/report-builder"
-        )
-        assert loop._pre_injected_skill_context["workspace_relative_path"] == (
-            "skills/report-builder/"
-        )
-        assert loop._pre_injected_skill_context["location"] == (
-            "skills/report-builder/SKILL.md"
-        )
-        assert loop._pre_injected_skill_context["organized"] is True
-        save_kwargs = AgentLoop._session_message_save_kwargs(
-            invoked_skill=loop._pre_injected_skill_context,
-        )
-        assert save_kwargs["invoked_skills"] == [{
-            "name": "report-builder",
-            "location": "skills/report-builder/SKILL.md",
-            "workspace_relative_path": "skills/report-builder/",
-            "organized": True,
-            "source": "skill_match",
-        }]
+        assert not hasattr(AgentLoop, "_pre_inject_matched_skill")
+        assert not hasattr(AgentLoop, "_extract_skill_names_from_tool_text")
 
     def test_recent_invoked_skill_prompt_hint_does_not_rehydrate_old_task_text(self, tmp_path):
         """Continuity should expose only bounded skill identity, not old prompt content."""
@@ -753,7 +828,6 @@ when_to_use: Use when the user asks to assemble or continue report packets.
         loop._skill_paths = [workspace / "skills"]
         loop._touched_paths = set()
         loop._session = session
-        loop._pre_injected_skill_context = None
         loop._extract_env_for_prompt = MagicMock(return_value="")
 
         AgentLoop._refresh_recent_invoked_skill_contexts(loop)
@@ -763,35 +837,105 @@ when_to_use: Use when the user asks to assemble or continue report packets.
         )
 
         assert "[RECENT INVOKED SKILL]: `report-builder`" in prompt
+        assert "[RECENT SESSION CONTEXT]" in prompt
+        assert "Report packet created." in prompt
         assert "skills/report-builder/SKILL.md" in prompt
+        assert "Short confirmation or imperative follow-ups" in prompt
+        assert "generic welcome" in prompt
         assert "internal-only source notes" not in prompt
 
         runtime_message = AgentLoop._append_recent_invoked_skill_context(
             loop,
             "Continue with the latest item.",
         )
+        runtime_message = AgentLoop._append_recent_session_context(loop, runtime_message)
         assert "[RECENT INVOKED SKILL]: `report-builder`" in runtime_message
+        assert "[RECENT SESSION CONTEXT]" in runtime_message
+        assert "Report packet created." in runtime_message
+        assert runtime_message.index("[RECENT INVOKED SKILL]") < runtime_message.index("Continue with the latest item.")
         assert "internal-only source notes" not in runtime_message
 
-    def test_recent_invoked_skill_hint_is_suppressed_when_current_turn_preloads_skill(self, tmp_path):
-        """A direct skill match should own the turn instead of mixing prior skill hints."""
+    def test_runtime_tool_usage_marks_latest_user_turn_with_skill(self, tmp_path):
+        """Skill continuity should be inferred from actual tool use, not prompt text."""
         from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.session.manager import Session
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "report-builder"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Report Builder\n", encoding="utf-8")
+        other_skill_dir = workspace / "skills" / "image-helper"
+        other_skill_dir.mkdir()
+        (other_skill_dir / "SKILL.md").write_text("# Image Helper\n", encoding="utf-8")
+
+        session = Session(session_key="tool-usage-skill")
+        session.add_message(
+            "user",
+            "Install the uploaded skill and start it.",
+            turn_state="pending",
+        )
 
         loop = AgentLoop.__new__(AgentLoop)
-        loop.workspace = tmp_path / "workspace"
-        loop._recent_invoked_skill_contexts = [{
-            "name": "report-builder",
-            "location": "skills/report-builder/SKILL.md",
-        }]
-        loop._pre_injected_skill_context = {
-            "name": "invoice-builder",
-            "location": "skills/invoice-builder/SKILL.md",
-        }
-        loop._extract_env_for_prompt = MagicMock(return_value="")
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+        loop._session = session
+        loop._agent = MagicMock()
+        loop._agent.memory.messages = [
+            {"role": "user", "content": "Install the uploaded skill and start it."},
+            {
+                "role": "assistant",
+                "content": "Checking an older skill first.",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({
+                                "path": "skills/image-helper/SKILL.md",
+                            }),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "Checking the skill.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({
+                                "path": "skills/report-builder/SKILL.md",
+                            }),
+                        },
+                    }
+                ],
+            },
+        ]
 
-        prompt = AgentLoop._build_step_prompt(loop, "Use invoice builder now.")
+        merged = AgentLoop._merge_turn_invoked_skills_from_runtime(loop, 1)
 
-        assert "[RECENT INVOKED SKILL]" not in prompt
+        assert merged == 2
+        assert session.messages[0]["invoked_skills"] == [
+            {
+                "name": "report-builder",
+                "location": "skills/report-builder/SKILL.md",
+                "workspace_relative_path": "skills/report-builder/",
+                "organized": True,
+                "source": "tool_usage",
+            },
+            {
+                "name": "image-helper",
+                "location": "skills/image-helper/SKILL.md",
+                "workspace_relative_path": "skills/image-helper/",
+                "organized": True,
+                "source": "tool_usage",
+            },
+        ]
 
     def test_recent_invoked_skill_context_keeps_multiple_skill_anchors(self, tmp_path):
         """Continuity should keep a bounded newest-first skill stack, not one slot."""
@@ -836,7 +980,6 @@ when_to_use: Use for {skill_name} tasks.
         loop._skill_paths = [skills_root]
         loop._touched_paths = set()
         loop._session = session
-        loop._pre_injected_skill_context = None
         loop._extract_env_for_prompt = MagicMock(return_value="")
 
         AgentLoop._refresh_recent_invoked_skill_contexts(loop)
@@ -891,7 +1034,6 @@ when_to_use: Use for {skill_name} tasks.
         loop._skill_paths = [workspace / "skills"]
         loop._touched_paths = set()
         loop._session = session
-        loop._pre_injected_skill_context = None
 
         contexts = AgentLoop._find_recent_invoked_skill_contexts(loop)
 
@@ -996,6 +1138,43 @@ when_to_use: Use for {skill_name} tasks.
         assert done_chunks[0]["metadata"]["content"] == "Latest task executed."
 
     @pytest.mark.asyncio
+    async def test_stream_retries_once_after_provider_silence(self):
+        """A silent provider attempt should be retried before exposing timeout fallback."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        attempts = 0
+        agent = self._make_stream_agent([])
+        agent.provider_silence_timeout = 0.01
+        agent.provider_total_timeout = 1.0
+        agent.provider_silence_retries = 1
+
+        async def run(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await asyncio.sleep(0.2)
+                return MagicMock(content=None)
+            await agent._agent.output_queue.put({"content": "Recovered answer."})
+            return MagicMock(content="Recovered answer.")
+
+        async def run_with_retry(label="agent", pre_retry_cleanup=None, **run_kwargs):
+            return await agent._agent.run(**run_kwargs)
+
+        agent._agent.run = AsyncMock(side_effect=run)
+        agent._run_agent_with_retry = AsyncMock(side_effect=run_with_retry)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="test", reasoning_effort="medium"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert attempts == 2
+        assert "".join(chunk["delta"] for chunk in content_chunks) == "Recovered answer."
+        assert done_chunks[-1]["metadata"]["content"] == "Recovered answer."
+
+    @pytest.mark.asyncio
     async def test_stream_handles_string_chunks(self):
         """stream() should handle plain string chunks."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1010,6 +1189,24 @@ when_to_use: Use for {skill_name} tasks.
         assert len(content_chunks) == 2
         assert content_chunks[0]["delta"] == "Hello"
         assert content_chunks[1]["delta"] == " World"
+
+    @pytest.mark.asyncio
+    async def test_stream_masks_private_key_content_chunks(self):
+        """Raw EVM private keys must not be emitted in streamed content."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        raw_key = "0x" + ("a" * 64)
+        agent = self._make_stream_agent([f"Private key: {raw_key}"])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="test"):
+            chunks.append(chunk)
+
+        emitted = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        done = [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"]
+        assert raw_key not in emitted
+        assert raw_key not in done
+        assert "***masked_private_key***" in emitted
 
     @pytest.mark.asyncio
     async def test_stream_handles_thinking_chunks(self):
@@ -1058,12 +1255,14 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         assert any(chunk["type"] == "content" for chunk in chunks)
-        agent._build_runtime_message_content.assert_called_with(
-            "user",
-            "test",
-            media=media,
-            attachments=attachments,
-        )
+        runtime_call = agent._build_runtime_message_content.call_args
+        assert runtime_call.args[0] == "user"
+        assert "[CURRENT DATE]:" in runtime_call.args[1]
+        assert runtime_call.args[1].endswith("[USER REQUEST]:\ntest")
+        assert runtime_call.kwargs == {
+            "media": media,
+            "attachments": attachments,
+        }
         agent._session.add_message.assert_any_call(
             "assistant",
             "hello",
@@ -1112,8 +1311,6 @@ when_to_use: Use for {skill_name} tasks.
         agent._normalize_comparable_text = AgentLoop._normalize_comparable_text
         agent._current_tool_owner_key = MagicMock(return_value="user:test|session:default")
         agent._persist_turn = MagicMock()
-        agent._maybe_create_persistent_subagent_from_request = MagicMock(return_value=None)
-        agent._maybe_route_to_persistent_specialist_result = AsyncMock(return_value=None)
         agent.set_subagent_context = MagicMock()
         agent._drain_reasoning_chunks = AgentLoop._drain_reasoning_chunks.__get__(agent, AgentLoop)
         agent._reset_reasoning_capture = AgentLoop._reset_reasoning_capture.__get__(agent, AgentLoop)
@@ -1339,7 +1536,7 @@ when_to_use: Use for {skill_name} tasks.
         async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
             chunks.append(chunk)
 
-        emitted = [c for c in chunks if c["type"] in {"content", "tool_call"}]
+        emitted = [c for c in chunks if c["type"] in {"thinking", "content", "tool_call"}]
         assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
         assert emitted[0]["metadata"]["segment_start"] is True
         assert emitted[1]["metadata"]["segment_start"] is True
@@ -1397,13 +1594,14 @@ when_to_use: Use for {skill_name} tasks.
         async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
             chunks.append(chunk)
 
-        emitted = [c for c in chunks if c["type"] in {"tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
+        emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
+        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
         assert emitted[0]["delta"] == "Need tool first. "
+        assert emitted[0]["metadata"]["phase"] == "pre_tool_scratchpad"
         assert emitted[2]["delta"] == "Final answer."
-        assert emitted[2]["metadata"]["fallback"] == "run_result_after_tool_preamble"
+        assert emitted[2]["metadata"]["fallback"] == "run_result_no_chunks"
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert done_chunks[0]["metadata"]["content"] == "Need tool first. Final answer."
+        assert done_chunks[0]["metadata"]["content"] == "Final answer."
 
     @pytest.mark.asyncio
     async def test_stream_fallback_after_tool_preamble_emits_only_missing_suffix(self):
@@ -1452,13 +1650,85 @@ when_to_use: Use for {skill_name} tasks.
         async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
             chunks.append(chunk)
 
-        emitted = [c for c in chunks if c["type"] in {"tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
+        emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
+        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
         assert emitted[0]["delta"] == "Need tool first. "
+        assert emitted[0]["metadata"]["phase"] == "pre_tool_scratchpad"
         assert emitted[2]["delta"] == "Final answer."
-        assert emitted[2]["metadata"]["fallback"] == "run_result_after_tool_preamble"
+        assert emitted[2]["metadata"]["fallback"] == "run_result_no_chunks"
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert done_chunks[0]["metadata"]["content"] == "Need tool first. Final answer."
+        assert done_chunks[0]["metadata"]["content"] == "Final answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_strips_post_tool_scratchpad_prefix_before_content(self):
+        """Provider-surfaced planning text after tools should not stream as content."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"pwd"}'
+
+        agent = self._make_stream_agent([
+            {"tool_calls": [tool_call]},
+            {
+                "content": (
+                    "Need continue core flow and inspect result. "
+                    "Done: generated the requested file."
+                )
+            },
+        ])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == [
+            "Done: generated the requested file."
+        ]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Done: generated the requested file."
+
+    @pytest.mark.asyncio
+    async def test_stream_treats_post_tool_content_before_next_tool_as_private(self):
+        """Assistant text between two tool calls is tool planning, not final content."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        first_tool = MagicMock()
+        first_tool.id = "call_1"
+        first_tool.function = MagicMock()
+        first_tool.function.name = "shell"
+        first_tool.function.arguments = '{"command":"pwd"}'
+
+        second_tool = MagicMock()
+        second_tool.id = "call_2"
+        second_tool.function = MagicMock()
+        second_tool.function.name = "shell"
+        second_tool.function.arguments = '{"command":"ls"}'
+
+        agent = self._make_stream_agent([
+            {"tool_calls": [first_tool]},
+            {"content": "Need"},
+            {"content": " a fresh workspace. maybe command takes --flag?"},
+            {"content": "check status maybe switch active.let's run status."},
+            {"tool_calls": [second_tool]},
+            {"content": "Completed: created the requested report."},
+        ])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == [
+            "Completed: created the requested report."
+        ]
+        thinking_chunks = [c for c in chunks if c["type"] == "thinking"]
+        assert "Need a fresh workspace" in "".join(c["delta"] for c in thinking_chunks)
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Completed: created the requested report."
 
     @pytest.mark.asyncio
     async def test_stream_passes_through_structured_tool_result_chunks(self):
@@ -1522,6 +1792,175 @@ when_to_use: Use for {skill_name} tasks.
         assert emitted[1]["metadata"]["id"] == "call_1"
         assert emitted[1]["metadata"]["name"] == "shell"
         assert emitted[1]["metadata"]["result"] == '{"stdout": "/workspace"}'
+
+    @pytest.mark.asyncio
+    async def test_stream_returns_tool_evidence_when_tool_loop_stalls(self):
+        """A stalled tool loop should produce a bounded answer, not an empty response."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"python task.py"}'
+
+        agent = self._make_stream_agent([])
+        agent.provider_total_timeout = 5.0
+        agent.tool_followup_timeout = 0.01
+        agent.max_stream_tool_results_without_content = 99
+
+        async def stalled_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_1", "name": "shell"},
+                    "result": "Error: remote endpoint did not respond",
+                }
+            )
+            await asyncio.sleep(10)
+
+        agent._agent.run = AsyncMock(side_effect=stalled_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        assert "stopped the tool loop" in content
+        assert "remote endpoint did not respond" in content
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == content
+
+    @pytest.mark.asyncio
+    async def test_stream_stops_after_too_many_tool_results_without_final_content(self):
+        """Repeated tool results without final content should be bounded generically."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        first_tool = MagicMock()
+        first_tool.id = "call_1"
+        first_tool.function = MagicMock()
+        first_tool.function.name = "shell"
+        first_tool.function.arguments = '{"command":"step one"}'
+        second_tool = MagicMock()
+        second_tool.id = "call_2"
+        second_tool.function = MagicMock()
+        second_tool.function.name = "shell"
+        second_tool.function.arguments = '{"command":"step two"}'
+
+        agent = self._make_stream_agent([])
+        agent.provider_total_timeout = 5.0
+        agent.tool_followup_timeout = 30.0
+        agent.max_stream_tool_results_without_content = 2
+
+        async def repeated_tool_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [first_tool]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_1", "name": "shell"},
+                    "result": "Step one returned no actionable result",
+                }
+            )
+            await agent._agent.output_queue.put({"tool_calls": [second_tool]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_2", "name": "shell"},
+                    "result": "Step two returned the same error",
+                }
+            )
+            await asyncio.sleep(10)
+
+        agent._agent.run = AsyncMock(side_effect=repeated_tool_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        assert "stopped the tool loop" in content
+        assert "Step one returned no actionable result" in content
+        assert "Step two returned the same error" in content
+
+    @pytest.mark.asyncio
+    async def test_stream_total_timeout_uses_recent_tool_evidence(self):
+        """Total stream timeout should not collapse tool-backed turns into empty output."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "read_file"
+        tool_call.function.arguments = '{"path":"lib/config.js"}'
+
+        agent = self._make_stream_agent([])
+        agent.provider_silence_timeout = 0.05
+        agent.provider_total_timeout = 0.05
+        agent.tool_followup_timeout = 0.01
+        agent.max_stream_tool_results_without_content = 99
+
+        async def slow_after_tool_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_1", "name": "read_file"},
+                    "result": "tokenAddress = 0xabc123",
+                }
+            )
+            await asyncio.sleep(10)
+
+        agent._agent.run = AsyncMock(side_effect=slow_after_tool_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        assert "response time budget" in content
+        assert "tokenAddress = ***masked***" in content
+        assert [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"] == content
+
+    @pytest.mark.asyncio
+    async def test_stream_total_timeout_waits_for_fresh_tool_progress(self):
+        """A fresh tool call/result should get follow-up time before total-timeout fallback."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"long-step"}'
+
+        agent = self._make_stream_agent([])
+        agent.provider_silence_timeout = 0.05
+        agent.provider_total_timeout = 0.05
+        agent.tool_followup_timeout = 1.0
+        agent.max_stream_tool_results_without_content = 99
+
+        async def slow_but_progressing_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await asyncio.sleep(0.08)
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_1", "name": "shell"},
+                    "result": "long step completed",
+                }
+            )
+            await asyncio.sleep(0.08)
+            return "finished after tool"
+
+        agent._agent.run = AsyncMock(side_effect=slow_but_progressing_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        assert "finished after tool" in content
+        assert "stopped the tool loop" not in content
 
     @pytest.mark.asyncio
     async def test_stream_backfills_tool_result_from_runtime_memory(self):
@@ -2259,8 +2698,6 @@ class TestAgentLoopProcessWithThinking:
         agent._latest_reasoning_excerpt = None
         agent._current_tool_owner_key = MagicMock(return_value="user:test|session:default")
         agent._select_next_step_prompt = AgentLoop._select_next_step_prompt.__get__(agent, AgentLoop)
-        agent._maybe_create_persistent_subagent_from_request = MagicMock(return_value=None)
-        agent._maybe_route_to_persistent_specialist_result = AsyncMock(return_value=None)
         agent.set_subagent_context = MagicMock()
         agent._auto_commit = False
         agent._git = None

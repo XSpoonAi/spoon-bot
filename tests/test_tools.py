@@ -92,6 +92,36 @@ class TestShellTool:
         assert "Error" in result or "not found" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_relative_working_dir_resolves_from_default_workspace(self, tmp_path):
+        """Relative cwd overrides should stay inside the configured workspace."""
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        marker = tmp_path / "marker.txt"
+        marker.write_text("workspace-ok", encoding="utf-8")
+        tool = ShellTool(
+            timeout=5,
+            working_dir=str(tmp_path),
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        result = await tool.execute(
+            "python -c \"print(open('marker.txt').read())\"",
+            working_dir=".",
+        )
+
+        assert "workspace-ok" in result
+
+    def test_windows_posix_drive_working_dir_is_normalized(self):
+        """Windows agents may receive /c/... cwd paths from bash-style output."""
+        if sys.platform != "win32":
+            pytest.skip("Windows-only path normalization")
+
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        assert ShellTool._posix_drive_path_to_windows("/c/Users/Test") == "C:\\Users\\Test"
+
+    @pytest.mark.asyncio
     async def test_output_truncation(self):
         """Test that long output is truncated."""
         from spoon_bot.agent.tools.shell import ShellTool
@@ -510,6 +540,33 @@ class TestFilesystemTools:
 
         assert "file1.txt" in result
         assert "file2.txt" in result
+
+    @pytest.mark.asyncio
+    async def test_read_and_list_allowed_external_skill_symlink(self, temp_dir):
+        """Workspace skill links may point at explicitly allowed external roots."""
+        from spoon_bot.agent.tools.filesystem import ListDirTool, ReadFileTool
+
+        external_root = temp_dir.parent / f"{temp_dir.name}-external-skill-root"
+        external_skill = external_root / "spot-agent-cypher"
+        external_skill.mkdir(parents=True)
+        (external_skill / "SKILL.md").write_text("CLI := node cli/index.js\n", encoding="utf-8")
+
+        skills_dir = temp_dir / "skills"
+        skills_dir.mkdir()
+        link_path = skills_dir / "spot-agent-cypher"
+        try:
+            os.symlink(external_skill, link_path, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        list_tool = ListDirTool(workspace=temp_dir, additional_read_paths=[external_root])
+        read_tool = ReadFileTool(workspace=temp_dir, additional_read_paths=[external_root])
+
+        listed = await list_tool.execute("skills/spot-agent-cypher")
+        read = await read_tool.execute("skills/spot-agent-cypher/SKILL.md")
+
+        assert "SKILL.md" in listed
+        assert "CLI := node cli/index.js" in read
 
     @pytest.mark.asyncio
     async def test_list_nonexistent_directory(self, list_tool, temp_dir):
