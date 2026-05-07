@@ -11,9 +11,8 @@ Message Format:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
 from enum import Enum
+from typing import Any
 
 
 class MessageType(str, Enum):
@@ -45,6 +44,7 @@ class ClientMethod(str, Enum):
     # Session methods
     SESSION_SWITCH = "session.switch"
     SESSION_LIST = "session.list"
+    SESSION_CLOSE = "session.close"
     SESSION_CLEAR = "session.clear"
     SESSION_EXPORT = "session.export"
     SESSION_IMPORT = "session.import"

@@ -278,6 +278,21 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
+The response includes `runtime_metrics` for multi-session runtime visibility:
+
+| Field | Description |
+|-------|-------------|
+| `active` | Number of live session runtimes |
+| `running` | Number of runtimes currently processing a task |
+| `idle` | Number of live runtimes without an active task |
+| `created_total` | Total runtimes created since gateway startup |
+| `closed_total` | Total runtimes closed since gateway startup |
+| `idle_closed_total` | Runtimes closed by idle cleanup |
+| `evicted_total` | Runtimes evicted by the active runtime limit |
+| `explicit_closed_total` | Runtimes closed via REST or WebSocket `session.close` |
+| `idle_seconds` | Configured idle threshold; `null` means disabled |
+| `max_active` | Configured active runtime limit; `null` means disabled |
+
 *Source: `spoon_bot/gateway/api/v1/agent.py:630`*
 
 ---
@@ -362,6 +377,32 @@ Delete a session.
 
 
 *Source: `spoon_bot/gateway/api/v1/sessions.py:308`*
+
+### `POST /v1/sessions/{session_key}/close`
+
+Close a session's in-memory runtime while keeping persisted history intact.
+Use this to release tools, MCP clients, skill state, and other runtime resources
+for an inactive session without deleting its conversation history. The `default`
+runtime and busy runtimes are not closable through this endpoint.
+
+**Auth Required:** Yes
+
+**Success Response:**
+
+```json
+{
+  "closed": true,
+  "session_key": "alpha"
+}
+```
+
+**Other Responses:**
+
+- `{"closed": false, "reason": "not_running"}` when the session has no live runtime.
+- `409 SESSION_BUSY` when the runtime is currently processing a task.
+- `{"closed": false, "reason": "not_closable"}` when the runtime is protected or could not be closed.
+
+*Source: `spoon_bot/gateway/api/v1/sessions.py:318`*
 
 ### `POST /v1/sessions/{session_key}/clear`
 
@@ -468,19 +509,64 @@ ws://localhost:8080/v1/ws?api_key=<api_key>
 
 #### `agent.chat`
 
-Handle chat.send / agent.chat
+Alias of `chat.send`. Send a chat request to the agent.
+
+Params:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `message` | string | Yes | User message text. Attachments may add extra context. |
+| `session_key` | string | No | Target logical session. Defaults to the connection's current session, then `default`. |
+| `stream` | bool | No | When `true`, emits `agent.stream.chunk` events followed by `agent.stream.done` and `agent.complete`. |
+| `thinking` | bool | No | Request thinking/reasoning chunks when supported by the provider. |
+| `reasoning_effort` | string | No | Provider-specific reasoning effort. |
+| `attachments` | list | No | Workspace attachment references. |
+| `media` | list | No | Workspace media paths or aliases. |
+
+Concurrency semantics:
+
+- The same `session_key` is serialized by that session runtime's lock.
+- Different `session_key` values run on independent session runtimes and may stream concurrently, even on the same WebSocket connection.
+- Clients should route stream events by `request_id` and `session_key`, not by connection alone.
+- Sending a new chat for the same `session_key` supersedes that session's active chat on the connection.
+
+The server returns a normal JSON-RPC-style response after the chat finishes. For streaming chats, the incremental content arrives first as events.
+
+#### `chat.send`
+
+Same params and behavior as `agent.chat`.
 
 #### `agent.cancel`
 
-Handle cancel request (#13)
+Cancel an in-flight chat request.
+
+Params:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_key` | string | No | Cancel the active task for this session. If omitted, cancels the connection's current chat task. |
+
+Cancellation is session-scoped when `session_key` is provided. Cancelling one session does not cancel other sessions streaming on the same WebSocket connection.
 
 #### `agent.status`
 
-Handle agent.status
+Return agent status, active session runtime information, and `runtime_metrics`.
 
 #### `session.switch`
 
-Handle session switch (#15)
+Switch the connection's default session.
+
+Params: `{ "session_key": "alpha" }`
+
+`session.switch` affects subsequent requests that omit `session_key`. Requests that include `session_key` are routed to that explicit session regardless of the connection default.
+
+#### `session.close`
+
+Close a session's in-memory runtime while preserving persisted history.
+Params: `{ "session_key": "alpha" }`. If omitted, the current connection's
+session is used. Busy runtimes return `{ "closed": false, "reason": "busy" }`.
+Closing the connection's current runtime moves the connection back to the
+registry default session.
 
 #### `session.clear`
 
@@ -536,6 +622,88 @@ Handle audio.stream.end
 | `sandbox.stdout` | Other | Sandbox Stdout |
 | `sandbox.file.changed` | Other | Sandbox File Changed |
 | `term.closed` | Other | Term Closed |
+
+### Agent Event Payloads
+
+Agent lifecycle and streaming events include routing metadata so clients can handle multiple sessions on one WebSocket connection.
+
+#### `agent.thinking`
+
+```json
+{
+  "task_id": "task_1234abcd",
+  "request_id": "client-request-id",
+  "session_key": "alpha",
+  "status": "processing",
+  "trace_id": "trc_1234abcd"
+}
+```
+
+#### `agent.stream.chunk`
+
+```json
+{
+  "task_id": "task_1234abcd",
+  "request_id": "client-request-id",
+  "session_key": "alpha",
+  "type": "content",
+  "delta": "partial text",
+  "metadata": {
+    "provider": "openrouter",
+    "channel": "text"
+  },
+  "trace_id": "trc_1234abcd",
+  "source": {
+    "kind": "agent",
+    "label": "primary"
+  }
+}
+```
+
+`type` may be `thinking`, `content`, `tool_call`, `tool_result`, `done`, or `error` depending on provider and runtime state.
+
+#### `agent.stream.done`
+
+```json
+{
+  "task_id": "task_1234abcd",
+  "request_id": "client-request-id",
+  "session_key": "alpha",
+  "content": "final accumulated response",
+  "trace_id": "trc_1234abcd",
+  "timing": {
+    "elapsed_ms": 1234
+  },
+  "source": {
+    "kind": "agent",
+    "label": "primary"
+  }
+}
+```
+
+#### `agent.complete`
+
+```json
+{
+  "task_id": "task_1234abcd",
+  "request_id": "client-request-id",
+  "session_key": "alpha",
+  "status": "done",
+  "response": "final response",
+  "trace_id": "trc_1234abcd",
+  "timing": {
+    "elapsed_ms": 1234
+  },
+  "source": {
+    "kind": "agent",
+    "label": "primary"
+  }
+}
+```
+
+`agent.error` and `agent.cancelled` use the same routing fields (`task_id`, `request_id`, `session_key`, `trace_id`) plus error or cancellation details.
+
+Deployment note: if gateway logs show `agent.thinking` or `agent.stream.chunk` without `request_id` and `session_key`, verify that the running image/process contains the multi-session runtime changes. Missing fields usually indicate an old deployment rather than a log truncation issue.
 
 ---
 
@@ -1033,6 +1201,8 @@ Health check response.
 | `GATEWAY_AUDIO_DEFAULT_LANGUAGE` | *(none)* | config.py |
 | `GATEWAY_AUDIO_STREAMING` | `true` | config.py |
 | `GATEWAY_AUDIO_NATIVE_PROVIDERS` | `openai,gemini` | config.py |
+| `SPOON_BOT_SESSION_RUNTIME_IDLE_SECONDS` | `1800` | session_registry.py |
+| `SPOON_BOT_SESSION_RUNTIME_MAX_ACTIVE` | `64` | session_registry.py |
 
 ### Default Models Per Provider
 

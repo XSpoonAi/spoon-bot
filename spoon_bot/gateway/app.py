@@ -21,6 +21,7 @@ from spoon_bot.gateway.core_integration import (
 )
 from spoon_bot.gateway.websocket.manager import ConnectionManager
 from spoon_bot.runtime.execution import ExecutionCoordinator
+from spoon_bot.runtime.session_registry import SessionRuntimeRegistry
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
@@ -37,6 +38,7 @@ _identity: SpoonCoreIdentity | None = None
 _payments: SpoonCorePayments | None = None
 _auth_required: bool = True  # Can be set to False via GATEWAY_AUTH_REQUIRED=false
 _execution_coordinator: ExecutionCoordinator | None = None
+_session_runtime_registry: SessionRuntimeRegistry | None = None
 _channel_delivery_service: ChannelDeliveryService | None = None
 _cron_service: "CronService | None" = None
 
@@ -51,6 +53,16 @@ def get_agent() -> SpoonCoreAgent | AgentLoop:
     if _agent is None:
         raise RuntimeError("Agent not initialized. Call set_agent() first.")
     return _agent
+
+
+def get_session_runtime_registry() -> SessionRuntimeRegistry:
+    """Get the session runtime registry."""
+    global _session_runtime_registry
+    if _session_runtime_registry is None:
+        if _agent is None:
+            raise RuntimeError("Agent not initialized. Call set_agent() first.")
+        _session_runtime_registry = SessionRuntimeRegistry(_agent)
+    return _session_runtime_registry
 
 
 def get_connection_manager() -> ConnectionManager:
@@ -95,8 +107,9 @@ def get_session_execution_lock(session_key: str) -> asyncio.Lock:
 
 def set_agent(agent: SpoonCoreAgent | AgentLoop) -> None:
     """Set the agent instance."""
-    global _agent
+    global _agent, _session_runtime_registry
     _agent = agent
+    _session_runtime_registry = SessionRuntimeRegistry(agent)
     logger.info(f"Agent set for gateway (type: {type(agent).__name__})")
 
 
@@ -195,6 +208,8 @@ async def lifespan(app: FastAPI):
         await _cron_service.stop()
     if _connection_manager:
         await _connection_manager.stop()
+    if _session_runtime_registry:
+        await _session_runtime_registry.close_all()
     await close_shared_http_client()
 
 
@@ -208,10 +223,11 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     Returns:
         Configured FastAPI application.
     """
-    global _config, _execution_coordinator, _channel_delivery_service, _cron_service, _channel_manager
+    global _config, _execution_coordinator, _session_runtime_registry, _channel_delivery_service, _cron_service, _channel_manager
 
     _config = config or GatewayConfig.from_env()
     _execution_coordinator = ExecutionCoordinator()
+    _session_runtime_registry = None
     _channel_delivery_service = ChannelDeliveryService()
     _cron_service = None
     _channel_manager = None
@@ -244,8 +260,8 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
 def _register_routes(app: FastAPI, config: GatewayConfig) -> None:
     """Register all routes."""
     from spoon_bot.gateway.api.health import router as health_router
-    from spoon_bot.gateway.api.webhooks import router as webhook_router
     from spoon_bot.gateway.api.v1.router import router as v1_router
+    from spoon_bot.gateway.api.webhooks import router as webhook_router
     from spoon_bot.gateway.websocket.handler import websocket_endpoint
 
     # Health endpoints (no prefix)

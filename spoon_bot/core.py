@@ -448,6 +448,24 @@ class SpoonBot:
             "mcp_servers": list(self.config.mcp_servers.keys()),
         }
 
+    def build_creation_kwargs(self, **overrides: Any) -> dict[str, Any]:
+        """Return kwargs that recreate this bot for an isolated session runtime."""
+        kwargs: dict[str, Any] = {
+            "model": self.config.model,
+            "provider": self.config.provider,
+            "api_key": self.config.api_key,
+            "base_url": self.config.base_url,
+            "reasoning_effort": self.config.reasoning_effort,
+            "mcp_servers": dict(self.config.mcp_servers),
+            "enable_skills": self.config.enable_skills,
+            "skill_paths": list(self.config.skill_paths),
+            "workspace": self.config.workspace,
+            "max_steps": self.config.max_steps,
+            "system_prompt": self.config.system_prompt,
+        }
+        kwargs.update(overrides)
+        return kwargs
+
 
 async def create_agent(
     model: str | None = None,

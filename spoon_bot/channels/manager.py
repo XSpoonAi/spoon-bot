@@ -21,6 +21,7 @@ from spoon_bot.channels.config import (
 )
 from spoon_bot.channels.delivery import ChannelDeliveryService
 from spoon_bot.runtime.execution import ExecutionCoordinator
+from spoon_bot.runtime.session_registry import SessionRuntimeRegistry
 
 if TYPE_CHECKING:
     from spoon_bot.agent.loop import AgentLoop
@@ -119,6 +120,7 @@ class ChannelManager:
         self._channel_agents: dict[str, AgentLoop] = {}
         self._group_agents: dict[str, AgentLoop] = {}
         self._scoped_agents: dict[str, AgentLoop] = {}
+        self._session_runtime_registries: dict[int, SessionRuntimeRegistry] = {}
         self._agent_init_lock = asyncio.Lock()
         self._running = False
         self._health_check_task: asyncio.Task | None = None
@@ -159,6 +161,7 @@ class ChannelManager:
             for key, value in self._default_agent_config.items()
             if value is not None
         }
+        self._session_runtime_registries[id(agent)] = SessionRuntimeRegistry(agent)
         self._config_path = (
             Path(config_path).expanduser()
             if config_path is not None
@@ -448,6 +451,12 @@ class ChannelManager:
         self._group_agents.clear()
         self._channel_agents.clear()
         self._scoped_agents.clear()
+        for registry in self._session_runtime_registries.values():
+            try:
+                await registry.close_all()
+            except Exception as e:
+                logger.debug(f"Channel session runtime cleanup failed: {e}")
+        self._session_runtime_registries.clear()
 
         for agent in managed_agents.values():
             try:
@@ -533,6 +542,14 @@ class ChannelManager:
         if scoped_agent is not None:
             return scoped_agent
         return self._select_agent_for_message(message)
+
+    def _runtime_registry_for_agent(self, agent: AgentLoop) -> SessionRuntimeRegistry:
+        key = id(agent)
+        registry = self._session_runtime_registries.get(key)
+        if registry is None:
+            registry = SessionRuntimeRegistry(agent)
+            self._session_runtime_registries[key] = registry
+        return registry
 
     def get_channel(self, name: str) -> BaseChannel | None:
         """
@@ -1059,10 +1076,11 @@ class ChannelManager:
             attachments = raw_attachments if isinstance(raw_attachments, list) else None
             session_key = message.session_key or None
 
-            session_lock = self._execution.get_session_lock(session_key)
-            agent_lock = self._execution.get_runner_lock("primary-agent")
+            runtime = await self._runtime_registry_for_agent(agent).get_or_create(session_key)
+            runtime_agent = runtime.agent
 
-            async with session_lock:
+            async with runtime.lock:
+                runtime.active_task_id = message.message_id
                 self._persist_delivery_binding(message)
 
                 process_kwargs = {
@@ -1074,7 +1092,7 @@ class ChannelManager:
                     "reply_to": message.message_id,
                     "attachments": attachments,
                 }
-                set_subagent_context = getattr(agent, "set_subagent_context", None)
+                set_subagent_context = getattr(runtime_agent, "set_subagent_context", None)
                 if callable(set_subagent_context):
                     set_subagent_context(
                         session_key=session_key,
@@ -1084,18 +1102,19 @@ class ChannelManager:
                     )
                 if reasoning_effort:
                     process_kwargs["reasoning_effort"] = reasoning_effort
-                if thinking_enabled:
-                    async with agent_lock:
-                        response_text, thinking_content = await agent.process_with_thinking(**process_kwargs)
-                    # Include thinking content in verbose mode
-                    if message.metadata.get("verbose") and thinking_content:
-                        response_text = (
-                            f"\ud83d\udcad *Thinking:*\n{thinking_content}\n\n"
-                            f"---\n\n{response_text}"
-                        )
-                else:
-                    async with agent_lock:
-                        response_text = await agent.process(**process_kwargs)
+                try:
+                    if thinking_enabled:
+                        response_text, thinking_content = await runtime_agent.process_with_thinking(**process_kwargs)
+                        # Include thinking content in verbose mode
+                        if message.metadata.get("verbose") and thinking_content:
+                            response_text = (
+                                f"\ud83d\udcad *Thinking:*\n{thinking_content}\n\n"
+                                f"---\n\n{response_text}"
+                            )
+                    else:
+                        response_text = await runtime_agent.process(**process_kwargs)
+                finally:
+                    runtime.active_task_id = None
 
             self._circuit_breaker.record_success()
 

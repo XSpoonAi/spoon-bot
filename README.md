@@ -770,8 +770,9 @@ asyncio.run(main())
 | `/v1/auth/login` | POST | Authenticate and get JWT tokens |
 | `/v1/agent/chat` | POST | Send message to agent (sync or streaming) |
 | `/v1/agent/chat/async` | POST | Async task-based chat |
-| `/v1/agent/status` | GET | Agent and channel status |
+| `/v1/agent/status` | GET | Agent, channel, and session runtime status |
 | `/v1/sessions` | GET/POST | Manage sessions |
+| `/v1/sessions/{session_key}/close` | POST | Close an in-memory session runtime without deleting history |
 | `/v1/tools` | GET | List available tools |
 | `/v1/skills` | GET/POST | List and manage skills |
 | `/v1/ws` | WS | WebSocket for real-time communication |
@@ -781,9 +782,25 @@ asyncio.run(main())
 The WebSocket endpoint supports:
 - `chat.send` — send messages (stream/non-stream)
 - `chat.cancel` — cancel in-flight requests (stream and non-stream)
-- `session.switch` / `session.list` / `session.export` / `session.import` — session management
+- `session.switch` / `session.list` / `session.close` / `session.export` / `session.import` — session management
+- `agent.status` — includes `runtime_metrics` for active, running, idle, closed, and evicted session runtimes
 - `subscribe` / `unsubscribe` — event subscriptions
 - Input validation with structured error codes (`INVALID_PARAMS`, `AGENT_NOT_READY`, etc.)
+
+### Multi-Session Runtime
+
+Gateway mode runs each logical `session_key` on its own in-memory agent runtime. Session history is still persisted through the configured `SessionManager`, but mutable execution state such as the active agent, current task, tool context, and cancellation state is scoped to the session runtime.
+
+Runtime behavior:
+
+- Requests without `session_key` use the backward-compatible `default` session.
+- The same `session_key` is serialized with a session-local lock, preserving message order.
+- Different `session_key` values can run concurrently across REST, SSE, WebSocket, channels, and cron.
+- A single WebSocket connection can send multiple `chat.send` requests for different sessions; their stream chunks may arrive interleaved and should be routed by `session_key` and `request_id`.
+- Streaming events include `task_id`, `request_id`, `session_key`, and `trace_id` on `agent.thinking`, `agent.stream.chunk`, `agent.stream.done`, `agent.complete`, `agent.error`, and `agent.cancelled`.
+- `session.close` releases an idle non-default in-memory runtime while keeping persisted history. Busy runtimes are not closed.
+
+Operational check: if a deployed gateway emits `agent.thinking` or `agent.stream.chunk` without `request_id` and `session_key`, it is usually running an older image or process. Rebuild and deploy a new image tag before retesting multi-session streaming.
 
 ### Authentication
 
@@ -952,6 +969,8 @@ ruff check spoon_bot/
 | `SESSION_STORE_BACKEND` | `file` | Session backend: `file`, `sqlite`, `postgres` |
 | `SESSION_STORE_DB_PATH` | `./workspace/sessions.db` | SQLite database path |
 | `SESSION_STORE_DSN` | — | PostgreSQL connection string |
+| `SPOON_BOT_SESSION_RUNTIME_IDLE_SECONDS` | `1800` | Close idle non-default session runtimes after this many seconds; `0` disables idle cleanup |
+| `SPOON_BOT_SESSION_RUNTIME_MAX_ACTIVE` | `64` | Maximum live session runtimes before LRU idle eviction; `0` disables the limit |
 | `SPOON_BOT_CONTEXT_WINDOW` | auto | Context window override (tokens, recommended) |
 | `CONTEXT_WINDOW` | auto | Legacy alias for `SPOON_BOT_CONTEXT_WINDOW` |
 | `GATEWAY_AUTH_REQUIRED` | `false` | Enable gateway authentication |
