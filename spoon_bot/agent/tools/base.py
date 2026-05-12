@@ -5,7 +5,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, TypedDict
 
-from spoon_bot.agent.tools.execution_context import bind_tool_invocation, finalize_tool_invocation
+from spoon_bot.agent.tools.execution_context import (
+    bind_tool_invocation,
+    finalize_tool_invocation,
+    suppress_repeated_tool_invocation,
+)
 
 try:
     from typing import NotRequired
@@ -136,13 +140,20 @@ class Tool(ABC):
 
         This allows the tool to be used as: `result = await tool(arg=value)`
         """
+        result: Any = None
+        executed = False
         with bind_tool_invocation(self.name, kwargs):
             try:
+                duplicate_result = suppress_repeated_tool_invocation(self.name, kwargs)
+                if duplicate_result is not None:
+                    result = duplicate_result
+                    return result
+                executed = True
                 result = await self.execute(**kwargs)
             finally:
-                finalize_tool_invocation(locals().get("result"))
+                finalize_tool_invocation(result)
 
-        if self._path_touch_callback is not None:
+        if executed and self._path_touch_callback is not None:
             _path = kwargs.get("path") or kwargs.get("file_path") or kwargs.get("directory")
             if _path:
                 try:

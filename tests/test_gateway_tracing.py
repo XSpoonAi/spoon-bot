@@ -395,6 +395,33 @@ class TestWsTracingInStreamingEvents:
         assert len(traced) > 0
 
     @pytest.mark.asyncio
+    async def test_stream_cancel_flag_does_not_return_success_empty_content(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        handler = WebSocketHandler("conn_test")
+        fm = _FakeManager()
+
+        async def cancelled_stream(**kwargs):
+            handler._cancel_requested = True
+            yield {"type": "content", "delta": "stale", "metadata": {}}
+
+        agent = _make_mock_agent()
+        agent.stream = cancelled_stream
+
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=agent):
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                    from spoon_bot.gateway.config import GatewayConfig
+                    mc.return_value = GatewayConfig()
+                    with pytest.raises(asyncio.CancelledError):
+                        await handler._handle_chat({"message": "hi", "stream": True})
+
+        responses = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("type") == "response"]
+        completes = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("event") == "agent.complete"]
+        assert responses == []
+        assert completes == []
+
+    @pytest.mark.asyncio
     async def test_streaming_chunk_events_contain_trace_id(self):
         from spoon_bot.gateway.websocket.handler import WebSocketHandler
         handler = WebSocketHandler("conn_test")

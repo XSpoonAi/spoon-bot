@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from spoon_bot.gateway.app import get_agent
+from spoon_bot.gateway.app import get_agent, get_session_runtime_registry
 from spoon_bot.gateway.auth.dependencies import CurrentUser
 from spoon_bot.gateway.models.requests import SessionCreateRequest
 from spoon_bot.gateway.models.responses import (
     APIResponse,
     MetaInfo,
-    SessionResponse,
-    SessionListResponse,
     SessionInfo,
+    SessionListResponse,
+    SessionResponse,
     SessionSearchHit,
     SessionSearchResponse,
 )
@@ -311,8 +310,35 @@ async def delete_session(
 ) -> dict:
     """Delete a session."""
     sessions_manager = _get_sessions_manager()
+    await get_session_runtime_registry().close(session_key)
     deleted = sessions_manager.delete(session_key)
     return {"deleted": deleted}
+
+
+@router.post("/{session_key}/close")
+async def close_session_runtime(
+    session_key: str,
+    user: CurrentUser,
+) -> dict:
+    """Close a session's in-memory runtime while keeping persisted history."""
+    registry = get_session_runtime_registry()
+    runtime = await registry.get(session_key)
+    if runtime is None:
+        return {"closed": False, "reason": "not_running"}
+
+    if runtime.active_task_id is not None or runtime.lock.locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "SESSION_BUSY",
+                "message": f"Session '{session_key}' is currently running",
+            },
+        )
+
+    closed = await registry.close(session_key)
+    if not closed:
+        return {"closed": False, "reason": "not_closable"}
+    return {"closed": True, "session_key": session_key}
 
 
 @router.post("/{session_key}/clear")

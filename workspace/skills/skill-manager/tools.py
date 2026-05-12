@@ -60,6 +60,20 @@ def _validate_subpath(raw: str, *, allow_empty: bool = False) -> str:
     return "/".join(parts)
 
 
+def _looks_like_github_repo_reference(value: str) -> bool:
+    """Return True for GitHub URLs or ``owner/repo`` shorthand, not local filesystem paths."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return False
+    if "github.com" in candidate:
+        return True
+    if candidate.startswith(("/", "\\", ".", "~")):
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", candidate):
+        return False
+    return bool(re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/.*)?$", candidate))
+
+
 def _parse_github_url(url: str) -> tuple[str, str, str, str]:
     """Parse a GitHub URL -> (owner, repo, branch, subpath)."""
     m = _GITHUB_URL_RE.match(url.strip())
@@ -96,6 +110,108 @@ def _build_git_clone_command(clone_url: str, branch: str, destination: Path, sub
         cmd.append("--sparse")
     cmd.extend([clone_url, str(destination)])
     return cmd
+
+
+def _select_skill_root_subpath(skill_md_paths: list[str], requested_subpath: str = "") -> str:
+    """Choose the directory that should be installed based on ``SKILL.md`` location."""
+    requested = _normalize_subpath(requested_subpath)
+    skill_roots: list[str] = []
+    seen: set[str] = set()
+
+    for raw_path in skill_md_paths:
+        normalized = _normalize_subpath(raw_path)
+        if not normalized or normalized.endswith("/SKILL.md") is False and normalized != "SKILL.md":
+            continue
+        root = normalized[:-len("/SKILL.md")] if normalized != "SKILL.md" else ""
+        if root not in seen:
+            seen.add(root)
+            skill_roots.append(root)
+
+    if requested:
+        skill_roots = [
+            root
+            for root in skill_roots
+            if root == requested or root.startswith(requested + "/")
+        ]
+
+    if not skill_roots:
+        scope = requested or "repository root"
+        raise RuntimeError(f"No SKILL.md found under {scope}")
+
+    if "" in skill_roots:
+        return ""
+
+    if requested and requested in skill_roots:
+        return requested
+
+    if len(skill_roots) == 1:
+        return skill_roots[0]
+
+    candidates = ", ".join(sorted(skill_roots))
+    raise RuntimeError(
+        "Multiple skill roots found; provide a GitHub tree URL to the exact skill folder. "
+        f"Candidates: {candidates}"
+    )
+
+
+async def _resolve_github_skill_source(
+    owner: str,
+    repo: str,
+    branch: str,
+    subpath: str,
+) -> tuple[str, str, str]:
+    """Resolve the branch, skill root subpath, and installed skill name for a GitHub repo."""
+    import httpx
+
+    async def _fetch_repo_tree_paths(client: httpx.AsyncClient, candidate_branch: str) -> list[str]:
+        resp = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/trees/{candidate_branch}",
+            params={"recursive": "1"},
+            headers=_github_headers(),
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        tree = payload.get("tree", [])
+        if not isinstance(tree, list):
+            raise RuntimeError("GitHub tree API returned an unexpected payload")
+        return [
+            str(item.get("path", ""))
+            for item in tree
+            if isinstance(item, dict)
+            and item.get("type") == "blob"
+            and str(item.get("path", "")).endswith("SKILL.md")
+        ]
+
+    requested_subpath = _normalize_subpath(subpath)
+    resolved_branch = branch
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                skill_md_paths = await _fetch_repo_tree_paths(client, resolved_branch)
+            except httpx.HTTPStatusError as exc:
+                should_retry_default_branch = exc.response.status_code == 404 and resolved_branch == "main"
+                if not should_retry_default_branch:
+                    raise
+                repo_resp = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}",
+                    headers=_github_headers(),
+                )
+                repo_resp.raise_for_status()
+                repo_data = repo_resp.json()
+                fallback_branch = str(repo_data.get("default_branch") or "").strip()
+                if not fallback_branch or fallback_branch == resolved_branch:
+                    raise
+                resolved_branch = fallback_branch
+                skill_md_paths = await _fetch_repo_tree_paths(client, resolved_branch)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to resolve skill root for {owner}/{repo}@{branch}: {exc}"
+        ) from exc
+
+    resolved_subpath = _select_skill_root_subpath(skill_md_paths, requested_subpath)
+    skill_name = resolved_subpath.rsplit("/", 1)[-1] if resolved_subpath else repo
+    return resolved_branch, resolved_subpath, skill_name
 
 
 async def _download_via_git(
@@ -252,11 +368,13 @@ class SkillMarketplaceTool(BaseTool):
         "WHEN THE USER GIVES A LOCAL PATH, call this tool with action='install_local' and url=<the path>. "
         "Actions: "
         "install_skill (url required) — install a skill from GitHub URL; "
-        "install_local (url required) — install/link a skill from a local directory path; "
+        "install_local (url required) — copy a skill from a local directory path; "
         "update_skill (url required) — re-download and update an already-installed skill; "
         "search_skills (query required) — search skills.sh; "
         "remove_skill (skill_name required) — remove installed skill; "
         "skill_info (skill_name required) — show SKILL.md. "
+        "For GitHub repos, resolve the folder containing SKILL.md and install only that folder into workspace/skills. "
+        "Do NOT create shortcuts/symlinks or manual clones for GitHub URLs. "
         "After install/update/remove, call self_upgrade(action='reload_skills') to activate."
     )
     parameters: dict = {
@@ -355,7 +473,9 @@ class SkillMarketplaceTool(BaseTool):
                 if _url.startswith(("http://", "https://")):
                     owner, repo, branch, subpath = _parse_github_url(_url)
                     subpath = _validate_subpath(subpath, allow_empty=True)
-                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
+                    branch, subpath, skill_name_derived = await _resolve_github_skill_source(
+                        owner, repo, branch, subpath
+                    )
                 else:
                     parts = [p for p in url.split("/") if p]
                     if len(parts) < 2:
@@ -375,7 +495,9 @@ class SkillMarketplaceTool(BaseTool):
                         branch = rest[1] if len(rest) > 1 else "main"
                         rest = rest[2:]
                     subpath = _validate_subpath("/".join(rest), allow_empty=True)
-                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
+                    branch, subpath, skill_name_derived = await _resolve_github_skill_source(
+                        owner, repo, branch, subpath
+                    )
 
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
@@ -403,6 +525,9 @@ class SkillMarketplaceTool(BaseTool):
 
                 return (
                     f"SUCCESS: Skill '{skill_name_derived}' installed ({count} files).\n"
+                    f"Source: {owner}/{repo}@{branch}"
+                    + (f" / {subpath}" if subpath else " / <repo-root>")
+                    + "\n"
                     f"Files: {', '.join(installed_files[:15])}\n\n"
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
@@ -428,6 +553,11 @@ class SkillMarketplaceTool(BaseTool):
         elif action == "install_local":
             if not url:
                 return "Error: 'url' (local path) is required for install_local"
+            if _looks_like_github_repo_reference(url):
+                return (
+                    "Error: GitHub repos must use action='install_skill'. "
+                    "Use the repo URL directly and let the marketplace resolve the SKILL.md folder."
+                )
             try:
                 source = Path(url.strip()).expanduser().resolve()
                 if not source.is_dir():
@@ -493,7 +623,9 @@ class SkillMarketplaceTool(BaseTool):
                 if _url.startswith(("http://", "https://")):
                     owner, repo, branch, subpath = _parse_github_url(_url)
                     subpath = _validate_subpath(subpath, allow_empty=True)
-                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
+                    branch, subpath, skill_name_derived = await _resolve_github_skill_source(
+                        owner, repo, branch, subpath
+                    )
                 else:
                     parts = [p for p in url.split("/") if p]
                     if len(parts) < 2:
@@ -513,7 +645,9 @@ class SkillMarketplaceTool(BaseTool):
                         branch = rest[1] if len(rest) > 1 else "main"
                         rest = rest[2:]
                     subpath = _validate_subpath("/".join(rest), allow_empty=True)
-                    skill_name_derived = subpath.rsplit("/", 1)[-1] if subpath else repo
+                    branch, subpath, skill_name_derived = await _resolve_github_skill_source(
+                        owner, repo, branch, subpath
+                    )
 
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
@@ -528,6 +662,9 @@ class SkillMarketplaceTool(BaseTool):
 
                 return (
                     f"SUCCESS: Skill '{skill_name_derived}' updated ({count} files).\n\n"
+                    f"Source: {owner}/{repo}@{branch}"
+                    + (f" / {subpath}" if subpath else " / <repo-root>")
+                    + "\n"
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
                     f"2) read_file(path='{_rel_path}/SKILL.md') for updated instructions.\n"

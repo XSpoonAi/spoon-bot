@@ -21,6 +21,10 @@ _CURRENT_TOOL_INVOCATION: ContextVar[str | None] = ContextVar(
     "current_tool_invocation",
     default=None,
 )
+_TOOL_INVOCATION_DEDUP_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "tool_invocation_dedup_state",
+    default=None,
+)
 
 
 @dataclass
@@ -39,6 +43,11 @@ _TOOL_OUTPUT_LOCK = Lock()
 _ACTIVE_TOOL_INVOCATIONS: dict[str, CapturedToolOutput] = {}
 _COMPLETED_TOOL_OUTPUTS: dict[str, list[CapturedToolOutput]] = defaultdict(list)
 _MAX_CAPTURED_TOOL_OUTPUTS_PER_SCOPE = 256
+_DUPLICATE_TOOL_INVOCATION_MESSAGE = (
+    "Error: duplicate tool invocation suppressed. The same tool and arguments "
+    "already executed in this request; use the previous result or choose "
+    "different arguments."
+)
 
 
 def normalize_tool_owner_user(user_id: str | None) -> str:
@@ -115,6 +124,42 @@ def normalize_tool_arguments(arguments: Any) -> str:
         except Exception:
             return str(arguments)
     return str(arguments)
+
+
+@contextmanager
+def track_tool_invocations(*, max_repeats: int = 2) -> Iterator[dict[str, Any]]:
+    """Track exact tool invocations for the current request.
+
+    This is a data-plane guard: it suppresses identical tool+argument executions
+    inside one request without routing based on user prompt wording.
+    """
+    state: dict[str, Any] = {
+        "counts": defaultdict(int),
+        "max_repeats": max(1, int(max_repeats or 1)),
+    }
+    token = _TOOL_INVOCATION_DEDUP_STATE.set(state)
+    try:
+        yield state
+    finally:
+        _TOOL_INVOCATION_DEDUP_STATE.reset(token)
+
+
+def suppress_repeated_tool_invocation(tool_name: str, arguments: Any) -> str | None:
+    """Return a compact duplicate result when the same call already ran."""
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if not isinstance(state, dict):
+        return None
+
+    counts = state.get("counts")
+    if counts is None:
+        return None
+
+    key = f"{str(tool_name or '')}\x1f{normalize_tool_arguments(arguments)}"
+    counts[key] += 1
+    max_repeats = int(state.get("max_repeats") or 1)
+    if counts[key] <= max_repeats:
+        return None
+    return _DUPLICATE_TOOL_INVOCATION_MESSAGE
 
 
 @contextmanager

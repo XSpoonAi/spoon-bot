@@ -894,70 +894,24 @@ async def test_channel_manager_formats_rate_limit_error():
     assert "retry" in outbound.content.lower() or "wait" in outbound.content.lower()
 
 
-def test_subagent_manager_finds_best_auto_route_specialist(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    manager.registry.register(
-        SubagentRecord(
-            agent_id="sub_auth",
-            label="auth specialist",
-            task="auth specialist",
-            state=SubagentState.COMPLETED,
-            config=SubagentConfig(
-                spawn_mode=SpawnMode.SESSION,
-                agent_name="auth-specialist",
-                auto_route=True,
-                specialization="Handles authentication, login, and password reset requests.",
-                match_keywords=["password reset", "login issue", "authentication"],
-                routing_mode=RoutingMode.DIRECT,
-            ),
-        )
-    )
-    manager.registry.register(
-        SubagentRecord(
-            agent_id="sub_billing",
-            label="billing specialist",
-            task="billing specialist",
-            state=SubagentState.COMPLETED,
-            config=SubagentConfig(
-                spawn_mode=SpawnMode.SESSION,
-                agent_name="billing-specialist",
-                auto_route=True,
-                specialization="Handles billing and invoice tasks.",
-                match_keywords=["invoice", "billing"],
-                routing_mode=RoutingMode.DIRECT,
-            ),
-        )
-    )
-
-    match = manager.find_best_auto_route_specialist(
-        "Please help reset a user's password because login is failing."
-    )
-
-    assert match is not None
-    assert match["agent_name"] == "auth-specialist"
-    assert match["score"] >= 7
-
-
-def test_subagent_manager_parses_natural_language_creation_request(workspace_dir):
+def test_subagent_manager_has_no_prompt_auto_route_entrypoint(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
     )
 
-    parsed = manager.parse_persistent_subagent_request(
-        "帮我创建一个 subagent 来总结今天的新闻"
+    assert not hasattr(manager, "find_best_auto_route_specialist")
+
+
+def test_subagent_manager_has_no_prompt_creation_parser(workspace_dir):
+    manager = SubagentManager(
+        session_manager=SessionManager(workspace=workspace_dir),
+        workspace=workspace_dir,
     )
 
-    assert parsed is not None
-    assert parsed["suggested_name"] == "news-subagent"
-    assert parsed["specialization"] == "总结今天的新闻"
-    assert "今天的新闻" in parsed["match_keywords"]
+    assert not hasattr(manager, "parse_persistent_subagent_request")
 
 
-@pytest.mark.xfail(reason="legacy mojibake fixture; covered by stable profile tests below")
 def test_subagent_manager_create_persistent_subagent_from_description(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
@@ -965,104 +919,14 @@ def test_subagent_manager_create_persistent_subagent_from_description(workspace_
     )
 
     record = manager.create_persistent_subagent(
-        description="总结今天的新闻",
+        description="summarize weekly engineering status reports",
     )
 
-    assert record.agent_name == "news-subagent"
-    assert record.spawn_mode == SpawnMode.SESSION
-    assert record.state == SubagentState.COMPLETED
-    assert record.config.auto_route is True
-    assert record.config.tool_profile == "research"
-    assert record.config.specialization == "总结今天的新闻"
-    assert "今天的新闻" in record.config.match_keywords
-
-
-def test_subagent_manager_skips_ambiguous_auto_route_specialist_match(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    for agent_name in ("invoice-a", "invoice-b"):
-        manager.registry.register(
-            SubagentRecord(
-                agent_id=f"sub_{agent_name}",
-                label=agent_name,
-                task=agent_name,
-                state=SubagentState.COMPLETED,
-                config=SubagentConfig(
-                    spawn_mode=SpawnMode.SESSION,
-                    agent_name=agent_name,
-                    auto_route=True,
-                    specialization="Handles invoice review.",
-                    match_keywords=["invoice review"],
-                    routing_mode=RoutingMode.DIRECT,
-                ),
-            )
-        )
-
-    assert manager.find_best_auto_route_specialist("Please do an invoice review.") is None
-
-
-@pytest.mark.asyncio
-async def test_agent_loop_process_auto_routes_to_specialist(workspace_dir):
-    pytest.importorskip("spoon_ai")
-    from spoon_bot.agent.loop import AgentLoop
-
-    loop = AgentLoop(
-        workspace=workspace_dir,
-        model="gpt-5.2",
-        provider="openai",
-        api_key="test-key",
-    )
-    loop._initialized = True
-    loop._subagent_manager._current_spawner_channel = "telegram:spoon"
-    loop._subagent_manager.find_best_auto_route_specialist = lambda message: {
-        "agent_name": "auth-specialist",
-        "score": 12,
-        "reasons": ["keyword:password reset"],
-    }
-    loop._subagent_manager.dispatch_persistent_subagent = AsyncMock(
-        return_value=SubagentRecord(
-            agent_id="sub_auth",
-            label="auth specialist",
-            task="Reset password for alice",
-            state=SubagentState.PENDING,
-            config=SubagentConfig(
-                spawn_mode=SpawnMode.SESSION,
-                agent_name="auth-specialist",
-                auto_route=True,
-                specialization="Handles authentication tasks.",
-            ),
-        )
-    )
-    loop._subagent_manager.collect_results = AsyncMock(
-        return_value=[
-            SubagentResult(
-                agent_id="sub_auth",
-                label="auth specialist",
-                state=SubagentState.COMPLETED,
-                result="Password reset flow has been implemented.",
-                spawner_session_key="root_session",
-                spawner_channel="telegram:spoon",
-            )
-        ]
-    )
-
-    result = await loop.process(
-        "Reset password for alice",
-        session_key="root_session",
-    )
-
-    assert "auth-specialist" in result
-    assert "Password reset flow has been implemented." in result
-    loop._subagent_manager.dispatch_persistent_subagent.assert_awaited_once()
-    resume_kwargs = loop._subagent_manager.dispatch_persistent_subagent.await_args.kwargs
-    assert resume_kwargs["agent_name"] == "auth-specialist"
-    assert resume_kwargs["task"] == "Reset password for alice"
-    assert resume_kwargs["spawner_session_key"] == "root_session"
-    assert resume_kwargs["spawner_channel"] == "telegram:spoon"
-    collect_kwargs = loop._subagent_manager.collect_results.await_args.kwargs
-    assert collect_kwargs["run_id"] == loop._subagent_manager.dispatch_persistent_subagent.return_value.run_id
+    assert record.name == "summarize-weekly-subagent"
+    assert record.auto_route is False
+    assert record.tool_profile == "coding"
+    assert record.specialization == "summarize weekly engineering status reports"
+    assert record.match_keywords == ["summarize weekly engineering status reports"]
 
 
 @pytest.mark.asyncio
@@ -1101,25 +965,11 @@ async def test_telegram_subagent_spawn_sets_specialist_metadata():
     assert config.spawn_mode == SpawnMode.SESSION
     assert config.agent_name == "auth-specialist"
     assert config.specialization == "Handles authentication tasks"
-    assert config.auto_route is True
+    assert config.auto_route is False
     assert config.match_keywords == ["login", "password reset"]
 
 
-def test_subagent_manager_parses_creation_request_with_sender_prefix_english(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-
-    parsed = manager.parse_persistent_subagent_request(
-        "[Alice]: Create a persistent subagent to summarize today's news"
-    )
-
-    assert parsed is not None
-    assert parsed["suggested_name"] == "news-subagent"
-
-
-def test_subagent_manager_creates_research_profile_from_english_description(workspace_dir):
+def test_subagent_manager_creates_generic_profile_from_english_description(workspace_dir):
     manager = SubagentManager(
         session_manager=SessionManager(workspace=workspace_dir),
         workspace=workspace_dir,
@@ -1129,43 +979,9 @@ def test_subagent_manager_creates_research_profile_from_english_description(work
         description="handle literature search, paper discovery, paper summaries, and research material collection",
     )
 
-    assert profile.name == "academic-research-subagent"
-    assert profile.auto_route is True
-    assert profile.tool_profile == "research"
-    assert "paper search" in profile.match_keywords
-
-
-def test_subagent_manager_matches_research_profile_for_related_request(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    manager.create_persistent_subagent(
-        description="handle literature search, paper discovery, paper summaries, and research material collection",
-        agent_name="academic-research-subagent",
-    )
-
-    match = manager.find_best_auto_route_specialist(
-        "Please find representative papers on multi-agent systems and provide a brief summary."
-    )
-
-    assert match is not None
-    assert match["agent_name"] == "academic-research-subagent"
-
-
-def test_subagent_manager_creates_research_profile_from_chinese_description(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-
-    profile = manager.create_persistent_subagent(
-        description="\u4eca\u540e\u4e13\u95e8\u5904\u7406\u6587\u732e\u67e5\u8be2\u3001\u8bba\u6587\u68c0\u7d22\u3001\u8bba\u6587\u6458\u8981\u6574\u7406\u548c\u7814\u7a76\u8d44\u6599\u6536\u96c6\u76f8\u5173\u4efb\u52a1",
-    )
-
-    assert profile.name == "academic-research-subagent"
-    assert profile.tool_profile == "research"
-    assert "\u6587\u732e\u67e5\u8be2" in profile.match_keywords
+    assert profile.name == "handle-literature-subagent"
+    assert profile.tool_profile == "coding"
+    assert profile.match_keywords == ["handle literature search, paper discovery, paper summaries, and research material collection"]
 
 
 @pytest.mark.asyncio
@@ -1236,34 +1052,6 @@ async def test_channel_manager_uses_metadata_reply_target():
     )
 
     assert outbound.reply_to == "42"
-
-
-def test_subagent_manager_routes_from_persistent_profile_without_runtime_record(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    manager.create_persistent_subagent(
-        description="专门处理文献查询、论文检索、论文摘要整理和研究资料收集",
-        agent_name="academic-research-subagent",
-        config=SubagentConfig(
-            tool_profile="research",
-            auto_route=True,
-            specialization="专门处理文献查询、论文检索、论文摘要整理和研究资料收集",
-            match_keywords=["文献查询", "论文检索", "论文摘要", "研究资料", "学术研究"],
-        ),
-    )
-
-    reloaded = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    match = reloaded.find_best_auto_route_specialist(
-        "帮我查一下多智能体系统方向最近的代表性论文，并做一个简要总结。"
-    )
-
-    assert match is not None
-    assert match["agent_name"] == "academic-research-subagent"
 
 
 @pytest.mark.asyncio
@@ -1651,38 +1439,6 @@ async def test_subagent_manager_scopes_info_cancel_and_steer_to_requester_lineag
 
 
 @pytest.mark.asyncio
-async def test_subagent_manager_matches_orchestrated_auto_route_specialist(workspace_dir):
-    manager = SubagentManager(
-        session_manager=SessionManager(workspace=workspace_dir),
-        workspace=workspace_dir,
-    )
-    manager.registry.register(
-        SubagentRecord(
-            agent_id="sub_orchestrated",
-            label="research orchestrator",
-            task="research orchestrator",
-            state=SubagentState.COMPLETED,
-            config=SubagentConfig(
-                spawn_mode=SpawnMode.SESSION,
-                agent_name="research-orchestrator",
-                auto_route=True,
-                allow_subagents=True,
-                specialization="Handles literature search and parallel paper review.",
-                match_keywords=["literature search", "paper review", "research summary"],
-                routing_mode=RoutingMode.ORCHESTRATED,
-            ),
-        )
-    )
-
-    match = manager.find_best_auto_route_specialist(
-        "Please do a literature search and summarize the most relevant papers."
-    )
-
-    assert match is not None
-    assert match["agent_name"] == "research-orchestrator"
-
-
-@pytest.mark.asyncio
 async def test_subagent_manager_orchestrated_parent_can_spawn_nested_workers(
     workspace_dir,
     monkeypatch,
@@ -1833,6 +1589,7 @@ async def test_channel_manager_passes_metadata_to_set_subagent_context():
         channel="telegram:spoon",
         metadata={"chat_id": 1001, "reply_to": "42"},
         reply_to="m1",
+        attachments=None,
     )
 
 

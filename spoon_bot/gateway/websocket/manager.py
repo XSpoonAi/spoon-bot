@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -45,11 +45,13 @@ def _is_disconnect_error(exc: BaseException) -> bool:
 
     # ``websockets`` is an optional transitive dep of uvicorn; import lazily.
     try:
-        from websockets.exceptions import ConnectionClosed as _WSConnectionClosed  # type: ignore
+        from websockets import exceptions as ws_exceptions  # type: ignore
     except Exception:  # pragma: no cover - defensive
-        _WSConnectionClosed = ()  # type: ignore[assignment]
+        connection_closed_type = ()
+    else:
+        connection_closed_type = ws_exceptions.ConnectionClosed
 
-    if _WSConnectionClosed and isinstance(exc, _WSConnectionClosed):
+    if connection_closed_type and isinstance(exc, connection_closed_type):
         return True
 
     if isinstance(exc, RuntimeError):
@@ -68,14 +70,14 @@ class Connection:
     websocket: WebSocket
     user_id: str
     session_key: str
-    connected_at: datetime = field(default_factory=datetime.utcnow)
-    last_activity: datetime = field(default_factory=datetime.utcnow)
+    connected_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_activity: datetime = field(default_factory=lambda: datetime.now(UTC))
     subscriptions: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def update_activity(self) -> None:
         """Update last activity timestamp."""
-        self.last_activity = datetime.utcnow()
+        self.last_activity = datetime.now(UTC)
 
 
 class ConnectionManager:
@@ -237,7 +239,7 @@ class ConnectionManager:
         # server was mid-stream (the common cause of the spurious
         # ``send_message ... failed (attempt 1/3)`` warnings seen in the wild).
         ws_state = getattr(conn.websocket, "client_state", None)
-        if ws_state is not None and ws_state != WebSocketState.CONNECTED:
+        if isinstance(ws_state, WebSocketState) and ws_state != WebSocketState.CONNECTED:
             logger.debug(
                 f"send_message to {connection_id} skipped: connection state={ws_state.name if hasattr(ws_state, 'name') else ws_state}"
             )
@@ -379,7 +381,7 @@ class ConnectionManager:
             except asyncio.CancelledError:
                 raise
 
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
             for conn_id in list(self._connections.keys()):
                 conn = self._connections.get(conn_id)
                 if conn is None:

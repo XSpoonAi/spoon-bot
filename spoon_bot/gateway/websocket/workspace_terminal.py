@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
 
-
 SandboxStdoutCallback = Callable[[dict[str, Any]], Awaitable[None]]
 TermClosedCallback = Callable[[dict[str, Any]], Awaitable[None]]
 TransportKind = Literal["pty", "pipe"]
@@ -48,7 +47,8 @@ class WorkspaceTerminalService:
         emit_closed: TermClosedCallback,
         sandbox_id: str = "runtime",
     ) -> None:
-        self._workspace_root = workspace_root.resolve()
+        self._workspace_root = workspace_root.absolute()
+        self._workspace_root_real = workspace_root.resolve()
         self._emit_stdout = emit_stdout
         self._emit_closed = emit_closed
         self._sandbox_id = sandbox_id.strip() or "runtime"
@@ -101,7 +101,7 @@ class WorkspaceTerminalService:
         payload = text.encode()
         if session.transport == "pty":
             assert session.master_fd is not None
-            await asyncio.to_thread(os.write, session.master_fd, payload)
+            os.write(session.master_fd, payload)
         else:
             stdin = session.process.stdin
             if stdin is None:
@@ -178,6 +178,9 @@ class WorkspaceTerminalService:
     ) -> TerminalSession:
         validated_cols = self._validate_dimension(cols, "cols")
         validated_rows = self._validate_dimension(rows, "rows")
+        session_env = dict(env)
+        if os.name == "posix":
+            session_env["PWD"] = cwd.as_posix()
 
         if os.name == "posix":
             master_fd, slave_fd = os.openpty()
@@ -189,7 +192,7 @@ class WorkspaceTerminalService:
                     stdout=slave_fd,
                     stderr=slave_fd,
                     cwd=str(cwd),
-                    env=env,
+                    env=session_env,
                     start_new_session=True,
                 )
             finally:
@@ -201,7 +204,7 @@ class WorkspaceTerminalService:
                 shell=shell,
                 cols=validated_cols,
                 rows=validated_rows,
-                env=env,
+                env=session_env,
                 transport="pty",
                 master_fd=master_fd,
             )
@@ -212,7 +215,7 @@ class WorkspaceTerminalService:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=str(cwd),
-            env=env,
+            env=session_env,
         )
         return TerminalSession(
             term_id=term_id,
@@ -221,7 +224,7 @@ class WorkspaceTerminalService:
             shell=shell,
             cols=validated_cols,
             rows=validated_rows,
-            env=env,
+            env=session_env,
             transport="pipe",
         )
 
@@ -314,19 +317,22 @@ class WorkspaceTerminalService:
         elif raw_path.startswith("/"):
             normalized = Path(raw_path).as_posix()
             sandbox_root = SANDBOX_WORKSPACE_ROOT.rstrip("/")
-            if normalized != sandbox_root and not normalized.startswith(sandbox_root + "/"):
-                workspace_root_str = self._workspace_root.as_posix().rstrip("/")
-                if normalized != workspace_root_str and not normalized.startswith(workspace_root_str + "/"):
-                    raise ValueError("Path is outside workspace boundary")
-                relative = normalized[len(workspace_root_str):].lstrip("/")
-            else:
+            workspace_root_str = self._workspace_root.as_posix().rstrip("/")
+            workspace_root_real_str = self._workspace_root_real.as_posix().rstrip("/")
+            if normalized == sandbox_root or normalized.startswith(sandbox_root + "/"):
                 relative = normalized[len(sandbox_root):].lstrip("/")
-            target = (self._workspace_root / relative).resolve(strict=False)
+            elif normalized == workspace_root_str or normalized.startswith(workspace_root_str + "/"):
+                relative = normalized[len(workspace_root_str):].lstrip("/")
+            elif normalized == workspace_root_real_str or normalized.startswith(workspace_root_real_str + "/"):
+                relative = normalized[len(workspace_root_real_str):].lstrip("/")
+            else:
+                raise ValueError("Path is outside workspace boundary")
+            target = (self._workspace_root / relative).absolute()
         else:
-            target = (self._workspace_root / raw_path).resolve(strict=False)
+            target = (self._workspace_root / raw_path).absolute()
 
         try:
-            target.relative_to(self._workspace_root)
+            target.resolve(strict=False).relative_to(self._workspace_root_real)
         except ValueError as exc:
             raise ValueError("Path is outside workspace boundary") from exc
         return target

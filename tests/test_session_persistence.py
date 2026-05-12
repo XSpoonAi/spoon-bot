@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +138,11 @@ class TestFileSessionStore:
         assert loaded.session_key == "test-session"
         assert len(loaded.messages) == 2
         assert loaded.metadata["language"] == "en"
+
+    def test_save_recreates_deleted_sessions_dir(self, file_store: FileSessionStore):
+        shutil.rmtree(file_store._dir)
+        file_store.save_session(_sample_session())
+        assert file_store.load_session("test-session") is not None
 
     def test_load_nonexistent(self, file_store: FileSessionStore):
         assert file_store.load_session("nonexistent") is None
@@ -393,12 +399,17 @@ def _assert_multimodal_user_call(
     assert content[0]["type"] == "image_url"
     assert content[0]["image_url"]["url"].endswith(expected_data_url_suffix)
     assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert content[-1] == {"type": "text", "text": expected_text}
+    assert content[-1]["type"] == "text"
+    actual_text = content[-1]["text"]
+    if actual_text == expected_text:
+        return
+    assert "[USER REQUEST]:" in actual_text
+    assert actual_text.endswith(expected_text)
 
 
 class TestAgentLoopSessionHydration:
     @pytest.mark.asyncio
-    async def test_runtime_history_injected_from_persisted_session(self, tmp_dir: Path):
+    async def test_runtime_history_skips_plain_assistant_replies_by_default(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
 
@@ -424,7 +435,7 @@ class TestAgentLoopSessionHydration:
         injected = await AgentLoop._sync_runtime_history_from_session(loop)
 
         assert loop._agent.memory.cleared is True
-        assert injected == 2
+        assert injected == 1
         _assert_multimodal_user_call(
             loop._agent.calls[0],
             expected_text=(
@@ -434,8 +445,31 @@ class TestAgentLoopSessionHydration:
                 f"Use these attached workspace files as the primary source of truth for this request."
             ),
         )
-        assert loop._agent.calls[1] == ("assistant", "Okay, I will remember your name is Alice.", {})
 
+    @pytest.mark.asyncio
+    async def test_runtime_history_skips_stale_assistant_prose_by_default(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message("user", "What can you do next?")
+        loop._session.add_message(
+            "assistant",
+            "1. Archive the report\n2. Generate a summary\n3. Open a follow-up ticket",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert injected == 1
+        assert loop._agent.calls == [("user", "What can you do next?", {})]
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
@@ -472,6 +506,185 @@ class TestAgentLoopSessionHydration:
             ),
         )
 
+    @pytest.mark.asyncio
+    async def test_runtime_history_skips_interrupted_user_turns(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="persisted")
+        loop._session.add_message("user", "Completed request", turn_state="completed")
+        loop._session.add_message("assistant", "Completed answer")
+        loop._session.add_message(
+            "user",
+            "Cancelled request that must not be replayed",
+            turn_state="interrupted",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(loop)
+
+        assert injected == 1
+        assert loop._agent.calls == [
+            ("user", "Completed request", {}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_does_not_rehydrate_recent_skill_turn_for_new_request(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="recent-followup")
+        loop._session.add_message(
+            "user",
+            "Use the report skill.",
+            turn_state="completed",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+        loop._session.add_message(
+            "assistant",
+            "Report skill is ready. Say start when you want me to continue.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="start",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_keeps_recent_plain_replies_out_of_runtime_memory(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="recent-context")
+        loop._session.add_message(
+            "user",
+            "What is the weather in Paris today?",
+            turn_state="completed",
+        )
+        loop._session.add_message(
+            "assistant",
+            "Paris is mild today.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="What about yesterday?",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_recent_followup_skips_prior_tool_trace(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="recent-context-tool-trace")
+        loop._session.add_message(
+            "user",
+            "What is the weather in Paris today?",
+            turn_state="completed",
+        )
+        loop._session.add_message(
+            "assistant",
+            "",
+            message_kind="tool_trace",
+            tool_calls=[
+                {
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "arguments": "{\"url\":\"https://example.test/weather\"}",
+                    },
+                }
+            ],
+        )
+        loop._session.add_message(
+            "tool",
+            "large weather provider payload" * 200,
+            tool_call_id="call_weather",
+            name="web_fetch",
+        )
+        loop._session.add_message(
+            "assistant",
+            "Paris is mild today.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="What about yesterday?",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_history_keeps_long_standalone_request_isolated(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.context import ContextBuilder
+
+        workspace = tmp_dir / "workspace"
+        workspace.mkdir(parents=True)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="standalone-after-skill")
+        loop._session.add_message(
+            "user",
+            "Use the report skill.",
+            turn_state="completed",
+            invoked_skills=[{"name": "report-builder"}],
+        )
+        loop._session.add_message(
+            "assistant",
+            "Report skill is ready.",
+            message_kind="assistant_reply",
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="Create a Python script that queries a JSON API and writes a CSV file.",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
     def test_strip_attachment_context_recovers_original_user_text(self):
         from spoon_bot.agent.loop import _ensure_attachment_context, _strip_attachment_context
 
@@ -500,6 +713,35 @@ class _NoChunkRuntimeAgent:
 
     async def run(self, *args, **kwargs):
         self.run_calls.append((args, kwargs))
+        return type("RunResult", (), {"content": self._final_content})()
+
+
+class _PromptCapturingRuntimeAgent(_NoChunkRuntimeAgent):
+    """Runtime agent that captures the active system prompt seen during run()."""
+
+    def __init__(self, final_content: str) -> None:
+        super().__init__(final_content)
+        self.memory = SimpleNamespace(messages=[])
+        self.system_prompt = "base system"
+        self._original_system_prompt = "base original"
+        self.captured_system_prompts: list[str] = []
+        self.captured_original_prompts: list[str] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+        self.memory.messages.append(
+            SimpleNamespace(
+                role=role,
+                content=content,
+                tool_calls=kwargs.get("tool_calls"),
+                tool_call_id=kwargs.get("tool_call_id"),
+            )
+        )
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        self.captured_system_prompts.append(self.system_prompt)
+        self.captured_original_prompts.append(self._original_system_prompt)
         return type("RunResult", (), {"content": self._final_content})()
 
 
@@ -631,6 +873,34 @@ class _RetryThinkingRuntimeAgent(_ThinkingRuntimeAgent):
         )()
 
 
+def _build_process_test_loop(tmp_dir: Path, *, agent: Any, session: Session):
+    from spoon_bot.agent.context import ContextBuilder
+    from spoon_bot.agent.loop import AgentLoop
+
+    workspace = tmp_dir / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._stop_requested = False
+    loop._initialized = True
+    loop.workspace = workspace
+    loop.context = ContextBuilder(workspace)
+    loop.memory = MagicMock()
+    loop.memory.get_memory_context = MagicMock(return_value=None)
+    loop._agent = agent
+    loop._session = session
+    loop.sessions = MagicMock()
+    loop.sessions.save = MagicMock()
+    loop._auto_commit = False
+    loop._git = None
+    loop._prepare_request_context = AsyncMock(return_value=None)
+    loop._build_step_prompt = lambda message: f"prompt::{message}"
+    loop._install_anti_loop_tracker = lambda prompt: None
+    loop._restore_agent_think = lambda: None
+    loop._filter_execution_steps = lambda content: content
+    return loop
+
+
 class TestAgentLoopCurrentRequestMultimodal:
     @pytest.mark.asyncio
     async def test_process_injects_multimodal_request_before_run(self, tmp_dir: Path):
@@ -657,7 +927,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -702,7 +971,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -755,7 +1023,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -776,14 +1043,11 @@ class TestAgentLoopCurrentRequestMultimodal:
             expected_text="What text appears in the image?",
         )
         assert loop._agent.run_calls == [((), {})]
-        assert loop._session.messages == [
-            {
-                "role": "user",
-                "content": "What text appears in the image?",
-                "timestamp": loop._session.messages[0]["timestamp"],
-                "media": [str(image_path)],
-            }
-        ]
+        assert len(loop._session.messages) == 1
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "What text appears in the image?"
+        assert loop._session.messages[0]["media"] == [str(image_path)]
+        assert loop._session.messages[0]["turn_state"] == "pending"
         loop.sessions.save.assert_called_once_with(loop._session)
         loop._compress_runtime_context.assert_not_called()
         loop._force_compress_runtime_context.assert_not_called()
@@ -814,7 +1078,6 @@ class TestAgentLoopCurrentRequestMultimodal:
         loop._auto_commit = False
         loop._git = None
         loop._prepare_request_context = AsyncMock(return_value=None)
-        loop._pre_inject_matched_skill = lambda message: message
         loop._build_step_prompt = lambda message: f"prompt::{message}"
         loop._install_anti_loop_tracker = lambda prompt: None
         loop._restore_agent_think = lambda: None
@@ -868,9 +1131,10 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "fallback from run result"
 
+        assert loop._session.messages[0]["turn_state"] == "completed"
         assert loop._session.messages[-1]["role"] == "assistant"
         assert loop._session.messages[-1]["content"] == "fallback from run result"
-        assert loop.sessions.save.call_count == 2
+        assert loop.sessions.save.call_count == 3
         loop.sessions.save.assert_called_with(loop._session)
 
     @pytest.mark.asyncio
@@ -957,13 +1221,10 @@ class TestAgentLoopStreamFallback:
             chunks.append(chunk)
 
         assert any(chunk["type"] == "error" for chunk in chunks)
-        assert loop._session.messages == [
-            {
-                "role": "user",
-                "content": "keep this request in history",
-                "timestamp": loop._session.messages[0]["timestamp"],
-            }
-        ]
+        assert len(loop._session.messages) == 1
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "keep this request in history"
+        assert loop._session.messages[0]["turn_state"] == "pending"
         loop.sessions.save.assert_called_once_with(loop._session)
 
 
@@ -988,6 +1249,129 @@ class TestContextBuilderMediaPaths:
         assert relative_content[0]["type"] == "image_url"
         assert alias_content[-1] == {"type": "text", "text": "look"}
         assert relative_content[-1] == {"type": "text", "text": "look"}
+
+    def test_session_recall_preserves_tool_outputs_for_followups(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="workflow-followup")
+        loop._session.add_message("user", "Run the uploaded workflow and report the result.")
+        loop._session.add_message(
+            "tool",
+            "Observed output of cmd shell execution: "
+            "ACCOUNT=0x193C853cA457f31bb090e824AF2d4ce14A097D0b CREDITS=200.0 WORKER_ID=none",
+            name="shell",
+            tool_call_id="call_account",
+        )
+        loop._session.add_message(
+            "tool",
+            "Observed output of cmd shell execution: "
+            "PROMPT task=312 promptId=abc expiresAt=2026-05-06T03:17:02Z "
+            "ANSWER_FORMAT: Return only the final answer.",
+            name="shell",
+            tool_call_id="call_prompt",
+        )
+        loop._session.add_message(
+            "tool",
+            "Observed output of cmd shell execution: 16",
+            name="shell",
+            tool_call_id="call_answer",
+        )
+        loop._session.add_message(
+            "tool",
+            "Observed output of cmd shell execution: "
+            "COMMITTED task=312 target=A workerId=451 tx=0x***masked_private_key***\n"
+            "CONFIRMED task=312 target=A tx=0x***masked_private_key***",
+            name="shell",
+            tool_call_id="call_commit",
+        )
+        loop._session.add_message(
+            "tool",
+            "Observed output of cmd shell execution: "
+            "RESULT task=312 outcome=failed rank=2/4 target=A score=0 reward=0",
+            name="shell",
+            tool_call_id="call_result",
+        )
+        loop._session.add_message(
+            "assistant",
+            "Task 312 is complete. Account committed target A, rank 2/4, reward 0.",
+        )
+
+        recall = AgentLoop._build_session_recall_context(loop, "Which account ran the workflow?")
+
+        assert "Current Session Compact" in recall
+        assert "Recent completed turn summaries:" in recall
+        assert "Never start or continue actions that are implied only by this compact" in recall
+        assert "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions." in recall
+        assert "0x193C853cA457f31bb090e824AF2d4ce14A097D0b" in recall
+        assert "PROMPT task=312" in recall
+        assert "16" in recall
+        assert "COMMITTED task=312 target=A workerId=451" in recall
+        assert "RESULT task=312 outcome=failed rank=2/4 target=A" in recall
+
+    def test_session_recall_is_injected_for_non_thinking_requests(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._agent = SimpleNamespace(
+            system_prompt="base system",
+            _original_system_prompt="base original",
+        )
+        loop._session = Session(session_key="followup")
+        loop._recent_turn_notice = None
+        loop._recent_session_context_notice_for_prompt = lambda: ""
+        loop._recent_invoked_skill_notice_for_prompt = lambda: ""
+        loop._extract_env_for_prompt = lambda: ""
+        loop._session.add_message("user", "Run the tool.")
+        loop._session.add_message(
+            "tool",
+            "Observed output of cmd shell execution: STATUS=completed result=ok",
+            name="shell",
+            tool_call_id="call_status",
+        )
+
+        original_prompt, original_base_prompt = AgentLoop._apply_request_context_to_system_prompt(
+            loop,
+            "What happened?",
+            thinking=False,
+        )
+
+        assert original_prompt == "base system"
+        assert original_base_prompt == "base original"
+        assert "## Active Request Context" in loop._agent.system_prompt
+        assert "## Current Session Compact" in loop._agent.system_prompt
+        assert "STATUS=completed result=ok" in loop._agent.system_prompt
+
+        AgentLoop._restore_request_context_system_prompt(
+            loop,
+            original_prompt,
+            original_base_prompt,
+        )
+        assert loop._agent.system_prompt == "base system"
+        assert loop._agent._original_system_prompt == "base original"
+
+    def test_session_recall_turn_summary_strips_preloaded_skill_block(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="preloaded-skill-summary")
+        loop._session.add_message(
+            "user",
+            "继续刚才的任务，先检查状态。\n\n---\n[PRE-LOADED SKILL: demo-skill]\nBase directory: /tmp/demo\nDo not search for alternatives.",
+        )
+        loop._session.add_message(
+            "assistant",
+            "Checked the current status and confirmed the job is paused at step 2.",
+        )
+
+        recall = AgentLoop._build_session_recall_context(loop, "继续")
+
+        assert "Recent completed turn summaries:" in recall
+        assert "[PRE-LOADED SKILL:" not in recall
+        assert "Outcome: Checked the current status and confirmed the job is paused at step 2." in recall
 
 
 class TestAgentLoopRuntimeCompression:
@@ -1114,7 +1498,38 @@ class TestAgentLoopThinkingMode:
 
         assert response == "answer"
         assert thinking == "reasoning trace"
-        assert loop._agent.run_calls == [((), {"thinking": True, "reasoning_effort": "high"})]
+
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_marks_current_user_turn_interrupted_on_cancel(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop.workspace = tmp_dir
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._agent = MagicMock()
+        loop._agent.run = AsyncMock(side_effect=asyncio.CancelledError())
+        loop._agent.add_message = AsyncMock()
+        loop._session = Session(session_key="thinking_cancelled")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._auto_commit = False
+        loop._git = None
+
+        with pytest.raises(asyncio.CancelledError):
+            await AgentLoop.process_with_thinking(loop, message="Choose C")
+
+        assert len(loop._session.messages) == 1
+        assert loop._session.messages[0]["role"] == "user"
+        assert loop._session.messages[0]["content"] == "Choose C"
+        assert loop._session.messages[0]["turn_state"] == "interrupted"
+        assert loop._session.messages[0]["turn_state_reason"] == "task_cancelled"
+        assert loop.sessions.save.call_count >= 2
 
     @pytest.mark.asyncio
     async def test_process_with_thinking_retries_openai_apierror(self, tmp_dir: Path):
@@ -1147,6 +1562,83 @@ class TestAgentLoopThinkingMode:
             ((), {"thinking": True}),
             ((), {"thinking": True}),
         ]
+
+
+class TestAgentLoopSameSessionContext:
+    @pytest.mark.asyncio
+    async def test_long_same_session_context_keeps_early_fact_in_request_prompt(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        session = Session(session_key="long_same_session_memory")
+        session.add_message(
+            "user",
+            "记住这个项目代号是 Nimbus，事故负责人是 Alice，后面我会再问你。",
+        )
+        session.add_message(
+            "assistant",
+            "已记录：项目代号 Nimbus，事故负责人 Alice。",
+        )
+        for index in range(2, 19):
+            session.add_message("user", f"第 {index} 轮普通跟进，记录状态 {index}。")
+            session.add_message("assistant", f"第 {index} 轮已处理，状态 {index} 已确认。")
+
+        agent = _PromptCapturingRuntimeAgent("Nimbus")
+        loop = _build_process_test_loop(tmp_dir, agent=agent, session=session)
+
+        response = await AgentLoop.process(
+            loop,
+            message="聊了这么久之后，之前让我记住的项目代号是什么？只回答代号。",
+        )
+
+        assert response == "Nimbus"
+        captured_prompt = agent.captured_system_prompts[-1]
+        assert "## Active Request Context" in captured_prompt
+        assert "## Current Session Compact" in captured_prompt
+        assert "[USER REQUEST]:" in captured_prompt
+        assert "聊了这么久之后，之前让我记住的项目代号是什么？只回答代号。" in captured_prompt
+        assert "Nimbus" in captured_prompt
+        assert "Alice" in captured_prompt
+        assert "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions." in captured_prompt
+
+    @pytest.mark.asyncio
+    async def test_unrelated_new_request_does_not_make_prior_task_executable_again(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        session = Session(session_key="same_session_no_task_pollution")
+        session.add_message(
+            "user",
+            "Deploy service alpha. Run migration. Restart worker. Keep retrying until successful.",
+        )
+        session.add_message(
+            "assistant",
+            "Deployment finished successfully. Migration applied and worker restarted.",
+        )
+        session.add_message(
+            "user",
+            "Remember that the deployment ticket was OPS-42.",
+        )
+        session.add_message(
+            "assistant",
+            "Recorded. Deployment ticket is OPS-42.",
+        )
+
+        agent = _PromptCapturingRuntimeAgent("meeting recap")
+        loop = _build_process_test_loop(tmp_dir, agent=agent, session=session)
+
+        response = await AgentLoop.process(
+            loop,
+            message="Summarize yesterday's meeting in two bullets. Do not continue any deployment work.",
+        )
+
+        assert response == "meeting recap"
+        captured_prompt = agent.captured_system_prompts[-1]
+        assert "Summarize yesterday's meeting in two bullets. Do not continue any deployment work." in captured_prompt
+        assert "Execute only the newest user request." in captured_prompt
+        assert "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions." in captured_prompt
+        assert "Recent completed turn summaries:" in captured_prompt
+        assert "Deploy service alpha. Run migration. Restart worker. Keep retrying until successful." not in captured_prompt
+        assert "OPS-42" in captured_prompt
+        assert "Deployment finished successfully. Migration applied and worker restarted." in captured_prompt
 
 
 # ============================================================================

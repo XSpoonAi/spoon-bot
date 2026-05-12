@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from uuid import uuid4
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -78,6 +79,26 @@ async def list_skills(user: CurrentUser) -> APIResponse[SkillListResponse]:
     return APIResponse(
         success=True,
         data=SkillListResponse(skills=skills),
+        meta=MetaInfo(request_id=request_id),
+    )
+
+
+
+
+@router.get("/catalog", response_model=APIResponse[dict[str, Any]])
+async def skill_catalog(user: CurrentUser) -> APIResponse[dict[str, Any]]:
+    """Return structured skill and MCP catalog metadata for observability."""
+    request_id = f"req_{uuid4().hex[:12]}"
+    agent = _safe_get_agent()
+    skills = []
+    mcp = []
+    if hasattr(agent, "get_skill_catalog"):
+        skills = agent.get_skill_catalog()
+    if hasattr(agent, "get_mcp_catalog"):
+        mcp = agent.get_mcp_catalog()
+    return APIResponse(
+        success=True,
+        data={"skills": skills, "mcp": mcp},
         meta=MetaInfo(request_id=request_id),
     )
 

@@ -5,14 +5,15 @@ from pathlib import Path
 from spoon_bot.skills.builtin import builtin_skills_root, ensure_builtin_skills
 
 
-def test_ensure_builtin_skills_installs_wallet(tmp_path):
+def test_ensure_builtin_skills_installs_builtin_skill_set(tmp_path):
     workspace = tmp_path / "workspace"
 
     installed = ensure_builtin_skills(workspace)
 
     installed_names = {path.name for path in installed}
-    assert "wallet" in installed_names
+    assert {"wallet", "subagents"}.issubset(installed_names)
     assert (workspace / "skills" / "wallet" / "SKILL.md").exists()
+    assert (workspace / "skills" / "subagents" / "SKILL.md").exists()
     assert not (workspace / "skills" / "wallet" / "scripts").exists()
     assert not (workspace / "skills" / "wallet" / "assets").exists()
 
@@ -30,9 +31,10 @@ def test_ensure_builtin_skills_does_not_overwrite_existing_skill(tmp_path):
     assert skill_file.read_text(encoding="utf-8") == "custom skill"
 
 
-def test_builtin_skills_root_contains_wallet():
+def test_builtin_skills_root_contains_builtin_skill_set():
     root = builtin_skills_root()
     assert root.is_dir()
     assert (root / "wallet" / "SKILL.md").exists()
+    assert (root / "subagents" / "SKILL.md").exists()
     assert not (root / "wallet" / "scripts").exists()
     assert not (root / "wallet" / "assets").exists()
