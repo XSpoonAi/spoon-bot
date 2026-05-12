@@ -9,7 +9,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from spoon_bot.agent.tools.shell import ShellTool, SafeShellTool, _BackgroundShellJob
-from spoon_bot.config import AgentLoopConfig, validate_agent_loop_params
+from spoon_bot.agent.loop import AgentLoop
+from spoon_bot.config import (
+    AgentLoopConfig,
+    DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
+    DEFAULT_PROVIDER_SILENCE_TIMEOUT,
+    DEFAULT_PROVIDER_TOTAL_TIMEOUT,
+    DEFAULT_TOOL_FOLLOWUP_TIMEOUT,
+    validate_agent_loop_params,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +53,35 @@ class TestConfigDefaults:
     def test_shell_max_timeout_lower_bound(self):
         config = AgentLoopConfig(shell_max_timeout=60)
         assert config.shell_max_timeout == 60
+
+    def test_agent_loop_stream_timeout_defaults(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SPOON_BOT_PROVIDER_SILENCE_TIMEOUT", raising=False)
+        monkeypatch.delenv("SPOON_BOT_PROVIDER_TOTAL_TIMEOUT", raising=False)
+        monkeypatch.delenv("SPOON_BOT_TOOL_FOLLOWUP_TIMEOUT", raising=False)
+        monkeypatch.delenv("SPOON_BOT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT", raising=False)
+
+        loop = AgentLoop(workspace=tmp_path, model="test-model", provider="openai", api_key="test")
+
+        assert loop.provider_silence_timeout == DEFAULT_PROVIDER_SILENCE_TIMEOUT
+        assert loop.provider_total_timeout == DEFAULT_PROVIDER_TOTAL_TIMEOUT
+        assert loop.tool_followup_timeout == DEFAULT_TOOL_FOLLOWUP_TIMEOUT
+        assert (
+            loop.max_stream_tool_results_without_content
+            == DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT
+        )
+
+    def test_agent_loop_stream_timeout_env_overrides(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPOON_BOT_PROVIDER_SILENCE_TIMEOUT", "301")
+        monkeypatch.setenv("SPOON_BOT_PROVIDER_TOTAL_TIMEOUT", "302")
+        monkeypatch.setenv("SPOON_BOT_TOOL_FOLLOWUP_TIMEOUT", "303")
+        monkeypatch.setenv("SPOON_BOT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT", "77")
+
+        loop = AgentLoop(workspace=tmp_path, model="test-model", provider="openai", api_key="test")
+
+        assert loop.provider_silence_timeout == 301
+        assert loop.provider_total_timeout == 302
+        assert loop.tool_followup_timeout == 303
+        assert loop.max_stream_tool_results_without_content == 77
 
 
 # ---------------------------------------------------------------------------

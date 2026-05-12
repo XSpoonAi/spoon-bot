@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import html as _html
 import json as _json
 import os
+import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from loguru import logger
@@ -44,22 +46,15 @@ _WEB_SEARCH_ENV_CANDIDATES: dict[str, tuple[str, ...]] = {
     "tavily": ("TAVILY_API_KEY",),
     "brave": ("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"),
 }
+_WEB_SEARCH_PROVIDER_PRIORITY: tuple[str, ...] = ("tavily", "brave", "duckduckgo")
 
 
 def get_configured_web_search_provider(preferred: str | None = None) -> str | None:
     """Return the first usable web_search provider configured in the environment."""
-    preferred_provider = (preferred or "").strip().lower()
-    candidates: list[str] = []
-    if preferred_provider:
-        candidates.append(preferred_provider)
-    candidates.extend(["tavily", "brave"])
-
-    seen: set[str] = set()
-    for provider in candidates:
-        if provider in seen:
-            continue
-        seen.add(provider)
-        if _get_web_search_api_key(provider):
+    for provider in _get_web_search_provider_candidates(preferred):
+        if provider == "duckduckgo":
+            return provider
+        if _get_web_search_api_keys(provider):
             return provider
     return None
 
@@ -69,29 +64,52 @@ def describe_web_search_capability(preferred: str | None = None) -> tuple[bool, 
     provider = get_configured_web_search_provider(preferred)
     if provider is not None:
         return True, f"Configured web_search provider: {provider}"
-    return (
-        False,
-        "No web_search provider is configured. Set TAVILY_API_KEY, "
-        "BRAVE_SEARCH_API_KEY/BRAVE_API_KEY, or disable live web retrieval for this task.",
-    )
+    return False, "No web_search provider is configured."
 
 
 def _get_web_search_api_key(provider: str) -> str | None:
+    keys = _get_web_search_api_keys(provider)
+    return keys[0] if keys else None
+
+
+def _get_web_search_provider_candidates(preferred: str | None = None) -> list[str]:
+    preferred_provider = (preferred or "").strip().lower()
+    candidates: list[str] = []
+    if preferred_provider:
+        candidates.append(preferred_provider)
+    candidates.extend(_WEB_SEARCH_PROVIDER_PRIORITY)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for provider in candidates:
+        if not provider or provider in seen:
+            continue
+        seen.add(provider)
+        deduped.append(provider)
+    return deduped
+
+
+def _get_web_search_api_keys(provider: str) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
     for env_var in _WEB_SEARCH_ENV_CANDIDATES.get(provider, ()):
         value = os.environ.get(env_var)
         if value:
-            text = value.strip()
-            if text:
-                return text
-    return None
+            for raw in value.split(","):
+                text = raw.strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                keys.append(text)
+    return keys
 
 
 class WebSearchTool(Tool):
     """
     Tool to search the web for information.
 
-    Supports multiple search providers.  Tavily is the recommended default
-    because it returns structured results out of the box.
+    Supports multiple search providers. Tavily is preferred when configured,
+    with DuckDuckGo as the final fallback because it works without an API key.
     """
 
     SUPPORTED_PROVIDERS = frozenset({
@@ -162,30 +180,57 @@ class WebSearchTool(Tool):
         provider: str | None = None,
         **kwargs: Any,
     ) -> str:
-        provider = self._resolve_provider(provider)
+        explicit_provider = (provider or "").strip().lower()
         max_results = min(max_results or self._max_results, 20)
 
-        if provider not in self.SUPPORTED_PROVIDERS:
+        if explicit_provider and explicit_provider not in self.SUPPORTED_PROVIDERS:
             return (
-                f"Error: Unsupported provider '{provider}'. "
+                f"Error: Unsupported provider '{explicit_provider}'. "
                 f"Supported: {', '.join(sorted(self.SUPPORTED_PROVIDERS))}"
             )
 
-        # Dispatch
+        last_failure = "No results found."
+        for candidate in self._resolve_provider_chain(explicit_provider or None):
+            result = await self._execute_with_provider(candidate, query, max_results, topic, time_range)
+            if not self._is_retryable_search_failure(result):
+                return result
+            last_failure = result
+            logger.warning(f"web_search provider '{candidate}' failed, trying next provider if available")
+        return last_failure
+
+    def _resolve_provider_chain(self, provider: str | None) -> list[str]:
+        explicit = (provider or "").strip().lower()
+        if explicit == "duckduckgo":
+            return ["duckduckgo"]
+        if explicit:
+            return [explicit, "duckduckgo"]
+
+        chain: list[str] = []
+        for candidate in _get_web_search_provider_candidates(self._default_provider):
+            if candidate == "duckduckgo" or _get_web_search_api_keys(candidate):
+                chain.append(candidate)
+        return chain or [self._default_provider, "duckduckgo"]
+
+    async def _execute_with_provider(
+        self,
+        provider: str,
+        query: str,
+        max_results: int,
+        topic: str | None,
+        time_range: str | None,
+    ) -> str:
         if provider == "tavily":
             return await self._search_tavily(query, max_results, topic, time_range)
         if provider == "brave":
             return await self._search_brave(query, max_results, topic, time_range)
-
-        # Fallback: stub for other providers (can be implemented later)
+        if provider == "duckduckgo":
+            return await self._search_duckduckgo(query, max_results, topic, time_range)
         return await self._search_stub(query, provider, max_results, time_range)
 
-    def _resolve_provider(self, provider: str | None) -> str:
-        explicit = (provider or "").strip().lower()
-        if explicit:
-            return explicit
-        configured = get_configured_web_search_provider(self._default_provider)
-        return configured or self._default_provider
+    @staticmethod
+    def _is_retryable_search_failure(result: str) -> bool:
+        normalized = (result or "").strip()
+        return normalized.startswith("Error:") or normalized == "No results found."
 
     # ---- Tavily implementation ---------------------------------------------
 
@@ -196,8 +241,8 @@ class WebSearchTool(Tool):
         topic: str | None,
         time_range: str | None,
     ) -> str:
-        api_key = _get_web_search_api_key("tavily")
-        if not api_key:
+        api_keys = _get_web_search_api_keys("tavily")
+        if not api_keys:
             return (
                 "Error: Tavily API key not configured. "
                 "Set TAVILY_API_KEY in your .env file.\n"
@@ -215,25 +260,30 @@ class WebSearchTool(Tool):
         if time_range:
             payload["time_range"] = time_range
 
-        try:
-            client = _get_http_client()
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as exc:
-            logger.error(f"Tavily API error: {exc.response.status_code} {exc.response.text[:300]}")
-            return f"Error: Tavily search failed ({exc.response.status_code})"
-        except Exception as exc:
-            logger.error(f"Tavily request error: {exc}")
-            return f"Error: Web search failed — {exc}"
+        client = _get_http_client()
+        last_error = "Error: Tavily search failed"
+        for index, api_key in enumerate(api_keys, start=1):
+            try:
+                resp = await client.post(
+                    "https://api.tavily.com/search",
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return self._format_tavily_results(data)
+            except httpx.HTTPStatusError as exc:
+                logger.error(f"Tavily API error (key {index}/{len(api_keys)}): {exc.response.status_code} {exc.response.text[:300]}")
+                last_error = f"Error: Tavily search failed ({exc.response.status_code})"
+            except Exception as exc:
+                logger.error(f"Tavily request error (key {index}/{len(api_keys)}): {exc}")
+                last_error = f"Error: Web search failed — {exc}"
+        return last_error
 
+    def _format_tavily_results(self, data: dict[str, Any]) -> str:
         # Format results
         parts: list[str] = []
 
@@ -253,6 +303,100 @@ class WebSearchTool(Tool):
             parts.append("No results found.")
 
         return "\n".join(parts)
+
+
+    async def _search_duckduckgo(
+        self,
+        query: str,
+        max_results: int,
+        topic: str | None,
+        time_range: str | None,
+    ) -> str:
+        """Search DuckDuckGo's lightweight HTML endpoint without an API key."""
+        search_query = query
+        if topic == "news":
+            search_query = f"{query} news"
+        if time_range:
+            search_query = f"{search_query} {time_range}"
+
+        try:
+            client = _get_http_client()
+            resp = await client.get(
+                "https://duckduckgo.com/html/",
+                params={"q": search_query},
+                headers={
+                    "User-Agent": WebFetchTool.DEFAULT_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,text/plain,*/*",
+                },
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            html = resp.text
+        except httpx.HTTPStatusError as exc:
+            logger.error(f"DuckDuckGo search error: {exc.response.status_code} {exc.response.text[:300]}")
+            return f"Error: DuckDuckGo search failed ({exc.response.status_code})"
+        except Exception as exc:
+            logger.error(f"DuckDuckGo request error: {exc}")
+            return f"Error: Web search failed — {exc}"
+
+        results = self._parse_duckduckgo_html(html, max_results)
+        if not results:
+            return "No results found."
+
+        parts = [f"**Search results ({len(results)}):**\n"]
+        for i, item in enumerate(results, 1):
+            parts.append(
+                f"{i}. **{item['title']}**\n"
+                f"   {item['url']}\n"
+                f"   {item['snippet']}\n"
+            )
+        return "\n".join(parts)
+
+    @staticmethod
+    def _parse_duckduckgo_html(html: str, max_results: int) -> list[dict[str, str]]:
+        """Extract title, URL, and snippet from DuckDuckGo HTML results."""
+        results: list[dict[str, str]] = []
+        result_pattern = re.compile(
+            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        snippet_pattern = re.compile(
+            r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(?P<snippet>.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        snippets = list(snippet_pattern.finditer(html))
+        for idx, match in enumerate(result_pattern.finditer(html)):
+            title = WebSearchTool._clean_html(match.group("title"))
+            url = WebSearchTool._normalize_duckduckgo_url(match.group("href"))
+            snippet = ""
+            if idx < len(snippets):
+                snippet = WebSearchTool._clean_html(snippets[idx].group("snippet"))
+            if title or url:
+                results.append({
+                    "title": title or url or "Untitled",
+                    "url": url,
+                    "snippet": snippet,
+                })
+            if len(results) >= max_results:
+                break
+        return results
+
+    @staticmethod
+    def _clean_html(value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", value or "")
+        text = _html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _normalize_duckduckgo_url(value: str) -> str:
+        text = _html.unescape(value or "").strip()
+        parsed = urlparse(text)
+        if parsed.path == "/l/" or parsed.netloc.endswith("duckduckgo.com"):
+            uddg = parse_qs(parsed.query).get("uddg", [""])[0]
+            if uddg:
+                return unquote(uddg)
+        return text
+
 
     async def _search_brave(
         self,
@@ -330,7 +474,7 @@ class WebSearchTool(Tool):
         env_var = self._ENV_VAR_MAP.get(provider, "")
         return (
             f"Error: Provider '{provider}' is not yet implemented. "
-            f"Use 'tavily' (default) instead.\n"
+            f"Use 'tavily' when configured, with DuckDuckGo as fallback.\n"
             f"Or set {env_var} to configure this provider."
         )
 

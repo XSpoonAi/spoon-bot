@@ -145,6 +145,9 @@ def test_workspace_terminal_service_preserves_logical_workspace_path_for_symlink
         assert resolved == linked_workspace.absolute()
         assert resolved != real_workspace.resolve()
 
+        real_path_resolved = service._resolve_workspace_path(real_workspace.as_posix())
+        assert real_path_resolved == linked_workspace.absolute()
+
 
 def test_workspace_terminal_service_terminates_process_group_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[int, int]] = []

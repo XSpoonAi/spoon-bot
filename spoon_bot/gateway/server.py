@@ -26,15 +26,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+from spoon_bot.agent.tools.web import close_shared_http_client
+from spoon_bot.gateway import app as app_module
 from spoon_bot.gateway.config import GatewayConfig
-from spoon_bot.gateway.websocket.manager import ConnectionManager
 from spoon_bot.gateway.core_integration import (
     SpoonCoreIdentity,
     SpoonCorePayments,
     is_spoon_core_available,
 )
-from spoon_bot.gateway import app as app_module
-from spoon_bot.agent.tools.web import close_shared_http_client
+from spoon_bot.gateway.websocket.manager import ConnectionManager
 
 
 @asynccontextmanager
@@ -245,6 +245,9 @@ async def _lifespan(app: FastAPI):
         logger.info("Channels stopped")
     if connection_manager:
         await connection_manager.stop()
+    if app_module._session_runtime_registry is not None:
+        await app_module._session_runtime_registry.close_all()
+        app_module._session_runtime_registry = None
     await close_shared_http_client()
 
 
@@ -276,6 +279,7 @@ def create_app() -> FastAPI:
         logger.info("Authentication ENABLED")
 
     app_module._config = config
+    app_module._session_runtime_registry = None
 
     app = FastAPI(
         title="spoon-bot Gateway",
@@ -298,8 +302,8 @@ def create_app() -> FastAPI:
 
     # Register routes
     from spoon_bot.gateway.api.health import router as health_router
-    from spoon_bot.gateway.api.webhooks import router as webhook_router
     from spoon_bot.gateway.api.v1.router import router as v1_router
+    from spoon_bot.gateway.api.webhooks import router as webhook_router
     from spoon_bot.gateway.websocket.handler import websocket_endpoint
 
     app.include_router(health_router)

@@ -1095,6 +1095,264 @@ class TestWSStreamingContent:
             assert response is not None
             assert response["result"]["content"] != ""
 
+    def test_stream_surfaces_runtime_compaction_notice(self, client):
+        """WS streaming should forward runtime compaction notice chunks to the client."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _stream_with_notice(**kwargs):
+            yield {
+                "type": "notice",
+                "delta": "Context window near limit. Earlier history was compacted before continuing the latest request.",
+                "metadata": {
+                    "kind": "runtime_compaction",
+                    "stage": "preflight",
+                    "compressed_actions": 5,
+                    "visible": True,
+                },
+            }
+            yield {"type": "content", "delta": "Hello from test agent", "metadata": {}}
+            yield {"type": "done", "delta": "", "metadata": {"content": "Hello from test agent"}}
+
+        agent.stream = _stream_with_notice
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_notice1",
+                "method": "chat.send",
+                "params": {
+                    "message": "hello stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            notice_events = [
+                e for e in events
+                if e.get("type") == "event"
+                and e.get("event") == "agent.stream.chunk"
+                and e.get("data", {}).get("type") == "notice"
+            ]
+
+            assert len(notice_events) == 1
+            assert notice_events[0]["data"]["metadata"]["kind"] == "runtime_compaction"
+            assert notice_events[0]["data"]["metadata"]["stage"] == "preflight"
+            assert "compacted" in notice_events[0]["data"]["delta"]
+
+    def test_stream_tool_result_chunk_surfaces_output_payload(self, client):
+        """WS tool_result chunks should expose output in both delta and metadata aliases."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _stream_with_tool_result(**kwargs):
+            yield {
+                "type": "tool_call",
+                "delta": "",
+                "metadata": {
+                    "id": "call_1",
+                    "name": "shell",
+                    "arguments": '{"command":"pwd"}',
+                },
+            }
+            yield {
+                "type": "tool_result",
+                "delta": "",
+                "metadata": {
+                    "id": "call_1",
+                    "tool_call_id": "call_1",
+                    "name": "shell",
+                    "result": "/workspace",
+                },
+            }
+            yield {"type": "content", "delta": "Done.", "metadata": {}}
+            yield {"type": "done", "delta": "", "metadata": {"content": "Done."}}
+
+        agent.stream = _stream_with_tool_result
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_tool_result1",
+                "method": "chat.send",
+                "params": {
+                    "message": "hello stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            tool_result_events = [
+                e for e in events
+                if e.get("type") == "event"
+                and e.get("event") == "agent.stream.chunk"
+                and e.get("data", {}).get("type") == "tool_result"
+            ]
+
+            assert len(tool_result_events) == 1
+            tool_result = tool_result_events[0]["data"]
+            assert tool_result["delta"] == "/workspace"
+            assert tool_result["metadata"]["result"] == "/workspace"
+            assert tool_result["metadata"]["output"] == "/workspace"
+
+    def test_stream_empty_final_response_gets_user_visible_fallback(self, client):
+        """Streaming chat should never complete with an empty user-visible response."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _empty_stream(**kwargs):
+            yield {"type": "tool_call", "delta": "", "metadata": {"name": "shell"}}
+            yield {"type": "done", "delta": "", "metadata": {}}
+
+        agent.stream = _empty_stream
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_empty1",
+                "method": "chat.send",
+                "params": {
+                    "message": "empty stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            response = next((e for e in events if e.get("type") == "response"), None)
+            assert response is not None
+            assert response["result"]["content"].strip()
+            assert "empty final response" in response["result"]["content"]
+
+            done = next(
+                e for e in events
+                if e.get("type") == "event" and e.get("event") == "agent.stream.done"
+            )
+            assert done["data"]["content"].strip()
+
+
+    def test_new_chat_request_interrupts_stale_streaming_turn(self, client):
+        """A newer chat request should supersede a still-running stream."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _stream(**kwargs):
+            yield {"type": "content", "delta": "old partial", "metadata": {}}
+            await asyncio.sleep(30)
+
+        agent.stream = _stream
+        agent.process = AsyncMock(return_value="latest answer")
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "old_stream",
+                "method": "chat.send",
+                "params": {
+                    "message": "first request",
+                    "stream": True,
+                },
+            })
+
+            saw_old_partial = False
+            for _ in range(10):
+                msg = ws.receive_json()
+                if (
+                    msg.get("type") == "event"
+                    and msg.get("event") == "agent.stream.chunk"
+                    and msg.get("data", {}).get("delta") == "old partial"
+                ):
+                    saw_old_partial = True
+                    break
+            assert saw_old_partial
+
+            ws.send_json({
+                "type": "request",
+                "id": "new_turn",
+                "method": "chat.send",
+                "params": {
+                    "message": "second request",
+                    "stream": False,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response" and msg.get("id") == "new_turn":
+                    break
+
+            old_error = next(
+                (m for m in events if m.get("type") == "error" and m.get("id") == "old_stream"),
+                None,
+            )
+            assert old_error is not None
+            assert old_error["error"]["code"] == "REQUEST_INTERRUPTED"
+
+            new_response = next(
+                (m for m in events if m.get("type") == "response" and m.get("id") == "new_turn"),
+                None,
+            )
+            assert new_response is not None
+            assert new_response["result"]["content"] == "latest answer"
+
+    def test_non_stream_empty_final_response_gets_user_visible_fallback(self, client):
+        """Non-streaming chat should never return an empty user-visible response."""
+        agent = app_module._agent
+        assert agent is not None
+        agent.process = AsyncMock(return_value="")
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "nostream_empty1",
+                "method": "chat.send",
+                "params": {
+                    "message": "empty non-stream",
+                    "stream": False,
+                },
+            })
+
+            events = []
+            for _ in range(10):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            response = next((e for e in events if e.get("type") == "response"), None)
+            assert response is not None
+            assert response["result"]["content"].strip()
+            assert "empty final response" in response["result"]["content"]
+
     def test_non_stream_returns_content(self, client):
         """Non-streaming chat should return non-empty content."""
         with client.websocket_connect("/v1/ws") as ws:

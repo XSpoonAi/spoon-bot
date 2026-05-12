@@ -160,7 +160,7 @@ async def test_install_anti_loop_tracker_logs_provider_reasoning_summary():
 
 @pytest.mark.requires_spoon_core
 @pytest.mark.asyncio
-async def test_install_anti_loop_tracker_uses_non_summary_progress_guard():
+async def test_install_anti_loop_tracker_does_not_append_prompt_progress_guard():
     from spoon_ai.schema import Function, ToolCall
     from spoon_bot.agent.loop import AgentLoop
 
@@ -198,7 +198,6 @@ async def test_install_anti_loop_tracker_uses_non_summary_progress_guard():
 
     assert len(seen_prompts) == 2
     assert seen_prompts[0] == "prompt"
-    assert seen_prompts[1] is not None
-    assert "[ALREADY COMPLETED ACTIONS - do not repeat]" in seen_prompts[1]
-    assert "[DONE]" not in seen_prompts[1]
-    assert "Do not restate this list to the user." in seen_prompts[1]
+    assert seen_prompts[1] == "prompt"
+    assert "[ALREADY COMPLETED ACTIONS - do not repeat]" not in seen_prompts[1]
+    assert "Do not restate this list to the user." not in seen_prompts[1]

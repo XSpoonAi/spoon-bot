@@ -245,8 +245,13 @@ class PathValidator:
             # Get the target of the symlink
             target = path.resolve(strict=True)
 
-            # Check if target is within workspace
-            if not self._is_within_workspace(target):
+            # Check if target is within workspace or an explicitly allowed
+            # read-only root, such as an installed skill directory outside the
+            # runtime workspace.
+            if (
+                not self._is_within_workspace(target)
+                and not self._is_within_additional_read_paths(target)
+            ):
                 return False, f"Symlink target '{target}' escapes workspace boundary"
 
             # Recursively check if target is also a symlink

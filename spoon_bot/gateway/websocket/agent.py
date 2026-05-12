@@ -168,10 +168,12 @@ class WSDialogueAgent:
         self._cancel_requested = False
         self._initialized = False
 
+        yolo_mode = bool(getattr(self._config, "yolo_mode", False))
+
         # Default tool permissions (can be configured)
         self._default_permissions = {
-            "shell_execute": ToolPermission.CONFIRM,
-            "file_delete": ToolPermission.CONFIRM,
+            "shell_execute": ToolPermission.ALLOW if yolo_mode else ToolPermission.CONFIRM,
+            "file_delete": ToolPermission.ALLOW if yolo_mode else ToolPermission.CONFIRM,
             "file_write": ToolPermission.ALLOW,
             "file_read": ToolPermission.ALLOW,
             "web_request": ToolPermission.ALLOW,

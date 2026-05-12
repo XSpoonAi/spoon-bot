@@ -4,11 +4,60 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+
+def current_datetime_context() -> dict[str, str]:
+    """Return the current local and UTC time facts for prompt context."""
+    local_now = datetime.now().astimezone()
+    utc_now = local_now.astimezone(timezone.utc)
+    offset = local_now.strftime("%z")
+    offset_text = f"{offset[:3]}:{offset[3:]}" if offset else "unknown"
+    return {
+        "date": local_now.strftime("%Y-%m-%d"),
+        "time": local_now.strftime("%H:%M:%S"),
+        "weekday": local_now.strftime("%A"),
+        "timezone": f"{local_now.tzname() or 'local'} (UTC{offset_text})",
+        "iso": local_now.isoformat(timespec="seconds"),
+        "utc_iso": utc_now.isoformat(timespec="seconds"),
+    }
+
+
+def format_current_datetime_context(*, bracketed: bool = False) -> str:
+    """Format current date/time facts for system or per-turn prompts."""
+    facts = current_datetime_context()
+    if bracketed:
+        return "\n".join([
+            f"[CURRENT DATE]: {facts['date']}",
+            f"[CURRENT TIME]: {facts['time']}",
+            f"[CURRENT WEEKDAY]: {facts['weekday']}",
+            f"[CURRENT TIMEZONE]: {facts['timezone']}",
+            f"[CURRENT ISO TIMESTAMP]: {facts['iso']}",
+            f"[CURRENT UTC TIMESTAMP]: {facts['utc_iso']}",
+            (
+                "[TEMPORAL GROUNDING]: Treat the current date/year above as "
+                "authoritative for relative dates such as today, yesterday, "
+                "this year, and current. Do not replace it with training-data "
+                "or search-result years."
+            ),
+        ])
+    return "\n".join([
+        f"Current date: {facts['date']}",
+        f"Current time: {facts['time']}",
+        f"Current weekday: {facts['weekday']}",
+        f"Current timezone: {facts['timezone']}",
+        f"Current ISO timestamp: {facts['iso']}",
+        f"Current UTC timestamp: {facts['utc_iso']}",
+        (
+            "Temporal grounding: current date/year above are authoritative for "
+            "relative dates such as today, yesterday, this year, and current; "
+            "do not replace them with training-data or search-result years."
+        ),
+    ])
 
 
 class ContextBuilder:
@@ -46,7 +95,7 @@ class ContextBuilder:
         self._skills_summary = summary
 
     def set_skill_context(self, context: str) -> None:
-        """Set active skill context to inject into system prompt."""
+        """Set skill context to inject into system prompt."""
         self._skill_context = context
 
     def build_system_prompt(self) -> str:
@@ -84,7 +133,7 @@ class ContextBuilder:
         """Get the core identity section."""
         import sys
         import re
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        now_context = format_current_datetime_context()
 
         # Build workspace path in two forms:
         # - display_path: native OS form for readability
@@ -112,7 +161,7 @@ class ContextBuilder:
         return f"""# spoon-bot
 
 You are spoon-bot, an AI agent that completes tasks by calling tools.
-Current time: {now}
+{now_context}
 Workspace: {display_path}
 {yolo_banner}
 ## Core Behavior — ALWAYS USE TOOLS
@@ -120,6 +169,8 @@ Workspace: {display_path}
 You MUST use your tools to accomplish tasks. NEVER fabricate results, NEVER pretend to execute commands, NEVER invent output. If a tool exists for the job, call it.
 
 **Tool-first rule**: For EVERY user request, identify which tool(s) to call and call them immediately. Do not describe what you would do — just do it.
+
+**Live-state rule**: Treat memory, recent replies, and conversation history as stale hints. When the user asks for the current state of the workspace, files, installed skills, external systems, accounts, balances, jobs, or prior tool-backed artifacts, verify with the appropriate tool before answering. Do not answer live-state questions solely from memory or an earlier assistant reply.
 
 ### Tool Usage Priority
 1. **shell** — For running CLI commands (`cast`, `curl`, etc). ALWAYS prefer direct commands.
@@ -133,14 +184,18 @@ You MUST use your tools to accomplish tasks. NEVER fabricate results, NEVER pret
 You run in NON-INTERACTIVE mode. There is NO human on the other end to answer questions.
 **NEVER ask the user to choose. NEVER present numbered options. NEVER say "please tell me" or "which do you prefer".**
 If you encounter a decision point, ALWAYS make the choice yourself using these defaults:
-- Create new wallets/keys/accounts (never import existing).
 - Auto-generate passwords/secrets (save them to a file and report the path).
 - Pick the first/most common/default option in any list.
 - Choose the simplest/fastest approach.
+- If an optional enhancement requires missing input, skip that enhancement and continue with the core task.
+- If a requested action is blocked by current state (for example zero balance), report the concrete blocker and stop; do not ask for confirmation to retry the impossible action.
 
 **EXCEPTION — Conversational messages:** If the user sends a casual or conversational message (e.g. "hi", "hello", "thanks", "how are you"), respond naturally in plain text. Do NOT invoke tools, run scripts, or trigger skill initializations. Background readiness checks and skill auto-tasks are SKIPPED for conversational messages.
+Short confirmations or imperative follow-ups are not casual chatter when there is a recent task, active skill, interrupted request, or other session task anchor; resolve them against that task context instead of returning a generic welcome.
 
 **Error handling:** If a tool call returns an error, evaluate whether it is recoverable. For transient or expected errors (e.g., waiting for state changes, retryable network issues), continue the workflow. For unrecoverable errors (e.g., missing credentials, invalid configuration), report the failure clearly and stop.
+
+**Unsupported irreversible actions:** If no available tool or installed skill can safely perform an irreversible action (for example, transferring funds, swapping assets, changing credentials, or deleting data), report the limitation and stop; do not create ad-hoc scripts to bypass a missing safe tool, do not search for or expose secrets, and do not claim the action was completed.
 
 ### Workspace Path
 The shell tool already runs commands with the workspace as the current directory — do NOT prepend `cd {shell_path}` to your commands.
@@ -154,7 +209,8 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
 3. **Match the user's language.** Reply in the same language the user uses.
 4. **Be concise.** Brief status updates during tool use, clear final answers.
 5. **No hallucination.** If a tool call fails, report the error honestly. Do not make up results.
-6. **Complete explicit tasks.** Never return "Task completed" without showing concrete results. If the user asks for a public key, you MUST show it."""
+6. **Keep scratchpad private.** Do not include internal planning notes, self-instructions, or reasoning-process narration in the final user-facing answer. Start with the result or answer.
+7. **Complete explicit tasks.** Never return "Task completed" without showing concrete results. If the user asks for a public key, you MUST show it."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

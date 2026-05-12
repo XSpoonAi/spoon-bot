@@ -73,6 +73,13 @@ async def test_prepare_request_context_proactively_compacts_near_context_limit()
         budget_tokens=380_000,
     )
     loop._force_compress_runtime_context.assert_not_called()
+    notices = AgentLoop._drain_runtime_notices(loop)
+    assert len(notices) == 1
+    assert notices[0]["kind"] == "runtime_compaction"
+    assert notices[0]["stage"] == "preflight"
+    assert notices[0]["compressed_actions"] == 3
+    assert notices[0]["estimated_tokens_before"] == 390_000
+    assert notices[0]["estimated_tokens_after"] == 280_000
 
 
 @pytest.mark.asyncio
@@ -182,6 +189,7 @@ def test_insert_compaction_marker_is_runtime_only():
     assert "search_history" in content
     assert "latest real user request" in content
     assert "assistant analysis/conclusions" in content
+    assert "Plain earlier assistant replies are omitted there by default" in content
 
 
 @pytest.mark.requires_spoon_core
@@ -215,6 +223,7 @@ def test_compress_runtime_context_neutralizes_old_assistant_conclusions_but_keep
     assert messages[1].content.startswith("[earlier user message compacted]")
     assert messages[2].content.startswith("[assistant reply compacted;")
     assert "Prioritize the latest user request" in messages[2].content
+    assert "Use search_history to recover exact earlier user/tool facts" in messages[2].content
     assert messages[7].content == latest_request
 
 

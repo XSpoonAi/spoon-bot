@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, Field
@@ -14,7 +14,7 @@ class MetaInfo(BaseModel):
     """Response metadata."""
 
     request_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     duration_ms: int | None = None
     trace_id: str | None = None
     timing: dict[str, Any] | None = None
@@ -249,6 +249,7 @@ class StatusResponse(BaseModel):
     uptime: int  # seconds
     stats: AgentStats
     channels: ChannelsInfo | None = None
+    runtime_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthCheck(BaseModel):

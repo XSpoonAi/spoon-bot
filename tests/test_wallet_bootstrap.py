@@ -182,7 +182,7 @@ async def test_create_agent_skips_wallet_failure_when_not_required(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_create_agent_raises_wallet_failure_when_required(monkeypatch, tmp_path):
+async def test_create_agent_does_not_treat_removed_web3_names_as_wallet_required(monkeypatch, tmp_path):
     from spoon_bot.agent import loop as loop_mod
 
     class FakeAgentLoop:
@@ -198,11 +198,13 @@ async def test_create_agent_raises_wallet_failure_when_required(monkeypatch, tmp
     monkeypatch.setattr(loop_mod, "AgentLoop", FakeAgentLoop)
     monkeypatch.setattr(loop_mod, "ensure_wallet_runtime", fake_ensure_wallet_runtime)
 
-    with pytest.raises(RuntimeError):
-        await loop_mod.create_agent(
-            workspace=tmp_path / "workspace",
-            enabled_tools={"transfer"},
-        )
+    agent = await loop_mod.create_agent(
+        workspace=tmp_path / "workspace",
+        enabled_tools={"transfer"},
+    )
+
+    assert agent.kwargs["enabled_tools"] == {"transfer"}
+    assert os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -219,3 +221,16 @@ def test_web3_tools_default_to_neox(tool_cls, expected_default):
     assert default_value == expected_default
     assert "neox" in tool_cls.SUPPORTED_CHAINS
     assert "neox_testnet" in tool_cls.SUPPORTED_CHAINS
+
+
+def test_core_tool_profile_excludes_removed_web3_transaction_tools():
+    from spoon_bot.agent.tools.registry import TOOL_PROFILES
+
+    removed_tools = {
+        "balance_check",
+        "transfer",
+        "swap",
+        "contract_call",
+    }
+    assert removed_tools.isdisjoint(TOOL_PROFILES["core"])
+    assert "web3" not in TOOL_PROFILES

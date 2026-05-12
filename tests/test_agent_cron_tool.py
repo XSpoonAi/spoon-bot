@@ -143,10 +143,7 @@ async def test_cron_tool_create_preview_and_confirm_uses_current_chat_binding(tm
 
 
 @pytest.mark.asyncio
-async def test_cron_tool_live_info_preview_warns_when_search_provider_missing(tmp_path, monkeypatch):
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+async def test_cron_tool_does_not_infer_allowed_tools_from_prompt(tmp_path):
     agent = DummyAgentLoop(tmp_path)
     _bind_current_chat(agent)
     service = FakeCronService()
@@ -156,19 +153,18 @@ async def test_cron_tool_live_info_preview_warns_when_search_provider_missing(tm
 
     preview = await tool.execute(
         action="create",
-        prompt="Every 5 minutes, fetch the latest news and summarize it for this chat.",
+        prompt="Every 5 minutes, collect release notes and summarize them for this chat.",
         schedule_kind="every",
         every_seconds=300,
     )
-    assert "Capability warning:" in preview
-    assert "No web_search provider is configured" in preview
+    assert "Allowed tools:" not in preview
 
     created = await tool.execute(action="create", confirm=True)
     assert "Created scheduled task successfully" in created
 
     job = next(iter(service.jobs.values()))
     assert job.target_mode == "isolated"
-    assert job.allowed_tools == ["web_search", "web_fetch", "read_file", "list_dir"]
+    assert job.allowed_tools is None
 
 
 @pytest.mark.asyncio
@@ -224,6 +220,37 @@ async def test_cron_tool_list_is_scoped_to_current_chat_binding(tmp_path):
     service.jobs[other_job.id] = other_job
 
     result = await tool.execute(action="list")
+    assert current_job.id in result
+    assert other_job.id not in result
+
+
+@pytest.mark.asyncio
+async def test_cron_tool_list_filters_session_jobs_without_chat_binding(tmp_path):
+    agent = DummyAgentLoop(tmp_path, session_key="ws_session_a")
+    service = FakeCronService()
+    tool = CronTool()
+    tool.set_agent_loop(agent)
+    tool.set_cron_service(service)
+
+    current_job = CronJob(
+        name="Current WS session reminder",
+        prompt="Reply with exactly: hi",
+        schedule=EverySchedule(seconds=60),
+        target_mode="current",
+        session_key="ws_session_a",
+    )
+    other_job = CronJob(
+        name="Other WS session reminder",
+        prompt="Reply with exactly: hi",
+        schedule=EverySchedule(seconds=60),
+        target_mode="current",
+        session_key="ws_session_b",
+    )
+    service.jobs[current_job.id] = current_job
+    service.jobs[other_job.id] = other_job
+
+    result = await tool.execute(action="list")
+
     assert current_job.id in result
     assert other_job.id not in result
 
@@ -356,7 +383,7 @@ async def test_cron_tool_supports_complex_prompt_current_mode_and_silent_deliver
     assert job.session_key == agent.session_key
     assert job.delivery_mode == "none"
     assert job.delivery is None
-    assert "Target mode note:" in preview
+    assert "Target mode note:" not in preview
     assert job.max_attempts == 3
     assert job.backoff_seconds == 30
 

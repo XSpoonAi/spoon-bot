@@ -39,6 +39,20 @@ class TestConfigPriority:
         assert result["provider"] == "anthropic"
         assert result["model"] == "claude-sonnet"
 
+    def test_workspace_env_overrides_yaml_workspace(self, tmp_path, monkeypatch):
+        """A launched gateway workspace should override repo-level YAML defaults."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent:
+              workspace: ~/.spoon-bot/workspace
+        """)
+        runtime_workspace = tmp_path / "runtime-workspace"
+        monkeypatch.setenv("SPOON_BOT_WORKSPACE_PATH", str(runtime_workspace))
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["workspace"] == str(runtime_workspace)
+
     def test_env_used_when_yaml_missing(self, tmp_path, monkeypatch):
         """Env vars fill in fields absent from YAML."""
         cfg_path = self._write_yaml(tmp_path, """\

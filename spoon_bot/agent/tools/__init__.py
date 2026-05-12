@@ -26,12 +26,6 @@ from spoon_bot.agent.tools.self_config import (
     MemoryManagementTool,
     SelfUpgradeTool,
 )
-from spoon_bot.agent.tools.web3 import (
-    BalanceCheckTool,
-    TransferTool,
-    SwapTool,
-    ContractCallTool,
-)
 from spoon_bot.agent.tools.web import (
     WebSearchTool,
     WebFetchTool,
@@ -68,11 +62,6 @@ __all__ = [
     "SelfConfigTool",
     "MemoryManagementTool",
     "SelfUpgradeTool",
-    # Web3
-    "BalanceCheckTool",
-    "TransferTool",
-    "SwapTool",
-    "ContractCallTool",
     # Web
     "WebSearchTool",
     "WebFetchTool",

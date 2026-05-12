@@ -40,6 +40,39 @@ class TestShellTool:
         assert "hello" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_sensitive_env_vars_not_exposed_to_shell(self, shell_tool, monkeypatch):
+        """Shell subprocesses must not inherit secret-bearing env vars."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-secret")
+        monkeypatch.setenv("TAVILY_API_KEY", "tvly-secret")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-secret")
+        monkeypatch.setenv("PRIVATE_KEY", "0x" + "11" * 32)
+        monkeypatch.setenv("SPOON_BOT_DEFAULT_PROVIDER", "openrouter")
+
+        from spoon_bot.agent.tools.shell import _scrub_env
+
+        result_env = _scrub_env(dict(os.environ))
+        result = "\n".join(
+            f"{key}={result_env.get(key, '')}"
+            for key in (
+                "OPENROUTER_API_KEY",
+                "TAVILY_API_KEY",
+                "TELEGRAM_BOT_TOKEN",
+                "PRIVATE_KEY",
+                "SPOON_BOT_DEFAULT_PROVIDER",
+            )
+        )
+
+        assert "OPENROUTER_API_KEY=" in result
+        assert "TAVILY_API_KEY=" in result
+        assert "TELEGRAM_BOT_TOKEN=" in result
+        assert "PRIVATE_KEY=" in result
+        assert "OPENROUTER_API_KEY=sk-or-v1-secret" not in result
+        assert "TAVILY_API_KEY=tvly-secret" not in result
+        assert "TELEGRAM_BOT_TOKEN=telegram-secret" not in result
+        assert "PRIVATE_KEY=0x" not in result
+        assert "SPOON_BOT_DEFAULT_PROVIDER=openrouter" in result
+
+    @pytest.mark.asyncio
     async def test_dangerous_command_blocked(self, shell_tool):
         """Test that dangerous commands are blocked."""
         result = await shell_tool.execute("rm -rf /")
@@ -57,6 +90,36 @@ class TestShellTool:
         """Test handling of nonexistent working directory."""
         result = await shell_tool.execute("echo test", working_dir="/nonexistent/path")
         assert "Error" in result or "not found" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_relative_working_dir_resolves_from_default_workspace(self, tmp_path):
+        """Relative cwd overrides should stay inside the configured workspace."""
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        marker = tmp_path / "marker.txt"
+        marker.write_text("workspace-ok", encoding="utf-8")
+        tool = ShellTool(
+            timeout=5,
+            working_dir=str(tmp_path),
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        result = await tool.execute(
+            "python -c \"print(open('marker.txt').read())\"",
+            working_dir=".",
+        )
+
+        assert "workspace-ok" in result
+
+    def test_windows_posix_drive_working_dir_is_normalized(self):
+        """Windows agents may receive /c/... cwd paths from bash-style output."""
+        if sys.platform != "win32":
+            pytest.skip("Windows-only path normalization")
+
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        assert ShellTool._posix_drive_path_to_windows("/c/Users/Test") == "C:\\Users\\Test"
 
     @pytest.mark.asyncio
     async def test_output_truncation(self):
@@ -254,6 +317,63 @@ class TestShellTool:
         assert "done" in result.lower()
         assert job.job_id not in _SHELL_BACKGROUND_JOBS
 
+    @pytest.mark.asyncio
+    async def test_foreground_cancellation_terminates_job(self, shell_tool):
+        """Cancelling a foreground shell tool call must not leave the process running."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        started = asyncio.Event()
+        terminated = asyncio.Event()
+
+        class _FakeProcess:
+            returncode = None
+            pid = None
+
+            async def wait(self):
+                started.set()
+                while self.returncode is None:
+                    await asyncio.sleep(0.01)
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+                terminated.set()
+
+            def kill(self):
+                self.returncode = -9
+                terminated.set()
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        stdout_task = asyncio.create_task(asyncio.sleep(60))
+        stderr_task = asyncio.create_task(asyncio.sleep(60))
+        job = _BackgroundShellJob(
+            job_id="sh_cancelled",
+            command="sleep 60",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="started",
+        )
+
+        async def _fake_start_background_job(*args, **kwargs):
+            _SHELL_BACKGROUND_JOBS[job.job_id] = job
+            return job
+
+        with patch.object(shell_tool, "_start_background_job", AsyncMock(side_effect=_fake_start_background_job)):
+            task = asyncio.create_task(shell_tool.execute("sleep 60", timeout=60))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert terminated.is_set()
+        assert job.status == "cancelled"
+        assert job.job_id not in _SHELL_BACKGROUND_JOBS
+        assert stdout_task.done()
+        assert stderr_task.done()
+
     def test_windows_shell_uses_user_home_env(self, monkeypatch):
         """Windows bash execution should preserve the user's home path."""
         from spoon_bot.agent.tools.shell import ShellTool
@@ -420,6 +540,33 @@ class TestFilesystemTools:
 
         assert "file1.txt" in result
         assert "file2.txt" in result
+
+    @pytest.mark.asyncio
+    async def test_read_and_list_allowed_external_skill_symlink(self, temp_dir):
+        """Workspace skill links may point at explicitly allowed external roots."""
+        from spoon_bot.agent.tools.filesystem import ListDirTool, ReadFileTool
+
+        external_root = temp_dir.parent / f"{temp_dir.name}-external-skill-root"
+        external_skill = external_root / "spot-agent-cypher"
+        external_skill.mkdir(parents=True)
+        (external_skill / "SKILL.md").write_text("CLI := node cli/index.js\n", encoding="utf-8")
+
+        skills_dir = temp_dir / "skills"
+        skills_dir.mkdir()
+        link_path = skills_dir / "spot-agent-cypher"
+        try:
+            os.symlink(external_skill, link_path, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        list_tool = ListDirTool(workspace=temp_dir, additional_read_paths=[external_root])
+        read_tool = ReadFileTool(workspace=temp_dir, additional_read_paths=[external_root])
+
+        listed = await list_tool.execute("skills/spot-agent-cypher")
+        read = await read_tool.execute("skills/spot-agent-cypher/SKILL.md")
+
+        assert "SKILL.md" in listed
+        assert "CLI := node cli/index.js" in read
 
     @pytest.mark.asyncio
     async def test_list_nonexistent_directory(self, list_tool, temp_dir):

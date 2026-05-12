@@ -9,7 +9,7 @@ Local-first AI agent with native OS tools, powered by spoon-core.
 - **OS-native**: Built-in shell/filesystem tools as priority
 - **Memory-first**: Four-layer memory system (file + semantic search via memsearch + short-term + checkpointer)
 - **Session Persistence**: Pluggable backends — JSONL files (default), SQLite, or PostgreSQL
-- **Web Search**: Built-in Tavily/Brave integration for real-time information retrieval
+- **Web Search**: Built-in DuckDuckGo/Tavily/Brave integration for real-time information retrieval
 - **Self-managing**: Self-configuration, self-upgrade, memory management tools
 - **Web3-enabled**: Blockchain operations via spoon-core and spoon-toolkits
 - **Extensible**: MCP servers + Skills ecosystem with dynamic tool activation
@@ -87,7 +87,8 @@ GEMINI_API_KEY=xxx
 OPENROUTER_API_KEY=sk-or-xxx
 
 # Optional: web search
-TAVILY_API_KEY=tvly-xxx
+# You can provide multiple Tavily keys separated by commas for automatic failover.
+TAVILY_API_KEY=tvly-primary,tvly-secondary
 BRAVE_SEARCH_API_KEY=bsa-xxx
 ```
 
@@ -492,13 +493,14 @@ When enabled, the `memory` tool's `search` action automatically uses semantic se
 
 ## Web Search
 
-spoon-bot includes a built-in web search tool powered by Tavily. The agent autonomously decides when to search the web for real-time information.
+spoon-bot includes a built-in web search tool that prefers Tavily when configured, automatically rotates across comma-separated Tavily API keys on failure, and falls back to DuckDuckGo as a final no-key search provider. Brave remains available as an explicit provider when configured. The agent autonomously decides when to search the web for real-time information.
 
 ### Setup
 
 ```bash
-# Get a free API key at https://tavily.com (1,000 free credits/month)
-export TAVILY_API_KEY=tvly-your-key
+# DuckDuckGo search works as the final fallback without an API key.
+# Optional: get one or more Tavily API keys at https://tavily.com for preferred search.
+export TAVILY_API_KEY=tvly-your-key,tvly-backup-key
 ```
 
 Once configured, the agent will automatically use `web_search` when it needs current information (e.g., prices, news, documentation).
@@ -557,7 +559,7 @@ The agent includes its context budget in the system prompt, allowing it to adjus
 │  └── list_dir        List directory contents                     │
 ├──────────────────────────────────────────────────────────────────┤
 │  Web & Search Tools                                              │
-│  ├── web_search      Tavily-powered real-time web search         │
+│  ├── web_search      DuckDuckGo default real-time web search         │
 │  └── web_fetch       Fetch and parse web page content            │
 ├──────────────────────────────────────────────────────────────────┤
 │  Self-Management Tools                                           │
@@ -769,8 +771,9 @@ asyncio.run(main())
 | `/v1/auth/login` | POST | Authenticate and get JWT tokens |
 | `/v1/agent/chat` | POST | Send message to agent (sync or streaming) |
 | `/v1/agent/chat/async` | POST | Async task-based chat |
-| `/v1/agent/status` | GET | Agent and channel status |
+| `/v1/agent/status` | GET | Agent, channel, and session runtime status |
 | `/v1/sessions` | GET/POST | Manage sessions |
+| `/v1/sessions/{session_key}/close` | POST | Close an in-memory session runtime without deleting history |
 | `/v1/tools` | GET | List available tools |
 | `/v1/skills` | GET/POST | List and manage skills |
 | `/v1/ws` | WS | WebSocket for real-time communication |
@@ -780,9 +783,25 @@ asyncio.run(main())
 The WebSocket endpoint supports:
 - `chat.send` — send messages (stream/non-stream)
 - `chat.cancel` — cancel in-flight requests (stream and non-stream)
-- `session.switch` / `session.list` / `session.export` / `session.import` — session management
+- `session.switch` / `session.list` / `session.close` / `session.export` / `session.import` — session management
+- `agent.status` — includes `runtime_metrics` for active, running, idle, closed, and evicted session runtimes
 - `subscribe` / `unsubscribe` — event subscriptions
 - Input validation with structured error codes (`INVALID_PARAMS`, `AGENT_NOT_READY`, etc.)
+
+### Multi-Session Runtime
+
+Gateway mode runs each logical `session_key` on its own in-memory agent runtime. Session history is still persisted through the configured `SessionManager`, but mutable execution state such as the active agent, current task, tool context, and cancellation state is scoped to the session runtime.
+
+Runtime behavior:
+
+- Requests without `session_key` use the backward-compatible `default` session.
+- The same `session_key` is serialized with a session-local lock, preserving message order.
+- Different `session_key` values can run concurrently across REST, SSE, WebSocket, channels, and cron.
+- A single WebSocket connection can send multiple `chat.send` requests for different sessions; their stream chunks may arrive interleaved and should be routed by `session_key` and `request_id`.
+- Streaming events include `task_id`, `request_id`, `session_key`, and `trace_id` on `agent.thinking`, `agent.stream.chunk`, `agent.stream.done`, `agent.complete`, `agent.error`, and `agent.cancelled`.
+- `session.close` releases an idle non-default in-memory runtime while keeping persisted history. Busy runtimes are not closed.
+
+Operational check: if a deployed gateway emits `agent.thinking` or `agent.stream.chunk` without `request_id` and `session_key`, it is usually running an older image or process. Rebuild and deploy a new image tag before retesting multi-session streaming.
 
 ### Authentication
 
@@ -902,7 +921,7 @@ Complex scheduled tasks follow a stricter runtime model:
 For news/weather/search-driven cron jobs, configure at least one web-search provider before enabling the task:
 
 ```bash
-export TAVILY_API_KEY=tvly-your-key
+export TAVILY_API_KEY=tvly-your-key,tvly-backup-key
 # or
 export BRAVE_SEARCH_API_KEY=bsa-your-key
 ```
@@ -942,7 +961,7 @@ ruff check spoon_bot/
 | `DEEPSEEK_API_KEY` | — | DeepSeek API key |
 | `GEMINI_API_KEY` | — | Google Gemini API key |
 | `OPENROUTER_API_KEY` | — | OpenRouter API key |
-| `TAVILY_API_KEY` | — | Tavily web search API key |
+| `TAVILY_API_KEY` | — | Optional Tavily web search API key |
 | `BRAVE_SEARCH_API_KEY` | — | Brave Search API key |
 | `BRAVE_API_KEY` | — | Alias for `BRAVE_SEARCH_API_KEY` |
 | `OPENAI_EMBEDDING_API_KEY` | — | Embedding provider API key (falls back to `OPENAI_API_KEY`) |
@@ -951,6 +970,8 @@ ruff check spoon_bot/
 | `SESSION_STORE_BACKEND` | `file` | Session backend: `file`, `sqlite`, `postgres` |
 | `SESSION_STORE_DB_PATH` | `./workspace/sessions.db` | SQLite database path |
 | `SESSION_STORE_DSN` | — | PostgreSQL connection string |
+| `SPOON_BOT_SESSION_RUNTIME_IDLE_SECONDS` | `1800` | Close idle non-default session runtimes after this many seconds; `0` disables idle cleanup |
+| `SPOON_BOT_SESSION_RUNTIME_MAX_ACTIVE` | `64` | Maximum live session runtimes before LRU idle eviction; `0` disables the limit |
 | `SPOON_BOT_CONTEXT_WINDOW` | auto | Context window override (tokens, recommended) |
 | `CONTEXT_WINDOW` | auto | Legacy alias for `SPOON_BOT_CONTEXT_WINDOW` |
 | `GATEWAY_AUTH_REQUIRED` | `false` | Enable gateway authentication |
