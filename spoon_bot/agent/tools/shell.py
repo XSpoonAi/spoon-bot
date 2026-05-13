@@ -429,37 +429,6 @@ class ShellTool(Tool):
     - Safe argument parsing with shlex
     """
 
-    SIDE_EFFECT_SERIES_VERBS: set[str] = {
-        "apply",
-        "approve",
-        "challenge-answer",
-        "claim",
-        "commit",
-        "create",
-        "delete",
-        "deploy",
-        "faucet",
-        "finalize",
-        "fund",
-        "join",
-        "mint",
-        "publish",
-        "push",
-        "register",
-        "remove",
-        "restart",
-        "reveal",
-        "send",
-        "settle",
-        "submit",
-        "swap",
-        "trade",
-        "transfer",
-        "update",
-        "upload",
-        "write",
-    }
-
     def __init__(
         self,
         timeout: int = DEFAULT_SHELL_TIMEOUT,
@@ -586,52 +555,6 @@ class ShellTool(Tool):
                 },
             },
         }
-
-    def tool_invocation_series_key(self, arguments: dict[str, Any]) -> str | None:
-        """Return a generic side-effect command family for per-request loop guards."""
-        if not isinstance(arguments, dict):
-            return None
-        action = str(arguments.get("action") or "execute").strip().lower()
-        if action != "execute":
-            return None
-        return self._side_effect_command_series_key(arguments.get("command"))
-
-    @classmethod
-    def _side_effect_command_series_key(cls, command: Any) -> str | None:
-        if not isinstance(command, str) or not command.strip():
-            return None
-
-        normalized = command.replace("\\\n", " ").replace("\n", " ")
-        for segment in re.split(r"\s*(?:&&|\|\||;|\|)\s*", normalized):
-            tokens = cls._tokenize_command_segment_for_series(segment)
-            if not tokens:
-                continue
-            lowered = [token.strip("'\"").lower() for token in tokens if token.strip("'\"")]
-            for index, token in enumerate(lowered):
-                if token not in cls.SIDE_EFFECT_SERIES_VERBS:
-                    continue
-                prefix_tokens = [
-                    item
-                    for item in lowered[max(0, index - 2):index]
-                    if not cls._looks_like_env_assignment(item)
-                ]
-                prefix = " ".join(prefix_tokens)
-                return f"{prefix} {token}".strip()
-        return None
-
-    @staticmethod
-    def _tokenize_command_segment_for_series(segment: str) -> list[str]:
-        segment = str(segment or "").strip()
-        if not segment:
-            return []
-        try:
-            return shlex.split(segment, posix=True)
-        except ValueError:
-            return re.findall(r"[^\s\"']+", segment)
-
-    @staticmethod
-    def _looks_like_env_assignment(token: str) -> bool:
-        return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", str(token or "")))
 
     def _parse_command_args(self, command: str) -> list[str]:
         """
