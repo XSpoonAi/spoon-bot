@@ -1360,14 +1360,14 @@ class TestContextBuilderMediaPaths:
         loop._session = Session(session_key="preloaded-skill-summary")
         loop._session.add_message(
             "user",
-            "继续刚才的任务，先检查状态。\n\n---\n[PRE-LOADED SKILL: demo-skill]\nBase directory: /tmp/demo\nDo not search for alternatives.",
+            "Continue the previous task and check status first.\n\n---\n[PRE-LOADED SKILL: demo-skill]\nBase directory: /tmp/demo\nDo not search for alternatives.",
         )
         loop._session.add_message(
             "assistant",
             "Checked the current status and confirmed the job is paused at step 2.",
         )
 
-        recall = AgentLoop._build_session_recall_context(loop, "继续")
+        recall = AgentLoop._build_session_recall_context(loop, "Continue")
 
         assert "Recent completed turn summaries:" in recall
         assert "[PRE-LOADED SKILL:" not in recall
@@ -1572,22 +1572,22 @@ class TestAgentLoopSameSessionContext:
         session = Session(session_key="long_same_session_memory")
         session.add_message(
             "user",
-            "记住这个项目代号是 Nimbus，事故负责人是 Alice，后面我会再问你。",
+            "Remember this project codename is Nimbus and the incident owner is Alice. I will ask again later.",
         )
         session.add_message(
             "assistant",
-            "已记录：项目代号 Nimbus，事故负责人 Alice。",
+            "Recorded: project codename Nimbus, incident owner Alice.",
         )
         for index in range(2, 19):
-            session.add_message("user", f"第 {index} 轮普通跟进，记录状态 {index}。")
-            session.add_message("assistant", f"第 {index} 轮已处理，状态 {index} 已确认。")
+            session.add_message("user", f"Round {index} normal follow-up, record state {index}.")
+            session.add_message("assistant", f"Round {index} processed, state {index} confirmed.")
 
         agent = _PromptCapturingRuntimeAgent("Nimbus")
         loop = _build_process_test_loop(tmp_dir, agent=agent, session=session)
 
         response = await AgentLoop.process(
             loop,
-            message="聊了这么久之后，之前让我记住的项目代号是什么？只回答代号。",
+            message="After this long chat, what was the project codename I asked you to remember? Reply with codename only.",
         )
 
         assert response == "Nimbus"
@@ -1595,7 +1595,7 @@ class TestAgentLoopSameSessionContext:
         assert "## Active Request Context" in captured_prompt
         assert "## Current Session Compact" in captured_prompt
         assert "[USER REQUEST]:" in captured_prompt
-        assert "聊了这么久之后，之前让我记住的项目代号是什么？只回答代号。" in captured_prompt
+        assert "After this long chat, what was the project codename I asked you to remember? Reply with codename only." in captured_prompt
         assert "Nimbus" in captured_prompt
         assert "Alice" in captured_prompt
         assert "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions." in captured_prompt

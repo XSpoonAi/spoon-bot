@@ -49,7 +49,7 @@ def extract(data: dict) -> str:
 async def test_btc_price():
     """BTC price query — numeric answer, not code."""
     print("\n━━━ §1 BTC Price ━━━")
-    data = await chat("BTC价格多少？", "test-btc-price")
+    data = await chat("What is the BTC price now?", "test-btc-price")
     resp = extract(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success"), f"Fail: {data}"
@@ -62,7 +62,7 @@ async def test_btc_price():
 async def test_eth_price():
     """ETH price via auto-selected provider."""
     print("\n━━━ §1 ETH Price ━━━")
-    data = await chat("ETH现在多少钱", "test-eth-price")
+    data = await chat("What is ETH trading at now?", "test-eth-price")
     resp = extract(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success"), f"Fail: {data}"
@@ -73,7 +73,7 @@ async def test_eth_price():
 async def test_sol_price():
     """SOL price — Raydium provider."""
     print("\n━━━ §1 SOL Price ━━━")
-    data = await chat("SOL最近行情如何？价格是多少", "test-sol-price")
+    data = await chat("How is SOL performing lately? What is the current price?", "test-sol-price")
     resp = extract(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success"), f"Fail: {data}"
@@ -84,7 +84,7 @@ async def test_sol_price():
 async def test_ambiguous_crypto():
     """Ambiguous crypto query with comparison."""
     print("\n━━━ §1 Ambiguous Crypto ━━━")
-    data = await chat("WBTC和BTC有什么区别？价格差多少？", "test-ambiguous")
+    data = await chat("What is the difference between WBTC and BTC? How far apart are their prices?", "test-ambiguous")
     resp = extract(data)
     print(f"  Reply: {resp[:400]}")
     assert data.get("success"), f"Fail: {data}"
@@ -100,7 +100,7 @@ async def test_ambiguous_crypto():
 async def test_coding_question():
     """Non-crypto coding question should NOT activate crypto tools."""
     print("\n━━━ §2 Coding Question ━━━")
-    data = await chat("Python如何读取JSON文件？", "test-coding-01")
+    data = await chat("How do I read a JSON file in Python?", "test-coding-01")
     resp = extract(data)
     print(f"  Reply: {resp[:400]}")
     assert data.get("success"), f"Fail: {data}"
@@ -121,10 +121,10 @@ async def test_single_word_token():
     print("  ✅ PASSED")
 
 
-async def test_chinese_crypto_slang():
-    """'大饼' (BTC slang) should trigger tool activation."""
-    print("\n━━━ §2 Chinese Crypto Slang ━━━")
-    data = await chat("大饼现在什么价", "test-slang-01")
+async def test_crypto_symbol_slang():
+    """Lowercase crypto shorthand should still trigger tool activation."""
+    print("\n━━━ §2 Crypto Symbol Slang ━━━")
+    data = await chat("btc price now?", "test-slang-01")
     resp = extract(data)
     print(f"  Reply: {resp[:400]}")
     assert data.get("success") and resp, f"Fail: {data}"
@@ -136,9 +136,9 @@ async def test_follow_up_in_session():
     """Follow-up in same session maintains context."""
     print("\n━━━ §2 Follow-up Session ━━━")
     sid = "test-followup-01"
-    data1 = await chat("SOL多少钱", sid)
+    data1 = await chat("What is the SOL price?", sid)
     assert data1.get("success"), f"Q1 Fail: {data1}"
-    data2 = await chat("那ETH呢", sid)
+    data2 = await chat("What about ETH?", sid)
     resp2 = extract(data2)
     print(f"  Q2 Reply: {resp2[:200]}")
     assert data2.get("success"), f"Q2 Fail: {data2}"
@@ -150,7 +150,7 @@ async def test_follow_up_in_session():
 async def test_math_question():
     """Math question should NOT activate specialized tools."""
     print("\n━━━ §2 Math Question ━━━")
-    data = await chat("1+1等于多少", "test-math-01")
+    data = await chat("What is 1+1?", "test-math-01")
     resp = extract(data)
     print(f"  Reply: {resp[:200]}")
     assert data.get("success"), f"Fail: {data}"
@@ -161,7 +161,7 @@ async def test_math_question():
 async def test_general_search():
     """Non-crypto query uses web_search, not crypto tools."""
     print("\n━━━ §2 General Search ━━━")
-    data = await chat("今天天气怎么样", "test-general-search")
+    data = await chat("How is the weather today?", "test-general-search")
     resp = extract(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success") and resp, f"Fail: {data}"
@@ -239,7 +239,7 @@ async def main():
         test_btc_price, test_eth_price, test_sol_price, test_ambiguous_crypto,
         # §2 Non-crypto & edge cases
         test_tools_list, test_math_question, test_coding_question,
-        test_single_word_token, test_chinese_crypto_slang,
+        test_single_word_token, test_crypto_symbol_slang,
         test_follow_up_in_session, test_general_search,
         # §3 Real agent
         test_agent_real,
