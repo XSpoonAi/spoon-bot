@@ -671,6 +671,15 @@ class WebSocketHandler:
             return self._chat_task_ids.get(session_key)
         return self._current_task_id
 
+    def _session_key_for_task_id(self, task_id: str | None) -> str | None:
+        task_id = (task_id or "").strip()
+        if not task_id:
+            return None
+        for session_key, current_task_id in self._chat_task_ids.items():
+            if current_task_id == task_id:
+                return session_key
+        return None
+
     def _request_current_task_cancel(self, session_key: str | None = None) -> None:
         if session_key:
             self._cancel_requested_by_session[session_key] = True
@@ -1060,11 +1069,23 @@ class WebSocketHandler:
             if isinstance(params, dict) and "session_key" in params
             else None
         )
+        requested_task_id = (
+            str(params.get("task_id") or "").strip()
+            if isinstance(params, dict)
+            else ""
+        )
+        if requested_task_id:
+            session_key = self._session_key_for_task_id(requested_task_id) or session_key
         self._request_current_task_cancel(session_key)
-        task_id = self._current_task_id_for_cancel(session_key)
+        task_id = requested_task_id or self._current_task_id_for_cancel(session_key)
 
         # Also cancel the asyncio task if running (#13)
         cancelled = await self._cancel_current_task_for_cleanup(session_key=session_key)
+        if not cancelled and session_key is not None and len(self._chat_tasks) == 1:
+            fallback_session_key = next(iter(self._chat_tasks))
+            self._request_current_task_cancel(fallback_session_key)
+            task_id = task_id or self._current_task_id_for_cancel(fallback_session_key)
+            cancelled = await self._cancel_current_task_for_cleanup(session_key=fallback_session_key)
 
         content = "Task interrupted." if cancelled else "No active task to cancel."
         return {
