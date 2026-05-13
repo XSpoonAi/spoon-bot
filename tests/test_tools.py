@@ -72,6 +72,44 @@ class TestShellTool:
         assert "PRIVATE_KEY=0x" not in result
         assert "SPOON_BOT_DEFAULT_PROVIDER=openrouter" in result
 
+    def test_side_effect_series_key_normalizes_external_cli_actions(self, shell_tool):
+        """Repeated side-effecting CLI actions should share a guard key without prompt routing."""
+        first = shell_tool.tool_invocation_series_key(
+            {
+                "command": (
+                    "cd /workspace/tools/demo && SECRET_REF=$KEY "
+                    "runner taskctl submit 47 A"
+                )
+            }
+        )
+        second = shell_tool.tool_invocation_series_key(
+            {
+                "command": (
+                    "cd /workspace/tools/demo && SECRET_REF=$KEY "
+                    "runner taskctl submit 48 B"
+                )
+            }
+        )
+        simulated = shell_tool.tool_invocation_series_key(
+            {"command": "echo runner taskctl submit 49 C"}
+        )
+        read_only = shell_tool.tool_invocation_series_key(
+            {"command": "cd /workspace/tools/demo && runner taskctl list"}
+        )
+
+        assert first == "runner taskctl submit"
+        assert second == first
+        assert simulated == first
+        assert read_only is None
+
+    def test_shell_description_preserves_protective_wrappers(self, shell_tool):
+        """Tool instructions should not invite converting a replay into a live command."""
+        description = shell_tool.description
+
+        assert "execute it exactly as provided" in description
+        assert "do not remove protective wrappers" in description
+        assert "echo/printf" in description
+
     @pytest.mark.asyncio
     async def test_dangerous_command_blocked(self, shell_tool):
         """Test that dangerous commands are blocked."""

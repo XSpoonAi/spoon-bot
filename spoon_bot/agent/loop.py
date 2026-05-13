@@ -156,6 +156,22 @@ _ATTACHMENT_ONLY_PLACEHOLDER = (
 )
 _SANDBOX_WORKSPACE_ROOT = "/workspace"
 _MISSING = object()
+_EXTERNAL_SIDE_EFFECT_BOUNDARY = (
+    "[EXTERNAL SIDE-EFFECT BOUNDARY]: For external systems, account/wallet "
+    "state, remote jobs, approvals, registrations, entries, submissions, "
+    "trades, or any action that spends credits/tokens/funds or changes remote "
+    "state, do at most one unit of side effect per user request unless the "
+    "newest request gives an explicit count or range. After one unit, report "
+    "the result or concrete blocker; do not loop into additional units just "
+    "because tools remain available. Do not batch multiple alternative tool "
+    "attempts in one assistant step; run one attempt, inspect its result, and "
+    "then either answer with the blocker or proceed only when the newest "
+    "request explicitly allows another attempt. If the user gives an exact command for "
+    "a replay, simulation, dry-run, or no-op check, run that command exactly "
+    "as written; never remove protective wrappers such as echo/printf or "
+    "dry-run/no-op flags, and never convert a simulated command into a live "
+    "side-effecting command.\n"
+)
 _TURN_STATE_PENDING = "pending"
 _TURN_STATE_COMPLETED = "completed"
 _TURN_STATE_INTERRUPTED = "interrupted"
@@ -4358,6 +4374,70 @@ class AgentLoop:
         return result.strip()
 
     @staticmethod
+    def _looks_like_raw_tool_transcript_leak(content: str) -> bool:
+        """Return True when provider fallback text is dominated by tool transcript artifacts."""
+        text = str(content or "")
+        if "Observed output of cmd" not in text:
+            return False
+        if len(text) >= 4_000:
+            return True
+        return bool(re.search(r"(?s).\s*Step\s+\d+:\s*Observed output of cmd", text))
+
+    @staticmethod
+    def _compact_tool_evidence_text(value: Any, *, limit: int = 700) -> str:
+        text = AgentLoop._stringify_stream_payload(value)
+        text = re.sub(r"^Observed output of cmd [^\n]* execution:\s*", "", text.strip())
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+        if lines:
+            text = "\n".join(lines)
+        text = AgentLoop._mask_user_visible_text(text)
+        if len(text) <= limit:
+            return text
+        head = text[: max(120, limit // 2)].rstrip()
+        tail = text[-max(120, limit // 3):].lstrip()
+        return f"{head}\n... (tool output truncated)\n{tail}"
+
+    def _build_raw_tool_transcript_leak_response(self, start_index: int) -> str:
+        """Build a bounded fallback when raw tool transcript text leaks as final content."""
+        parts = [
+            "The model returned raw tool transcript text instead of a clean final answer.",
+            "Recent tool evidence:",
+        ]
+
+        try:
+            messages = AgentLoop._get_runtime_memory_messages(self)
+        except Exception:
+            messages = []
+        if not isinstance(messages, list):
+            messages = []
+        if isinstance(start_index, int) and start_index >= 0:
+            messages = messages[start_index:]
+
+        tool_lines: list[str] = []
+        for msg in messages:
+            if AgentLoop._stream_message_role(msg).lower() != "tool":
+                continue
+            content = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if content in (None, ""):
+                content = AgentLoop._stream_message_attr(msg, "content", "")
+            summary = AgentLoop._compact_tool_evidence_text(content)
+            if not summary:
+                continue
+            name = str(
+                AgentLoop._stream_message_attr(msg, "name", None)
+                or AgentLoop._stream_message_attr(msg, "tool_name", None)
+                or "tool"
+            )
+            tool_lines.append(f"Tool `{name}` output:\n{summary}")
+
+        if tool_lines:
+            parts.extend(tool_lines[-3:])
+        else:
+            parts.append("No bounded tool evidence was captured before cleanup.")
+        parts.append("Please continue or retry if you need the agent to finish the remaining work.")
+        return "\n\n".join(parts)
+
+    @staticmethod
     def _looks_like_internal_scratchpad_text(text: str) -> bool:
         """Return True for short provider-surfaced planning notes."""
         compact = " ".join(str(text or "").strip().split())
@@ -4441,6 +4521,13 @@ class AgentLoop:
         turn_memory_start_index: int,
     ) -> str:
         """Apply generic execution-step filtering without prompt-derived dispatch."""
+        if AgentLoop._looks_like_raw_tool_transcript_leak(content):
+            return AgentLoop._mask_user_visible_text(
+                AgentLoop._build_raw_tool_transcript_leak_response(
+                    self,
+                    turn_memory_start_index,
+                )
+            )
         filtered = AgentLoop._filter_execution_steps(self, content)
         cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
         return AgentLoop._mask_user_visible_text(cleaned)
@@ -4550,17 +4637,36 @@ class AgentLoop:
         return f"Tool `{tool_name}` output:\n{text}"
 
     @staticmethod
+    def _is_tool_loop_suppression_event(event: dict[str, Any]) -> bool:
+        """Return True for tool guardrail results that should end the current loop."""
+        metadata = dict(event.get("metadata") or {})
+        payload = (
+            metadata.get("model_result")
+            or metadata.get("model_output")
+            or metadata.get("model_content")
+            or metadata.get("output")
+            or metadata.get("result")
+            or metadata.get("content")
+            or metadata.get("full_output")
+            or metadata.get("full_result")
+            or event.get("delta")
+        )
+        text = AgentLoop._stringify_stream_payload(payload).lower()
+        return "stop_tool_loop" in text
+
+    @staticmethod
     def _build_tool_loop_fallback_response(
         tool_result_events: list[dict[str, Any]],
         *,
         reason: str,
     ) -> str:
         """Return a bounded final answer when a tool loop never yields final content."""
-        reason_text = (
-            "the agent kept running tools without producing a final answer"
-            if reason == "tool_followup_timeout"
-            else "the request reached the response time budget while tools were still active"
-        )
+        if reason == "tool_followup_timeout":
+            reason_text = "the agent kept running tools without producing a final answer"
+        elif reason == "tool_suppression":
+            reason_text = "a tool guardrail suppressed repeated work for the same action"
+        else:
+            reason_text = "the request reached the response time budget while tools were still active"
         parts = [
             f"The agent stopped the tool loop because {reason_text}.",
             "Recent tool evidence:",
@@ -4573,7 +4679,10 @@ class AgentLoop:
             parts.extend(summaries)
         else:
             parts.append("No tool result text was captured before the stop condition.")
-        parts.append("Continue the task to let the agent proceed from this tool evidence.")
+        if reason == "tool_suppression":
+            parts.append("Stop here and report the latest result or blocker; do not retry the same tool action.")
+        else:
+            parts.append("Continue the task to let the agent proceed from this tool evidence.")
         return "\n\n".join(parts)
 
     def _get_runtime_memory_messages(self) -> list[Any]:
@@ -4726,6 +4835,9 @@ class AgentLoop:
         tool_output_capture_scope: str | None = None
         capture_manager = None
         withheld_initial_content = False
+        pending_fallback_content_emit = False
+        pending_fallback_reason: str | None = None
+        pending_fallback_delta = ""
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context(message)
@@ -4993,6 +5105,10 @@ class AgentLoop:
                 _record_tool_result_events(tool_result_events)
                 for event in tool_result_events:
                     yield _decorate_stream_event(event)
+                if any(AgentLoop._is_tool_loop_suppression_event(event) for event in tool_result_events):
+                    logger.warning("Stopping tool loop after repeated-tool guardrail result.")
+                    _stop_tool_loop("tool_suppression")
+                    break
                 if _stop_if_total_timeout():
                     break
 
@@ -5129,38 +5245,12 @@ class AgentLoop:
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
                         last_tool_progress_at = time.monotonic()
+                        # These buffers hold inferred private tool-planning text.
+                        # Only provider-declared thinking chunks should reach the UI.
                         if pre_tool_scratchpad_events:
-                            if thinking:
-                                for buffered in pre_tool_scratchpad_events:
-                                    buffered_metadata = dict(buffered.get("metadata") or {})
-                                    for key in ("segment_index", "segment_start", "segment_type"):
-                                        buffered_metadata.pop(key, None)
-                                    yield _decorate_stream_event({
-                                        "type": "thinking",
-                                        "delta": buffered.get("delta", ""),
-                                        "metadata": {
-                                            **buffered_metadata,
-                                            "phase": "pre_tool_scratchpad",
-                                            "source": buffered_metadata.get("source", "pre_tool_content"),
-                                        },
-                                    })
                             pre_tool_scratchpad_events = []
                             pre_tool_scratchpad_buffer = ""
                         if post_tool_content_buffer:
-                            if thinking:
-                                for buffered in post_tool_content_events:
-                                    buffered_metadata = dict(buffered.get("metadata") or {})
-                                    for key in ("segment_index", "segment_start", "segment_type"):
-                                        buffered_metadata.pop(key, None)
-                                    yield _decorate_stream_event({
-                                        "type": "thinking",
-                                        "delta": buffered.get("delta", ""),
-                                        "metadata": {
-                                            **buffered_metadata,
-                                            "phase": "post_tool_preamble",
-                                            "source": buffered_metadata.get("source", "post_tool_content"),
-                                        },
-                                    })
                             post_tool_content_events = []
                             post_tool_content_buffer = ""
                         for tc in chunk["tool_calls"]:
@@ -5252,11 +5342,16 @@ class AgentLoop:
                     delta = chunk
 
                 if chunk_type == "tool_result":
-                    yield _decorate_stream_event({
+                    tool_result_event = {
                         "type": chunk_type,
                         "delta": delta,
                         "metadata": metadata,
-                    })
+                    }
+                    yield _decorate_stream_event(tool_result_event)
+                    if AgentLoop._is_tool_loop_suppression_event(tool_result_event):
+                        logger.warning("Stopping tool loop after repeated-tool guardrail result.")
+                        _stop_tool_loop("tool_suppression")
+                        break
                     if _stop_if_total_timeout():
                         break
                     continue
@@ -5387,28 +5482,43 @@ class AgentLoop:
                 full_content = AgentLoop._mask_user_visible_text(full_content)
                 fallback_delta = AgentLoop._mask_user_visible_text(fallback_delta)
                 if fallback_delta:
-                    if not buffer_stream_content:
-                        yield _decorate_stream_event({
-                            "type": "content",
-                            "delta": fallback_delta,
-                            "metadata": {"fallback": fallback_reason},
-                        })
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = fallback_reason
+                    pending_fallback_delta = fallback_delta
 
+            pre_finalize_full_content = full_content
             final_content = AgentLoop._finalize_response_content(
                 self,
                 authoritative_message,
                 full_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
-            if (buffer_stream_content or withheld_initial_content) and final_content:
+            if (
+                (
+                    buffer_stream_content
+                    or withheld_initial_content
+                    or pending_fallback_content_emit
+                )
+                and final_content
+            ):
+                emit_delta = final_content
+                if (
+                    pending_fallback_content_emit
+                    and self._normalize_comparable_text(final_content)
+                    == self._normalize_comparable_text(pre_finalize_full_content)
+                ):
+                    emit_delta = pending_fallback_delta or final_content
+                emit_metadata = {
+                    "buffered": bool(buffer_stream_content),
+                    "withheld_initial_content": bool(withheld_initial_content),
+                    "validated": True,
+                }
+                if pending_fallback_reason:
+                    emit_metadata["fallback"] = pending_fallback_reason
                 yield _decorate_stream_event({
                     "type": "content",
-                    "delta": final_content,
-                    "metadata": {
-                        "buffered": bool(buffer_stream_content),
-                        "withheld_initial_content": bool(withheld_initial_content),
-                        "validated": True,
-                    },
+                    "delta": emit_delta,
+                    "metadata": emit_metadata,
                 })
             full_content = final_content
 
@@ -6033,6 +6143,7 @@ class AgentLoop:
             "unless the newest user message explicitly says to continue it.\n"
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n\n"
@@ -6062,6 +6173,7 @@ class AgentLoop:
             "unless the newest user message explicitly says to continue it.\n"
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
             f"[WORKSPACE]: {_ws}/\n"

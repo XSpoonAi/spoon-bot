@@ -72,3 +72,27 @@ def test_session_compact_does_not_preserve_long_prior_task_as_user_evidence() ->
     assert "Deploy service alpha. Run migration." not in compact
     assert "User evidence: Remember that the deployment ticket was OPS-42." in compact
     assert "OPS-42" in compact
+
+
+def test_session_compact_includes_interrupted_user_fact_as_non_executable_evidence() -> None:
+    raw_key = "0x" + "ab" * 32
+    session = DummySession(
+        [
+            {"role": "user", "content": "加入游戏", "turn_state": "completed"},
+            {"role": "assistant", "content": "旧钱包已加入一场游戏。"},
+            {
+                "role": "user",
+                "content": f"{raw_key} 使用这个私钥重新加入最新的游戏吧",
+                "turn_state": "interrupted",
+            },
+            {"role": "user", "content": "现在战绩怎么样了", "turn_state": "completed"},
+            {"role": "assistant", "content": "旧钱包当前 1 胜 12 负。"},
+        ]
+    )
+
+    compact = build_session_compact_context(session, "我不是给你新秘钥的钱包吗")
+
+    assert "Interrupted/superseded user evidence" in compact
+    assert "do not execute unless the newest request explicitly resumes it" in compact
+    assert raw_key not in compact
+    assert "***masked_private_key***" in compact

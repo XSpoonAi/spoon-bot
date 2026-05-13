@@ -432,6 +432,7 @@ class TestAgentLoopStream:
         agent.memory.get_memory_context = MagicMock(return_value=None)
         agent.context = MagicMock()
         agent._prepare_request_context = AsyncMock()
+        agent._add_current_turn_skill_zip_context = MagicMock(side_effect=lambda text: text)
         agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
         agent._build_step_prompt = MagicMock(return_value="prompt")
         agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
@@ -564,6 +565,25 @@ class TestAgentLoopStream:
         assert "[TURN PRIORITY]:" in prompt
         assert "Execute only the newest user request." in prompt
         assert "stale tool sequence" in prompt
+
+    def test_build_request_context_prompt_bounds_external_side_effects(self):
+        """A single request must not turn into an unbounded external side-effect loop."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "Run the next external action.")
+
+        assert "[EXTERNAL SIDE-EFFECT BOUNDARY]:" in prompt
+        assert "at most one" in prompt
+        assert "external" in prompt
+        assert "explicit count" in prompt
+        assert "Do not batch multiple alternative tool attempts" in prompt
+        assert "run that command exactly as written" in prompt
+        assert "never remove protective wrappers" in prompt
+        assert "never convert a simulated command into a live" in prompt
 
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
@@ -750,6 +770,45 @@ class TestAgentLoopStream:
 
         assert "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in cleaned
         assert "***masked_private_key***" in cleaned
+
+    def test_finalize_response_content_replaces_raw_tool_trace_leak(self):
+        """Provider fallback text can contain raw tool transcript; final output must stay bounded."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = SimpleNamespace(
+            memory=SimpleNamespace(
+                messages=[
+                    SimpleNamespace(role="user", content="run external workflow"),
+                    SimpleNamespace(
+                        role="tool",
+                        content=(
+                            "Observed output of cmd shell execution: "
+                            "FINAL_STATE task=347 action=joined result=pending"
+                        ),
+                        name="shell",
+                        tool_call_id="call_join",
+                    ),
+                ]
+            )
+        )
+        content = (
+            "Let me start by fetching the repo."
+            "Step 1: Observed output of cmd web_fetch execution: "
+            + ("raw page text " * 1000)
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Run the external workflow",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert "raw tool transcript" in cleaned
+        assert "FINAL_STATE task=347 action=joined" in cleaned
+        assert "Step 1:" not in cleaned
+        assert len(cleaned) < 1600
 
     def test_stream_tool_result_metadata_caps_large_payloads(self):
         from spoon_bot.agent.loop import AgentLoop
@@ -1583,13 +1642,47 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
-        assert emitted[0]["delta"] == "Need tool first. "
-        assert emitted[0]["metadata"]["phase"] == "pre_tool_scratchpad"
-        assert emitted[2]["delta"] == "Final answer."
-        assert emitted[2]["metadata"]["fallback"] == "run_result_no_chunks"
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
+        assert emitted[1]["delta"] == "Final answer."
+        assert emitted[1]["metadata"]["fallback"] == "run_result_no_chunks"
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Final answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_fallback_finalizes_raw_tool_transcript_before_content_emit(self):
+        """Run-result fallback must not stream raw Step/Observed-output transcript as content."""
+        from types import SimpleNamespace
+
+        from spoon_bot.agent.loop import AgentLoop
+
+        raw_result = (
+            "Let me execute it. Step 1: Observed output of cmd shell execution: "
+            + ("raw output " * 200)
+        )
+        agent = self._make_stream_agent([], run_result_text=raw_result)
+        agent._agent.memory = SimpleNamespace(
+            messages=[
+                SimpleNamespace(role="user", content="run external workflow"),
+                SimpleNamespace(
+                    role="tool",
+                    content="Observed output of cmd shell execution: FINAL_STATE ok",
+                    name="shell",
+                    tool_call_id="call_1",
+                ),
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+        assert emitted_content
+        assert all("Step 1: Observed output" not in c["delta"] for c in emitted_content)
+        assert "raw tool transcript" in emitted_content[0]["delta"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert "raw tool transcript" in done_chunks[0]["metadata"]["content"]
+        assert "Step 1: Observed output" not in done_chunks[0]["metadata"]["content"]
 
     @pytest.mark.asyncio
     async def test_stream_fallback_after_tool_preamble_emits_only_missing_suffix(self):
@@ -1639,13 +1732,89 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
-        assert emitted[0]["delta"] == "Need tool first. "
-        assert emitted[0]["metadata"]["phase"] == "pre_tool_scratchpad"
-        assert emitted[2]["delta"] == "Final answer."
-        assert emitted[2]["metadata"]["fallback"] == "run_result_no_chunks"
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
+        assert emitted[1]["delta"] == "Final answer."
+        assert emitted[1]["metadata"]["fallback"] == "run_result_no_chunks"
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Final answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_stops_after_tool_suppression_guardrail(self):
+        """Suppressed repeated tool work should end the stream loop instead of burning iterations."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"echo runner taskctl submit 47 A"}'
+
+        suppressed_result = (
+            "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. "
+            "The same tool and arguments already executed in this request."
+        )
+        agent = self._make_stream_agent(
+            [
+                {"tool_calls": [tool_call]},
+                {
+                    "type": "tool_result",
+                    "name": "shell",
+                    "tool_call_id": "call_1",
+                    "result": suppressed_result,
+                },
+                {"tool_calls": [tool_call]},
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_tool_calls = [c for c in chunks if c["type"] == "tool_call"]
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+
+        assert len(emitted_tool_calls) == 1
+        assert emitted_content
+        assert "tool guardrail suppressed repeated work" in emitted_content[0]["delta"]
+        assert "do not retry the same tool action" in emitted_content[0]["delta"]
+
+    @pytest.mark.asyncio
+    async def test_stream_stops_after_tool_failure_suppression_guardrail(self):
+        """Tool-layer failure suppression should end the stream loop."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        def _tool_call(call_id: str, command: str):
+            tool_call = MagicMock()
+            tool_call.id = call_id
+            tool_call.function = MagicMock()
+            tool_call.function.name = "shell"
+            tool_call.function.arguments = f'{{"command":"{command}"}}'
+            return tool_call
+
+        agent = self._make_stream_agent(
+            [
+                {"tool_calls": [_tool_call("call_1", "cmd one")]},
+                {
+                    "type": "tool_result",
+                    "name": "shell",
+                    "tool_call_id": "call_1",
+                    "result": "Error: consecutive tool failures suppressed. STOP_TOOL_LOOP",
+                },
+                {"tool_calls": [_tool_call("call_2", "cmd two")]},
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_tool_calls = [c for c in chunks if c["type"] == "tool_call"]
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+
+        assert len(emitted_tool_calls) == 1
+        assert emitted_content
+        assert "tool guardrail suppressed repeated work" in emitted_content[0]["delta"]
+        assert "do not retry the same tool action" in emitted_content[0]["delta"]
 
     @pytest.mark.asyncio
     async def test_stream_strips_post_tool_scratchpad_prefix_before_content(self):
@@ -1714,7 +1883,7 @@ when_to_use: Use for {skill_name} tasks.
             "Completed: created the requested report."
         ]
         thinking_chunks = [c for c in chunks if c["type"] == "thinking"]
-        assert "Need a fresh workspace" in "".join(c["delta"] for c in thinking_chunks)
+        assert "Need a fresh workspace" not in "".join(c["delta"] for c in thinking_chunks)
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Completed: created the requested report."
 

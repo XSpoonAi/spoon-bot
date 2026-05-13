@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -44,9 +45,21 @@ _ACTIVE_TOOL_INVOCATIONS: dict[str, CapturedToolOutput] = {}
 _COMPLETED_TOOL_OUTPUTS: dict[str, list[CapturedToolOutput]] = defaultdict(list)
 _MAX_CAPTURED_TOOL_OUTPUTS_PER_SCOPE = 256
 _DUPLICATE_TOOL_INVOCATION_MESSAGE = (
-    "Error: duplicate tool invocation suppressed. The same tool and arguments "
+    "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. The same tool and arguments "
     "already executed in this request; use the previous result or choose "
-    "different arguments."
+    "different arguments. Do not call more tools for this same action; report "
+    "the previous result or blocker now."
+)
+_REPEATED_TOOL_SERIES_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: repeated side-effecting tool series suppressed. This request has "
+    "already executed the same kind of external side effect; report the latest "
+    "result or ask for an explicit count before continuing. Do not call more "
+    "tools for this same action."
+)
+_CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "
+    "has failed repeatedly in this request without producing progress; report "
+    "the blocker now instead of trying more alternate commands."
 )
 
 
@@ -105,6 +118,33 @@ def stringify_tool_output(payload: Any) -> str:
     return str(payload)
 
 
+def _tool_failure_signal(payload: Any) -> str | None:
+    """Return a generic failure signal for loop guards, independent of paths/routes."""
+    if isinstance(payload, dict):
+        for key in ("success", "ok"):
+            value = payload.get(key)
+            if value is False:
+                return f"{key}=false"
+        for key in ("returncode", "return_code", "exit_code"):
+            value = payload.get(key)
+            if isinstance(value, int) and value != 0:
+                return f"{key}=nonzero"
+        status = payload.get("status")
+        if isinstance(status, str) and status.strip().lower() in {"failed", "error"}:
+            return "status=failed"
+
+    text = stringify_tool_output(payload).lower()
+    if not text.strip():
+        return None
+    if re.search(r"exit code:\s*[1-9]\d*", text):
+        return "nonzero_exit"
+    if text.lstrip().startswith("error:"):
+        return "error_prefix"
+    if "traceback" in text or "exception" in text:
+        return "runtime_error"
+    return None
+
+
 def normalize_tool_arguments(arguments: Any) -> str:
     """Normalize tool arguments so captured output can be matched later."""
     if arguments is None:
@@ -127,7 +167,12 @@ def normalize_tool_arguments(arguments: Any) -> str:
 
 
 @contextmanager
-def track_tool_invocations(*, max_repeats: int = 2) -> Iterator[dict[str, Any]]:
+def track_tool_invocations(
+    *,
+    max_repeats: int = 2,
+    max_series_repeats: int = 2,
+    max_consecutive_failures: int = 3,
+) -> Iterator[dict[str, Any]]:
     """Track exact tool invocations for the current request.
 
     This is a data-plane guard: it suppresses identical tool+argument executions
@@ -135,7 +180,11 @@ def track_tool_invocations(*, max_repeats: int = 2) -> Iterator[dict[str, Any]]:
     """
     state: dict[str, Any] = {
         "counts": defaultdict(int),
+        "series_counts": defaultdict(int),
+        "consecutive_failures": [],
         "max_repeats": max(1, int(max_repeats or 1)),
+        "max_series_repeats": max(1, int(max_series_repeats or 1)),
+        "max_consecutive_failures": max(1, int(max_consecutive_failures or 1)),
     }
     token = _TOOL_INVOCATION_DEDUP_STATE.set(state)
     try:
@@ -160,6 +209,66 @@ def suppress_repeated_tool_invocation(tool_name: str, arguments: Any) -> str | N
     if counts[key] <= max_repeats:
         return None
     return _DUPLICATE_TOOL_INVOCATION_MESSAGE
+
+
+def suppress_repeated_tool_series(tool_name: str, series_key: str | None) -> str | None:
+    """Return a compact result when one request repeats the same side-effect series."""
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if not isinstance(state, dict):
+        return None
+    if not isinstance(series_key, str) or not series_key.strip():
+        return None
+
+    counts = state.get("series_counts")
+    if counts is None:
+        return None
+
+    key = f"{str(tool_name or '')}\x1f{series_key.strip()}"
+    counts[key] += 1
+    max_repeats = int(state.get("max_series_repeats") or 1)
+    if counts[key] <= max_repeats:
+        return None
+    return _REPEATED_TOOL_SERIES_MESSAGE
+
+
+def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:
+    """Return a compact result when one tool keeps failing without progress."""
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if not isinstance(state, dict):
+        return None
+
+    failures = state.get("consecutive_failures")
+    if not isinstance(failures, list):
+        return None
+    max_failures = int(state.get("max_consecutive_failures") or 3)
+    if len(failures) < max_failures:
+        return None
+
+    recent = failures[-max_failures:]
+    current_name = str(tool_name or "")
+    if all(item.get("tool") == current_name for item in recent if isinstance(item, dict)):
+        return _CONSECUTIVE_TOOL_FAILURE_MESSAGE
+    return None
+
+
+def record_tool_invocation_result(tool_name: str, result: Any) -> None:
+    """Record generic success/failure outcome for per-request failure-loop guards."""
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if not isinstance(state, dict):
+        return
+
+    failures = state.get("consecutive_failures")
+    if not isinstance(failures, list):
+        return
+
+    signal = _tool_failure_signal(result)
+    if signal is None:
+        failures.clear()
+        return
+
+    failures.append({"tool": str(tool_name or ""), "signal": signal})
+    max_failures = int(state.get("max_consecutive_failures") or 3)
+    del failures[: -max(1, max_failures)]
 
 
 @contextmanager

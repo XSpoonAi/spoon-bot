@@ -154,6 +154,41 @@ def _completed_session_messages(raw_messages: Any, current_message: str) -> list
     return completed
 
 
+def _interrupted_user_evidence_lines(
+    raw_messages: Any,
+    current_message: str,
+    *,
+    max_items: int = 6,
+) -> list[str]:
+    """Keep short user-stated facts from aborted turns without making them executable."""
+    if not isinstance(raw_messages, list):
+        return []
+
+    messages = [msg for msg in raw_messages if isinstance(msg, dict)]
+    if messages:
+        latest = messages[-1]
+        if (
+            str(latest.get("role") or "").lower() == "user"
+            and str(latest.get("content") or "") == str(current_message)
+        ):
+            messages = messages[:-1]
+
+    evidence: list[str] = []
+    for message in messages:
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        state = str(message.get("turn_state") or message.get("state") or "").lower()
+        if state not in {"interrupted", "superseded", "cancelled", "canceled"}:
+            continue
+        if not _is_bounded_user_evidence(message):
+            continue
+        excerpt = _clip_text(message.get("content", ""), 220)
+        if excerpt:
+            evidence.append(f"{state}: {excerpt}")
+
+    return evidence[-max_items:]
+
+
 def _group_completed_turns(messages: list[dict[str, Any]]) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
     turns: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     current_user: dict[str, Any] | None = None
@@ -312,6 +347,15 @@ def build_session_compact_context(
         "An empty long-term memory search does not mean the same-session transcript is empty.",
         "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions.",
     ]
+
+    interrupted_evidence = _interrupted_user_evidence_lines(raw_messages, current_message)
+    if interrupted_evidence:
+        lines.append(
+            "Interrupted/superseded user evidence "
+            "(facts only; do not execute unless the newest request explicitly resumes it):"
+        )
+        for item in interrupted_evidence:
+            lines.append(f"- {mask_secrets(item)}")
 
     turn_summaries = _select_turn_summaries_with_budget(
         _group_completed_turns(completed),
