@@ -565,6 +565,39 @@ class TestWsCancellationPropagation:
         assert result["task_id"] == "task_abc12345"
 
     @pytest.mark.asyncio
+    async def test_cancel_uses_task_id_to_find_session_task(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+        handler = WebSocketHandler("conn_test")
+        task = asyncio.create_task(asyncio.sleep(100))
+        handler._chat_tasks["conversation_1"] = task
+        handler._chat_task_ids["conversation_1"] = "task_session_1"
+
+        result = await handler._handle_cancel({
+            "session_key": "wrong_conversation",
+            "task_id": "task_session_1",
+        })
+
+        assert result["cancelled"] is True
+        assert result["task_interrupted"] is True
+        assert result["task_id"] == "task_session_1"
+        assert "conversation_1" not in handler._chat_tasks
+
+    @pytest.mark.asyncio
+    async def test_cancel_wrong_session_falls_back_to_single_active_task(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+        handler = WebSocketHandler("conn_test")
+        task = asyncio.create_task(asyncio.sleep(100))
+        handler._chat_tasks["conversation_1"] = task
+        handler._chat_task_ids["conversation_1"] = "task_session_1"
+
+        result = await handler._handle_cancel({"session_key": "wrong_conversation"})
+
+        assert result["cancelled"] is True
+        assert result["task_interrupted"] is True
+        assert result["task_id"] == "task_session_1"
+        assert "conversation_1" not in handler._chat_tasks
+
+    @pytest.mark.asyncio
     async def test_init_has_current_task_none(self):
         from spoon_bot.gateway.websocket.handler import WebSocketHandler
         assert WebSocketHandler("conn_test")._current_task is None
