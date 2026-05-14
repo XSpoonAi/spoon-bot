@@ -680,6 +680,41 @@ class TestAgentLoopStream:
 
         assert cleaned == "Here is the result: the script queries balances only."
 
+    def test_finalize_response_content_strips_let_me_scratchpad_prefix(self):
+        """English execution preambles should not be replayed as final content."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "Let me start by fetching the repo to understand the skill structure."
+            "The agent stopped the tool loop because status was already known."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Continue",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "The agent stopped the tool loop because status was already known."
+
+    def test_finalize_response_content_strips_chinese_scratchpad_prefix(self):
+        """Chinese execution preambles should stay private too."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = "我先检查当前状态并运行必要命令确认。已完成：当前任务可以继续。"
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "继续",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "已完成：当前任务可以继续。"
+
     def test_finalize_response_content_strips_mixed_prompt_reference_prefix(self):
         """Quoted user text inside a scratchpad prefix should not defeat cleanup."""
         from spoon_bot.agent.loop import AgentLoop
@@ -2484,6 +2519,31 @@ when_to_use: Use for {skill_name} tasks.
         assert emitted[0]["metadata"]["segment_type"] == "thinking"
         assert emitted[1]["type"] == "content"
         assert emitted[1]["delta"] == "Final answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_drops_explicit_thinking_when_not_requested(self):
+        """thinking=false should keep provider thinking chunks out of the UI and final answer."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        agent = self._make_stream_agent([
+            {
+                "type": "thinking",
+                "delta": "Inspecting candidate commands.",
+                "content": "Inspecting candidate commands.",
+                "metadata": {"phase": "think", "source": "provider"},
+            },
+            {"content": "Final answer."},
+        ])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="test", thinking=False):
+            chunks.append(chunk)
+
+        assert [c for c in chunks if c["type"] == "thinking"] == []
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == ["Final answer."]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Final answer."
 
     @pytest.mark.asyncio
     async def test_stream_without_tool_call_keeps_plain_content(self):

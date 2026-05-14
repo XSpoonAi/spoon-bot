@@ -54,6 +54,17 @@ class FailingTool(CountingTool):
         return f"provider {kwargs['value']} request failed\nExit code: 1"
 
 
+class PollingTool(CountingTool):
+    @property
+    def name(self) -> str:
+        return "polling_tool"
+
+    def tool_invocation_dedup_key(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        if kwargs.get("action") == "status":
+            return None
+        return kwargs
+
+
 @pytest.mark.asyncio
 async def test_track_tool_invocations_suppresses_exact_repeated_call() -> None:
     tool = CountingTool()
@@ -68,6 +79,23 @@ async def test_track_tool_invocations_suppresses_exact_repeated_call() -> None:
     assert "duplicate tool invocation suppressed" in duplicate
     assert different == "executed:beta:2"
     assert tool.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_can_opt_out_of_exact_duplicate_dedup_for_polling() -> None:
+    tool = PollingTool()
+
+    with track_tool_invocations(max_repeats=1):
+        first = await tool(value="alpha", action="status")
+        second = await tool(value="alpha", action="status")
+        execute = await tool(value="alpha", action="execute")
+        duplicate_execute = await tool(value="alpha", action="execute")
+
+    assert first == "executed:alpha:1"
+    assert second == "executed:alpha:2"
+    assert execute == "executed:alpha:3"
+    assert "STOP_TOOL_LOOP" in duplicate_execute
+    assert tool.calls == 3
 
 
 @pytest.mark.asyncio

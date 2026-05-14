@@ -76,6 +76,58 @@ class TestShellTool:
         """Shell should not guess business side effects from command words."""
         assert not callable(getattr(shell_tool, "tool_invocation_series_key", None))
 
+    def test_shell_read_only_background_actions_skip_exact_dedup(self, shell_tool):
+        """Polling an existing background job should not be mistaken for a loop."""
+        for action in ("list_jobs", "job_status", "job_output"):
+            assert shell_tool.tool_invocation_dedup_key(
+                {"action": action, "job_id": "sh_testjob"}
+            ) is None
+
+        assert shell_tool.tool_invocation_dedup_key(
+            {"action": "terminate_job", "job_id": "sh_testjob"}
+        ) == {"action": "terminate_job", "job_id": "sh_testjob"}
+
+    @pytest.mark.asyncio
+    async def test_background_job_status_can_be_polled_repeatedly_in_request_scope(self, shell_tool):
+        """The generic duplicate guard should not block repeated status reads."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            returncode = None
+
+            async def wait(self):
+                return None
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        stdout_task = asyncio.create_task(asyncio.sleep(0))
+        stderr_task = asyncio.create_task(asyncio.sleep(0))
+        job = _BackgroundShellJob(
+            job_id="sh_polljob",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="line one",
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        with track_tool_invocations(max_repeats=1):
+            first = await shell_tool(action="job_status", job_id=job.job_id)
+            second = await shell_tool(action="job_status", job_id=job.job_id)
+
+        assert "job_id: sh_polljob" in first
+        assert "job_id: sh_polljob" in second
+        assert "STOP_TOOL_LOOP" not in second
+
     def test_shell_description_preserves_protective_wrappers(self, shell_tool):
         """Tool instructions should not invite converting a replay into a live command."""
         description = shell_tool.description

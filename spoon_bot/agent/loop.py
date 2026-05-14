@@ -4443,6 +4443,17 @@ class AgentLoop:
         compact = " ".join(str(text or "").strip().split())
         if len(compact) < 12 or len(compact) > 500:
             return False
+
+        if re.search(
+            r"(?:我(?:先|会|需要|应该|来)|先(?:检查|查看|确认|读取|搜索|运行|执行)|"
+            r"让我(?:先|来)|接下来|现在(?:先|我)|然后|随后)",
+            compact,
+        ) and re.search(
+            r"(?:检查|查看|确认|读取|搜索|运行|执行|调用|处理|继续|准备|需要|开始)",
+            compact,
+        ):
+            return True
+
         ascii_chars = sum(1 for ch in compact if ord(ch) < 128)
         if ascii_chars / max(len(compact), 1) < 0.70:
             return False
@@ -4453,6 +4464,7 @@ class AgentLoop:
             r"i\s+(?:need|should|have\s+to)|"
             r"we\s+(?:need|should|may|can)|"
             r"user\s+(?:asks|asked|wants|requested|said)|"
+            r"let\s+me\s+(?:start|check|inspect|fetch|run|use|look|read|verify|confirm|execute|search|open|review|try|handle|continue|see)|"
             r"let(?:'|’)s|likely|maybe"
             r")\b",
             compact,
@@ -4492,12 +4504,14 @@ class AgentLoop:
                 if match.start() <= 0:
                     continue
                 prefix = value[:match.start()]
+                if re.search(r"[\u4e00-\u9fff]", prefix):
+                    continue
                 suffix = value[match.start():]
                 if suffix.strip() and AgentLoop._looks_like_internal_scratchpad_text(prefix):
                     return suffix.lstrip()
 
             sentence_match = re.match(
-                r"^((?:[^\n.!?。！？]{1,240}[.!?]\s*){1,3})(\S[\s\S]*)$",
+                r"^((?:[^\n.!?。！？]{1,240}[.!?。！？]\s*){1,3})(\S[\s\S]*)$",
                 value,
             )
             if sentence_match:
@@ -5354,6 +5368,17 @@ class AgentLoop:
                         break
                     if _stop_if_total_timeout():
                         break
+                    continue
+
+                if chunk_type == "thinking":
+                    if thinking and delta:
+                        yield _decorate_stream_event({
+                            "type": "thinking",
+                            "delta": delta,
+                            "metadata": metadata,
+                        })
+                        if _stop_if_total_timeout():
+                            break
                     continue
 
                 if delta:

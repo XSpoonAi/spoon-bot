@@ -151,10 +151,16 @@ class Tool(ABC):
                 if failure_loop_result is not None:
                     result = failure_loop_result
                     return result
-                duplicate_result = suppress_repeated_tool_invocation(self.name, kwargs)
-                if duplicate_result is not None:
-                    result = duplicate_result
-                    return result
+                dedup_key_func = getattr(self, "tool_invocation_dedup_key", None)
+                dedup_arguments = dedup_key_func(kwargs) if callable(dedup_key_func) else kwargs
+                if dedup_arguments is not None:
+                    duplicate_result = suppress_repeated_tool_invocation(
+                        self.name,
+                        dedup_arguments,
+                    )
+                    if duplicate_result is not None:
+                        result = duplicate_result
+                        return result
                 series_key_func = getattr(self, "tool_invocation_series_key", None)
                 if callable(series_key_func):
                     series_result = suppress_repeated_tool_series(

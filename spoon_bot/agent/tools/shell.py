@@ -556,6 +556,15 @@ class ShellTool(Tool):
             },
         }
 
+    def tool_invocation_dedup_key(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        """Skip exact-call suppression for read-only background job inspection."""
+        if not isinstance(arguments, dict):
+            return arguments
+        action = str(arguments.get("action") or "execute").strip().lower()
+        if action in {"list_jobs", "job_status", "job_output"}:
+            return None
+        return arguments
+
     def _parse_command_args(self, command: str) -> list[str]:
         """
         Parse command into arguments for safe execution without shell.
