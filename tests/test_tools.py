@@ -211,6 +211,7 @@ class TestShellTool:
         from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
 
         shell_tool.timeout = 0.01
+        shell_tool.background_handoff_timeout = 0
 
         class _FakeProcess:
             returncode = None
@@ -251,6 +252,52 @@ class TestShellTool:
         stderr_task.cancel()
 
     @pytest.mark.asyncio
+    async def test_command_completion_during_timeout_handoff_returns_output(self, shell_tool):
+        """Near-timeout completions should not force the agent into background polling."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        shell_tool.timeout = 0.01
+        shell_tool.background_handoff_timeout = 0.2
+
+        class _FakeProcess:
+            def __init__(self):
+                self.returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(0.03)
+                self.returncode = 0
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        job = _BackgroundShellJob(
+            job_id="sh_handoff_done",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=asyncio.create_task(asyncio.sleep(0)),
+            stderr_task=asyncio.create_task(asyncio.sleep(0)),
+            buffer_limit=1000,
+            stdout_text="done",
+        )
+
+        async def _fake_start_background_job(*args, **kwargs):
+            _SHELL_BACKGROUND_JOBS[job.job_id] = job
+            return job
+
+        with patch.object(shell_tool, "_start_background_job", AsyncMock(side_effect=_fake_start_background_job)):
+            result = await shell_tool.execute("echo hello")
+
+        assert "done" in result
+        assert "command moved to background" not in result
+        assert job.job_id not in _SHELL_BACKGROUND_JOBS
+
+    @pytest.mark.asyncio
     async def test_background_job_status_and_terminate_actions(self, shell_tool):
         """Shell background jobs should expose status and terminate actions."""
         from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
@@ -289,6 +336,46 @@ class TestShellTool:
 
         terminated = await shell_tool.execute(action="terminate_job", job_id=job.job_id)
         assert "Terminated background shell job sh_statusjob" in terminated
+
+    @pytest.mark.asyncio
+    async def test_terminate_completed_background_job_preserves_terminal_status(self, shell_tool):
+        """Terminating an already completed job should not relabel successful output."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        job = _BackgroundShellJob(
+            job_id="sh_donejob",
+            command="echo done",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=asyncio.create_task(asyncio.sleep(0)),
+            stderr_task=asyncio.create_task(asyncio.sleep(0)),
+            buffer_limit=1000,
+            stdout_text="NEXT: continue",
+            status="completed",
+            returncode=0,
+            finished_at=1.0,
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        result = await shell_tool.execute(action="terminate_job", job_id=job.job_id)
+
+        assert "already completed" in result
+        assert "NEXT: continue" in result
+        assert "Terminated background shell job" not in result
+        assert job.status == "completed"
 
     @pytest.mark.asyncio
     async def test_background_jobs_are_scoped_by_owner(self, shell_tool):

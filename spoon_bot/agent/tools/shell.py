@@ -19,7 +19,12 @@ from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import capture_tool_output, get_tool_owner
-from spoon_bot.config import DEFAULT_MAX_OUTPUT, DEFAULT_SHELL_MAX_TIMEOUT, DEFAULT_SHELL_TIMEOUT
+from spoon_bot.config import (
+    DEFAULT_MAX_OUTPUT,
+    DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT,
+    DEFAULT_SHELL_MAX_TIMEOUT,
+    DEFAULT_SHELL_TIMEOUT,
+)
 from spoon_bot.utils.rate_limit import (
     RateLimitConfig,
     get_rate_limiter,
@@ -444,6 +449,7 @@ class ShellTool(Tool):
         strict_mode: bool = False,
         use_shell: bool = True,
         rate_limit_config: RateLimitConfig | None = None,
+        background_handoff_timeout: float | None = None,
     ):
         """
         Initialize shell tool.
@@ -463,12 +469,17 @@ class ShellTool(Tool):
             strict_mode: If True, block all potentially dangerous patterns.
             use_shell: If True, use shell execution; if False, use direct exec.
             rate_limit_config: Configuration for rate limiting shell commands.
+            background_handoff_timeout: Extra seconds to watch a command after
+                its foreground budget expires before handing it to background.
         """
         self.timeout = timeout
         self.max_timeout = max(timeout, max_timeout)
         self.max_output = max_output
         self.working_dir = working_dir
         self.use_shell = use_shell
+        self.background_handoff_timeout = self._resolve_background_handoff_timeout(
+            background_handoff_timeout
+        )
 
         # Initialize command validator
         self.validator = CommandValidator(
@@ -934,11 +945,57 @@ class ShellTool(Tool):
                 pass
         return getattr(process, "returncode", None)
 
+    @staticmethod
+    def _resolve_background_handoff_timeout(value: float | None = None) -> float:
+        if value is None:
+            raw = os.getenv("SPOON_BOT_SHELL_BACKGROUND_HANDOFF_TIMEOUT")
+            if raw not in (None, ""):
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    value = DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT
+            else:
+                value = DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT
+        try:
+            return max(0.0, min(float(value), 120.0))
+        except (TypeError, ValueError):
+            return DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT
+
     async def _wait_for_process(self, process: Any) -> int | None:
         wait = getattr(process, "wait")
         if asyncio.iscoroutinefunction(wait):
             return await wait()
         return await asyncio.to_thread(wait)
+
+    async def _wait_for_background_handoff(
+        self,
+        job: _BackgroundShellJob,
+    ) -> bool:
+        """Briefly absorb near-timeout completions before exposing a background job."""
+        grace_seconds = float(getattr(self, "background_handoff_timeout", 0.0) or 0.0)
+        if grace_seconds <= 0:
+            await self._refresh_background_job(job)
+            return self._is_terminal_status(job.status)
+
+        try:
+            await asyncio.wait_for(self._wait_for_process(job.process), timeout=grace_seconds)
+        except asyncio.TimeoutError:
+            pass
+        await self._refresh_background_job(job)
+        return self._is_terminal_status(job.status)
+
+    def _build_completed_job_result(
+        self,
+        job: _BackgroundShellJob,
+    ) -> tuple[str, str]:
+        full_result = self._build_output_result(
+            job.stdout_text,
+            job.stderr_text,
+            job.returncode,
+            truncate=False,
+        )
+        result = self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
+        return result, full_result
 
     async def _terminate_process_tree(
         self,
@@ -1106,8 +1163,10 @@ class ShellTool(Tool):
             f"  1. Check progress: action='job_status', job_id='{job.job_id}'\n"
             f"  2. Read full output: action='job_output', job_id='{job.job_id}'\n"
             f"  3. Stop if stuck:   action='terminate_job', job_id='{job.job_id}'\n"
-            "Decide whether the command is making progress or is hung. "
-            "If no new output appears after two checks, terminate it."
+            "The command is still active. Do not rerun the same command while "
+            "this job exists. Quiet output can be normal for network, build, "
+            "or waiting operations; keep polling until it reaches a terminal "
+            "status or until the caller explicitly no longer needs it."
         )
 
     async def _handle_background_action(
@@ -1151,7 +1210,11 @@ class ShellTool(Tool):
                 f"command: {job.command}\n"
                 f"returncode: {job.returncode if job.returncode is not None else 'running'}\n"
                 "Recent output tail:\n"
-                f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}"
+                f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}\n"
+                "Guidance: if status is running, keep polling this job or read "
+                "job_output; do not rerun the same command. Terminate only when "
+                "the caller explicitly wants to abandon it or you have evidence "
+                "that it is unrecoverably stuck."
             )
 
         if action == "job_output":
@@ -1174,10 +1237,10 @@ class ShellTool(Tool):
         if action == "terminate_job":
             if self._get_process_returncode(job.process) is None:
                 await self._terminate_background_job(job, status="terminated")
+                prefix = f"Terminated background shell job {job.job_id}.\n"
             else:
                 await self._refresh_background_job(job)
-                job.status = "terminated"
-                job.finished_at = time.time()
+                prefix = f"Background shell job {job.job_id} already {job.status}.\n"
             full_body = self._build_output_result(
                 job.stdout_text,
                 job.stderr_text,
@@ -1191,11 +1254,8 @@ class ShellTool(Tool):
                 job.returncode,
                 max_chars=tail_chars,
             )
-            result = (
-                f"Terminated background shell job {job.job_id}.\n"
-                f"{summary_body}"
-            )
-            full_result = f"Terminated background shell job {job.job_id}.\n{full_body}"
+            result = prefix + summary_body
+            full_result = f"{prefix}{full_body}"
             capture_tool_output(result, full_result)
             return result
 
@@ -1257,19 +1317,18 @@ class ShellTool(Tool):
             try:
                 await asyncio.wait_for(self._wait_for_process(job.process), timeout=effective_timeout)
                 await self._refresh_background_job(job)
-                full_result = self._build_output_result(
-                    job.stdout_text,
-                    job.stderr_text,
-                    job.returncode,
-                    truncate=False,
-                )
-                result = self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
+                result, full_result = self._build_completed_job_result(job)
                 capture_tool_output(result, full_result)
                 _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
                 self._prune_background_jobs(owner_key=owner_key)
                 return result
             except asyncio.TimeoutError:
-                await self._refresh_background_job(job)
+                if await self._wait_for_background_handoff(job):
+                    result, full_result = self._build_completed_job_result(job)
+                    capture_tool_output(result, full_result)
+                    _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
+                    self._prune_background_jobs(owner_key=owner_key)
+                    return result
                 self._prune_background_jobs(owner_key=owner_key)
                 return self._format_background_job_summary(
                     job,

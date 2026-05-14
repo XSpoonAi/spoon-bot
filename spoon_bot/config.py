@@ -28,6 +28,7 @@ from pydantic_settings import BaseSettings
 
 DEFAULT_SHELL_TIMEOUT: int = 600       # 10 min foreground budget
 DEFAULT_SHELL_MAX_TIMEOUT: int = 7200  # 2 hour per-command cap
+DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT: float = 10.0
 DEFAULT_PROVIDER_SILENCE_TIMEOUT: float = 600.0
 DEFAULT_PROVIDER_TOTAL_TIMEOUT: float = 600.0
 DEFAULT_TOOL_FOLLOWUP_TIMEOUT: float = 600.0
