@@ -24,6 +24,8 @@ case "${MODE}" in
     echo "  Port: ${GATEWAY_PORT:-8080}"
     echo "  Workers: ${GATEWAY_WORKERS:-1}"
     echo "  Debug: ${GATEWAY_DEBUG:-false}"
+    echo "  WS ping interval: ${SPOON_BOT_UVICORN_WS_PING_INTERVAL_SECONDS:-30}s"
+    echo "  WS ping timeout: ${SPOON_BOT_UVICORN_WS_PING_TIMEOUT_SECONDS:-60}s"
     echo ""
     echo "Endpoints:"
     echo "  REST API:    http://${GATEWAY_HOST:-0.0.0.0}:${GATEWAY_PORT:-8080}/v1/"
@@ -41,6 +43,8 @@ case "${MODE}" in
       "--port" "${GATEWAY_PORT:-8080}"
       "--workers" "${GATEWAY_WORKERS:-1}"
       "--log-level" "$(echo "${SPOON_BOT_LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')"
+      "--ws-ping-interval" "${SPOON_BOT_UVICORN_WS_PING_INTERVAL_SECONDS:-30}"
+      "--ws-ping-timeout" "${SPOON_BOT_UVICORN_WS_PING_TIMEOUT_SECONDS:-60}"
       "--access-log"
     )
 
