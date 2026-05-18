@@ -1015,7 +1015,9 @@ class AgentLoop:
             self.tools.register(ft)
 
         # Self-management tools
-        self.tools.register(SelfConfigTool())
+        self_config_tool = SelfConfigTool()
+        self_config_tool.set_agent_loop(self)
+        self.tools.register(self_config_tool)
         memory_tool = MemoryManagementTool()
         memory_tool.set_memory_store(self.memory)
         self.tools.register(memory_tool)
