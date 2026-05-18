@@ -753,6 +753,42 @@ class _FailingStreamRuntimeAgent(_NoChunkRuntimeAgent):
         raise RuntimeError("upstream exploded")
 
 
+class _FailingToolTraceRuntimeAgent(_PromptCapturingRuntimeAgent):
+    """Runtime agent that records tool work, then fails before final content."""
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        self.memory.messages.append(
+            SimpleNamespace(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_joker",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"cmd": "node skills/joker-game-agent/cli/index.js challenge-answer"}',
+                        },
+                    }
+                ],
+            )
+        )
+        self.memory.messages.append(
+            SimpleNamespace(
+                role="tool",
+                content=(
+                    "Observed output of cmd shell execution: "
+                    "job_id=sh_2398786724 command=node skills/joker-game-agent/cli/index.js "
+                    "challenge-answer status=running"
+                ),
+                name="shell",
+                tool_call_id="call_joker",
+            )
+        )
+        raise RuntimeError("openrouter network error")
+
+
 class _ChunkedRuntimeAgent:
     """Runtime agent that emits real incremental chunks through output_queue."""
 
@@ -1043,12 +1079,15 @@ class TestAgentLoopCurrentRequestMultimodal:
             expected_text="What text appears in the image?",
         )
         assert loop._agent.run_calls == [((), {})]
-        assert len(loop._session.messages) == 1
+        assert len(loop._session.messages) == 2
         assert loop._session.messages[0]["role"] == "user"
         assert loop._session.messages[0]["content"] == "What text appears in the image?"
         assert loop._session.messages[0]["media"] == [str(image_path)]
-        assert loop._session.messages[0]["turn_state"] == "pending"
-        loop.sessions.save.assert_called_once_with(loop._session)
+        assert loop._session.messages[0]["turn_state"] == "interrupted"
+        assert loop._session.messages[0]["turn_state_reason"] == "process_error:RuntimeError"
+        assert loop._session.messages[1]["role"] == "assistant"
+        assert loop._session.messages[1]["incomplete"] is True
+        loop.sessions.save.assert_called_with(loop._session)
         loop._compress_runtime_context.assert_not_called()
         loop._force_compress_runtime_context.assert_not_called()
 
@@ -1221,11 +1260,50 @@ class TestAgentLoopStreamFallback:
             chunks.append(chunk)
 
         assert any(chunk["type"] == "error" for chunk in chunks)
-        assert len(loop._session.messages) == 1
+        assert len(loop._session.messages) == 2
         assert loop._session.messages[0]["role"] == "user"
         assert loop._session.messages[0]["content"] == "keep this request in history"
-        assert loop._session.messages[0]["turn_state"] == "pending"
-        loop.sessions.save.assert_called_once_with(loop._session)
+        assert loop._session.messages[0]["turn_state"] == "interrupted"
+        assert loop._session.messages[0]["turn_state_reason"] == "stream_error:RuntimeError"
+        assert loop._session.messages[1]["role"] == "assistant"
+        assert loop._session.messages[1]["incomplete"] is True
+        loop.sessions.save.assert_called_with(loop._session)
+
+    @pytest.mark.asyncio
+    async def test_stream_failure_persists_tool_trace_for_followup_recall(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _FailingToolTraceRuntimeAgent("unused")
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_error_tool_context")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run the joker-game-agent challenge"):
+            chunks.append(chunk)
+
+        assert any(chunk["type"] == "error" for chunk in chunks)
+        roles = [message["role"] for message in loop._session.messages]
+        assert roles == ["user", "assistant", "tool", "assistant"]
+        assert loop._session.messages[0]["turn_state"] == "interrupted"
+        assert loop._session.messages[1]["tool_calls"][0]["id"] == "call_joker"
+        assert "joker-game-agent" in loop._session.messages[2]["content"]
+        assert loop._session.messages[3]["incomplete"] is True
+
+        recall = AgentLoop._build_session_recall_context(loop, "joker-game-agent 这个呀")
+
+        assert "Current Session Compact" in recall
+        assert "joker-game-agent" in recall
+        assert "Previous request did not complete" in recall
 
 
 class TestContextBuilderMediaPaths:
@@ -1360,14 +1438,14 @@ class TestContextBuilderMediaPaths:
         loop._session = Session(session_key="preloaded-skill-summary")
         loop._session.add_message(
             "user",
-            "继续刚才的任务，先检查状态。\n\n---\n[PRE-LOADED SKILL: demo-skill]\nBase directory: /tmp/demo\nDo not search for alternatives.",
+            "Continue the previous task and check status first.\n\n---\n[PRE-LOADED SKILL: demo-skill]\nBase directory: /tmp/demo\nDo not search for alternatives.",
         )
         loop._session.add_message(
             "assistant",
             "Checked the current status and confirmed the job is paused at step 2.",
         )
 
-        recall = AgentLoop._build_session_recall_context(loop, "继续")
+        recall = AgentLoop._build_session_recall_context(loop, "Continue")
 
         assert "Recent completed turn summaries:" in recall
         assert "[PRE-LOADED SKILL:" not in recall
@@ -1468,6 +1546,63 @@ class TestAgentLoopThinkingMode:
         assert response == "answer"
         assert thinking == "reasoning trace"
         assert loop._agent.run_calls == [((), {"thinking": True})]
+
+    @pytest.mark.asyncio
+    async def test_process_with_thinking_retries_pseudo_tool_call_text(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        class _RepairThinkingRuntimeAgent(_ThinkingRuntimeAgent):
+            def __init__(self) -> None:
+                super().__init__("", "")
+                self._contents = [
+                    (
+                        "- write_file(path='skills/weather/SKILL.md'): "
+                        "Observed output of cmd write_file execution: Success"
+                    ),
+                    "Weather skill created.",
+                ]
+
+            async def run(self, *args, **kwargs):
+                self.run_calls.append((args, kwargs))
+                index = min(len(self.run_calls) - 1, len(self._contents) - 1)
+                return type(
+                    "RunResult",
+                    (),
+                    {
+                        "content": self._contents[index],
+                        "thinking_content": f"thinking-{index}",
+                    },
+                )()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop.workspace = tmp_dir
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._agent = _RepairThinkingRuntimeAgent()
+        loop._session = Session(session_key="thinking_mode")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._restore_agent_think = lambda: None
+        loop._auto_commit = False
+        loop._git = None
+
+        response, thinking = await AgentLoop.process_with_thinking(
+            loop,
+            message="Create a weather skill.",
+        )
+
+        assert response == "Weather skill created."
+        assert thinking == "thinking-1"
+        assert len(loop._agent.run_calls) == 2
+        assert any(
+            role == "user" and "[INTERNAL TOOL-CALL REPAIR]" in str(content)
+            for role, content, _kwargs in loop._agent.add_message_calls
+        )
 
     @pytest.mark.asyncio
     async def test_process_with_thinking_passes_reasoning_effort_when_runtime_accepts_it(self, tmp_dir: Path):
@@ -1572,22 +1707,22 @@ class TestAgentLoopSameSessionContext:
         session = Session(session_key="long_same_session_memory")
         session.add_message(
             "user",
-            "记住这个项目代号是 Nimbus，事故负责人是 Alice，后面我会再问你。",
+            "Remember this project codename is Nimbus and the incident owner is Alice. I will ask again later.",
         )
         session.add_message(
             "assistant",
-            "已记录：项目代号 Nimbus，事故负责人 Alice。",
+            "Recorded: project codename Nimbus, incident owner Alice.",
         )
         for index in range(2, 19):
-            session.add_message("user", f"第 {index} 轮普通跟进，记录状态 {index}。")
-            session.add_message("assistant", f"第 {index} 轮已处理，状态 {index} 已确认。")
+            session.add_message("user", f"Round {index} normal follow-up, record state {index}.")
+            session.add_message("assistant", f"Round {index} processed, state {index} confirmed.")
 
         agent = _PromptCapturingRuntimeAgent("Nimbus")
         loop = _build_process_test_loop(tmp_dir, agent=agent, session=session)
 
         response = await AgentLoop.process(
             loop,
-            message="聊了这么久之后，之前让我记住的项目代号是什么？只回答代号。",
+            message="After this long chat, what was the project codename I asked you to remember? Reply with codename only.",
         )
 
         assert response == "Nimbus"
@@ -1595,7 +1730,7 @@ class TestAgentLoopSameSessionContext:
         assert "## Active Request Context" in captured_prompt
         assert "## Current Session Compact" in captured_prompt
         assert "[USER REQUEST]:" in captured_prompt
-        assert "聊了这么久之后，之前让我记住的项目代号是什么？只回答代号。" in captured_prompt
+        assert "After this long chat, what was the project codename I asked you to remember? Reply with codename only." in captured_prompt
         assert "Nimbus" in captured_prompt
         assert "Alice" in captured_prompt
         assert "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions." in captured_prompt

@@ -13,7 +13,11 @@ import httpx
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
-from spoon_bot.agent.tools.execution_context import capture_tool_output
+from spoon_bot.agent.tools.execution_context import (
+    capture_tool_output,
+    get_request_execution_hints,
+    get_tracked_tool_invocation_counts,
+)
 
 # Shared httpx client for connection pooling across web tools.
 # Created lazily on first use to avoid issues at import time.
@@ -619,6 +623,10 @@ class WebFetchTool(Tool):
         if not is_valid:
             return f"Error: {error_msg}"
 
+        deferred_fetch_blocker = self._build_local_skill_fetch_blocker(url)
+        if deferred_fetch_blocker:
+            return deferred_fetch_blocker
+
         # Validate method
         if method not in ("GET", "POST", "HEAD"):
             return f"Error: Invalid method '{method}'. Allowed: GET, POST, HEAD"
@@ -680,6 +688,65 @@ class WebFetchTool(Tool):
             return f"Error: Request timed out after {self._timeout}s for {url}"
         except Exception as exc:
             return f"Error fetching {url}: {exc}"
+
+    @staticmethod
+    def _build_local_skill_fetch_blocker(url: str) -> str | None:
+        """Defer skill-derived remote probes until a local executable path is tried."""
+        hints = get_request_execution_hints()
+        if not hints or hints.get("allow_remote_probe"):
+            return None
+
+        local_skills = hints.get("local_executable_skills")
+        if not isinstance(local_skills, list) or not local_skills:
+            return None
+
+        invocation_counts = get_tracked_tool_invocation_counts()
+        if invocation_counts.get("shell", 0) > 0:
+            return None
+
+        parsed = urlparse(str(url or ""))
+        target_host = (parsed.hostname or "").lower().strip()
+        target_url = str(url or "").strip().lower()
+        if not target_host and not target_url:
+            return None
+
+        for skill in local_skills:
+            if not isinstance(skill, dict):
+                continue
+            urls = skill.get("urls")
+            if not isinstance(urls, list) or not urls:
+                continue
+
+            matched = False
+            for candidate in urls:
+                parsed_candidate = urlparse(str(candidate or ""))
+                candidate_host = (parsed_candidate.hostname or "").lower().strip()
+                candidate_url = str(candidate or "").strip().lower()
+                if candidate_host and candidate_host == target_host:
+                    matched = True
+                    break
+                if candidate_url and target_url.startswith(candidate_url.rstrip("/")):
+                    matched = True
+                    break
+            if not matched:
+                continue
+
+            commands = skill.get("commands") if isinstance(skill.get("commands"), list) else []
+            command_hint = ""
+            if commands:
+                command_hint = " For example: " + " | ".join(str(cmd) for cmd in commands[:2])
+            skill_name = str(skill.get("name") or "local skill")
+            skill_location = str(skill.get("location") or "")
+            location_hint = f" at {skill_location}" if skill_location else ""
+            return (
+                "Error: Deferred remote fetch from a skill-derived endpoint before any "
+                f"local execution. This request already matches local skill `{skill_name}`"
+                f"{location_hint}. Read its SKILL.md and run one of its documented local "
+                f"commands first.{command_hint} Only probe remote endpoints after the local "
+                "command reports a concrete blocker that requires network inspection."
+            )
+
+        return None
 
     @staticmethod
     def _extract_text_from_html(html: str, selector: str | None = None) -> str:

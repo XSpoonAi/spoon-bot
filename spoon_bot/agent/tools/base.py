@@ -8,7 +8,10 @@ from typing import Any, TypedDict
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_invocation,
     finalize_tool_invocation,
+    record_tool_invocation_result,
+    suppress_after_consecutive_tool_failures,
     suppress_repeated_tool_invocation,
+    suppress_repeated_tool_series,
 )
 
 try:
@@ -144,13 +147,33 @@ class Tool(ABC):
         executed = False
         with bind_tool_invocation(self.name, kwargs):
             try:
-                duplicate_result = suppress_repeated_tool_invocation(self.name, kwargs)
-                if duplicate_result is not None:
-                    result = duplicate_result
+                failure_loop_result = suppress_after_consecutive_tool_failures(self.name)
+                if failure_loop_result is not None:
+                    result = failure_loop_result
                     return result
+                dedup_key_func = getattr(self, "tool_invocation_dedup_key", None)
+                dedup_arguments = dedup_key_func(kwargs) if callable(dedup_key_func) else kwargs
+                if dedup_arguments is not None:
+                    duplicate_result = suppress_repeated_tool_invocation(
+                        self.name,
+                        dedup_arguments,
+                    )
+                    if duplicate_result is not None:
+                        result = duplicate_result
+                        return result
+                series_key_func = getattr(self, "tool_invocation_series_key", None)
+                if callable(series_key_func):
+                    series_result = suppress_repeated_tool_series(
+                        self.name,
+                        series_key_func(kwargs),
+                    )
+                    if series_result is not None:
+                        result = series_result
+                        return result
                 executed = True
                 result = await self.execute(**kwargs)
             finally:
+                record_tool_invocation_result(self.name, result)
                 finalize_tool_invocation(result)
 
         if executed and self._path_touch_callback is not None:

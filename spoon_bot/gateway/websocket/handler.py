@@ -831,6 +831,9 @@ class WebSocketHandler:
                             metadata = chunk_data.get("metadata", {})
                             source = chunk_data.get("source") or _get_agent_response_source(agent)
 
+                            if chunk_type == "thinking" and not thinking:
+                                continue
+
                             if chunk_type == "error":
                                 had_error = True
                                 await manager.send_message(

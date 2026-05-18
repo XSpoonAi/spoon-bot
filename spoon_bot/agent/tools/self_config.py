@@ -139,6 +139,7 @@ class SelfConfigTool(Tool):
 
     # Critical keys that warrant extra warnings when modified
     CRITICAL_KEYS = frozenset({"model", "provider", "max_iterations"})
+    SENSITIVE_KEY_FRAGMENTS = ("key", "token", "secret", "password")
 
     def __init__(self, config_path: Path | str | None = None):
         """
@@ -151,6 +152,11 @@ class SelfConfigTool(Tool):
             Path.home() / ".spoon-bot" / "config.json"
         )
         self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        self._agent_loop: Any = None
+
+    def set_agent_loop(self, agent_loop: Any) -> None:
+        """Inject the owning AgentLoop so reads can reflect runtime config."""
+        self._agent_loop = agent_loop
 
     @property
     def name(self) -> str:
@@ -186,14 +192,84 @@ class SelfConfigTool(Tool):
             "required": ["action"],
         }
 
-    def _load_config(self) -> dict[str, Any]:
-        """Load configuration from file."""
+    @classmethod
+    def _is_sensitive_key(cls, key: str) -> bool:
+        lower = key.lower()
+        return any(fragment in lower for fragment in cls.SENSITIVE_KEY_FRAGMENTS)
+
+    def _sanitize_value(self, key: str, value: Any) -> Any:
+        """Redact secrets before returning config values to the model/user."""
+        if self._is_sensitive_key(key):
+            return "[redacted]"
+        if isinstance(value, dict):
+            return {k: self._sanitize_value(k, v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [
+                self._sanitize_value(f"{key}[{idx}]", item)
+                for idx, item in enumerate(value)
+            ]
+        return value
+
+    def _sanitize_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        return {key: self._sanitize_value(key, value) for key, value in config.items()}
+
+    def _load_legacy_config(self) -> dict[str, Any]:
+        """Load the legacy self-config JSON file when no runtime is attached."""
         if self._config_path.exists():
             try:
                 return json.loads(self._config_path.read_text())
             except Exception:
-                pass
+                logger.debug("Failed to read legacy self_config JSON; falling back")
+        return {}
+
+    def _load_effective_config(self) -> dict[str, Any]:
+        """Load effective config using the same chain as the running agent."""
+        resolved: dict[str, Any] = {}
+        config_path = getattr(self._agent_loop, "_config_path", None) if self._agent_loop else None
+
+        try:
+            from spoon_bot.channels.config import load_agent_config
+
+            resolved = dict(load_agent_config(config_path))
+        except FileNotFoundError:
+            resolved = {}
+        except Exception as exc:
+            logger.debug(f"Failed to resolve runtime config chain for self_config: {exc}")
+
+        if self._agent_loop is not None:
+            runtime_values = {
+                "model": getattr(self._agent_loop, "model", None),
+                "provider": getattr(self._agent_loop, "provider", None),
+                "api_key": getattr(self._agent_loop, "api_key", None),
+                "base_url": getattr(self._agent_loop, "base_url", None),
+                "reasoning_effort": getattr(self._agent_loop, "reasoning_effort", None),
+                "workspace": (
+                    str(self._agent_loop.workspace)
+                    if getattr(self._agent_loop, "workspace", None) is not None
+                    else None
+                ),
+                "max_iterations": getattr(self._agent_loop, "max_iterations", None),
+                "shell_timeout": getattr(self._agent_loop, "shell_timeout", None),
+                "shell_max_timeout": getattr(self._agent_loop, "shell_max_timeout", None),
+                "max_output": getattr(self._agent_loop, "max_output", None),
+                "context_window": getattr(self._agent_loop, "context_window", None),
+                "yolo_mode": getattr(self._agent_loop, "yolo_mode", None),
+            }
+            resolved.update({
+                key: value for key, value in runtime_values.items() if value is not None
+            })
+
+        if resolved:
+            return resolved
+
+        legacy = self._load_legacy_config()
+        if legacy:
+            return legacy
         return self._get_defaults()
+
+    def _load_config(self) -> dict[str, Any]:
+        """Load the effective configuration visible to the running agent."""
+        return self._load_effective_config()
 
     def _save_config(self, config: dict[str, Any]) -> None:
         """Save configuration to file."""
@@ -202,11 +278,9 @@ class SelfConfigTool(Tool):
     def _get_defaults(self) -> dict[str, Any]:
         """Get default configuration."""
         return {
-            "model": "claude-sonnet-4.6",
             "max_iterations": 50,
             "shell_timeout": 3600,
             "max_output": 10000,
-            "provider": "anthropic",
         }
 
     async def execute(self, **kwargs: Any) -> str:
@@ -215,20 +289,28 @@ class SelfConfigTool(Tool):
         value = kwargs.get("value")
 
         config = self._load_config()
+        public_config = self._sanitize_config(config)
 
         if action == "get":
             if not key:
                 return "Error: 'key' is required for 'get' action"
-            if key in config:
-                return f"{key} = {config[key]}"
+            if key in public_config:
+                return f"{key} = {public_config[key]}"
             return f"Key '{key}' not found"
 
         elif action == "set":
+            if self._agent_loop is not None:
+                return (
+                    "Error: self_config is read-only for a running agent. "
+                    "Effective config comes from runtime overrides plus config.yaml/env. "
+                    "Update the launch args, config.yaml, or environment variables instead."
+                )
             if not key:
                 return "Error: 'key' is required for 'set' action"
             if value is None:
                 return "Error: 'value' is required for 'set' action"
 
+            config = self._load_legacy_config() or self._get_defaults()
             # Type conversion
             old_value = config.get(key)
             if isinstance(old_value, int):
@@ -242,28 +324,35 @@ class SelfConfigTool(Tool):
             config[key] = value
             self._save_config(config)
             logger.info(f"Config updated: {key} = {value}")
+            old_display = self._sanitize_value(key, old_value) if old_value is not None else "(unset)"
+            new_display = self._sanitize_value(key, value)
 
             # Add warning for critical configuration changes
             if key in self.CRITICAL_KEYS:
-                old_display = old_value if old_value is not None else "(unset)"
                 return (
                     f"Warning: Configuration change: {key} will be changed from "
-                    f"{old_display} to {value}. This takes effect immediately."
+                    f"{old_display} to {new_display}. "
+                    "This applies to the legacy self_config store."
                 )
-            return f"Updated {key} = {value}"
+            return f"Updated {key} = {new_display}"
 
         elif action == "list":
             lines = ["Current configuration:"]
-            for k, v in config.items():
+            for k, v in public_config.items():
                 lines.append(f"  {k}: {v}")
             return "\n".join(lines)
 
         elif action == "reset":
+            if self._agent_loop is not None:
+                return (
+                    "Error: self_config reset is disabled for a running agent. "
+                    "Effective config is sourced from runtime overrides plus config.yaml/env."
+                )
             config = self._get_defaults()
             self._save_config(config)
             return (
-                "Warning: This will reset ALL configuration to defaults. "
-                "Configuration reset completed."
+                "Warning: Reset the legacy self_config store to local defaults. "
+                "This does not modify config.yaml, environment variables, or CLI overrides."
             )
 
         return f"Unknown action: {action}"

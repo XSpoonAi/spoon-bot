@@ -254,6 +254,8 @@ class TestBackgroundJobSummary:
         assert "job_output" in summary
         assert "terminate_job" in summary
         assert "NEXT STEPS" in summary
+        assert "Quiet output can be normal" in summary
+        assert "after two checks" not in summary
 
     def test_summary_includes_elapsed_time(self):
         tool = ShellTool()

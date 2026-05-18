@@ -364,11 +364,13 @@ class SkillMarketplaceTool(BaseTool):
     name: str = "skill_marketplace"
     description: str = (
         "Install, update, remove, or search skills. "
-        "WHEN THE USER GIVES A GITHUB URL, call this tool with action='install_skill' and url=<the URL>. "
-        "WHEN THE USER GIVES A LOCAL PATH, call this tool with action='install_local' and url=<the path>. "
+        "Use install actions only when the user explicitly asks to install an Agent Skill "
+        "or after you have already confirmed the source contains a skill SKILL.md. "
+        "Do NOT call this tool for arbitrary GitHub repositories, GitHub files, or local files; "
+        "inspect/review those first with the normal file, shell, or web tools. "
         "Actions: "
-        "install_skill (url required) — install a skill from GitHub URL; "
-        "install_local (url required) — copy a skill from a local directory path; "
+        "install_skill (url required) — install a confirmed Agent Skill from GitHub URL; "
+        "install_local (url required) — copy a confirmed local skill directory containing SKILL.md; "
         "update_skill (url required) — re-download and update an already-installed skill; "
         "search_skills (query required) — search skills.sh; "
         "remove_skill (skill_name required) — remove installed skill; "
@@ -399,7 +401,8 @@ class SkillMarketplaceTool(BaseTool):
             "url": {
                 "type": "string",
                 "description": (
-                    "GitHub URL to install from, or a local filesystem path for install_local. "
+                    "Confirmed skill GitHub URL to install from, or a local skill directory path "
+                    "for install_local. Do not pass generic repos/files before inspection. "
                     "e.g. 'https://github.com/openclaw/skills/tree/main/skills/tezatezaz/clawcast-wallet' "
                     "or '/home/user/my-skills/my-skill' or 'C:\\Projects\\my-skill'."
                 ),
@@ -545,6 +548,13 @@ class SkillMarketplaceTool(BaseTool):
                             shutil.rmtree(str(target), ignore_errors=True)
                 except NameError:
                     pass
+                message = str(e)
+                if "No SKILL.md" in message or "not a valid skill" in message:
+                    return (
+                        "Not installed: this source was not confirmed as an Agent Skill "
+                        f"({message}). For a regular repository or file, inspect/review it first "
+                        "with normal tools instead of copying it into workspace/skills."
+                    )
                 return f"Error installing skill: {e}"
 
         # ----------------------------------------------------------
@@ -555,8 +565,8 @@ class SkillMarketplaceTool(BaseTool):
                 return "Error: 'url' (local path) is required for install_local"
             if _looks_like_github_repo_reference(url):
                 return (
-                    "Error: GitHub repos must use action='install_skill'. "
-                    "Use the repo URL directly and let the marketplace resolve the SKILL.md folder."
+                    "Error: GitHub repos can use action='install_skill' only after the source "
+                    "is confirmed to be an Agent Skill with SKILL.md. Inspect generic repos/files first."
                 )
             try:
                 source = Path(url.strip()).expanduser().resolve()

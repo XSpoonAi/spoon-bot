@@ -1211,6 +1211,51 @@ class TestWSStreamingContent:
             assert tool_result["metadata"]["result"] == "/workspace"
             assert tool_result["metadata"]["output"] == "/workspace"
 
+    def test_stream_drops_thinking_chunks_when_thinking_disabled(self, client):
+        """WS should not surface thinking chunks unless the request enables thinking."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _stream_with_thinking(**kwargs):
+            yield {
+                "type": "thinking",
+                "delta": "Inspecting candidate commands.",
+                "metadata": {"source": "provider"},
+            }
+            yield {"type": "content", "delta": "Final answer.", "metadata": {}}
+            yield {"type": "done", "delta": "", "metadata": {"content": "Final answer."}}
+
+        agent.stream = _stream_with_thinking
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_no_thinking1",
+                "method": "chat.send",
+                "params": {
+                    "message": "continue",
+                    "stream": True,
+                    "thinking": False,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            chunk_events = [
+                e for e in events
+                if e.get("type") == "event"
+                and e.get("event") == "agent.stream.chunk"
+            ]
+            assert [e["data"]["type"] for e in chunk_events] == ["content"]
+            assert chunk_events[0]["data"]["delta"] == "Final answer."
+
     def test_stream_empty_final_response_gets_user_visible_fallback(self, client):
         """Streaming chat should never complete with an empty user-visible response."""
         agent = app_module._agent

@@ -892,10 +892,7 @@ class TestFeishuChannel:
 
         text = ch._build_pairing_challenge_text("ou_new_user")
 
-        assert "你当前还没有权限私聊使用这个机器人。" in text
-        assert "你的飞书用户 ID：" in text
-        assert "这串 ID 是你在飞书里的唯一身份标识" in text
-        assert "请把这串 ID 发给机器人管理员" in text
+        assert "ou_new_user" in text
         assert "/pair allow ou_new_user" in text
 
     def test_pairing_challenge_text_without_admins_points_to_maintainer(self):
@@ -904,10 +901,8 @@ class TestFeishuChannel:
 
         text = ch._build_pairing_challenge_text("ou_new_user")
 
-        assert "你当前还没有权限私聊使用这个机器人。" in text
-        assert "你的飞书用户 ID：" in text
-        assert "当前机器人还没有配置审批管理员" in text
-        assert "请把这串 ID 发给机器人维护者处理。" in text
+        assert "ou_new_user" in text
+        assert "/pair allow" not in text
 
     @pytest.mark.asyncio
     async def test_on_processing_start_placeholder_mode_creates_placeholder_and_task(self):

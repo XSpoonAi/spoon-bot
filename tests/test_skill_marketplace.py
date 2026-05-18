@@ -38,6 +38,27 @@ def skill_manager_module(monkeypatch: pytest.MonkeyPatch):
     return module
 
 
+def test_skill_marketplace_description_does_not_route_generic_github_urls(
+    skill_manager_module,
+):
+    description = skill_manager_module.SkillMarketplaceTool.description
+
+    assert "WHEN THE USER GIVES A GITHUB URL" not in description
+    assert "arbitrary GitHub repositories" in description
+    assert "inspect/review those first" in description
+
+
+def test_builtin_skill_manager_requires_confirmed_skill_sources():
+    repo_root = Path(__file__).resolve().parent.parent
+    skill_md = repo_root / "workspace" / "skills" / "skill-manager" / "SKILL.md"
+    content = skill_md.read_text(encoding="utf-8")
+    keywords_line = next(line for line in content.splitlines() if "keywords:" in line)
+
+    assert "Do not use this skill for arbitrary GitHub repositories" in content
+    assert "github.com" not in keywords_line
+    assert "confirmed Agent Skill sources" in content
+
+
 @pytest.mark.asyncio
 async def test_install_skill_writes_into_workspace_skills_directory(
     skill_manager_module,
@@ -112,6 +133,31 @@ async def test_install_root_skill_repo_writes_into_workspace_skills_directory(
     assert (installed_dir / "SKILL.md").exists()
     assert not (tmp_path / "SKILL.md").exists()
     assert not (tmp_path / "README.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_install_skill_missing_skill_md_does_not_install_generic_repo(
+    skill_manager_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("SPOON_BOT_WORKSPACE_PATH", str(tmp_path))
+
+    async def fake_resolve(owner, repo, branch, subpath):
+        raise RuntimeError("No SKILL.md found under repository root")
+
+    monkeypatch.setattr(skill_manager_module, "_resolve_github_skill_source", fake_resolve)
+
+    tool = skill_manager_module.SkillMarketplaceTool()
+    result = await tool.execute(
+        action="install_skill",
+        url="https://github.com/XSpoonAi/spoon-core",
+    )
+
+    assert result.startswith("Not installed:")
+    assert "inspect/review it first" in result
+    assert "workspace/skills" in result
+    assert not (tmp_path / "skills" / "spoon-core").exists()
 
 
 def test_git_clone_command_uses_full_clone_for_root_skill_repo(skill_manager_module):

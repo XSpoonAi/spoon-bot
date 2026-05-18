@@ -16,15 +16,15 @@ class DummySession:
 def test_session_compact_keeps_user_fact_as_evidence() -> None:
     session = DummySession(
         [
-            {"role": "user", "content": "我刚才说的菜名是西红柿炒蛋。"},
-            {"role": "assistant", "content": "记下了，菜名是西红柿炒蛋。"},
+            {"role": "user", "content": "I mentioned the dish name was tomato scrambled eggs."},
+            {"role": "assistant", "content": "Recorded. The dish name is tomato scrambled eggs."},
         ]
     )
 
-    compact = build_session_compact_context(session, "刚才我说的菜名是什么？")
+    compact = build_session_compact_context(session, "What dish name did I mention earlier?")
 
-    assert "User evidence: 我刚才说的菜名是西红柿炒蛋。" in compact
-    assert "西红柿炒蛋" in compact
+    assert "User evidence: I mentioned the dish name was tomato scrambled eggs." in compact
+    assert "tomato scrambled eggs" in compact
 
 
 def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence() -> None:
@@ -33,7 +33,7 @@ def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence(
             {
                 "role": "user",
                 "content": (
-                    "继续刚才的任务，先检查状态。\n\n"
+                    "Continue the previous task and check status first.\n\n"
                     "---\n"
                     "[PRE-LOADED SKILL: demo-skill]\n"
                     "Base directory: /tmp/demo\n"
@@ -44,9 +44,9 @@ def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence(
         ]
     )
 
-    compact = build_session_compact_context(session, "继续")
+    compact = build_session_compact_context(session, "Continue")
 
-    assert "User evidence: 继续刚才的任务，先检查状态。" in compact
+    assert "User evidence: Continue the previous task and check status first." in compact
     assert "[PRE-LOADED SKILL:" not in compact
     assert "Do not search for alternatives" not in compact
 
@@ -72,3 +72,27 @@ def test_session_compact_does_not_preserve_long_prior_task_as_user_evidence() ->
     assert "Deploy service alpha. Run migration." not in compact
     assert "User evidence: Remember that the deployment ticket was OPS-42." in compact
     assert "OPS-42" in compact
+
+
+def test_session_compact_includes_interrupted_user_fact_as_non_executable_evidence() -> None:
+    raw_key = "0x" + "ab" * 32
+    session = DummySession(
+        [
+            {"role": "user", "content": "Join the game", "turn_state": "completed"},
+            {"role": "assistant", "content": "The old wallet joined one game."},
+            {
+                "role": "user",
+                "content": f"{raw_key} Use this private key to rejoin the latest game",
+                "turn_state": "interrupted",
+            },
+            {"role": "user", "content": "What is the current score now?", "turn_state": "completed"},
+            {"role": "assistant", "content": "The old wallet is currently 1 win and 12 losses."},
+        ]
+    )
+
+    compact = build_session_compact_context(session, "Didn't I give you the new-key wallet?")
+
+    assert "Interrupted/superseded user evidence" in compact
+    assert "do not execute unless the newest request explicitly resumes it" in compact
+    assert raw_key not in compact
+    assert "***masked_private_key***" in compact

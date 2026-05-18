@@ -432,6 +432,7 @@ class TestAgentLoopStream:
         agent.memory.get_memory_context = MagicMock(return_value=None)
         agent.context = MagicMock()
         agent._prepare_request_context = AsyncMock()
+        agent._add_current_turn_skill_zip_context = MagicMock(side_effect=lambda text: text)
         agent._build_runtime_message_content = MagicMock(side_effect=lambda *args, **kwargs: args[1])
         agent._build_step_prompt = MagicMock(return_value="prompt")
         agent._build_request_context_prompt = MagicMock(return_value="[USER REQUEST]: test")
@@ -565,6 +566,25 @@ class TestAgentLoopStream:
         assert "Execute only the newest user request." in prompt
         assert "stale tool sequence" in prompt
 
+    def test_build_request_context_prompt_bounds_external_side_effects(self):
+        """A single request must not turn into an unbounded external side-effect loop."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "Run the next external action.")
+
+        assert "[EXTERNAL SIDE-EFFECT BOUNDARY]:" in prompt
+        assert "at most one" in prompt
+        assert "external" in prompt
+        assert "explicit count" in prompt
+        assert "Do not batch multiple alternative tool attempts" in prompt
+        assert "run that command exactly as written" in prompt
+        assert "never remove protective wrappers" in prompt
+        assert "never convert a simulated command into a live" in prompt
+
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
         from spoon_bot.agent.loop import AgentLoop
@@ -660,6 +680,44 @@ class TestAgentLoopStream:
 
         assert cleaned == "Here is the result: the script queries balances only."
 
+    def test_finalize_response_content_strips_let_me_scratchpad_prefix(self):
+        """English execution preambles should not be replayed as final content."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "Let me start by fetching the repo to understand the skill structure."
+            "The agent stopped the tool loop because status was already known."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Continue",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "The agent stopped the tool loop because status was already known."
+
+    def test_finalize_response_content_strips_ill_run_scratchpad_prefix(self):
+        """First-person execution preambles should also stay private."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "I'll run the command you specified and report the result briefly."
+            "Great! The wallet command executed successfully."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Run the wallet command",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "The wallet command executed successfully."
+
     def test_finalize_response_content_strips_mixed_prompt_reference_prefix(self):
         """Quoted user text inside a scratchpad prefix should not defeat cleanup."""
         from spoon_bot.agent.loop import AgentLoop
@@ -750,6 +808,83 @@ class TestAgentLoopStream:
 
         assert "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in cleaned
         assert "***masked_private_key***" in cleaned
+
+    def test_finalize_response_content_replaces_raw_tool_trace_leak(self):
+        """Provider fallback text can contain raw tool transcript; final output must stay bounded."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = SimpleNamespace(
+            memory=SimpleNamespace(
+                messages=[
+                    SimpleNamespace(role="user", content="run external workflow"),
+                    SimpleNamespace(
+                        role="tool",
+                        content=(
+                            "Observed output of cmd shell execution: "
+                            "FINAL_STATE task=347 action=joined result=pending"
+                        ),
+                        name="shell",
+                        tool_call_id="call_join",
+                    ),
+                ]
+            )
+        )
+        content = (
+            "Let me start by fetching the repo."
+            "Step 1: Observed output of cmd web_fetch execution: "
+            + ("raw page text " * 1000)
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "Run the external workflow",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert "raw tool transcript" in cleaned
+        assert "FINAL_STATE task=347 action=joined" in cleaned
+        assert "Step 1:" not in cleaned
+        assert len(cleaned) < 1600
+
+    def test_finalize_response_content_replaces_markdown_tool_trace_leak(self):
+        """Markdown pseudo tool calls should not be accepted as completed work."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = SimpleNamespace(
+            memory=SimpleNamespace(
+                messages=[
+                    SimpleNamespace(role="user", content="create a weather skill"),
+                    SimpleNamespace(
+                        role="tool",
+                        content="Observed output of cmd list_dir execution: (no items)",
+                        name="list_dir",
+                        tool_call_id="call_list",
+                    ),
+                ]
+            )
+        )
+        content = (
+            "- write_file(path='skills/weather/SKILL.md'): "
+            "Observed output of cmd write_file execution: Success\n"
+            "- shell(command='bash skills/weather/scripts/weather.sh London'): "
+            "Observed output of cmd shell execution: Light rain\n\n"
+            "Weather skill created successfully."
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "create a weather skill",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert "raw tool transcript" in cleaned
+        assert "Tool `list_dir` output:" in cleaned
+        assert "write_file(path=" not in cleaned
+        assert "Weather skill created successfully" not in cleaned
 
     def test_stream_tool_result_metadata_caps_large_payloads(self):
         from spoon_bot.agent.loop import AgentLoop
@@ -1026,6 +1161,51 @@ when_to_use: Use for {skill_name} tasks.
         contexts = AgentLoop._find_recent_invoked_skill_contexts(loop)
 
         assert [ctx["name"] for ctx in contexts] == ["report-builder"]
+
+    def test_request_execution_hints_extract_local_skill_commands_and_urls(self, tmp_path):
+        """Request execution hints should derive local executable skill metadata generically."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description: Play the SPOT game through the local CLI
+when_to_use: Use when the user wants to play SPOT or continue a SPOT game.
+---
+# Spot Agent
+
+CLI := node skills/spot-agent-cypher/cli/index.js
+
+```bash
+$CLI wallet
+$CLI join A
+```
+
+API base: http://13.251.72.206:8080/api/agent/games
+""",
+            encoding="utf-8",
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        hints = AgentLoop._build_request_execution_hints(
+            loop,
+            "Continue the SPOT game with spot-agent-cypher and finish the round.",
+        )
+
+        assert hints["allow_remote_probe"] is False
+        assert len(hints["local_executable_skills"]) == 1
+        skill_hint = hints["local_executable_skills"][0]
+        assert skill_hint["name"] == "spot-agent-cypher"
+        assert "node skills/spot-agent-cypher/cli/index.js" in skill_hint["commands"][0]
+        assert any("join A" in command for command in skill_hint["commands"])
+        assert "http://13.251.72.206:8080/api/agent/games" in skill_hint["urls"]
+        assert hints["exact_shell_commands"] == []
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
@@ -1368,8 +1548,8 @@ when_to_use: Use for {skill_name} tasks.
         assert done_chunks[0]["metadata"]["content"] == "Answer"
 
     @pytest.mark.asyncio
-    async def test_stream_keeps_pre_tool_content_as_content(self):
-        """Plain content must remain content even if a tool call follows."""
+    async def test_stream_withholds_initial_content_when_tool_follows(self):
+        """Initial content before the first tool call is private tool preamble."""
         from spoon_bot.agent.loop import AgentLoop
 
         tool_call = MagicMock()
@@ -1412,17 +1592,15 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
-        assert emitted[0]["delta"] == "Part A. "
-        assert emitted[0]["metadata"]["segment_type"] == "content"
-        assert emitted[1]["metadata"]["name"] == "shell"
-        assert emitted[2]["delta"] == "Part B."
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
+        assert emitted[0]["metadata"]["name"] == "shell"
+        assert emitted[1]["delta"] == "Part B."
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert done_chunks[0]["metadata"]["content"] == "Part A. Part B."
+        assert done_chunks[0]["metadata"]["content"] == "Part B."
 
     @pytest.mark.asyncio
-    async def test_stream_preserves_pre_tool_content_chunk_boundaries(self):
-        """Multiple pre-tool content chunks should stay split and ordered."""
+    async def test_stream_withholds_split_initial_content_when_tool_follows(self):
+        """Split initial content should not leak before the first tool call."""
         from spoon_bot.agent.loop import AgentLoop
 
         tool_call = MagicMock()
@@ -1467,17 +1645,9 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"tool_call", "content"}]
-        assert [c["type"] for c in emitted] == [
-            "content",
-            "content",
-            "content",
-            "tool_call",
-            "content",
-        ]
-        assert [c["delta"] for c in emitted[:3]] == ["First", " second", "."]
-        assert len({c["metadata"]["segment_index"] for c in emitted[:3]}) == 1
-        assert emitted[3]["metadata"]["name"] == "read_file"
-        assert emitted[4]["delta"] == "Done."
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
+        assert emitted[0]["metadata"]["name"] == "read_file"
+        assert emitted[1]["delta"] == "Done."
 
     @pytest.mark.asyncio
     async def test_stream_marks_segment_boundaries_around_tool_calls(self):
@@ -1525,15 +1695,12 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"thinking", "content", "tool_call"}]
-        assert [c["type"] for c in emitted] == ["content", "tool_call", "content"]
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
         assert emitted[0]["metadata"]["segment_start"] is True
         assert emitted[1]["metadata"]["segment_start"] is True
-        assert emitted[2]["metadata"]["segment_start"] is True
         assert emitted[0]["metadata"]["segment_index"] != emitted[1]["metadata"]["segment_index"]
-        assert emitted[1]["metadata"]["segment_index"] != emitted[2]["metadata"]["segment_index"]
-        assert emitted[0]["metadata"]["segment_type"] == "content"
-        assert emitted[1]["metadata"]["segment_type"] == "tool_call"
-        assert emitted[2]["metadata"]["segment_type"] == "content"
+        assert emitted[0]["metadata"]["segment_type"] == "tool_call"
+        assert emitted[1]["metadata"]["segment_type"] == "content"
 
     @pytest.mark.asyncio
     async def test_stream_falls_back_to_run_result_after_pre_tool_content_without_final_chunk(self):
@@ -1583,13 +1750,47 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
-        assert emitted[0]["delta"] == "Need tool first. "
-        assert emitted[0]["metadata"]["phase"] == "pre_tool_scratchpad"
-        assert emitted[2]["delta"] == "Final answer."
-        assert emitted[2]["metadata"]["fallback"] == "run_result_no_chunks"
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
+        assert emitted[1]["delta"] == "Final answer."
+        assert emitted[1]["metadata"]["fallback"] == "run_result_no_chunks"
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Final answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_fallback_finalizes_raw_tool_transcript_before_content_emit(self):
+        """Run-result fallback must not stream raw Step/Observed-output transcript as content."""
+        from types import SimpleNamespace
+
+        from spoon_bot.agent.loop import AgentLoop
+
+        raw_result = (
+            "Let me execute it. Step 1: Observed output of cmd shell execution: "
+            + ("raw output " * 200)
+        )
+        agent = self._make_stream_agent([], run_result_text=raw_result)
+        agent._agent.memory = SimpleNamespace(
+            messages=[
+                SimpleNamespace(role="user", content="run external workflow"),
+                SimpleNamespace(
+                    role="tool",
+                    content="Observed output of cmd shell execution: FINAL_STATE ok",
+                    name="shell",
+                    tool_call_id="call_1",
+                ),
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+        assert emitted_content
+        assert all("Step 1: Observed output" not in c["delta"] for c in emitted_content)
+        assert "raw tool transcript" in emitted_content[0]["delta"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert "raw tool transcript" in done_chunks[0]["metadata"]["content"]
+        assert "Step 1: Observed output" not in done_chunks[0]["metadata"]["content"]
 
     @pytest.mark.asyncio
     async def test_stream_fallback_after_tool_preamble_emits_only_missing_suffix(self):
@@ -1639,13 +1840,91 @@ when_to_use: Use for {skill_name} tasks.
             chunks.append(chunk)
 
         emitted = [c for c in chunks if c["type"] in {"thinking", "tool_call", "content"}]
-        assert [c["type"] for c in emitted] == ["thinking", "tool_call", "content"]
-        assert emitted[0]["delta"] == "Need tool first. "
-        assert emitted[0]["metadata"]["phase"] == "pre_tool_scratchpad"
-        assert emitted[2]["delta"] == "Final answer."
-        assert emitted[2]["metadata"]["fallback"] == "run_result_no_chunks"
+        assert [c["type"] for c in emitted] == ["tool_call", "content"]
+        assert emitted[1]["delta"] == "Final answer."
+        assert emitted[1]["metadata"]["fallback"] == "run_result_no_chunks"
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Final answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_stops_after_tool_suppression_guardrail(self):
+        """Suppressed repeated tool work should end the stream loop instead of burning iterations."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"echo runner taskctl submit 47 A"}'
+
+        suppressed_result = (
+            "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. "
+            "The same tool and arguments already executed in this request."
+        )
+        agent = self._make_stream_agent(
+            [
+                {"tool_calls": [tool_call]},
+                {
+                    "type": "tool_result",
+                    "name": "shell",
+                    "tool_call_id": "call_1",
+                    "result": suppressed_result,
+                },
+                {"tool_calls": [tool_call]},
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_tool_calls = [c for c in chunks if c["type"] == "tool_call"]
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+
+        assert len(emitted_tool_calls) == 1
+        assert emitted_content
+        assert "I skipped a repeated action that had already run." in emitted_content[0]["delta"]
+        assert "STOP_TOOL_LOOP" not in emitted_content[0]["delta"]
+        assert "tool guardrail" not in emitted_content[0]["delta"]
+
+    @pytest.mark.asyncio
+    async def test_stream_stops_after_tool_failure_suppression_guardrail(self):
+        """Tool-layer failure suppression should end the stream loop."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        def _tool_call(call_id: str, command: str):
+            tool_call = MagicMock()
+            tool_call.id = call_id
+            tool_call.function = MagicMock()
+            tool_call.function.name = "shell"
+            tool_call.function.arguments = f'{{"command":"{command}"}}'
+            return tool_call
+
+        agent = self._make_stream_agent(
+            [
+                {"tool_calls": [_tool_call("call_1", "cmd one")]},
+                {
+                    "type": "tool_result",
+                    "name": "shell",
+                    "tool_call_id": "call_1",
+                    "result": "Error: consecutive tool failures suppressed. STOP_TOOL_LOOP",
+                },
+                {"tool_calls": [_tool_call("call_2", "cmd two")]},
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_tool_calls = [c for c in chunks if c["type"] == "tool_call"]
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+
+        assert len(emitted_tool_calls) == 1
+        assert emitted_content
+        assert "I stopped retrying after repeated failures." in emitted_content[0]["delta"]
+        assert "STOP_TOOL_LOOP" not in emitted_content[0]["delta"]
+        assert "tool guardrail" not in emitted_content[0]["delta"]
 
     @pytest.mark.asyncio
     async def test_stream_strips_post_tool_scratchpad_prefix_before_content(self):
@@ -1678,6 +1957,160 @@ when_to_use: Use for {skill_name} tasks.
         ]
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Done: generated the requested file."
+
+    @pytest.mark.asyncio
+    async def test_stream_replaces_post_tool_markdown_tool_trace_before_emit(self):
+        """Pseudo tool-call markdown should trigger a real tool-call retry."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        def _tool_call(call_id: str, name: str, arguments: str):
+            tool_call = MagicMock()
+            tool_call.id = call_id
+            tool_call.function = MagicMock()
+            tool_call.function.name = name
+            tool_call.function.arguments = arguments
+            return tool_call
+
+        initial_tool = _tool_call("call_1", "list_dir", '{"path":"skills"}')
+        repair_tool = _tool_call(
+            "call_2",
+            "write_file",
+            '{"path":"skills/weather/SKILL.md","content":"# Weather"}',
+        )
+
+        leaked_transcript = (
+            "- write_file(path='skills/weather/SKILL.md'): "
+            "Observed output of cmd write_file execution: Success\n"
+            "- shell(command='bash skills/weather/scripts/weather.sh London'): "
+            "Observed output of cmd shell execution: Light rain\n\n"
+            "Weather skill created successfully."
+        )
+        agent = self._make_stream_agent([])
+        attempts = 0
+
+        async def run(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await agent._agent.output_queue.put({"tool_calls": [initial_tool]})
+                await agent._agent.output_queue.put({"content": leaked_transcript})
+                return MagicMock(content=leaked_transcript)
+            await agent._agent.output_queue.put({"tool_calls": [repair_tool]})
+            await agent._agent.output_queue.put({
+                "type": "tool_result",
+                "name": "write_file",
+                "tool_call_id": "call_2",
+                "result": "Success",
+            })
+            await agent._agent.output_queue.put({"content": "Weather skill created."})
+            return MagicMock(content="Weather skill created.")
+
+        agent._agent.run = AsyncMock(side_effect=run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        content_text = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        tool_call_names = [
+            c["metadata"]["name"]
+            for c in chunks
+            if c["type"] == "tool_call"
+        ]
+
+        assert attempts == 2
+        assert tool_call_names == ["list_dir", "write_file"]
+        assert content_text == "Weather skill created."
+        assert "raw tool transcript" not in content_text
+        assert "write_file(path=" not in content_text
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Weather skill created."
+        assert "write_file(path=" not in done_chunks[0]["metadata"]["content"]
+
+    def test_build_tool_loop_fallback_response_unwraps_exact_shell_failure(self):
+        """Exact requested shell failures should surface as the blocker, not generic guardrail prose."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        event = {
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": (
+                    "STOP_TOOL_LOOP: Exact requested shell command failed. "
+                    "Report this blocker directly instead of switching to additional exploratory tools.\n"
+                    "STDERR:\nSPOT API GET /api/agent/games/assign failed after 5 attempts: fetch failed\n\n"
+                    "Exit code: 1"
+                ),
+            },
+        }
+
+        cleaned = AgentLoop._build_tool_loop_fallback_response([event], reason="tool_suppression")
+
+        assert "tool guardrail suppressed repeated work" not in cleaned
+        assert "STOP_TOOL_LOOP" not in cleaned
+        assert "SPOT API GET /api/agent/games/assign failed after 5 attempts: fetch failed" in cleaned
+
+    def test_build_tool_loop_fallback_response_reports_prior_result_for_duplicate_suppression(self):
+        """Duplicate suppression should not surface STOP_TOOL_LOOP internals to users."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "Inserted comment rows for Alice and alice@example.com.",
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. "
+                        "The same tool and arguments already executed in this request."
+                    ),
+                },
+            },
+        ]
+
+        cleaned = AgentLoop._build_tool_loop_fallback_response(events, reason="tool_suppression")
+
+        assert "I skipped a repeated action that had already run." in cleaned
+        assert "Latest available result:" in cleaned
+        assert "Inserted comment rows" in cleaned
+        assert "STOP_TOOL_LOOP" not in cleaned
+        assert "tool guardrail" not in cleaned
+        assert "duplicate tool invocation suppressed" not in cleaned
+
+    @pytest.mark.asyncio
+    async def test_stream_buffers_split_pre_tool_scratchpad_prefix(self):
+        """Tiny split scratchpad chunks before the first tool call should not leak."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"node skills/spot-agent-cypher/cli/index.js wallet"}'
+
+        agent = self._make_stream_agent([
+            {"content": "I"},
+            {"content": "'ll run the command and report briefly."},
+            {"tool_calls": [tool_call]},
+            {"content": "Wallet command executed successfully."},
+        ])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == [
+            "Wallet command executed successfully."
+        ]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Wallet command executed successfully."
 
     @pytest.mark.asyncio
     async def test_stream_treats_post_tool_content_before_next_tool_as_private(self):
@@ -1714,7 +2147,7 @@ when_to_use: Use for {skill_name} tasks.
             "Completed: created the requested report."
         ]
         thinking_chunks = [c for c in chunks if c["type"] == "thinking"]
-        assert "Need a fresh workspace" in "".join(c["delta"] for c in thinking_chunks)
+        assert "Need a fresh workspace" not in "".join(c["delta"] for c in thinking_chunks)
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == "Completed: created the requested report."
 
@@ -1948,6 +2381,60 @@ when_to_use: Use for {skill_name} tasks.
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
         assert "finished after tool" in content
+        assert "stopped the tool loop" not in content
+
+    @pytest.mark.asyncio
+    async def test_stream_total_timeout_waits_for_active_shell_budget(self):
+        """An active shell tool should get its foreground budget before stream fallback."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        first_tool = MagicMock()
+        first_tool.id = "call_0"
+        first_tool.function = MagicMock()
+        first_tool.function.name = "shell"
+        first_tool.function.arguments = '{"command":"setup-step"}'
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"long-game-command"}'
+
+        agent = self._make_stream_agent([])
+        agent.provider_silence_timeout = 0.05
+        agent.provider_total_timeout = 0.05
+        agent.tool_followup_timeout = 0.05
+        agent.shell_timeout = 0.1
+        agent.max_stream_tool_results_without_content = 99
+
+        async def slow_shell_result_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [first_tool]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_0", "name": "shell"},
+                    "result": "setup step completed",
+                }
+            )
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await asyncio.sleep(0.12)
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_1", "name": "shell"},
+                    "result": "long game command moved forward",
+                }
+            )
+            return "finished after active shell"
+
+        agent._agent.run = AsyncMock(side_effect=slow_shell_result_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        assert "finished after active shell" in content
         assert "stopped the tool loop" not in content
 
     @pytest.mark.asyncio
@@ -2317,6 +2804,31 @@ when_to_use: Use for {skill_name} tasks.
         assert emitted[1]["delta"] == "Final answer."
 
     @pytest.mark.asyncio
+    async def test_stream_drops_explicit_thinking_when_not_requested(self):
+        """thinking=false should keep provider thinking chunks out of the UI and final answer."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        agent = self._make_stream_agent([
+            {
+                "type": "thinking",
+                "delta": "Inspecting candidate commands.",
+                "content": "Inspecting candidate commands.",
+                "metadata": {"phase": "think", "source": "provider"},
+            },
+            {"content": "Final answer."},
+        ])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="test", thinking=False):
+            chunks.append(chunk)
+
+        assert [c for c in chunks if c["type"] == "thinking"] == []
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == ["Final answer."]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        assert done_chunks[0]["metadata"]["content"] == "Final answer."
+
+    @pytest.mark.asyncio
     async def test_stream_without_tool_call_keeps_plain_content(self):
         """thinking=true should not force all plain answers into thinking."""
         from spoon_bot.agent.loop import AgentLoop
@@ -2362,15 +2874,12 @@ when_to_use: Use for {skill_name} tasks.
         assert done_chunks[0]["metadata"]["content"] == "Direct answer"
 
     @pytest.mark.asyncio
-    async def test_stream_without_tool_call_emits_first_content_before_run_finishes(self):
-        """thinking=true should not buffer normal content until the very end."""
+    async def test_stream_without_tool_call_releases_initial_content_after_run_finishes(self):
+        """Initial content is released once the turn finishes without a tool call."""
         from spoon_bot.agent.loop import AgentLoop
-
-        release_run = asyncio.Event()
 
         async def mock_run(**kwargs):
             await agent._agent.output_queue.put({"content": "chunk-1 "})
-            await asyncio.wait_for(release_run.wait(), timeout=0.2)
             await agent._agent.output_queue.put({"content": "chunk-2"})
 
         agent = MagicMock(spec=AgentLoop)
@@ -2397,20 +2906,15 @@ when_to_use: Use for {skill_name} tasks.
         agent._reset_reasoning_capture = MagicMock()
         agent._drain_reasoning_chunks = MagicMock(return_value=[])
 
-        stream_iter = AgentLoop.stream(agent, message="test", thinking=True)
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="test", thinking=True):
+            chunks.append(chunk)
 
-        first_chunk = await asyncio.wait_for(anext(stream_iter), timeout=0.2)
-        assert first_chunk["type"] == "content"
-        assert first_chunk["delta"] == "chunk-1 "
-        assert first_chunk["metadata"]["segment_type"] == "content"
-        assert first_chunk["metadata"]["segment_start"] is True
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
 
-        release_run.set()
-        remaining_chunks = [chunk async for chunk in stream_iter]
-        content_chunks = [first_chunk, *[c for c in remaining_chunks if c["type"] == "content"]]
-        done_chunks = [c for c in remaining_chunks if c["type"] == "done"]
-
-        assert [c["delta"] for c in content_chunks] == ["chunk-1 ", "chunk-2"]
+        assert [c["delta"] for c in content_chunks] == ["chunk-1 chunk-2"]
+        assert content_chunks[0]["metadata"]["withheld_initial_content"] is True
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "chunk-1 chunk-2"
 
@@ -2533,7 +3037,7 @@ when_to_use: Use for {skill_name} tasks.
 
         user_call = agent._session.add_message.call_args_list[0]
         assert user_call.args[:2] == ("user", "test")
-        agent.sessions.save.assert_called_once()
+        agent.sessions.save.assert_called()
 
     @pytest.mark.asyncio
     async def test_stream_saves_session_on_success(self):

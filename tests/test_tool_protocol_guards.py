@@ -102,6 +102,103 @@ async def test_tool_guard_retries_without_parallel_flag_when_provider_rejects_it
 
 
 @pytest.mark.asyncio
+async def test_tool_guard_retries_truncated_tool_arguments_with_larger_budget(monkeypatch):
+    captured_kwargs: list[dict] = []
+
+    truncated_call = SimpleNamespace(
+        id="call_write",
+        function=SimpleNamespace(
+            name="write_file",
+            arguments='{"path":"skills/mbti-test/data/questions.json"',
+        ),
+    )
+    complete_call = SimpleNamespace(
+        id="call_write",
+        function=SimpleNamespace(
+            name="write_file",
+            arguments='{"path":"skills/mbti-test/data/questions.json","content":"[]"}',
+        ),
+    )
+
+    class FakeLLM:
+        async def ask_tool(self, *args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            if len(captured_kwargs) == 1:
+                return SimpleNamespace(
+                    content="",
+                    tool_calls=[truncated_call],
+                    finish_reason="length",
+                    native_finish_reason="length",
+                    metadata={},
+                )
+            return SimpleNamespace(
+                content="",
+                tool_calls=[complete_call],
+                finish_reason="tool_calls",
+                native_finish_reason="tool_calls",
+                metadata={},
+            )
+
+    monkeypatch.setenv("SPOON_BOT_TOOL_CALL_MAX_TOKENS", "12000")
+    monkeypatch.setenv("SPOON_BOT_TOOL_CALL_RETRY_MAX_TOKENS", "24000")
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.provider = "openrouter"
+    loop.model = "anthropic/claude-sonnet-4.6"
+    loop.base_url = "https://openrouter.ai/api/v1"
+    loop._agent = SimpleNamespace(llm=FakeLLM())
+
+    loop._install_tool_call_protocol_guards()
+    response = await loop._agent.llm.ask_tool(messages=[], tools=[])
+
+    assert len(captured_kwargs) == 2
+    assert captured_kwargs[0]["max_tokens"] == 12000
+    assert captured_kwargs[1]["max_tokens"] == 24000
+    assert response.tool_calls == [complete_call]
+
+
+@pytest.mark.asyncio
+async def test_tool_guard_blocks_still_truncated_tool_arguments_after_retry(monkeypatch):
+    captured_kwargs: list[dict] = []
+
+    truncated_call = SimpleNamespace(
+        id="call_write",
+        function=SimpleNamespace(
+            name="write_file",
+            arguments='{"path":"skills/mbti-test/data/questions.json"',
+        ),
+    )
+
+    class FakeLLM:
+        async def ask_tool(self, *args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return SimpleNamespace(
+                content="",
+                tool_calls=[truncated_call],
+                finish_reason="length",
+                native_finish_reason="length",
+                metadata={},
+            )
+
+    monkeypatch.setenv("SPOON_BOT_TOOL_CALL_MAX_TOKENS", "12000")
+    monkeypatch.setenv("SPOON_BOT_TOOL_CALL_RETRY_MAX_TOKENS", "24000")
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.provider = "openrouter"
+    loop.model = "anthropic/claude-sonnet-4.6"
+    loop.base_url = "https://openrouter.ai/api/v1"
+    loop._agent = SimpleNamespace(llm=FakeLLM())
+
+    loop._install_tool_call_protocol_guards()
+    response = await loop._agent.llm.ask_tool(messages=[], tools=[])
+
+    assert len(captured_kwargs) == 2
+    assert response.tool_calls == []
+    assert "Tool call generation was truncated" in response.content
+    assert response.metadata["incomplete_tool_calls_blocked"] is True
+
+
+@pytest.mark.asyncio
 async def test_tool_guard_leaves_non_strict_provider_kwargs_unchanged():
     captured_kwargs: list[dict] = []
 

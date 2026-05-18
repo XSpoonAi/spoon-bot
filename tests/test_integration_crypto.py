@@ -49,7 +49,7 @@ def extract_response(data: dict) -> str:
 async def test_btc_price():
     """BTC price query should return a numeric answer, not code."""
     print("\n━━━ Test: BTC Price ━━━")
-    data = await chat("BTC价格多少？", "test-btc-price")
+    data = await chat("What is the BTC price now?", "test-btc-price")
     resp = extract_response(data)
     print(f"  Reply: {resp[:300]}")
     # Basic checks
@@ -66,7 +66,7 @@ async def test_btc_price():
 async def test_eth_price():
     """ETH price query should work via auto-selected provider."""
     print("\n━━━ Test: ETH Price ━━━")
-    data = await chat("ETH现在多少钱", "test-eth-price")
+    data = await chat("What is ETH trading at now?", "test-eth-price")
     resp = extract_response(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success"), f"Request failed: {data}"
@@ -79,7 +79,7 @@ async def test_eth_price():
 async def test_sol_price():
     """SOL price query — should use Raydium provider."""
     print("\n━━━ Test: SOL Price ━━━")
-    data = await chat("SOL最近行情如何？价格是多少", "test-sol-price")
+    data = await chat("How is SOL performing lately? What is the current price?", "test-sol-price")
     resp = extract_response(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success"), f"Request failed: {data}"
@@ -92,7 +92,7 @@ async def test_sol_price():
 async def test_general_search():
     """Non-crypto query should use web_search, not crypto tools."""
     print("\n━━━ Test: General Web Search ━━━")
-    data = await chat("今天天气怎么样", "test-general-search")
+    data = await chat("How is the weather today?", "test-general-search")
     resp = extract_response(data)
     print(f"  Reply: {resp[:300]}")
     assert data.get("success"), f"Request failed: {data}"
@@ -103,7 +103,7 @@ async def test_general_search():
 async def test_ambiguous_crypto():
     """Ambiguous query with crypto context should still activate tools."""
     print("\n━━━ Test: Ambiguous Crypto Query ━━━")
-    data = await chat("WBTC和BTC有什么区别？价格差多少？", "test-ambiguous")
+    data = await chat("What is the difference between WBTC and BTC? How far apart are their prices?", "test-ambiguous")
     resp = extract_response(data)
     print(f"  Reply: {resp[:400]}")
     assert data.get("success"), f"Request failed: {data}"

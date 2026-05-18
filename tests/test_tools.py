@@ -72,6 +72,98 @@ class TestShellTool:
         assert "PRIVATE_KEY=0x" not in result
         assert "SPOON_BOT_DEFAULT_PROVIDER=openrouter" in result
 
+    def test_shell_tool_does_not_infer_side_effect_series_from_command_text(self, shell_tool):
+        """Shell should not guess business side effects from command words."""
+        assert not callable(getattr(shell_tool, "tool_invocation_series_key", None))
+
+    def test_shell_read_only_background_actions_skip_exact_dedup(self, shell_tool):
+        """Polling an existing background job should not be mistaken for a loop."""
+        for action in ("list_jobs", "job_status", "job_output"):
+            assert shell_tool.tool_invocation_dedup_key(
+                {"action": action, "job_id": "sh_testjob"}
+            ) is None
+
+        assert shell_tool.tool_invocation_dedup_key(
+            {"action": "terminate_job", "job_id": "sh_testjob"}
+        ) == {"action": "terminate_job", "job_id": "sh_testjob"}
+
+    @pytest.mark.asyncio
+    async def test_background_job_status_can_be_polled_repeatedly_in_request_scope(self, shell_tool):
+        """The generic duplicate guard should not block repeated status reads."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            returncode = None
+
+            async def wait(self):
+                return None
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        stdout_task = asyncio.create_task(asyncio.sleep(0))
+        stderr_task = asyncio.create_task(asyncio.sleep(0))
+        job = _BackgroundShellJob(
+            job_id="sh_polljob",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="line one",
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        with track_tool_invocations(max_repeats=1):
+            first = await shell_tool(action="job_status", job_id=job.job_id)
+            second = await shell_tool(action="job_status", job_id=job.job_id)
+
+        assert "job_id: sh_polljob" in first
+        assert "job_id: sh_polljob" in second
+        assert "STOP_TOOL_LOOP" not in second
+
+    def test_shell_stops_after_exact_requested_command_failure(self, shell_tool):
+        """Exact user-requested shell commands should fail fast without extra tool detours."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+
+        with bind_request_execution_hints(
+            {"exact_shell_commands": ["node skills/spot-agent-cypher/cli/index.js join A"]}
+        ):
+            result = shell_tool._maybe_stop_after_exact_command_failure(
+                "node skills/spot-agent-cypher/cli/index.js join A",
+                "SPOT API GET /api/agent/games/assign failed after 5 attempts: fetch failed",
+            )
+
+        assert result.startswith("STOP_TOOL_LOOP: Exact requested shell command failed.")
+
+    def test_shell_exact_command_guard_ignores_non_matching_commands(self, shell_tool):
+        """The fast-stop guard should only apply to the exact requested command."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+
+        with bind_request_execution_hints(
+            {"exact_shell_commands": ["node skills/spot-agent-cypher/cli/index.js join A"]}
+        ):
+            result = shell_tool._maybe_stop_after_exact_command_failure(
+                "node skills/spot-agent-cypher/cli/index.js wallet",
+                "Exit code: 1",
+            )
+
+        assert result == "Exit code: 1"
+
+    def test_shell_description_preserves_protective_wrappers(self, shell_tool):
+        """Tool instructions should not invite converting a replay into a live command."""
+        description = shell_tool.description
+
+        assert "execute it exactly as provided" in description
+        assert "do not remove protective wrappers" in description
+        assert "echo/printf" in description
+
     @pytest.mark.asyncio
     async def test_dangerous_command_blocked(self, shell_tool):
         """Test that dangerous commands are blocked."""
@@ -147,6 +239,7 @@ class TestShellTool:
         from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
 
         shell_tool.timeout = 0.01
+        shell_tool.background_handoff_timeout = 0
 
         class _FakeProcess:
             returncode = None
@@ -187,6 +280,52 @@ class TestShellTool:
         stderr_task.cancel()
 
     @pytest.mark.asyncio
+    async def test_command_completion_during_timeout_handoff_returns_output(self, shell_tool):
+        """Near-timeout completions should not force the agent into background polling."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        shell_tool.timeout = 0.01
+        shell_tool.background_handoff_timeout = 0.2
+
+        class _FakeProcess:
+            def __init__(self):
+                self.returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(0.03)
+                self.returncode = 0
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        job = _BackgroundShellJob(
+            job_id="sh_handoff_done",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=asyncio.create_task(asyncio.sleep(0)),
+            stderr_task=asyncio.create_task(asyncio.sleep(0)),
+            buffer_limit=1000,
+            stdout_text="done",
+        )
+
+        async def _fake_start_background_job(*args, **kwargs):
+            _SHELL_BACKGROUND_JOBS[job.job_id] = job
+            return job
+
+        with patch.object(shell_tool, "_start_background_job", AsyncMock(side_effect=_fake_start_background_job)):
+            result = await shell_tool.execute("echo hello")
+
+        assert "done" in result
+        assert "command moved to background" not in result
+        assert job.job_id not in _SHELL_BACKGROUND_JOBS
+
+    @pytest.mark.asyncio
     async def test_background_job_status_and_terminate_actions(self, shell_tool):
         """Shell background jobs should expose status and terminate actions."""
         from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
@@ -225,6 +364,46 @@ class TestShellTool:
 
         terminated = await shell_tool.execute(action="terminate_job", job_id=job.job_id)
         assert "Terminated background shell job sh_statusjob" in terminated
+
+    @pytest.mark.asyncio
+    async def test_terminate_completed_background_job_preserves_terminal_status(self, shell_tool):
+        """Terminating an already completed job should not relabel successful output."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        job = _BackgroundShellJob(
+            job_id="sh_donejob",
+            command="echo done",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=asyncio.create_task(asyncio.sleep(0)),
+            stderr_task=asyncio.create_task(asyncio.sleep(0)),
+            buffer_limit=1000,
+            stdout_text="NEXT: continue",
+            status="completed",
+            returncode=0,
+            finished_at=1.0,
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        result = await shell_tool.execute(action="terminate_job", job_id=job.job_id)
+
+        assert "already completed" in result
+        assert "NEXT: continue" in result
+        assert "Terminated background shell job" not in result
+        assert job.status == "completed"
 
     @pytest.mark.asyncio
     async def test_background_jobs_are_scoped_by_owner(self, shell_tool):
@@ -885,6 +1064,99 @@ class TestToolBase:
 
         tool = TestTool()
         assert "my_tool" in repr(tool)
+
+
+class TestWebFetchTool:
+    """Tests for generic web fetch guardrails around local executable skills."""
+
+    @pytest.fixture
+    def web_fetch_tool(self):
+        from spoon_bot.agent.tools.web import WebFetchTool
+
+        return WebFetchTool(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_web_fetch_defers_skill_derived_remote_probe_before_shell(self, web_fetch_tool):
+        """A matching local skill should be executed before probing its backend endpoint."""
+        from spoon_bot.agent.tools.execution_context import (
+            bind_request_execution_hints,
+            track_tool_invocations,
+        )
+
+        hints = {
+            "allow_remote_probe": False,
+            "local_executable_skills": [
+                {
+                    "name": "spot-agent-cypher",
+                    "location": "skills/spot-agent-cypher/SKILL.md",
+                    "commands": [
+                        "node skills/spot-agent-cypher/cli/index.js join A",
+                        "node skills/spot-agent-cypher/cli/index.js wallet",
+                    ],
+                    "urls": ["http://13.251.72.206:8080/api/agent/games"],
+                }
+            ],
+        }
+
+        with bind_request_execution_hints(hints), track_tool_invocations():
+            result = await web_fetch_tool.execute("http://13.251.72.206:8080/api/agent/games")
+
+        assert "Deferred remote fetch from a skill-derived endpoint" in result
+        assert "spot-agent-cypher" in result
+        assert "join A" in result
+
+    @pytest.mark.asyncio
+    async def test_web_fetch_allows_same_endpoint_after_shell_progress(self, web_fetch_tool):
+        """Once shell work has happened in the request, the same remote endpoint may be fetched."""
+        from spoon_bot.agent.tools.base import Tool
+        from spoon_bot.agent.tools.execution_context import (
+            bind_request_execution_hints,
+            track_tool_invocations,
+        )
+
+        hints = {
+            "allow_remote_probe": False,
+            "local_executable_skills": [
+                {
+                    "name": "spot-agent-cypher",
+                    "location": "skills/spot-agent-cypher/SKILL.md",
+                    "commands": ["node skills/spot-agent-cypher/cli/index.js join A"],
+                    "urls": ["http://13.251.72.206:8080/api/agent/games"],
+                }
+            ],
+        }
+
+        class _StubShell(Tool):
+            @property
+            def name(self) -> str:
+                return "shell"
+
+            @property
+            def description(self) -> str:
+                return "stub"
+
+            @property
+            def parameters(self):
+                return {"type": "object", "properties": {}}
+
+            async def execute(self, **kwargs):
+                return "ok"
+
+        fake_response = MagicMock()
+        fake_response.headers = {"content-type": "application/json"}
+        fake_response.text = '{"ok":true}'
+        fake_response.json.return_value = {"ok": True}
+        fake_response.raise_for_status.return_value = None
+
+        fake_client = AsyncMock()
+        fake_client.request = AsyncMock(return_value=fake_response)
+
+        with bind_request_execution_hints(hints), track_tool_invocations():
+            await _StubShell()()
+            with patch("spoon_bot.agent.tools.web._get_http_client", return_value=fake_client):
+                result = await web_fetch_tool.execute("http://13.251.72.206:8080/api/agent/games")
+
+        assert result == '{\n  "ok": true\n}'
 
 
 if __name__ == "__main__":
