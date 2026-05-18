@@ -1,13 +1,13 @@
 ---
 name: wallet
-description: Use when working with spoon-bot's built-in EVM wallet, checking Neo X wallet readiness, or supporting skills that expect the legacy ~/.agent-wallet layout.
+description: Use when working with spoon-bot's built-in EVM wallet, checking balances, transferring EVM assets, signing messages or transactions, rotating/exporting keys, or supporting skills that expect the legacy ~/.agent-wallet layout.
 ---
 
 # Wallet
 
 ## Overview
 
-`wallet` is a built-in spoon-bot skill. The wallet runtime is implemented in Python inside spoon-bot, so this skill is documentation and operating guidance only.
+`wallet` is a built-in spoon-bot skill. The wallet runtime and signing tools are implemented in Python inside spoon-bot, so prefer the native `wallet`, `balance_check`, `transfer`, and `contract_call` tools over ad hoc shell commands.
 
 Do not install or bootstrap an external `openclaw/skills` wallet flow when this built-in skill is present.
 
@@ -16,11 +16,13 @@ Do not install or bootstrap an external `openclaw/skills` wallet flow when this 
 Use this skill when:
 
 - a task needs the agent wallet address, network, or compatibility paths
+- a task needs wallet balance lookup, token transfer, message signing, typed-data signing, or prepared transaction signing
+- a user explicitly asks to export a private key or create a fresh wallet
 - a skill such as `joker-game-agent` expects the legacy `~/.agent-wallet` files
 - the user asks whether a wallet already exists or was auto-created on startup
 - the user wants to confirm which Neo X network is active
 
-Do not use this skill to expose or print the raw private key unless the user explicitly asks for that secret.
+Do not use this skill to expose or print the raw private key unless the user explicitly asks for that secret. Private-key export requires `wallet(action="export_private_key", confirm=true, ...)`.
 
 ## Private Key Safety (CRITICAL)
 
@@ -43,6 +45,8 @@ Skills that need the private key for signing transactions access it through the 
 4. The default network is `neox` (Neo X Mainnet). `neox_testnet` is also supported.
 5. If the operator already provided `WALLET_ADDRESS`, `RPC_URL`, or `ETH_RPC_URL`, treat those values as higher priority than the auto-created defaults.
 6. Do not delete, rotate, or replace wallet files unless the user explicitly requests that action.
+7. `wallet(action="create_new", confirm=true)` creates a new wallet and backs up existing wallet files first.
+8. Real transfers and write contract calls require explicit `confirm=true`.
 
 ## What To Check
 

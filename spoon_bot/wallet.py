@@ -9,11 +9,14 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from eth_account import Account
+from eth_account.messages import encode_defunct
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,15 @@ def _password_file(wallet_root: Path) -> Path:
 
 def _private_key_file(wallet_root: Path) -> Path:
     return wallet_root / "privatekey.tmp"
+
+
+def _wallet_files(wallet_root: Path) -> list[Path]:
+    return [
+        _state_file(wallet_root),
+        _keystore_file(wallet_root),
+        _password_file(wallet_root),
+        _private_key_file(wallet_root),
+    ]
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -326,6 +338,148 @@ def ensure_wallet_runtime(workspace: Path | str | None = None) -> WalletRuntime:
     export_wallet_environment(runtime)
     os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] = "1" if auto_created else "0"
     return runtime
+
+
+def backup_wallet(
+    workspace: Path | str | None = None,
+    *,
+    backup_root: Path | str | None = None,
+) -> Path | None:
+    """Copy the current wallet files into a timestamped backup directory.
+
+    Returns ``None`` when no wallet files exist yet.
+    """
+    wallet_root = _wallet_root(workspace)
+    existing_files = [path for path in _wallet_files(wallet_root) if path.exists()]
+    if not existing_files:
+        return None
+
+    root = (
+        Path(backup_root).expanduser().resolve()
+        if backup_root is not None
+        else wallet_root / "backups"
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = root / stamp
+    suffix = 1
+    while backup_dir.exists():
+        backup_dir = root / f"{stamp}-{suffix}"
+        suffix += 1
+
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    for source in existing_files:
+        shutil.copy2(source, backup_dir / source.name)
+
+    metadata = {
+        "backed_up_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "source": str(wallet_root),
+        "files": [path.name for path in existing_files],
+    }
+    _write_json(backup_dir / "metadata.json", metadata)
+    try:
+        backup_dir.chmod(0o700)
+    except OSError:
+        pass
+    return backup_dir
+
+
+def create_new_wallet(
+    workspace: Path | str | None = None,
+    *,
+    network: str | None = None,
+    backup_existing: bool = True,
+) -> tuple[WalletRuntime, Path | None]:
+    """Create a fresh wallet, backing up existing wallet files first."""
+    wallet_root = _wallet_root(workspace)
+    backup_dir = backup_wallet(workspace) if backup_existing else None
+    runtime = _create_wallet(wallet_root, resolve_wallet_network(network))
+    export_wallet_environment(runtime)
+    os.environ["SPOON_BOT_WALLET_AUTO_CREATED"] = "1"
+    return runtime, backup_dir
+
+
+def _hex(value: Any) -> str:
+    raw = value.hex() if hasattr(value, "hex") else str(value)
+    return raw if raw.startswith("0x") or raw == "" else f"0x{raw}"
+
+
+def _signed_payload(runtime: WalletRuntime, signed: Any) -> dict[str, Any]:
+    return {
+        "address": runtime.address,
+        "signature": _hex(signed.signature),
+        "message_hash": _hex(getattr(signed, "message_hash", "")),
+        "v": int(signed.v),
+        "r": hex(int(signed.r)),
+        "s": hex(int(signed.s)),
+    }
+
+
+def sign_wallet_message(
+    *,
+    message: str | None = None,
+    hexstr: str | None = None,
+    workspace: Path | str | None = None,
+) -> dict[str, Any]:
+    """Sign an EIP-191 compatible text or hex message with the built-in wallet."""
+    supplied = [value is not None and str(value) != "" for value in (message, hexstr)]
+    if sum(supplied) != 1:
+        raise ValueError("Provide exactly one of message or hexstr")
+
+    runtime = ensure_wallet_runtime(workspace)
+    signable = (
+        encode_defunct(hexstr=hexstr)
+        if hexstr is not None
+        else encode_defunct(text=str(message))
+    )
+    signed = Account.sign_message(signable, private_key=runtime.private_key)
+    payload = _signed_payload(runtime, signed)
+    payload["kind"] = "eip191"
+    return payload
+
+
+def sign_wallet_typed_data(
+    *,
+    full_message: dict[str, Any] | None = None,
+    domain_data: dict[str, Any] | None = None,
+    message_types: dict[str, Any] | None = None,
+    message_data: dict[str, Any] | None = None,
+    workspace: Path | str | None = None,
+) -> dict[str, Any]:
+    """Sign EIP-712 typed data with the built-in wallet."""
+    runtime = ensure_wallet_runtime(workspace)
+    if full_message is not None:
+        signed = Account.sign_typed_data(runtime.private_key, full_message=full_message)
+    else:
+        signed = Account.sign_typed_data(
+            runtime.private_key,
+            domain_data=domain_data,
+            message_types=message_types,
+            message_data=message_data,
+        )
+    payload = _signed_payload(runtime, signed)
+    payload["kind"] = "eip712"
+    return payload
+
+
+def sign_wallet_transaction(
+    transaction: dict[str, Any],
+    *,
+    workspace: Path | str | None = None,
+) -> dict[str, Any]:
+    """Sign a prepared EVM transaction without broadcasting it."""
+    if not isinstance(transaction, dict):
+        raise TypeError("transaction must be an object")
+
+    runtime = ensure_wallet_runtime(workspace)
+    tx = dict(transaction)
+    tx.setdefault("from", Account.from_key(runtime.private_key).address)
+    signed = Account.sign_transaction(tx, runtime.private_key)
+    raw_transaction = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+    return {
+        "address": runtime.address,
+        "transaction_hash": _hex(signed.hash),
+        "raw_transaction": _hex(raw_transaction),
+    }
 
 
 def wallet_summary(runtime: WalletRuntime) -> dict[str, Any]:

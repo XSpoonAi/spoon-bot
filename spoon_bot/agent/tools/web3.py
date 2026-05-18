@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from spoon_bot.agent.tools.base import Tool
-from spoon_bot.wallet import DEFAULT_WALLET_NETWORK
+from eth_account import Account
 
+from spoon_bot.agent.tools.base import Tool
+from spoon_bot.wallet import DEFAULT_WALLET_NETWORK, ensure_wallet_runtime
 
 SUPPORTED_WEB3_CHAINS = frozenset({
     "ethereum", "polygon", "arbitrum", "optimism", "base",
@@ -30,6 +32,126 @@ NETWORK_SYMBOLS = {
     "neox": "GAS",
     "neox_testnet": "GAS",
 }
+
+
+def _decimal_to_units(amount: str, decimals: int) -> int:
+    try:
+        value = Decimal(str(amount))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Invalid amount '{amount}'. Must be a valid number.") from exc
+    if value <= 0:
+        raise ValueError("Amount must be greater than 0")
+    units = value * (Decimal(10) ** int(decimals))
+    if units != units.to_integral_value():
+        raise ValueError(f"Amount has more than {decimals} decimal places")
+    return int(units)
+
+
+def _get_env_rpc_url(chain: str, default_rpc_url: str | None = None) -> str | None:
+    chain_env_var = f"{chain.upper()}_RPC_URL"
+    rpc_url = os.environ.get(chain_env_var)
+    if not rpc_url and os.environ.get("WALLET_NETWORK") == chain:
+        rpc_url = os.environ.get("ETH_RPC_URL")
+    if not rpc_url and chain == "ethereum":
+        rpc_url = os.environ.get("RPC_URL") or os.environ.get("ETH_RPC_URL") or default_rpc_url
+    return rpc_url
+
+
+def _get_default_wallet_address() -> str | None:
+    address = os.environ.get("WALLET_ADDRESS")
+    if address:
+        return address
+    try:
+        return ensure_wallet_runtime().address
+    except Exception:
+        return None
+
+
+def _get_signing_private_key() -> str | None:
+    private_key = os.environ.get("PRIVATE_KEY")
+    if private_key:
+        return private_key
+    try:
+        return ensure_wallet_runtime().private_key
+    except Exception:
+        return None
+
+
+def _signed_raw_transaction(signed: Any) -> Any:
+    return getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+
+
+def _fee_fields(web3: Any) -> dict[str, int]:
+    try:
+        latest = web3.eth.get_block("latest")
+        base_fee = latest.get("baseFeePerGas") if hasattr(latest, "get") else latest["baseFeePerGas"]
+    except Exception:
+        base_fee = None
+
+    if base_fee is not None:
+        try:
+            priority_fee = int(web3.eth.max_priority_fee)
+        except Exception:
+            priority_fee = int(web3.to_wei(Decimal("1.5"), "gwei"))
+        return {
+            "maxPriorityFeePerGas": priority_fee,
+            "maxFeePerGas": int(base_fee) * 2 + priority_fee,
+        }
+
+    return {"gasPrice": int(web3.eth.gas_price)}
+
+
+def _env_enabled(name: str) -> bool:
+    raw = os.environ.get(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _live_transfer_disabled_message(operation: str) -> str:
+    return (
+        "SAFETY CHECK FAILED: live blockchain writes are disabled by runtime configuration.\n\n"
+        f"Blocked operation: {operation}\n"
+        "Unset SPOON_BOT_DISABLE_LIVE_TRANSFERS or set it to false, then retry "
+        "after the user explicitly confirms the exact operation."
+    )
+
+
+def _to_hex(web3: Any, value: Any) -> str:
+    return web3.to_hex(value) if hasattr(web3, "to_hex") else value.hex()
+
+
+ERC20_ABI: list[dict[str, Any]] = [
+    {
+        "constant": True,
+        "inputs": [{"name": "owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function",
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function",
+    },
+    {
+        "constant": False,
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function",
+    },
+]
 
 
 class BalanceCheckTool(Tool):
@@ -88,18 +210,11 @@ class BalanceCheckTool(Tool):
 
     def _get_rpc_url(self, chain: str) -> str | None:
         """Get RPC URL for the specified chain from environment."""
-        # Check chain-specific env var first
-        chain_env_var = f"{chain.upper()}_RPC_URL"
-        rpc_url = os.environ.get(chain_env_var)
-
-        if not rpc_url and chain == "ethereum":
-            rpc_url = os.environ.get("RPC_URL") or self._default_rpc_url
-
-        return rpc_url
+        return _get_env_rpc_url(chain, self._default_rpc_url)
 
     def _get_default_address(self) -> str | None:
         """Get default wallet address from environment."""
-        return os.environ.get("WALLET_ADDRESS")
+        return _get_default_wallet_address()
 
     async def execute(
         self,
@@ -178,33 +293,9 @@ class BalanceCheckTool(Tool):
             }
 
             if tokens:
-                erc20_abi = [
-                    {
-                        "constant": True,
-                        "inputs": [{"name": "owner", "type": "address"}],
-                        "name": "balanceOf",
-                        "outputs": [{"name": "balance", "type": "uint256"}],
-                        "type": "function",
-                    },
-                    {
-                        "constant": True,
-                        "inputs": [],
-                        "name": "decimals",
-                        "outputs": [{"name": "", "type": "uint8"}],
-                        "type": "function",
-                    },
-                    {
-                        "constant": True,
-                        "inputs": [],
-                        "name": "symbol",
-                        "outputs": [{"name": "", "type": "string"}],
-                        "type": "function",
-                    },
-                ]
-
                 for token in tokens:
                     token_address = web3.to_checksum_address(token)
-                    contract = web3.eth.contract(address=token_address, abi=erc20_abi)
+                    contract = web3.eth.contract(address=token_address, abi=ERC20_ABI)
                     balance = contract.functions.balanceOf(checksum_address).call()
                     try:
                         decimals = contract.functions.decimals().call()
@@ -300,15 +391,11 @@ class TransferTool(Tool):
 
     def _get_rpc_url(self, chain: str) -> str | None:
         """Get RPC URL for the specified chain from environment."""
-        chain_env_var = f"{chain.upper()}_RPC_URL"
-        rpc_url = os.environ.get(chain_env_var)
-        if not rpc_url and chain == "ethereum":
-            rpc_url = os.environ.get("RPC_URL")
-        return rpc_url
+        return _get_env_rpc_url(chain)
 
     def _get_private_key(self) -> str | None:
         """Get private key from environment."""
-        return os.environ.get("PRIVATE_KEY")
+        return _get_signing_private_key()
 
     async def execute(
         self,
@@ -342,7 +429,12 @@ class TransferTool(Tool):
                 f"  Amount: {amount}\n"
                 f"  Token: {token}\n"
                 f"  Chain: {chain}\n\n"
-                "To proceed, call this tool again with confirm=true."
+                "To proceed, call this tool again with confirm=true after the user "
+                "explicitly confirms the exact operation."
+            )
+        if self._require_confirmation and _env_enabled("SPOON_BOT_DISABLE_LIVE_TRANSFERS"):
+            return _live_transfer_disabled_message(
+                f"transfer {amount} {token} on {chain} to {to_address}"
             )
 
         # Validate chain
@@ -352,14 +444,6 @@ class TransferTool(Tool):
         # Validate address format (basic check)
         if not to_address.startswith("0x") or len(to_address) != 42:
             return "Error: Invalid address format. Expected 0x followed by 40 hex characters."
-
-        # Check amount is valid number
-        try:
-            amount_float = float(amount)
-            if amount_float <= 0:
-                return "Error: Amount must be greater than 0"
-        except ValueError:
-            return f"Error: Invalid amount '{amount}'. Must be a valid number."
 
         # Check RPC configuration
         rpc_url = self._get_rpc_url(chain)
@@ -379,17 +463,74 @@ class TransferTool(Tool):
                 "WARNING: Never share your private key. Use a dedicated wallet for bot operations."
             )
 
-        # Stub implementation
-        return (
-            f"[STUB] Transfer would execute:\n"
-            f"  To: {to_address}\n"
-            f"  Amount: {amount}\n"
-            f"  Token: {token}\n"
-            f"  Chain: {chain}\n\n"
-            f"To enable Web3 functionality, install web3.py:\n"
-            f"  pip install web3\n\n"
-            f"This is a stub - no actual transaction was sent."
-        )
+        try:
+            from web3 import Web3
+        except ImportError:
+            return (
+                "Error: Web3 provider not available. Install web3.py to enable blockchain tools.\n"
+                "  pip install web3"
+            )
+
+        try:
+            web3 = Web3(Web3.HTTPProvider(rpc_url))
+            if not web3.is_connected():
+                return "Error: RPC connection failed"
+
+            account = Account.from_key(private_key)
+            sender = web3.to_checksum_address(account.address)
+            recipient = web3.to_checksum_address(to_address)
+            nonce = web3.eth.get_transaction_count(sender)
+            chain_id = int(web3.eth.chain_id)
+            base_tx: dict[str, Any] = {
+                "from": sender,
+                "nonce": nonce,
+                "chainId": chain_id,
+                **_fee_fields(web3),
+            }
+
+            if token == "native":
+                value = _decimal_to_units(amount, 18)
+                tx: dict[str, Any] = {
+                    **base_tx,
+                    "to": recipient,
+                    "value": value,
+                }
+                tx["gas"] = int(web3.eth.estimate_gas(tx))
+                symbol = NETWORK_SYMBOLS.get(chain, "NATIVE")
+            else:
+                token_address = web3.to_checksum_address(token)
+                contract = web3.eth.contract(address=token_address, abi=ERC20_ABI)
+                try:
+                    decimals = int(contract.functions.decimals().call())
+                except Exception:
+                    decimals = 18
+                try:
+                    symbol = str(contract.functions.symbol().call())
+                except Exception:
+                    symbol = "TOKEN"
+                value = _decimal_to_units(amount, decimals)
+                tx = contract.functions.transfer(recipient, value).build_transaction(base_tx)
+                if "gas" not in tx:
+                    tx["gas"] = int(web3.eth.estimate_gas(tx))
+
+            signed = web3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = web3.eth.send_raw_transaction(_signed_raw_transaction(signed))
+            return json.dumps(
+                {
+                    "success": True,
+                    "chain": chain,
+                    "chain_id": chain_id,
+                    "from": sender,
+                    "to": recipient,
+                    "token": token,
+                    "symbol": symbol,
+                    "amount": str(amount),
+                    "tx_hash": _to_hex(web3, tx_hash),
+                },
+                ensure_ascii=True,
+            )
+        except Exception as e:
+            return f"Error: Transfer failed: {e}"
 
 
 class SwapTool(Tool):
@@ -477,15 +618,11 @@ class SwapTool(Tool):
 
     def _get_rpc_url(self, chain: str) -> str | None:
         """Get RPC URL for the specified chain from environment."""
-        chain_env_var = f"{chain.upper()}_RPC_URL"
-        rpc_url = os.environ.get(chain_env_var)
-        if not rpc_url and chain == "ethereum":
-            rpc_url = os.environ.get("RPC_URL")
-        return rpc_url
+        return _get_env_rpc_url(chain)
 
     def _get_private_key(self) -> str | None:
         """Get private key from environment."""
-        return os.environ.get("PRIVATE_KEY")
+        return _get_signing_private_key()
 
     async def execute(
         self,
@@ -663,15 +800,11 @@ class ContractCallTool(Tool):
 
     def _get_rpc_url(self, chain: str) -> str | None:
         """Get RPC URL for the specified chain from environment."""
-        chain_env_var = f"{chain.upper()}_RPC_URL"
-        rpc_url = os.environ.get(chain_env_var)
-        if not rpc_url and chain == "ethereum":
-            rpc_url = os.environ.get("RPC_URL")
-        return rpc_url
+        return _get_env_rpc_url(chain)
 
     def _get_private_key(self) -> str | None:
         """Get private key from environment."""
-        return os.environ.get("PRIVATE_KEY")
+        return _get_signing_private_key()
 
     async def execute(
         self,
@@ -727,7 +860,12 @@ class ContractCallTool(Tool):
                 "  - This will submit a transaction to the blockchain\n"
                 "  - Gas fees will be charged\n"
                 "  - State changes may be irreversible\n\n"
-                "To proceed, call this tool again with confirm=true."
+                "To proceed, call this tool again with confirm=true after the user "
+                "explicitly confirms the exact operation."
+            )
+        if is_write and self._require_confirmation and _env_enabled("SPOON_BOT_DISABLE_LIVE_TRANSFERS"):
+            return _live_transfer_disabled_message(
+                f"contract write {method} on {chain} at {contract_address}"
             )
 
         # Check RPC configuration
@@ -758,17 +896,84 @@ class ContractCallTool(Tool):
             except ValueError:
                 return f"Error: Invalid value '{value}'. Must be a valid number."
 
-        # Stub implementation
-        operation_type = "Write (Transaction)" if is_write else "Read (Call)"
-        return (
-            f"[STUB] Contract {operation_type.lower()} would execute:\n"
-            f"  Contract: {contract_address}\n"
-            f"  Method: {method}\n"
-            f"  Arguments: {args}\n"
-            f"  Chain: {chain}\n"
-            f"  Value: {value or '0'}\n"
-            f"  Operation: {operation_type}\n\n"
-            f"To enable Web3 functionality, install web3.py:\n"
-            f"  pip install web3\n\n"
-            f"This is a stub - no actual contract call was made."
-        )
+        try:
+            from web3 import Web3
+        except ImportError:
+            return (
+                "Error: Web3 provider not available. Install web3.py to enable blockchain tools.\n"
+                "  pip install web3"
+            )
+
+        try:
+            parsed_abi = json.loads(abi) if isinstance(abi, str) and abi.strip() else None
+        except json.JSONDecodeError as exc:
+            return f"Error: Invalid ABI JSON: {exc}"
+        if not parsed_abi:
+            return "Error: ABI is required for contract_call"
+
+        try:
+            web3 = Web3(Web3.HTTPProvider(rpc_url))
+            if not web3.is_connected():
+                return "Error: RPC connection failed"
+
+            checksum_contract = web3.to_checksum_address(contract_address)
+            contract = web3.eth.contract(address=checksum_contract, abi=parsed_abi)
+            function_name = method.split("(", 1)[0].strip()
+            if not function_name:
+                return "Error: Method name is required"
+            try:
+                fn = contract.get_function_by_name(function_name)(*args)
+            except Exception:
+                fn = getattr(contract.functions, function_name)(*args)
+
+            if not is_write:
+                call_result = fn.call()
+                return json.dumps(
+                    {
+                        "success": True,
+                        "operation": "call",
+                        "chain": chain,
+                        "contract": checksum_contract,
+                        "method": function_name,
+                        "result": call_result,
+                    },
+                    ensure_ascii=True,
+                    default=str,
+                )
+
+            private_key = self._get_private_key()
+            if not private_key:
+                return (
+                    "Error: Private key not configured for write operation. "
+                    "Set PRIVATE_KEY environment variable or initialize the built-in wallet."
+                )
+            account = Account.from_key(private_key)
+            sender = web3.to_checksum_address(account.address)
+            tx_value = _decimal_to_units(value, 18) if value else 0
+            tx_params: dict[str, Any] = {
+                "from": sender,
+                "nonce": web3.eth.get_transaction_count(sender),
+                "chainId": int(web3.eth.chain_id),
+                "value": tx_value,
+                **_fee_fields(web3),
+            }
+            tx = fn.build_transaction(tx_params)
+            if "gas" not in tx:
+                tx["gas"] = int(web3.eth.estimate_gas(tx))
+            signed = web3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = web3.eth.send_raw_transaction(_signed_raw_transaction(signed))
+            return json.dumps(
+                {
+                    "success": True,
+                    "operation": "transaction",
+                    "chain": chain,
+                    "chain_id": int(web3.eth.chain_id),
+                    "from": sender,
+                    "contract": checksum_contract,
+                    "method": function_name,
+                    "tx_hash": _to_hex(web3, tx_hash),
+                },
+                ensure_ascii=True,
+            )
+        except Exception as e:
+            return f"Error: Contract call failed: {e}"

@@ -105,6 +105,13 @@ from spoon_bot.agent.tools.self_config import (
 )
 from spoon_bot.agent.tools.cron import CronTool
 from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
+from spoon_bot.agent.tools.wallet import WalletTool
+from spoon_bot.agent.tools.web3 import (
+    BalanceCheckTool,
+    ContractCallTool,
+    SwapTool,
+    TransferTool,
+)
 from spoon_bot.config import (
     AgentLoopConfig,
     DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
@@ -1075,6 +1082,15 @@ class AgentLoop:
         # Web tools
         self.tools.register(WebSearchTool())
         self.tools.register(WebFetchTool())
+
+        # Wallet and Web3 tools are registered but remain inactive under the
+        # default core profile. The agent can load them when a wallet task needs
+        # balance checks, signing, transfers, swaps, or contract calls.
+        self.tools.register(WalletTool())
+        self.tools.register(BalanceCheckTool())
+        self.tools.register(TransferTool())
+        self.tools.register(SwapTool())
+        self.tools.register(ContractCallTool())
 
         logger.debug(f"Registered native tools: {self.tools.list_tools()}")
 

@@ -17,7 +17,7 @@ from spoon_bot.agent.tools.execution_context import bind_tool_invocation, finali
 CORE_TOOLS: frozenset[str] = frozenset({
     "shell", "read_file", "write_file", "edit_file", "list_dir", "grep",
     "self_config", "memory", "activate_tool", "self_upgrade", "cron",
-    "web_search", "web_fetch",
+    "web_search", "web_fetch", "wallet", "balance_check",
 })
 
 AUTOMATION_TOOLS: frozenset[str] = frozenset({

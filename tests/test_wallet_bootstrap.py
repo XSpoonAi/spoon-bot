@@ -223,14 +223,11 @@ def test_web3_tools_default_to_neox(tool_cls, expected_default):
     assert "neox_testnet" in tool_cls.SUPPORTED_CHAINS
 
 
-def test_core_tool_profile_excludes_removed_web3_transaction_tools():
+def test_core_tool_profile_excludes_web3_transaction_tools():
     from spoon_bot.agent.tools.registry import TOOL_PROFILES
 
-    removed_tools = {
-        "balance_check",
-        "transfer",
-        "swap",
-        "contract_call",
-    }
-    assert removed_tools.isdisjoint(TOOL_PROFILES["core"])
+    risky_transaction_tools = {"transfer", "swap", "contract_call"}
+    assert risky_transaction_tools.isdisjoint(TOOL_PROFILES["core"])
+    assert "balance_check" in TOOL_PROFILES["core"]
+    assert "wallet" in TOOL_PROFILES["core"]
     assert "web3" not in TOOL_PROFILES
