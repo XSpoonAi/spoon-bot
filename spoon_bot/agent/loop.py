@@ -185,6 +185,11 @@ _TURN_STATE_PENDING = "pending"
 _TURN_STATE_COMPLETED = "completed"
 _TURN_STATE_INTERRUPTED = "interrupted"
 _TURN_STATE_SUPERSEDED = "superseded"
+_REPEATED_READ_RECOVERY_THRESHOLD = 4
+_CLIENT_STREAM_TOOL_RESULT_LIMIT = 12_000
+_CLIENT_STREAM_TOOL_DELTA_LIMIT = 4_000
+
+
 def _workspace_root_path(workspace: Path | str | None) -> Path:
     """Resolve the workspace root used to validate persisted file references."""
     return Path(workspace or Path.home() / ".spoon-bot" / "workspace").expanduser().resolve()
@@ -4175,6 +4180,9 @@ class AgentLoop:
         """Prefer one tool result turn at a time for strict OpenAI-compatible APIs."""
         import os as _os
 
+        if getattr(self, "_force_serial_tool_calls", False):
+            return True
+
         raw = _os.getenv("SPOON_BOT_PARALLEL_TOOL_CALLS")
         if raw is not None:
             return raw.strip().lower() in {"0", "false", "no", "off"}
@@ -4669,6 +4677,23 @@ class AgentLoop:
         )
 
     @staticmethod
+    def _build_repeated_read_recovery_prompt(user_request: str) -> str:
+        """Build an internal continuation prompt after repeated duplicate reads."""
+        return (
+            "[INTERNAL REPEATED-READ RECOVERY]\n"
+            "The previous tool loop repeatedly called read_file for the same file "
+            "range and stopped making progress. The requested read has already "
+            "been satisfied by earlier read_file results in this same turn.\n\n"
+            "Continue the latest user request from the next non-read step. Do not "
+            "call read_file again for that same path and range. If the user asked "
+            "for an edit, use the editing tool directly from the existing context. "
+            "Call at most one file mutation tool for each unique replacement. "
+            "After a successful file mutation, do not repeat the same mutation; "
+            "one verification read is allowed before the final answer.\n\n"
+            f"Latest user request:\n{user_request}"
+        )
+
+    @staticmethod
     def _drop_pseudo_tool_call_assistant_messages(self, start_index: int) -> int:
         """Remove runtime assistant messages that contain fake tool-call transcripts."""
         if not isinstance(start_index, int) or start_index < 0:
@@ -4820,6 +4845,10 @@ class AgentLoop:
         value = str(text or "")
         replacements = [
             (
+                r"READ_FILE_CACHE_HIT:\s*requested file range already available in this request\.[^\n]*",
+                "The requested file range is already available in this request; continuing from the existing context.",
+            ),
+            (
                 r"STOP_TOOL_LOOP:\s*Error:\s*redundant file read suppressed\.[^\n]*",
                 "The duplicate file read was skipped because that content range was already available.",
             ),
@@ -4908,6 +4937,49 @@ class AgentLoop:
             text = stripped
         return text
 
+    @staticmethod
+    def _request_suppresses_file_body(message: str) -> bool:
+        """Return true when the user explicitly asked not to show file contents."""
+        text = str(message or "").lower()
+        patterns = [
+            r"(?:不要|别|无需|不需要).{0,12}(?:展示|显示|输出|打印).{0,12}(?:文件正文|文件内容|正文|内容)",
+            r"(?:文件正文|文件内容|正文|内容).{0,12}(?:不要|别|无需|不需要).{0,12}(?:展示|显示|输出|打印)",
+            r"do\s+not\s+(?:show|display|print|include).{0,40}(?:file\s+body|file\s+content|contents?)",
+            r"without\s+(?:showing|displaying|printing|including).{0,40}(?:file\s+body|file\s+content|contents?)",
+        ]
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+    @staticmethod
+    def _omit_file_body_for_user_constraint(message: str, content: str) -> str:
+        """Remove file-body snippets from final text when the user requested omission."""
+        if not AgentLoop._request_suppresses_file_body(message):
+            return content
+
+        text = str(content or "")
+        placeholder = "[文件正文已按要求省略]"
+        text = re.sub(
+            r"(?is)(?:文件|正文|内容)[^\n]{0,80}(?:显示|如下|内容)[^\n]*\n\s*```.*?```",
+            placeholder,
+            text,
+        )
+        text = re.sub(
+            r"(?is)(?:file|content|body|lines?)[^\n]{0,80}(?:shows?|below|content)[^\n]*\n\s*```.*?```",
+            "File content omitted as requested.",
+            text,
+        )
+        text = re.sub(
+            r"(?is)```(?:text|txt|html|js|javascript|json|css|[a-z0-9_-]*)?\n.*?```",
+            f"```text\n{placeholder}\n```",
+            text,
+        )
+        text = re.sub(
+            r"(?im)^\s*(?:<!doctype\b.*|<html\b.*|function\s+\w+\s*\(.*|const\s+\w+\s*=.*|[a-z0-9_.-]+\s*=\s*[^`\n]{1,200})\s*$",
+            placeholder,
+            text,
+        )
+        text = re.sub(rf"(?:{re.escape(placeholder)}\s*){{2,}}", placeholder + "\n", text)
+        return text
+
     def _finalize_response_content(
         self,
         message: str,
@@ -4925,6 +4997,7 @@ class AgentLoop:
             )
         filtered = AgentLoop._filter_execution_steps(self, content)
         cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
+        cleaned = AgentLoop._omit_file_body_for_user_constraint(message, cleaned)
         return AgentLoop._mask_user_visible_text(cleaned)
     @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
@@ -5023,7 +5096,10 @@ class AgentLoop:
             merged["guardrail_message"] = guardrail_message
         if client_result:
             stream_full_result, stream_truncated, stream_original_len = (
-                AgentLoop._cap_stream_metadata_text(client_result)
+                AgentLoop._cap_stream_metadata_text(
+                    client_result,
+                    limit=_CLIENT_STREAM_TOOL_RESULT_LIMIT,
+                )
             )
             merged["result"] = stream_full_result
             merged["content"] = stream_full_result
@@ -5037,11 +5113,20 @@ class AgentLoop:
                 merged["stream_output_truncated"] = True
                 merged["stream_output_original_chars"] = stream_original_len
         if client_summary:
-            merged["model_result"] = client_summary
-            merged["model_content"] = client_summary
-            merged["model_output"] = client_summary
+            stream_summary, summary_truncated, summary_original_len = (
+                AgentLoop._cap_stream_metadata_text(
+                    client_summary,
+                    limit=_CLIENT_STREAM_TOOL_RESULT_LIMIT,
+                )
+            )
+            merged["model_result"] = stream_summary
+            merged["model_content"] = stream_summary
+            merged["model_output"] = stream_summary
             if omitted_summary_body:
                 merged["model_result_body_omitted"] = True
+            if summary_truncated:
+                merged["model_output_truncated"] = True
+                merged["model_output_original_chars"] = summary_original_len
         if full_result and summary_result and full_result != summary_result:
             merged["result_truncated_for_model"] = True
         return merged
@@ -5088,7 +5173,12 @@ class AgentLoop:
                 or metadata.get("model_content")
                 or ""
             )
-        return AgentLoop._client_visible_tool_result_text(text)[0]
+        visible, _ = AgentLoop._client_visible_tool_result_text(text)
+        capped, _, _ = AgentLoop._cap_stream_metadata_text(
+            visible,
+            limit=_CLIENT_STREAM_TOOL_DELTA_LIMIT,
+        )
+        return capped
 
     @staticmethod
     def _is_tool_loop_suppression_event(event: dict[str, Any]) -> bool:
@@ -5472,6 +5562,9 @@ class AgentLoop:
             recent_tool_result_events: list[dict[str, Any]] = []
             stream_tool_result_count = 0
             stream_tool_call_count = 0
+            read_file_argument_counts: dict[str, int] = {}
+            non_read_tool_call_count = 0
+            repeated_read_recovery_attempted = False
             # 2. Start run() in background
             run_result_text = ""
             provider_silence_retry_count = 0
@@ -5819,11 +5912,184 @@ class AgentLoop:
 
                 return repair_text, repair_events
 
+            async def _run_repeated_read_recovery() -> tuple[str, list[dict[str, Any]]]:
+                """Retry once when duplicate read_file calls consume the tool loop."""
+                nonlocal stream_tool_result_index
+
+                AgentLoop._drain_agent_output_queue(self)
+                try:
+                    AgentLoop._normalize_runtime_tool_context(
+                        AgentLoop._get_runtime_memory_messages(self),
+                        finalized=True,
+                    )
+                except Exception as exc:
+                    logger.debug(f"Repeated-read recovery memory normalization skipped: {exc}")
+                self._reset_agent_state_for_retry()
+
+                repair_prompt = AgentLoop._build_repeated_read_recovery_prompt(
+                    authoritative_message
+                )
+                await self._agent.add_message("user", repair_prompt)
+                self._agent.next_step_prompt = repair_prompt
+
+                repair_kwargs: dict[str, Any] = {}
+                if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
+                    repair_kwargs["thinking"] = True
+                repair_reasoning_effort = retry_reasoning_effort or effective_reasoning_effort
+                if (
+                    repair_reasoning_effort
+                    and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
+                ):
+                    repair_kwargs["reasoning_effort"] = repair_reasoning_effort
+
+                request_execution_hints = self._build_request_execution_hints(authoritative_message)
+                previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+                self._force_serial_tool_calls = True
+                try:
+                    with (
+                        bind_request_execution_hints(request_execution_hints),
+                        track_tool_invocations(max_repeats=1),
+                    ):
+                        result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                            self,
+                            label="stream_repeated_read_recovery",
+                            retry_runner=AgentLoop._resolve_retry_runner(self),
+                            pre_overflow_retry_cleanup=lambda: AgentLoop._drain_agent_output_queue(self),
+                            **repair_kwargs,
+                        )
+                finally:
+                    if previous_force_serial:
+                        self._force_serial_tool_calls = True
+                    elif hasattr(self, "_force_serial_tool_calls"):
+                        delattr(self, "_force_serial_tool_calls")
+
+                repair_text = AgentLoop._extract_run_result_text(result)
+                repair_events: list[dict[str, Any]] = []
+                queued_content_parts: list[str] = []
+
+                while not self._agent.output_queue.empty():
+                    try:
+                        queued = self._agent.output_queue.get_nowait()
+                    except Exception:
+                        break
+
+                    if isinstance(queued, dict) and queued.get("tool_calls"):
+                        for tc in queued.get("tool_calls") or []:
+                            if isinstance(tc, dict):
+                                fn = tc.get("function", {})
+                                tc_id = tc.get("id", "")
+                                fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                                fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                            else:
+                                tc_id = getattr(tc, "id", "")
+                                fn_obj = getattr(tc, "function", None)
+                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                            if tc_id:
+                                tool_call_arguments_by_id[tc_id] = AgentLoop._tool_call_arguments_key(fn_args)
+                            repair_events.append({
+                                "type": "tool_call",
+                                "delta": "",
+                                "metadata": {
+                                    "id": tc_id,
+                                    "name": fn_name,
+                                    "arguments": fn_args,
+                                    "repair": "repeated_read_recovery",
+                                },
+                            })
+                        continue
+
+                    if isinstance(queued, dict) and queued.get("type") == "tool_result":
+                        metadata = dict(queued.get("metadata") or {})
+                        tool_name = queued.get("name") or metadata.get("name") or ""
+                        tool_result = (
+                            queued.get("result")
+                            or queued.get("content")
+                            or queued.get("response")
+                            or queued.get("output")
+                        )
+                        serialized_result = AgentLoop._stringify_stream_payload(tool_result)
+                        tool_call_id = (
+                            queued.get("tool_call_id")
+                            or queued.get("id")
+                            or metadata.get("tool_call_id")
+                            or metadata.get("id")
+                        )
+                        captured_output = consume_captured_tool_output(
+                            tool_output_capture_scope,
+                            tool_name=tool_name,
+                            arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                        )
+                        if tool_name:
+                            metadata.setdefault("name", tool_name)
+                        if tool_call_id:
+                            metadata.setdefault("tool_call_id", tool_call_id)
+                            metadata.setdefault("id", tool_call_id)
+                            emitted_tool_result_ids.add(tool_call_id)
+                        metadata["repair"] = "repeated_read_recovery"
+                        metadata = AgentLoop._merge_stream_tool_result_metadata(
+                            metadata,
+                            streamed_result=serialized_result,
+                            captured_output=captured_output,
+                        )
+                        repair_events.append({
+                            "type": "tool_result",
+                            "delta": "",
+                            "metadata": metadata,
+                        })
+                        continue
+
+                    if isinstance(queued, dict):
+                        text = queued.get("content") or queued.get("delta") or ""
+                    else:
+                        text = getattr(queued, "content", None) or (
+                            queued if isinstance(queued, str) else ""
+                        )
+                    if text:
+                        queued_content_parts.append(str(text))
+
+                if not repair_text.strip() and queued_content_parts:
+                    repair_text = "".join(queued_content_parts)
+
+                tool_result_events, stream_tool_result_index = (
+                    AgentLoop._collect_stream_tool_result_events(
+                        self,
+                        stream_tool_result_index,
+                        emitted_tool_result_ids,
+                        tool_output_capture_scope=tool_output_capture_scope,
+                        tool_call_arguments_by_id=tool_call_arguments_by_id,
+                    )
+                )
+                for event in tool_result_events:
+                    metadata = dict(event.get("metadata") or {})
+                    metadata["repair"] = "repeated_read_recovery"
+                    repair_events.append({**event, "metadata": metadata})
+
+                return repair_text, repair_events
+
             def _active_tool_within_budget(now: float | None = None) -> bool:
                 if not saw_tool_call or last_tool_progress_kind != "tool_call":
                     return False
                 now = time.monotonic() if now is None else now
                 return now - last_tool_progress_at < active_tool_timeout
+
+            def _repeated_read_storm_active() -> bool:
+                return (
+                    not repeated_read_recovery_attempted
+                    and non_read_tool_call_count == 0
+                    and any(
+                        count >= _REPEATED_READ_RECOVERY_THRESHOLD
+                        for count in read_file_argument_counts.values()
+                    )
+                )
+
+            def _stop_current_run_for_repeated_read_recovery() -> None:
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    td.set()
+                except Exception:
+                    pass
 
             while not (td.is_set() and oq.empty()):
                 if _stop_if_total_timeout():
@@ -6013,8 +6279,15 @@ class AgentLoop:
                                 fn_obj = getattr(tc, "function", None)
                                 fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
                                 fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                            arguments_key = AgentLoop._tool_call_arguments_key(fn_args)
                             if tc_id:
-                                tool_call_arguments_by_id[tc_id] = AgentLoop._tool_call_arguments_key(fn_args)
+                                tool_call_arguments_by_id[tc_id] = arguments_key
+                            if str(fn_name or "").strip() == "read_file":
+                                read_file_argument_counts[arguments_key] = (
+                                    read_file_argument_counts.get(arguments_key, 0) + 1
+                                )
+                            else:
+                                non_read_tool_call_count += 1
                             yield _decorate_stream_event({
                                 "type": "tool_call",
                                 "delta": "",
@@ -6024,6 +6297,13 @@ class AgentLoop:
                                     "arguments": fn_args,
                                 },
                             })
+                        if _repeated_read_storm_active():
+                            logger.warning(
+                                "Repeated read_file calls are no longer making progress; "
+                                "switching to internal continuation recovery."
+                            )
+                            _stop_current_run_for_repeated_read_recovery()
+                            break
                         if _stop_if_total_timeout():
                             break
                         continue
@@ -6188,6 +6468,33 @@ class AgentLoop:
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
+
+            repeated_read_storm = (
+                _repeated_read_storm_active()
+            )
+            if repeated_read_storm:
+                logger.warning(
+                    "Repeated read_file calls consumed the tool loop; "
+                    "running internal continuation recovery."
+                )
+                repeated_read_recovery_attempted = True
+                repair_text, repair_events = await _run_repeated_read_recovery()
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        metadata = dict(event.get("metadata") or {})
+                        event = {
+                            **event,
+                            "delta": AgentLoop._stream_tool_result_visible_delta(
+                                event.get("delta", ""),
+                                metadata,
+                            ),
+                            "metadata": metadata,
+                        }
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                run_result_text = repair_text
+                post_tool_content_buffer = repair_text
+                post_tool_content_events = []
 
             if pre_tool_scratchpad_buffer and not saw_tool_call:
                 full_content += AgentLoop._mask_user_visible_text(pre_tool_scratchpad_buffer)

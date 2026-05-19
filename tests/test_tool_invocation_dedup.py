@@ -179,8 +179,9 @@ async def test_track_tool_invocations_suppresses_redundant_file_ranges(tmp_path:
         uncovered_range = await tool.execute(path=str(file_path), offset=4, limit=1)
 
     assert "line2" in first
-    assert "STOP_TOOL_LOOP" in duplicate_range
-    assert "redundant file read suppressed" in duplicate_range
+    assert "STOP_TOOL_LOOP" not in duplicate_range
+    assert "line2" in duplicate_range
+    assert "line3" in duplicate_range
     assert "line4" not in duplicate_range
     assert "line1" in partial
     assert "line4" in uncovered_range
@@ -199,8 +200,8 @@ async def test_truncated_file_read_only_covers_visible_complete_lines(tmp_path: 
 
     assert "... (truncated" in first
     assert "line3" in hidden_range
-    assert "STOP_TOOL_LOOP" in visible_range
-    assert "redundant file read suppressed" in visible_range
+    assert "STOP_TOOL_LOOP" not in visible_range
+    assert "line1" in visible_range
 
 
 @pytest.mark.asyncio
@@ -221,10 +222,33 @@ async def test_file_edit_invalidates_read_dedup_for_verification(tmp_path: Path)
         verify = await read_tool(path=str(file_path))
 
     assert "color = red" in first
-    assert "STOP_TOOL_LOOP" in duplicate_before_edit
+    assert "STOP_TOOL_LOOP" not in duplicate_before_edit
+    assert "color = red" in duplicate_before_edit
     assert "Successfully edited" in edited
     assert "STOP_TOOL_LOOP" not in verify
     assert "color = blue" in verify
+
+
+@pytest.mark.asyncio
+async def test_duplicate_file_edit_is_idempotent_after_success(tmp_path: Path) -> None:
+    file_path = tmp_path / "settings.txt"
+    file_path.write_text("color = red\n", encoding="utf-8")
+    edit_tool = EditFileTool(workspace=tmp_path)
+
+    first = await edit_tool.execute(
+        path=str(file_path),
+        old_text="color = red",
+        new_text="color = blue",
+    )
+    duplicate = await edit_tool.execute(
+        path=str(file_path),
+        old_text="color = red",
+        new_text="color = blue",
+    )
+
+    assert "Successfully edited" in first
+    assert "No change needed" in duplicate
+    assert file_path.read_text(encoding="utf-8") == "color = blue\n"
 
 
 @pytest.mark.asyncio
@@ -240,6 +264,7 @@ async def test_changed_file_content_allows_same_range_read(tmp_path: Path) -> No
         changed = await read_tool.execute(path=str(file_path))
 
     assert "color = red" in first
-    assert "STOP_TOOL_LOOP" in duplicate
+    assert "STOP_TOOL_LOOP" not in duplicate
+    assert "color = red" in duplicate
     assert "STOP_TOOL_LOOP" not in changed
     assert "color = blue" in changed

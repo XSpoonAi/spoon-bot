@@ -57,6 +57,10 @@ class ReadFileTool(Tool):
     def name(self) -> str:
         return "read_file"
 
+    def tool_invocation_dedup_key(self, kwargs: dict[str, Any]) -> None:
+        """Use content-range coverage instead of exact-call hard stops."""
+        return None
+
     @property
     def description(self) -> str:
         workspace_note = ""
@@ -150,27 +154,7 @@ class ReadFileTool(Tool):
             parts = file_path.parts
             is_skill_file = "skills" in parts
 
-            if self._max_output and total_size > self._max_output:
-                visible_prefix = full_content[:self._max_output]
-                visible_line_count = visible_prefix.count("\n")
-                content = visible_prefix + f"\n... (truncated, {total_size - self._max_output} more chars)"
-            else:
-                visible_line_count = selected_line_count
-                content = full_content
-
-            if visible_line_count > 0:
-                duplicate_read = suppress_redundant_file_read(
-                    str(file_path),
-                    offset=visible_start_line,
-                    limit=visible_line_count,
-                    total_lines=total_lines,
-                    content_fingerprint=content_fingerprint,
-                )
-                if duplicate_read is not None:
-                    capture_tool_output(duplicate_read, duplicate_read)
-                    return duplicate_read
-
-            # Use relative path to workspace for dedup, fallback to name
+            # Use relative path to workspace for display, fallback to name
             try:
                 if self._workspace:
                     rel = file_path.relative_to(self._workspace)
@@ -179,6 +163,24 @@ class ReadFileTool(Tool):
                     display_path = file_path.name
             except ValueError:
                 display_path = file_path.name
+
+            if self._max_output and total_size > self._max_output:
+                visible_prefix = full_content[:self._max_output]
+                visible_line_count = visible_prefix.count("\n")
+                content = visible_prefix + f"\n... (truncated, {total_size - self._max_output} more chars)"
+            else:
+                visible_line_count = selected_line_count
+                content = full_content
+
+            duplicate_read = None
+            if visible_line_count > 0:
+                duplicate_read = suppress_redundant_file_read(
+                    str(file_path),
+                    offset=visible_start_line,
+                    limit=visible_line_count,
+                    total_lines=total_lines,
+                    content_fingerprint=content_fingerprint,
+                )
 
             def _build_result(body: str) -> str:
                 body_size = len(body)
@@ -191,6 +193,8 @@ class ReadFileTool(Tool):
             summary_result = _build_result(content)
             full_result = _build_result(full_content)
             capture_tool_output(summary_result, full_result)
+            if duplicate_read is not None:
+                return summary_result
             return summary_result
 
         except PermissionError:
@@ -391,7 +395,9 @@ class EditFileTool(Tool):
             workspace_note = f" Files must be within the workspace: {self._workspace}"
         return (
             "Edit a file by replacing old_text with new_text. "
-            f"The old_text must exist exactly once in the file.{workspace_note}"
+            "The old_text must exist exactly once in the file. If the same "
+            "replacement has already been applied, this returns a no-op success. "
+            f"{workspace_note}"
         )
 
     @property
@@ -439,6 +445,8 @@ class EditFileTool(Tool):
                 content = await f.read()
 
             if old_text not in content:
+                if new_text and content.count(new_text) == 1:
+                    return f"No change needed: requested edit already applied to {path}"
                 return "Error: old_text not found in file. Make sure it matches exactly."
 
             # Count occurrences

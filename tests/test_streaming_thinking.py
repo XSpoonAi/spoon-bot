@@ -809,6 +809,33 @@ class TestAgentLoopStream:
         assert "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in cleaned
         assert "***masked_private_key***" in cleaned
 
+    def test_finalize_response_content_omits_file_body_when_user_requested_it(self):
+        """If the user says not to show file content, final text must honor it too."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        content = (
+            "文件的前3行显示：\n\n"
+            "```text\n"
+            "title=demo\n"
+            "color = blue\n"
+            "status=ready\n"
+            "```\n\n"
+            "修改已完成。"
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "读取文件并验证，不要展示文件正文。",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert "title=demo" not in cleaned
+        assert "status=ready" not in cleaned
+        assert "文件正文已按要求省略" in cleaned
+        assert "修改已完成" in cleaned
+
     def test_finalize_response_content_replaces_raw_tool_trace_leak(self):
         """Provider fallback text can contain raw tool transcript; final output must stay bounded."""
         from spoon_bot.agent.loop import AgentLoop
@@ -2480,6 +2507,134 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert "duplicate tool invocation suppressed" not in json.dumps(
             metadata,
             ensure_ascii=False,
+        )
+
+    def test_redundant_file_read_cache_hit_does_not_stop_stream_loop(self):
+        """Duplicate read_file cache hits are recoverable evidence, not final fallbacks."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        metadata = AgentLoop._merge_stream_tool_result_metadata(
+            {"name": "read_file"},
+            streamed_result=(
+                "READ_FILE_CACHE_HIT: requested file range already available in this "
+                "request. Treat this read as complete and continue the user's "
+                "remaining instructions without calling read_file again for the "
+                "same path and range."
+            ),
+            captured_output=None,
+        )
+        event = {"type": "tool_result", "delta": metadata["model_result"], "metadata": metadata}
+
+        assert AgentLoop._is_tool_loop_suppression_event(event) is False
+        assert "guardrail_stop" not in metadata
+        assert "READ_FILE_CACHE_HIT" not in json.dumps(metadata, ensure_ascii=False)
+        assert "STOP_TOOL_LOOP" not in json.dumps(metadata, ensure_ascii=False)
+
+    def test_stream_tool_result_metadata_caps_long_internal_outputs(self):
+        """Huge non-file tool outputs should not flood client-visible WS payloads."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        metadata = AgentLoop._merge_stream_tool_result_metadata(
+            {"name": "spawn"},
+            streamed_result="sub-agent result\n" + ("detail\n" * 5000),
+            captured_output=None,
+        )
+        visible_delta = AgentLoop._stream_tool_result_visible_delta("", metadata)
+
+        assert metadata["stream_output_truncated"] is True
+        assert metadata["model_output_truncated"] is True
+        assert len(metadata["result"]) < 13_000
+        assert len(metadata["model_result"]) < 13_000
+        assert len(visible_delta) < 4_500
+        assert "stream output truncated" in metadata["result"]
+
+    @pytest.mark.asyncio
+    async def test_stream_recovers_repeated_read_file_storm_before_tool_budget(self):
+        """Repeated identical reads should switch to continuation recovery quickly."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        def _tool_call(call_id: str, name: str, arguments: str) -> MagicMock:
+            tool_call = MagicMock()
+            tool_call.id = call_id
+            tool_call.function = MagicMock()
+            tool_call.function.name = name
+            tool_call.function.arguments = arguments
+            return tool_call
+
+        read_arguments = '{"path":"demo.txt","offset":1,"limit":3}'
+        agent = self._make_stream_agent([])
+        agent.provider_total_timeout = 30.0
+        agent.tool_followup_timeout = 30.0
+        agent.max_stream_tool_results_without_content = 99
+        run_count = 0
+
+        async def mock_run(**kwargs):
+            nonlocal run_count
+            run_count += 1
+            if run_count == 1:
+                for index in range(20):
+                    call_id = f"read_{index}"
+                    await agent._agent.output_queue.put(
+                        {"tool_calls": [_tool_call(call_id, "read_file", read_arguments)]}
+                    )
+                    await agent._agent.output_queue.put(
+                        {
+                            "type": "tool_result",
+                            "metadata": {"id": call_id, "name": "read_file"},
+                            "result": "[file: demo.txt | 12 chars | lines 1-3/3]\ncolor = red",
+                        }
+                    )
+                return MagicMock(content="")
+
+            edit_call = _tool_call(
+                "edit_1",
+                "edit_file",
+                '{"path":"demo.txt","old_text":"color = red","new_text":"color = blue"}',
+            )
+            verify_call = _tool_call("verify_1", "read_file", read_arguments)
+            await agent._agent.output_queue.put({"tool_calls": [edit_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "edit_1", "name": "edit_file"},
+                    "result": "Successfully edited demo.txt",
+                }
+            )
+            await agent._agent.output_queue.put({"tool_calls": [verify_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "verify_1", "name": "read_file"},
+                    "result": "[file: demo.txt | 13 chars | lines 1-3/3]\ncolor = blue",
+                }
+            )
+            await agent._agent.output_queue.put({"content": "Done."})
+            return MagicMock(content="Done.")
+
+        agent._agent.run = AsyncMock(side_effect=mock_run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="read twice, then edit"):
+            chunks.append(chunk)
+
+        tool_call_chunks = [chunk for chunk in chunks if chunk["type"] == "tool_call"]
+        read_file_calls = [
+            chunk
+            for chunk in tool_call_chunks
+            if chunk["metadata"].get("name") == "read_file"
+        ]
+        edit_file_calls = [
+            chunk
+            for chunk in tool_call_chunks
+            if chunk["metadata"].get("name") == "edit_file"
+        ]
+
+        assert run_count == 2
+        assert len(read_file_calls) < 10
+        assert len(edit_file_calls) == 1
+        assert edit_file_calls[0]["metadata"].get("repair") == "repeated_read_recovery"
+        assert "Done." in "".join(
+            chunk["delta"] for chunk in chunks if chunk["type"] == "content"
         )
 
     @pytest.mark.asyncio

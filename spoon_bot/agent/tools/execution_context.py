@@ -60,10 +60,9 @@ _REPEATED_TOOL_SERIES_MESSAGE = (
     "tools for this same action."
 )
 _REDUNDANT_FILE_READ_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: redundant file read suppressed. This file range "
-    "was already returned in this request; use the previous read_file result "
-    "or request a different uncovered range. Do not call more tools for the "
-    "same read; continue from the existing context."
+    "READ_FILE_CACHE_HIT: requested file range already available in this "
+    "request. Treat this read as complete and continue the user's remaining "
+    "instructions without calling read_file again for the same path and range."
 )
 _CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
     "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "

@@ -220,6 +220,32 @@ async def test_tool_guard_leaves_non_strict_provider_kwargs_unchanged():
 
 
 @pytest.mark.asyncio
+async def test_tool_guard_can_force_serial_calls_for_recovery_on_native_provider():
+    captured_kwargs: list[dict] = []
+    tool_a = SimpleNamespace(id="call_a")
+    tool_b = SimpleNamespace(id="call_b")
+
+    class FakeLLM:
+        async def ask_tool(self, *args, **kwargs):
+            captured_kwargs.append(dict(kwargs))
+            return SimpleNamespace(tool_calls=[tool_a, tool_b], metadata={})
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.provider = "anthropic"
+    loop.model = "claude-sonnet-4.6"
+    loop.base_url = "https://api.anthropic.com"
+    loop._force_serial_tool_calls = True
+    loop._agent = SimpleNamespace(llm=FakeLLM())
+
+    loop._install_tool_call_protocol_guards()
+    response = await loop._agent.llm.ask_tool(messages=[], tools=[])
+
+    assert captured_kwargs[0]["parallel_tool_calls"] is False
+    assert response.tool_calls == [tool_a]
+    assert response.metadata["serial_tool_calls_enforced"] is True
+
+
+@pytest.mark.asyncio
 async def test_openrouter_tool_guard_textualizes_completed_tool_history():
     captured_messages = []
     original_messages = _completed_tool_history()
