@@ -12,7 +12,6 @@ from threading import Lock
 from typing import Any, Iterator
 from uuid import uuid4
 
-
 _TOOL_OWNER: ContextVar[str] = ContextVar("tool_owner", default="default")
 _TOOL_OUTPUT_CAPTURE_SCOPE: ContextVar[str | None] = ContextVar(
     "tool_output_capture_scope",
@@ -59,6 +58,12 @@ _REPEATED_TOOL_SERIES_MESSAGE = (
     "already executed the same kind of external side effect; report the latest "
     "result or ask for an explicit count before continuing. Do not call more "
     "tools for this same action."
+)
+_REDUNDANT_FILE_READ_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: redundant file read suppressed. This file range "
+    "was already returned in this request; use the previous read_file result "
+    "or request a different uncovered range. Do not call more tools for the "
+    "same read; continue from the existing context."
 )
 _CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
     "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "
@@ -186,6 +191,7 @@ def track_tool_invocations(
         "counts": defaultdict(int),
         "series_counts": defaultdict(int),
         "consecutive_failures": [],
+        "file_read_coverage": defaultdict(list),
         "max_repeats": max(1, int(max_repeats or 1)),
         "max_series_repeats": max(1, int(max_series_repeats or 1)),
         "max_consecutive_failures": max(1, int(max_consecutive_failures or 1)),
@@ -233,6 +239,117 @@ def suppress_repeated_tool_series(tool_name: str, series_key: str | None) -> str
     if counts[key] <= max_repeats:
         return None
     return _REPEATED_TOOL_SERIES_MESSAGE
+
+
+def suppress_redundant_file_read(
+    path_key: str,
+    *,
+    offset: int | None,
+    limit: int | None,
+    total_lines: int,
+    content_fingerprint: str | None = None,
+) -> str | None:
+    """Return a compact result when a request re-reads covered file content."""
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if not isinstance(state, dict):
+        return None
+
+    coverage = state.get("file_read_coverage")
+    if not isinstance(coverage, dict):
+        return None
+
+    normalized_path = str(path_key or "").strip()
+    if not normalized_path:
+        return None
+
+    total = max(1, int(total_lines or 1))
+    start = max(1, int(offset or 1))
+    if limit is None:
+        end = total
+    else:
+        end = min(total, start + max(1, int(limit or 1)) - 1)
+    if end < start:
+        end = start
+
+    fingerprint = str(content_fingerprint or "")
+    raw_ranges = coverage.setdefault(normalized_path, [])
+    ranges: list[tuple[int, int, str]] = []
+    for item in raw_ranges:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        existing_fingerprint = str(item[2]) if len(item) >= 3 else ""
+        if fingerprint and existing_fingerprint and existing_fingerprint != fingerprint:
+            continue
+        ranges.append((int(item[0]), int(item[1]), existing_fingerprint))
+
+    for existing_start, existing_end, _existing_fingerprint in ranges:
+        if int(existing_start) <= start and end <= int(existing_end):
+            return _REDUNDANT_FILE_READ_MESSAGE
+
+    ranges.append((start, end, fingerprint))
+    ranges.sort(key=lambda item: (int(item[0]), int(item[1])))
+    merged: list[tuple[int, int, str]] = []
+    for range_start, range_end, range_fingerprint in ranges:
+        range_start = int(range_start)
+        range_end = int(range_end)
+        if (
+            not merged
+            or range_fingerprint != merged[-1][2]
+            or range_start > merged[-1][1] + 1
+        ):
+            merged.append((range_start, range_end, range_fingerprint))
+            continue
+        merged[-1] = (
+            merged[-1][0],
+            max(merged[-1][1], range_end),
+            merged[-1][2],
+        )
+    coverage[normalized_path] = merged
+    return None
+
+
+def _normalize_file_tracking_path(path_key: Any) -> str:
+    """Normalize file tracking paths for request-local cache invalidation."""
+    return str(path_key or "").strip().replace("\\", "/").lower()
+
+
+def invalidate_file_read_tracking(*path_keys: Any) -> None:
+    """Invalidate read coverage and exact read counts after a file changes."""
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if not isinstance(state, dict):
+        return
+
+    candidates = {
+        normalized
+        for normalized in (_normalize_file_tracking_path(path_key) for path_key in path_keys)
+        if normalized
+    }
+    if not candidates:
+        return
+
+    coverage = state.get("file_read_coverage")
+    if isinstance(coverage, dict):
+        for key in list(coverage.keys()):
+            if _normalize_file_tracking_path(key) in candidates:
+                coverage.pop(key, None)
+
+    counts = state.get("counts")
+    if counts is None:
+        return
+    for key in list(counts.keys()):
+        if not isinstance(key, str):
+            continue
+        tool_name, separator, argument_key = key.partition("\x1f")
+        if separator != "\x1f" or tool_name != "read_file":
+            continue
+        try:
+            arguments = json.loads(argument_key)
+        except Exception:
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        if _normalize_file_tracking_path(arguments.get("path")) in candidates:
+            counts.pop(key, None)
 
 
 def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:

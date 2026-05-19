@@ -4728,6 +4728,12 @@ class AgentLoop:
     def _compact_tool_evidence_text(value: Any, *, limit: int = 700) -> str:
         text = AgentLoop._stringify_stream_payload(value)
         text = re.sub(r"^Observed output of cmd [^\n]* execution:\s*", "", text.strip())
+        file_header = re.match(r"^\[file:\s*([^\]\n]+)\]\s*\n", text)
+        if file_header:
+            return (
+                f"[file: {file_header.group(1)}] "
+                "content body omitted from user-visible fallback"
+            )
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         if lines:
             text = "\n".join(lines)
@@ -4741,8 +4747,8 @@ class AgentLoop:
     def _build_raw_tool_transcript_leak_response(self, start_index: int) -> str:
         """Build a bounded fallback when raw tool transcript text leaks as final content."""
         parts = [
-            "The model returned raw tool transcript text instead of a clean final answer.",
-            "Recent tool evidence:",
+            "I could not turn the latest tool results into a clean final answer.",
+            "Recent tool summary:",
         ]
 
         try:
@@ -4775,7 +4781,7 @@ class AgentLoop:
             parts.extend(tool_lines[-3:])
         else:
             parts.append("No bounded tool evidence was captured before cleanup.")
-        parts.append("Please continue or retry if you need the agent to finish the remaining work.")
+        parts.append("Please continue or retry so the agent can finish from this evidence.")
         return "\n\n".join(parts)
 
     @staticmethod
@@ -4809,14 +4815,57 @@ class AgentLoop:
         )
 
     @staticmethod
+    def _sanitize_internal_guardrail_text(text: str) -> str:
+        """Map internal loop-control markers to user-facing wording."""
+        value = str(text or "")
+        replacements = [
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*redundant file read suppressed\.[^\n]*",
+                "The duplicate file read was skipped because that content range was already available.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*duplicate tool invocation suppressed\.[^\n]*",
+                "The duplicate action was skipped because the same action had already run.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*repeated side-effecting tool series suppressed\.[^\n]*",
+                "The repeated external action was skipped.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*consecutive tool failures suppressed\.[^\n]*",
+                "Repeated tool failures were stopped.",
+            ),
+            (
+                r"redundant file read suppressed",
+                "duplicate file read skipped",
+            ),
+            (
+                r"duplicate tool invocation suppressed",
+                "duplicate action skipped",
+            ),
+            (
+                r"repeated side-effecting tool series suppressed",
+                "repeated external action skipped",
+            ),
+            (
+                r"consecutive tool failures suppressed",
+                "repeated tool failures stopped",
+            ),
+        ]
+        for pattern, replacement in replacements:
+            value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+        return value
+
+    @staticmethod
     def _mask_user_visible_text(text: str) -> str:
         """Mask secrets before content is streamed, persisted, or finalized."""
         try:
             from spoon_bot.utils.privacy import mask_secrets
 
-            return mask_secrets(str(text or ""))
+            masked = mask_secrets(str(text or ""))
         except Exception:
-            return str(text or "")
+            masked = str(text or "")
+        return AgentLoop._sanitize_internal_guardrail_text(masked)
 
     @staticmethod
     def _strip_leaked_scratchpad_prefix(content: str) -> str:
@@ -4920,6 +4969,28 @@ class AgentLoop:
         return text[:limit] + suffix, True, original_len
 
     @staticmethod
+    def _client_visible_tool_result_text(value: Any) -> tuple[str, bool]:
+        """Return a client-visible tool result and whether body text was omitted."""
+        text = AgentLoop._stringify_stream_payload(value).strip()
+        text = AgentLoop._mask_user_visible_text(text)
+        file_header = re.match(
+            r"^Observed output of cmd [^\n]* execution:\s*(\[file:\s*[^\]\n]+\])\s*\n",
+            text,
+        )
+        if file_header:
+            return (
+                f"{file_header.group(1)} content body omitted from user-visible tool result",
+                True,
+            )
+        file_header = re.match(r"^(\[file:\s*[^\]\n]+\])\s*\n", text)
+        if file_header:
+            return (
+                f"{file_header.group(1)} content body omitted from user-visible tool result",
+                True,
+            )
+        return text, False
+
+    @staticmethod
     def _merge_stream_tool_result_metadata(
         metadata: dict[str, Any],
         *,
@@ -4937,9 +5008,22 @@ class AgentLoop:
             summary_result = captured_summary
             full_result = captured_full
 
-        if full_result:
+        guardrail_message = AgentLoop._tool_loop_suppression_message_from_text(
+            full_result or summary_result
+        )
+        client_result, omitted_body = AgentLoop._client_visible_tool_result_text(
+            full_result or summary_result
+        )
+        client_summary, omitted_summary_body = AgentLoop._client_visible_tool_result_text(
+            summary_result or client_result
+        )
+
+        if guardrail_message:
+            merged["guardrail_stop"] = True
+            merged["guardrail_message"] = guardrail_message
+        if client_result:
             stream_full_result, stream_truncated, stream_original_len = (
-                AgentLoop._cap_stream_metadata_text(full_result)
+                AgentLoop._cap_stream_metadata_text(client_result)
             )
             merged["result"] = stream_full_result
             merged["content"] = stream_full_result
@@ -4947,13 +5031,17 @@ class AgentLoop:
             merged["full_result"] = stream_full_result
             merged["full_content"] = stream_full_result
             merged["full_output"] = stream_full_result
+            if omitted_body:
+                merged["result_body_omitted"] = True
             if stream_truncated:
                 merged["stream_output_truncated"] = True
                 merged["stream_output_original_chars"] = stream_original_len
-        if summary_result:
-            merged.setdefault("model_result", summary_result)
-            merged.setdefault("model_content", summary_result)
-            merged.setdefault("model_output", summary_result)
+        if client_summary:
+            merged["model_result"] = client_summary
+            merged["model_content"] = client_summary
+            merged["model_output"] = client_summary
+            if omitted_summary_body:
+                merged["model_result_body_omitted"] = True
         if full_result and summary_result and full_result != summary_result:
             merged["result_truncated_for_model"] = True
         return merged
@@ -4976,6 +5064,13 @@ class AgentLoop:
         )
         text = AgentLoop._stringify_stream_payload(payload).strip()
         text = AgentLoop._mask_user_visible_text(text)
+        file_header = re.match(r"^Observed output of cmd [^\n]* execution:\s*(\[file:\s*[^\]\n]+\])\s*\n", text)
+        if file_header:
+            text = f"{file_header.group(1)} content body omitted from user-visible summary"
+        else:
+            file_header = re.match(r"^(\[file:\s*[^\]\n]+\])\s*\n", text)
+            if file_header:
+                text = f"{file_header.group(1)} content body omitted from user-visible summary"
         if len(text) > limit:
             text = text[:limit].rstrip() + "\n... (tool output truncated)"
         if not text:
@@ -4983,9 +5078,24 @@ class AgentLoop:
         return f"Tool `{tool_name}` output:\n{text}"
 
     @staticmethod
+    def _stream_tool_result_visible_delta(delta: Any, metadata: dict[str, Any]) -> str:
+        """Return the user-visible WebSocket delta for a tool_result chunk."""
+        text = AgentLoop._stringify_stream_payload(delta)
+        if not text:
+            text = AgentLoop._stringify_stream_payload(
+                metadata.get("model_result")
+                or metadata.get("model_output")
+                or metadata.get("model_content")
+                or ""
+            )
+        return AgentLoop._client_visible_tool_result_text(text)[0]
+
+    @staticmethod
     def _is_tool_loop_suppression_event(event: dict[str, Any]) -> bool:
         """Return True for tool guardrail results that should end the current loop."""
         metadata = dict(event.get("metadata") or {})
+        if metadata.get("guardrail_stop") is True:
+            return True
         payload = (
             metadata.get("model_result")
             or metadata.get("model_output")
@@ -4999,6 +5109,24 @@ class AgentLoop:
         )
         text = AgentLoop._stringify_stream_payload(payload).lower()
         return "stop_tool_loop" in text
+
+    @staticmethod
+    def _tool_loop_suppression_message_from_text(value: Any) -> str | None:
+        """Return a user-facing message for a raw STOP_TOOL_LOOP payload."""
+        text = AgentLoop._stringify_stream_payload(value).lower()
+        if "stop_tool_loop" not in text:
+            return None
+        if "exact requested shell command failed" in text:
+            return None
+        if "consecutive tool failures suppressed" in text:
+            return "I stopped retrying after repeated failures."
+        if "repeated side-effecting tool series suppressed" in text:
+            return "I stopped before repeating the same external action."
+        if "redundant file read suppressed" in text:
+            return "I skipped a file read whose content was already available."
+        if "duplicate tool invocation suppressed" in text:
+            return "I skipped a repeated action that had already run."
+        return "I stopped before repeating the same action."
 
     @staticmethod
     def _extract_exact_command_failure_blocker(event: dict[str, Any]) -> str | None:
@@ -5037,6 +5165,9 @@ class AgentLoop:
     def _tool_loop_suppression_message(event: dict[str, Any]) -> str | None:
         """Return a user-facing message for an internal STOP_TOOL_LOOP guardrail."""
         metadata = dict(event.get("metadata") or {})
+        guardrail_message = metadata.get("guardrail_message")
+        if isinstance(guardrail_message, str) and guardrail_message.strip():
+            return guardrail_message.strip()
         payload = (
             metadata.get("model_result")
             or metadata.get("model_output")
@@ -5048,18 +5179,7 @@ class AgentLoop:
             or metadata.get("full_result")
             or event.get("delta")
         )
-        text = AgentLoop._stringify_stream_payload(payload).lower()
-        if "stop_tool_loop" not in text:
-            return None
-        if "exact requested shell command failed" in text:
-            return None
-        if "consecutive tool failures suppressed" in text:
-            return "I stopped retrying after repeated failures."
-        if "repeated side-effecting tool series suppressed" in text:
-            return "I stopped before repeating the same external action."
-        if "duplicate tool invocation suppressed" in text:
-            return "I skipped a repeated action that had already run."
-        return "I stopped before repeating the same action."
+        return AgentLoop._tool_loop_suppression_message_from_text(payload)
 
     @staticmethod
     def _extract_tool_suppression_user_response(
@@ -5199,10 +5319,11 @@ class AgentLoop:
                 streamed_result=serialized_result,
                 captured_output=captured_output,
             )
+            visible_delta = AgentLoop._stream_tool_result_visible_delta("", metadata)
 
             events.append({
                 "type": "tool_result",
-                "delta": "",
+                "delta": visible_delta,
                 "metadata": metadata,
             })
             next_index = index + 1
@@ -5285,6 +5406,8 @@ class AgentLoop:
         pending_fallback_content_emit = False
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
+        tool_loop_fallback_active = False
+        initial_content_passthrough_started = False
         stream_error_reason: BaseException | str | None = None
 
         # Trim and inject persisted history into runtime memory
@@ -5516,6 +5639,7 @@ class AgentLoop:
             def _stop_tool_loop(reason: str) -> None:
                 nonlocal run_result_text, pre_tool_scratchpad_events, pre_tool_scratchpad_buffer
                 nonlocal post_tool_content_events, post_tool_content_buffer
+                nonlocal tool_loop_fallback_active
                 if recent_tool_result_events:
                     run_result_text = AgentLoop._build_tool_loop_fallback_response(
                         recent_tool_result_events,
@@ -5526,6 +5650,7 @@ class AgentLoop:
                         "The task did not reach a final answer before the request "
                         "timeout. Please retry or continue this task."
                     )
+                tool_loop_fallback_active = True
                 if bg_task is not None and not bg_task.done():
                     bg_task.cancel()
                 pre_tool_scratchpad_events = []
@@ -5965,6 +6090,7 @@ class AgentLoop:
                     delta = chunk
 
                 if chunk_type == "tool_result":
+                    delta = AgentLoop._stream_tool_result_visible_delta(delta, metadata)
                     tool_result_event = {
                         "type": chunk_type,
                         "delta": delta,
@@ -6011,11 +6137,20 @@ class AgentLoop:
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
-                            if thinking and not saw_tool_call:
+                            if (
+                                not saw_tool_call
+                                and not initial_content_passthrough_started
+                                and len(pre_tool_scratchpad_buffer + delta) <= 300
+                            ):
                                 pre_tool_scratchpad_buffer += delta
                                 pre_tool_scratchpad_events.append(event)
                                 continue
+                            if pre_tool_scratchpad_buffer:
+                                delta = pre_tool_scratchpad_buffer + delta
+                                pre_tool_scratchpad_events = []
+                                pre_tool_scratchpad_buffer = ""
                             if not saw_tool_call:
+                                initial_content_passthrough_started = True
                                 delta = AgentLoop._mask_user_visible_text(delta)
                                 if not delta:
                                     continue
@@ -6125,7 +6260,10 @@ class AgentLoop:
                     "falling back to run() result text."
                 )
                 fallback_delta = run_result_text
-                if full_content and fallback_after_tool_only_preamble:
+                if full_content and fallback_after_tool_only_preamble and tool_loop_fallback_active:
+                    full_content = run_result_text
+                    fallback_reason = "tool_loop_guardrail"
+                elif full_content and fallback_after_tool_only_preamble:
                     full_content, fallback_delta = AgentLoop._resolve_stream_fallback_delta(
                         full_content,
                         run_result_text,

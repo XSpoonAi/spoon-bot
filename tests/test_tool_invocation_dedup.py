@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from spoon_bot.agent.tools.base import Tool, ToolParameterSchema
 from spoon_bot.agent.tools.execution_context import track_tool_invocations
+from spoon_bot.agent.tools.filesystem import EditFileTool, ReadFileTool
 
 
 class CountingTool(Tool):
@@ -160,3 +162,84 @@ async def test_track_tool_invocations_suppresses_consecutive_failures() -> None:
     assert "STOP_TOOL_LOOP" in fourth
     assert "consecutive tool failures suppressed" in fourth
     assert tool.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_track_tool_invocations_suppresses_redundant_file_ranges(tmp_path: Path) -> None:
+    file_path = tmp_path / "app.py"
+    file_path.write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
+    tool = ReadFileTool(workspace=tmp_path)
+
+    with track_tool_invocations():
+        first = await tool.execute(path=str(file_path))
+        duplicate_range = await tool.execute(path=str(file_path), offset=2, limit=2)
+
+    with track_tool_invocations():
+        partial = await tool.execute(path=str(file_path), offset=1, limit=2)
+        uncovered_range = await tool.execute(path=str(file_path), offset=4, limit=1)
+
+    assert "line2" in first
+    assert "STOP_TOOL_LOOP" in duplicate_range
+    assert "redundant file read suppressed" in duplicate_range
+    assert "line4" not in duplicate_range
+    assert "line1" in partial
+    assert "line4" in uncovered_range
+
+
+@pytest.mark.asyncio
+async def test_truncated_file_read_only_covers_visible_complete_lines(tmp_path: Path) -> None:
+    file_path = tmp_path / "large.txt"
+    file_path.write_text("line1\nline2\nline3\nline4\n", encoding="utf-8")
+    tool = ReadFileTool(workspace=tmp_path, max_output=9)
+
+    with track_tool_invocations():
+        first = await tool.execute(path=str(file_path))
+        hidden_range = await tool.execute(path=str(file_path), offset=3, limit=1)
+        visible_range = await tool.execute(path=str(file_path), offset=1, limit=1)
+
+    assert "... (truncated" in first
+    assert "line3" in hidden_range
+    assert "STOP_TOOL_LOOP" in visible_range
+    assert "redundant file read suppressed" in visible_range
+
+
+@pytest.mark.asyncio
+async def test_file_edit_invalidates_read_dedup_for_verification(tmp_path: Path) -> None:
+    file_path = tmp_path / "settings.txt"
+    file_path.write_text("original=keep\ncolor = red\n", encoding="utf-8")
+    read_tool = ReadFileTool(workspace=tmp_path)
+    edit_tool = EditFileTool(workspace=tmp_path)
+
+    with track_tool_invocations():
+        first = await read_tool(path=str(file_path))
+        duplicate_before_edit = await read_tool(path=str(file_path))
+        edited = await edit_tool(
+            path=str(file_path),
+            old_text="color = red",
+            new_text="color = blue",
+        )
+        verify = await read_tool(path=str(file_path))
+
+    assert "color = red" in first
+    assert "STOP_TOOL_LOOP" in duplicate_before_edit
+    assert "Successfully edited" in edited
+    assert "STOP_TOOL_LOOP" not in verify
+    assert "color = blue" in verify
+
+
+@pytest.mark.asyncio
+async def test_changed_file_content_allows_same_range_read(tmp_path: Path) -> None:
+    file_path = tmp_path / "settings.txt"
+    file_path.write_text("color = red\n", encoding="utf-8")
+    read_tool = ReadFileTool(workspace=tmp_path)
+
+    with track_tool_invocations():
+        first = await read_tool.execute(path=str(file_path))
+        duplicate = await read_tool.execute(path=str(file_path))
+        file_path.write_text("color = blue\n", encoding="utf-8")
+        changed = await read_tool.execute(path=str(file_path))
+
+    assert "color = red" in first
+    assert "STOP_TOOL_LOOP" in duplicate
+    assert "STOP_TOOL_LOOP" not in changed
+    assert "color = blue" in changed

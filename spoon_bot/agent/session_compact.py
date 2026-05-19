@@ -7,11 +7,10 @@ putting prompt/domain routing rules in the agent loop.
 
 from __future__ import annotations
 
-from collections import Counter
 import json
 import re
+from collections import Counter
 from typing import Any
-
 
 DEFAULT_MAX_SESSION_MESSAGES = 80
 DEFAULT_MAX_SESSION_TURNS = 6
@@ -19,6 +18,7 @@ DEFAULT_CONTEXT_CHAR_BUDGET = 24_000
 EVENT_CLIP_LEVELS = (360, 220, 140)
 
 _OBSERVED_OUTPUT_RE = re.compile(r"^Observed output of cmd [^\n]* execution:\s*")
+_FILE_OUTPUT_HEADER_RE = re.compile(r"^\[file:\s*([^\]\n]+)\]\s*\n")
 _PRELOADED_SKILL_BLOCK_RE = re.compile(
     r"\n+---\n\[PRE-LOADED SKILL:[\s\S]*$",
     re.IGNORECASE,
@@ -67,6 +67,12 @@ def _compact_multiline_text(text: Any, *, line_window: int = 4) -> str:
             text = str(text)
 
     text = _OBSERVED_OUTPUT_RE.sub("", text.strip())
+    file_header = _FILE_OUTPUT_HEADER_RE.match(text)
+    if file_header:
+        return (
+            f"[file: {file_header.group(1)}] "
+            "content body omitted from compact; use search_history/read_file for exact text"
+        )
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     if not lines:
         return ""

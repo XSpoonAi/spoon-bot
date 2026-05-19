@@ -5,19 +5,25 @@ All tools enforce workspace boundary security to prevent path traversal attacks.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
+
 import aiofiles
 import aiofiles.os
 
 from spoon_bot.agent.tools.base import Tool
-from spoon_bot.agent.tools.execution_context import capture_tool_output
+from spoon_bot.agent.tools.execution_context import (
+    capture_tool_output,
+    invalidate_file_read_tracking,
+    suppress_redundant_file_read,
+)
 from spoon_bot.agent.tools.path_validator import (
     PathValidator,
+    set_default_validator,
+    validate_directory_path,
     validate_read_path,
     validate_write_path,
-    validate_directory_path,
-    set_default_validator,
 )
 
 
@@ -120,17 +126,23 @@ class ReadFileTool(Tool):
                 async with aiofiles.open(file_path, "r", encoding="latin-1") as f:
                     content = await f.read()
 
+            content_fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            all_lines = content.split("\n")
+            total_lines = len(all_lines)
+            start = max(0, (offset or 1) - 1)
+            if offset is not None and start >= total_lines:
+                return f"Error: Offset {offset} beyond end of file ({total_lines} lines)"
+
             # Line-range selection (Pi-style offset+limit)
             if offset is not None or limit is not None:
-                all_lines = content.split("\n")
-                total_lines = len(all_lines)
-                start = max(0, (offset or 1) - 1)
-                if start >= total_lines:
-                    return f"Error: Offset {offset} beyond end of file ({total_lines} lines)"
                 end = min(total_lines, start + limit) if limit else total_lines
                 content = "\n".join(all_lines[start:end])
+                visible_start_line = start + 1
+                selected_line_count = max(1, end - start)
                 range_note = f" | lines {start + 1}-{end}/{total_lines}"
             else:
+                visible_start_line = 1
+                selected_line_count = total_lines
                 range_note = ""
 
             full_content = content
@@ -139,9 +151,24 @@ class ReadFileTool(Tool):
             is_skill_file = "skills" in parts
 
             if self._max_output and total_size > self._max_output:
-                content = full_content[:self._max_output] + f"\n... (truncated, {total_size - self._max_output} more chars)"
+                visible_prefix = full_content[:self._max_output]
+                visible_line_count = visible_prefix.count("\n")
+                content = visible_prefix + f"\n... (truncated, {total_size - self._max_output} more chars)"
             else:
+                visible_line_count = selected_line_count
                 content = full_content
+
+            if visible_line_count > 0:
+                duplicate_read = suppress_redundant_file_read(
+                    str(file_path),
+                    offset=visible_start_line,
+                    limit=visible_line_count,
+                    total_lines=total_lines,
+                    content_fingerprint=content_fingerprint,
+                )
+                if duplicate_read is not None:
+                    capture_tool_output(duplicate_read, duplicate_read)
+                    return duplicate_read
 
             # Use relative path to workspace for dedup, fallback to name
             try:
@@ -252,7 +279,12 @@ class WriteFileTool(Tool):
         workspace_note = ""
         if self._workspace:
             workspace_note = f" Files must be within the workspace: {self._workspace}"
-        return f"Write content to a file at the given path. Creates parent directories if needed.{workspace_note}"
+        return (
+            "Write content to a new file, or replace an existing file only when "
+            "overwrite=true is intentionally set for a whole-file replacement. "
+            "For targeted changes to an existing file, use edit_file instead. "
+            f"Creates parent directories if needed.{workspace_note}"
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -267,6 +299,15 @@ class WriteFileTool(Tool):
                     "type": "string",
                     "description": "The content to write",
                 },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true only for an intentional whole-file replacement. "
+                        "Existing files are protected by default; use edit_file "
+                        "for targeted changes."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["path", "content"],
         }
@@ -275,6 +316,7 @@ class WriteFileTool(Tool):
         self,
         path: str,
         content: str,
+        overwrite: bool = False,
         **kwargs: Any,
     ) -> str:
         """Write content to file with path traversal protection."""
@@ -287,13 +329,30 @@ class WriteFileTool(Tool):
             file_path = result.resolved_path
             assert file_path is not None  # Guaranteed by valid=True
 
+            if file_path.exists() and file_path.is_file():
+                try:
+                    existing = file_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    existing = file_path.read_text(encoding="latin-1")
+                if existing == content:
+                    return f"No changes: {path} already has the requested content"
+                if not overwrite:
+                    return (
+                        f"Error: File already exists: {path}. "
+                        "Use edit_file for targeted changes, or call write_file "
+                        "with overwrite=true only when the whole-file replacement "
+                        "is intentional."
+                    )
+
             # Create parent directories (already validated to be within workspace)
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                 await f.write(content)
 
-            return f"Successfully wrote {len(content)} bytes to {path}"
+            invalidate_file_read_tracking(path, str(file_path))
+            action = "overwrote" if overwrite else "wrote"
+            return f"Successfully {action} {len(content)} bytes to {path}"
 
         except PermissionError:
             return f"Error: Permission denied: {path}"
@@ -395,6 +454,7 @@ class EditFileTool(Tool):
             async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                 await f.write(new_content)
 
+            invalidate_file_read_tracking(path, str(file_path))
             return f"Successfully edited {path}"
 
         except PermissionError:

@@ -51,6 +51,33 @@ def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence(
     assert "Do not search for alternatives" not in compact
 
 
+def test_session_compact_omits_file_body_from_tool_evidence() -> None:
+    session = DummySession(
+        [
+            {"role": "user", "content": "Inspect app.py"},
+            {
+                "role": "tool",
+                "name": "read_file",
+                "tool_call_id": "call_read",
+                "content": (
+                    "Observed output of cmd read_file execution: "
+                    "[file: app.py | 120 chars | lines 1-8/8]\n"
+                    "SECRET_BODY_SHOULD_NOT_BE_REPLAYED\n"
+                    "print('implementation detail')"
+                ),
+            },
+            {"role": "assistant", "content": "Inspected the file."},
+        ]
+    )
+
+    compact = build_session_compact_context(session, "Continue")
+
+    assert "[file: app.py | 120 chars | lines 1-8/8]" in compact
+    assert "content body omitted from compact" in compact
+    assert "SECRET_BODY_SHOULD_NOT_BE_REPLAYED" not in compact
+    assert "implementation detail" not in compact
+
+
 def test_session_compact_does_not_preserve_long_prior_task_as_user_evidence() -> None:
     session = DummySession(
         [

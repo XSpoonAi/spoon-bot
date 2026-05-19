@@ -843,7 +843,8 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "raw tool transcript" in cleaned
+        assert "could not turn the latest tool results into a clean final answer" in cleaned
+        assert "raw tool transcript" not in cleaned
         assert "FINAL_STATE task=347 action=joined" in cleaned
         assert "Step 1:" not in cleaned
         assert len(cleaned) < 1600
@@ -881,10 +882,53 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "raw tool transcript" in cleaned
+        assert "could not turn the latest tool results into a clean final answer" in cleaned
+        assert "raw tool transcript" not in cleaned
         assert "Tool `list_dir` output:" in cleaned
         assert "write_file(path=" not in cleaned
         assert "Weather skill created successfully" not in cleaned
+
+    def test_finalize_response_content_omits_file_body_from_fallback(self):
+        """Raw transcript cleanup must not expose full file bodies to users."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = SimpleNamespace(
+            memory=SimpleNamespace(
+                messages=[
+                    SimpleNamespace(role="user", content="inspect file"),
+                    SimpleNamespace(
+                        role="tool",
+                        content=(
+                            "Observed output of cmd read_file execution: "
+                            "[file: app.py | 100 chars | lines 1-10/10]\n"
+                            "SECRET_BODY_SHOULD_NOT_BE_VISIBLE\n"
+                            "print('implementation detail')"
+                        ),
+                        name="read_file",
+                        tool_call_id="call_read",
+                    ),
+                ]
+            )
+        )
+        content = (
+            "Step 1: Observed output of cmd read_file execution: "
+            "[file: app.py | 100 chars | lines 1-10/10]\n"
+            "SECRET_BODY_SHOULD_NOT_BE_VISIBLE"
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "inspect file",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert "could not turn the latest tool results into a clean final answer" in cleaned
+        assert "[file: app.py | 100 chars | lines 1-10/10]" in cleaned
+        assert "content body omitted from user-visible fallback" in cleaned
+        assert "SECRET_BODY_SHOULD_NOT_BE_VISIBLE" not in cleaned
+        assert "raw tool transcript" not in cleaned
 
     def test_stream_tool_result_metadata_caps_large_payloads(self):
         from spoon_bot.agent.loop import AgentLoop
@@ -1787,9 +1831,17 @@ API base: http://13.251.72.206:8080/api/agent/games
         emitted_content = [c for c in chunks if c["type"] == "content"]
         assert emitted_content
         assert all("Step 1: Observed output" not in c["delta"] for c in emitted_content)
-        assert "raw tool transcript" in emitted_content[0]["delta"]
+        assert (
+            "could not turn the latest tool results into a clean final answer"
+            in emitted_content[0]["delta"]
+        )
+        assert "raw tool transcript" not in emitted_content[0]["delta"]
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert "raw tool transcript" in done_chunks[0]["metadata"]["content"]
+        assert (
+            "could not turn the latest tool results into a clean final answer"
+            in done_chunks[0]["metadata"]["content"]
+        )
+        assert "raw tool transcript" not in done_chunks[0]["metadata"]["content"]
         assert "Step 1: Observed output" not in done_chunks[0]["metadata"]["content"]
 
     @pytest.mark.asyncio
@@ -2215,6 +2267,222 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert emitted[1]["metadata"]["result"] == '{"stdout": "/workspace"}'
 
     @pytest.mark.asyncio
+    async def test_stream_tool_result_delta_omits_file_body(self):
+        """User-visible tool_result delta should not expose read_file bodies."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "read_file"
+        tool_call.function.arguments = '{"path":"secret.txt"}'
+        file_result = (
+            "[file: secret.txt | 80 chars | lines 1-3/3]\n"
+            "SECRET_BODY_SHOULD_STAY_INTERNAL\n"
+            "implementation detail"
+        )
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {
+                        "id": "call_1",
+                        "name": "read_file",
+                    },
+                    "result": file_result,
+                }
+            )
+            await agent._agent.output_queue.put({"content": "Done."})
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(return_value="placeholder")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        tool_result_chunk = next(c for c in chunks if c["type"] == "tool_result")
+        assert "[file: secret.txt | 80 chars | lines 1-3/3]" in tool_result_chunk["delta"]
+        assert "content body omitted from user-visible tool result" in tool_result_chunk["delta"]
+        assert "SECRET_BODY_SHOULD_STAY_INTERNAL" not in tool_result_chunk["delta"]
+        assert "SECRET_BODY_SHOULD_STAY_INTERNAL" not in json.dumps(
+            tool_result_chunk["metadata"],
+            ensure_ascii=False,
+        )
+        assert tool_result_chunk["metadata"]["result_body_omitted"] is True
+        assert tool_result_chunk["metadata"]["model_result_body_omitted"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_withholds_short_pre_tool_content(self):
+        """Short content before a tool call is preamble and should not reach clients."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"pwd"}'
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"content": "我将"})
+            await agent._agent.output_queue.put({"content": "按照您的要求执行："})
+            await agent._agent.output_queue.put({"tool_calls": [tool_call]})
+            await agent._agent.output_queue.put(
+                {
+                    "type": "tool_result",
+                    "metadata": {
+                        "id": "call_1",
+                        "name": "shell",
+                    },
+                    "result": "/workspace",
+                }
+            )
+            await agent._agent.output_queue.put({"content": "完成。"})
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(return_value="placeholder")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == ["完成。"]
+        done_chunk = next(c for c in chunks if c["type"] == "done")
+        assert done_chunk["metadata"]["content"] == "完成。"
+        assert "我将按照您的要求执行" not in json.dumps(chunks, ensure_ascii=False)
+
+    @pytest.mark.asyncio
+    async def test_stream_does_not_duplicate_no_tool_content_after_initial_buffer(self):
+        """Once no-tool content streams through, later chunks should not be re-emitted."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        first_delta = "这是一个不需要工具的长回答。" * 25
+        second_delta = "后续内容。"
+
+        async def mock_run(**kwargs):
+            await agent._agent.output_queue.put({"content": first_delta})
+            await agent._agent.output_queue.put({"content": second_delta})
+
+        agent = MagicMock(spec=AgentLoop)
+        agent._initialized = True
+        agent._agent = MagicMock()
+        agent._agent.output_queue = asyncio.Queue()
+        agent._agent.task_done = asyncio.Event()
+        agent._agent.run = mock_run
+        agent._agent.add_message = AsyncMock()
+        agent._agent.memory = MagicMock()
+        agent._agent.memory.messages = []
+        agent._agent.state = "idle"
+        agent._session = MagicMock()
+        agent._session.add_message = MagicMock()
+        agent.sessions = MagicMock()
+        agent.sessions.save = MagicMock()
+        agent.memory = MagicMock()
+        agent.memory.get_memory_context = MagicMock(return_value=None)
+        agent.context = MagicMock()
+        agent._prepare_request_context = AsyncMock()
+        agent._build_runtime_message_content = MagicMock(return_value="placeholder")
+        agent._build_step_prompt = MagicMock(return_value="prompt")
+        agent._install_anti_loop_tracker = MagicMock()
+        agent._restore_agent_think = MagicMock()
+        agent._callable_accepts_kwarg = MagicMock(return_value=True)
+        agent._reset_reasoning_capture = MagicMock()
+        agent._drain_reasoning_chunks = MagicMock(return_value=[])
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        assert [c["delta"] for c in content_chunks] == [first_delta, second_delta]
+        done_chunk = next(c for c in chunks if c["type"] == "done")
+        assert done_chunk["metadata"]["content"] == first_delta + second_delta
+
+    def test_user_visible_text_masks_internal_guardrails(self):
+        """Internal loop-control markers should be converted before display."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        cleaned = AgentLoop._mask_user_visible_text(
+            '第二次读取显示 "redundant file read suppressed" 错误。'
+        )
+
+        assert "redundant file read suppressed" not in cleaned
+        assert "duplicate file read skipped" in cleaned
+
+    def test_stream_metadata_preserves_guardrail_stop_without_raw_marker(self):
+        """Sanitized WS metadata still has a structural stop signal."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        metadata = AgentLoop._merge_stream_tool_result_metadata(
+            {"name": "read_file"},
+            streamed_result=(
+                "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. "
+                "The same tool and arguments already ran."
+            ),
+            captured_output=None,
+        )
+        event = {"type": "tool_result", "delta": metadata["model_result"], "metadata": metadata}
+
+        assert AgentLoop._is_tool_loop_suppression_event(event) is True
+        assert AgentLoop._tool_loop_suppression_message(event) == (
+            "I skipped a repeated action that had already run."
+        )
+        assert "STOP_TOOL_LOOP" not in json.dumps(metadata, ensure_ascii=False)
+        assert "duplicate tool invocation suppressed" not in json.dumps(
+            metadata,
+            ensure_ascii=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_stream_returns_tool_evidence_when_tool_loop_stalls(self):
         """A stalled tool loop should produce a bounded answer, not an empty response."""
         from spoon_bot.agent.loop import AgentLoop
@@ -2568,7 +2836,7 @@ API base: http://13.251.72.206:8080/api/agent/games
 
     @pytest.mark.asyncio
     async def test_stream_backfilled_tool_result_uses_captured_full_output(self):
-        """Runtime-memory tool results should also expose captured full output in WS metadata."""
+        """Runtime-memory file results should backfill without exposing file bodies."""
         from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.tools.execution_context import bind_tool_invocation, capture_tool_output, finalize_tool_invocation
 
@@ -2628,9 +2896,20 @@ API base: http://13.251.72.206:8080/api/agent/games
             chunks.append(chunk)
 
         tool_result_chunk = next(c for c in chunks if c["type"] == "tool_result")
-        assert tool_result_chunk["metadata"]["result"] == full_result
-        assert tool_result_chunk["metadata"]["content"] == full_result
-        assert tool_result_chunk["metadata"]["model_result"] == summary_result
+        assert tool_result_chunk["delta"] == (
+            "[file: README.md | 40 chars] "
+            "content body omitted from user-visible tool result"
+        )
+        assert tool_result_chunk["metadata"]["result"] == (
+            "[file: README.md | 145 chars] "
+            "content body omitted from user-visible tool result"
+        )
+        assert tool_result_chunk["metadata"]["content"] == tool_result_chunk["metadata"]["result"]
+        assert tool_result_chunk["metadata"]["model_result"] == tool_result_chunk["delta"]
+        assert tool_result_chunk["metadata"]["result_body_omitted"] is True
+        assert tool_result_chunk["metadata"]["model_result_body_omitted"] is True
+        assert "hello" not in json.dumps(tool_result_chunk["metadata"], ensure_ascii=False)
+        assert "world" not in json.dumps(tool_result_chunk["metadata"], ensure_ascii=False)
 
     @pytest.mark.asyncio
     async def test_stream_uses_explicit_thinking_chunk_without_prompt_heuristic(self):

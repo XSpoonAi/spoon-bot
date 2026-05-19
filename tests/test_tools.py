@@ -705,8 +705,35 @@ class TestFilesystemTools:
             content="Test content"
         )
 
+        assert "Successfully wrote" in result
         assert test_file.exists()
         assert test_file.read_text() == "Test content"
+
+    @pytest.mark.asyncio
+    async def test_write_file_requires_explicit_overwrite_for_existing_file(self, write_tool, temp_dir):
+        """Existing files should default to targeted edits, not blind replacement."""
+        test_file = temp_dir / "output.txt"
+        test_file.write_text("original", encoding="utf-8")
+
+        result = await write_tool.execute(path=str(test_file), content="replacement")
+
+        assert "File already exists" in result
+        assert "edit_file" in result
+        assert test_file.read_text(encoding="utf-8") == "original"
+
+    @pytest.mark.asyncio
+    async def test_write_file_allows_explicit_overwrite_for_existing_file(self, write_tool, temp_dir):
+        test_file = temp_dir / "output.txt"
+        test_file.write_text("original", encoding="utf-8")
+
+        result = await write_tool.execute(
+            path=str(test_file),
+            content="replacement",
+            overwrite=True,
+        )
+
+        assert "Successfully overwrote" in result
+        assert test_file.read_text(encoding="utf-8") == "replacement"
 
     @pytest.mark.asyncio
     async def test_list_directory(self, list_tool, temp_dir):
