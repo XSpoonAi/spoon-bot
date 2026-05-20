@@ -5087,8 +5087,19 @@ class AgentLoop:
         original_len = len(text)
         if original_len <= limit:
             return text, False, original_len
-        suffix = f"\n... (stream output truncated, {original_len - limit} more chars)"
-        return text[:limit] + suffix, True, original_len
+        marker = "\n... (stream output middle truncated) ...\n"
+        available = limit - len(marker)
+        if available <= 0:
+            return text[:limit], True, original_len
+        head_limit = max(1, available // 2)
+        tail_limit = max(1, available - head_limit)
+        return (
+            text[:head_limit].rstrip()
+            + marker
+            + text[-tail_limit:].lstrip(),
+            True,
+            original_len,
+        )
 
     @staticmethod
     def _client_visible_tool_result_text(value: Any) -> tuple[str, bool]:

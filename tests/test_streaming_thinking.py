@@ -982,18 +982,21 @@ class TestAgentLoopStream:
     def test_stream_tool_result_metadata_caps_large_payloads(self):
         from spoon_bot.agent.loop import AgentLoop
 
+        full_output = "head evidence\n" + ("x" * 210_000) + "\ntail settlement evidence"
         merged = AgentLoop._merge_stream_tool_result_metadata(
             {},
             streamed_result="short",
             captured_output=SimpleNamespace(
                 summary_output="short",
-                full_output="x" * 210_000,
+                full_output=full_output,
             ),
         )
 
         assert merged["stream_output_truncated"] is True
-        assert merged["stream_output_original_chars"] == 210_000
+        assert merged["stream_output_original_chars"] == len(full_output)
         assert len(merged["full_output"]) < 201_000
+        assert "head evidence" in merged["full_output"]
+        assert "tail settlement evidence" in merged["full_output"]
     def test_prepare_agent_for_new_turn_clears_stale_runtime_state(self):
         """A new turn should not inherit unfinished runtime state from the prior task."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1475,6 +1478,31 @@ API base: http://13.251.72.206:8080/api/agent/games
 
         assert tool_events_have_user_summary_marker(status_events) is False
         assert tool_events_have_user_summary_marker(completion_events) is True
+
+    def test_tool_event_summary_marker_uses_full_output_tail(self):
+        """Verifier should not miss terminal evidence omitted from model summaries."""
+        from spoon_bot.agent.turn_verifiers import (
+            build_user_facing_tool_event_answer,
+            tool_events_have_user_summary_marker,
+        )
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "model_result": "JOINED game=123\nNEXT: node tool wait 123",
+                "full_result": (
+                    "JOINED game=123\n"
+                    "NEXT: node tool wait 123\n"
+                    "Read it aloud: SETTLEMENT game=123 result=WIN rank=1/4"
+                ),
+            },
+        }]
+
+        assert tool_events_have_user_summary_marker(events) is True
+        assert build_user_facing_tool_event_answer(events) == (
+            "Completed.\n\nSETTLEMENT game=123 result=WIN rank=1/4"
+        )
 
     def test_instruction_text_is_not_user_facing_completion_evidence(self):
         """Instruction-only skill text should not become a completed fallback."""

@@ -421,6 +421,7 @@ def _append_capped_text(existing: str, addition: str, limit: int) -> str:
 
 
 _SHELL_BACKGROUND_JOBS: dict[str, _BackgroundShellJob] = {}
+_SILENT_BACKGROUND_TERMINATE_GRACE_SECONDS = 300.0
 
 
 class ShellTool(Tool):
@@ -522,7 +523,9 @@ class ShellTool(Tool):
             "command, execute it exactly as provided; do not remove protective "
             "wrappers such as echo/printf or dry-run/no-op flags. "
             "Commands exceeding the budget keep running in the background — "
-            "use job_status to monitor and terminate_job to stop if stuck. "
+            "use job_status to monitor and terminate_job to stop if there is "
+            "evidence it is stuck. Silent running jobs are not stuck evidence; "
+            "keep polling unless the caller explicitly abandons the job. "
             "Do not install skills by cloning directly into workspace/skills; "
             "use the skill management tool for skill packages. "
             f"Security mode: {mode}. "
@@ -569,6 +572,15 @@ class ShellTool(Tool):
                     "default": 4000,
                     "minimum": 200,
                     "maximum": 50000,
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "For terminate_job only. Set true only when the latest "
+                        "user request explicitly cancels/abandons the running "
+                        "job, or when separate evidence proves it is unrecoverably stuck."
+                    ),
+                    "default": False,
                 },
             },
         }
@@ -1180,6 +1192,8 @@ class ShellTool(Tool):
         action: str,
         job_id: str | None,
         tail_chars: int,
+        *,
+        force: bool = False,
     ) -> str:
         owner_key = get_tool_owner()
         self._prune_background_jobs(owner_key=owner_key)
@@ -1242,6 +1256,22 @@ class ShellTool(Tool):
 
         if action == "terminate_job":
             if self._get_process_returncode(job.process) is None:
+                elapsed = time.time() - job.created_at
+                has_output = bool(job.stdout_text.strip() or job.stderr_text.strip())
+                if (
+                    not force
+                    and not has_output
+                    and elapsed < _SILENT_BACKGROUND_TERMINATE_GRACE_SECONDS
+                ):
+                    return (
+                        f"Not terminated: background shell job {job.job_id} is "
+                        f"still running silently after {elapsed:.0f}s. Silent "
+                        "output alone is not evidence that a long-running "
+                        "network/build/chain command is stuck. Keep polling "
+                        "job_status/job_output, or retry terminate_job with "
+                        "force=true only if the latest user request explicitly "
+                        "abandons this job."
+                    )
                 await self._terminate_background_job(job, status="terminated")
                 prefix = f"Terminated background shell job {job.job_id}.\n"
             else:
@@ -1289,7 +1319,12 @@ class ShellTool(Tool):
             Command output or error message.
         """
         if action != "execute":
-            return await self._handle_background_action(action, job_id, tail_chars)
+            return await self._handle_background_action(
+                action,
+                job_id,
+                tail_chars,
+                force=bool(kwargs.get("force") or kwargs.get("force_terminate")),
+            )
 
         if not command or not str(command).strip():
             return "Error: 'command' is required for action='execute'"

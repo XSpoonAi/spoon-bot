@@ -411,6 +411,57 @@ class TestShellTool:
         assert "Terminated background shell job sh_statusjob" in terminated
 
     @pytest.mark.asyncio
+    async def test_silent_running_background_job_is_not_terminated_without_force(self, shell_tool):
+        """Silence alone should not make the agent kill a long-running job."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+
+            async def wait(self):
+                self.returncode = -15
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.terminated = True
+                self.returncode = -9
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        process = _FakeProcess()
+        job = _BackgroundShellJob(
+            job_id="sh_silentjob",
+            command="node cli/index.js long-chain-operation",
+            cwd=os.getcwd(),
+            process=process,
+            stdout_task=asyncio.create_task(asyncio.sleep(0)),
+            stderr_task=asyncio.create_task(asyncio.sleep(0)),
+            buffer_limit=1000,
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        result = await shell_tool.execute(action="terminate_job", job_id=job.job_id)
+
+        assert "Not terminated" in result
+        assert "Silent output alone is not evidence" in result
+        assert process.terminated is False
+        assert job.status == "running"
+
+        forced = await shell_tool.execute(
+            action="terminate_job",
+            job_id=job.job_id,
+            force=True,
+        )
+
+        assert "Terminated background shell job sh_silentjob" in forced
+        assert process.terminated is True
+
+    @pytest.mark.asyncio
     async def test_terminate_completed_background_job_preserves_terminal_status(self, shell_tool):
         """Terminating an already completed job should not relabel successful output."""
         from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
