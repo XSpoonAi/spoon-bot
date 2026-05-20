@@ -129,6 +129,23 @@ async def test_default_request_scope_allows_one_intentional_rerun() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exact_duplicate_guard_resets_after_intervening_progress() -> None:
+    tool = CountingTool()
+
+    with track_tool_invocations():
+        first = await tool(value="alpha")
+        second = await tool(value="alpha")
+        progress = await tool(value="beta")
+        verify = await tool(value="alpha")
+
+    assert first == "executed:alpha:1"
+    assert second == "executed:alpha:2"
+    assert progress == "executed:beta:3"
+    assert verify == "executed:alpha:4"
+    assert tool.calls == 4
+
+
+@pytest.mark.asyncio
 async def test_track_tool_invocations_suppresses_repeated_side_effect_series() -> None:
     tool = SeriesTool()
 

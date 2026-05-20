@@ -188,6 +188,8 @@ def track_tool_invocations(
     """
     state: dict[str, Any] = {
         "counts": defaultdict(int),
+        "last_exact_key": None,
+        "last_exact_repeats": 0,
         "series_counts": defaultdict(int),
         "consecutive_failures": [],
         "file_read_coverage": defaultdict(list),
@@ -214,8 +216,15 @@ def suppress_repeated_tool_invocation(tool_name: str, arguments: Any) -> str | N
 
     key = f"{str(tool_name or '')}\x1f{normalize_tool_arguments(arguments)}"
     counts[key] += 1
+    if state.get("last_exact_key") == key:
+        repeat_count = int(state.get("last_exact_repeats") or 0) + 1
+    else:
+        repeat_count = 1
+    state["last_exact_key"] = key
+    state["last_exact_repeats"] = repeat_count
+
     max_repeats = int(state.get("max_repeats") or 1)
-    if counts[key] <= max_repeats:
+    if repeat_count <= max_repeats:
         return None
     return _DUPLICATE_TOOL_INVOCATION_MESSAGE
 
