@@ -585,6 +585,27 @@ class TestAgentLoopStream:
         assert "never remove protective wrappers" in prompt
         assert "never convert a simulated command into a live" in prompt
 
+    def test_build_request_context_prompt_does_not_embed_github_skill_route(self):
+        """Skill install routing should come from tools, not prompt-specific blocks."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        message = (
+            "https://github.com/Agent-Cypher-Lab/agent-spot-cypher\n"
+            "Help me install the skill in the repo."
+        )
+
+        prompt = AgentLoop._build_request_context_prompt(loop, message)
+
+        assert "[TURN PRIORITY]:" in prompt
+        assert "[GITHUB SKILL INSTALL REQUEST]:" not in prompt
+        assert "skill_marketplace(action='install_skill'" not in prompt
+        assert "Do not use web_fetch or git clone only to confirm SKILL.md" not in prompt
+        assert "If no SKILL.md exists" not in prompt
+
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
         from spoon_bot.agent.loop import AgentLoop
@@ -870,9 +891,10 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "could not turn the latest tool results into a clean final answer" in cleaned
+        assert "Completed from the latest tool evidence" in cleaned
         assert "raw tool transcript" not in cleaned
         assert "FINAL_STATE task=347 action=joined" in cleaned
+        assert "Tool `shell` output" not in cleaned
         assert "Step 1:" not in cleaned
         assert len(cleaned) < 1600
 
@@ -909,9 +931,9 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "could not turn the latest tool results into a clean final answer" in cleaned
+        assert "Internal tool details were suppressed" in cleaned
         assert "raw tool transcript" not in cleaned
-        assert "Tool `list_dir` output:" in cleaned
+        assert "Tool `list_dir` output:" not in cleaned
         assert "write_file(path=" not in cleaned
         assert "Weather skill created successfully" not in cleaned
 
@@ -951,9 +973,9 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "could not turn the latest tool results into a clean final answer" in cleaned
-        assert "[file: app.py | 100 chars | lines 1-10/10]" in cleaned
-        assert "content body omitted from user-visible fallback" in cleaned
+        assert "Internal tool details were suppressed" in cleaned
+        assert "[file: app.py | 100 chars | lines 1-10/10]" not in cleaned
+        assert "content body omitted from user-visible fallback" not in cleaned
         assert "SECRET_BODY_SHOULD_NOT_BE_VISIBLE" not in cleaned
         assert "raw tool transcript" not in cleaned
 
@@ -1277,6 +1299,250 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert any("join A" in command for command in skill_hint["commands"])
         assert "http://13.251.72.206:8080/api/agent/games" in skill_hint["urls"]
         assert hints["exact_shell_commands"] == []
+
+    def test_request_execution_hints_do_not_route_github_skill_install(self, tmp_path):
+        """Request hints should not classify GitHub URLs into skill-install routes."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        message = (
+            "https://github.com/example-org/example-skill\n"
+            "Please install the skill in this repo."
+        )
+
+        hints = AgentLoop._build_request_execution_hints(loop, message)
+
+        assert "github_skill_install_request" not in hints
+        assert "github_urls" not in hints
+        assert hints["local_executable_skills"] == []
+
+    def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
+        """A normal GitHub repo request should not be routed into workspace/skills."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        message = "Clone https://github.com/example-org/example-repo and inspect the README."
+
+        hints = AgentLoop._build_request_execution_hints(loop, message)
+
+        assert "github_skill_install_request" not in hints
+        assert "github_urls" not in hints
+
+    def test_skill_contract_check_uses_tool_evidence(self):
+        """Skill workflows get a generic verifier pass from tool evidence."""
+        from spoon_bot.agent.turn_verifiers import should_run_skill_contract_check
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "skill_marketplace",
+                "result": "SUCCESS: Skill 'example-skill' installed (1 files).",
+            },
+        }]
+
+        assert should_run_skill_contract_check(events) is True
+
+    def test_plain_repo_result_does_not_run_skill_contract_check(self):
+        """Regular repository tool results should not use the skill verifier."""
+        from spoon_bot.agent.turn_verifiers import should_run_skill_contract_check
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": "Cloned https://github.com/example-org/example-repo.git",
+            },
+        }]
+
+        assert should_run_skill_contract_check(events) is False
+
+    def test_skill_contract_check_prompt_is_generic(self):
+        """The verifier prompt compares request and evidence without task-specific routing."""
+        from spoon_bot.agent.turn_verifiers import build_skill_contract_check_prompt
+
+        message = (
+            "https://github.com/example-org/example-skill\n"
+            "Please install the skill in this repo, then complete the remaining objective."
+        )
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "skill_marketplace",
+                "result": (
+                    "SUCCESS: Skill 'example-skill' installed (1 files).\n"
+                    "NEXT: node skills/example-skill/cli/index.js run"
+                ),
+            },
+        }]
+
+        prompt = build_skill_contract_check_prompt(
+            message,
+            "Installation finished.",
+            events,
+        )
+
+        assert "[INTERNAL COMPLETION VERIFIER]" in prompt
+        assert "reply exactly COMPLETE" in prompt
+        assert "tool evidence" in prompt.lower()
+        assert "[STRUCTURAL NEXT COMMANDS]" in prompt
+        assert "node skills/example-skill/cli/index.js run" in prompt
+        assert "do not copy long 0x values" in prompt
+        assert "Do not append optional follow-up questions" in prompt
+        assert "does not prove downstream requested actions are complete" in prompt
+
+    def test_skill_contract_evidence_summary_preserves_head_and_tail(self):
+        """Long skill/tool evidence should preserve both setup and later contract rules."""
+        from spoon_bot.agent.turn_verifiers import build_skill_contract_check_prompt
+
+        long_contract = (
+            "SKILL HEAD: setup and wallet\n"
+            + ("middle instructions\n" * 300)
+            + "SKILL TAIL: after join, continue until settlement\n"
+        )
+        prompt = build_skill_contract_check_prompt(
+            "Install the skill and complete the workflow.",
+            "Setup completed.",
+            [{
+                "type": "tool_result",
+                "metadata": {
+                    "name": "self_upgrade",
+                    "result": long_contract,
+                },
+            }],
+        )
+
+        assert "SKILL HEAD: setup and wallet" in prompt
+        assert "SKILL TAIL: after join, continue until settlement" in prompt
+        assert "tool output middle omitted" in prompt
+
+    def test_skill_contract_check_pass_is_explicit_sentinel(self):
+        """The verifier preserves the existing answer only on the exact sentinel."""
+        from spoon_bot.agent.turn_verifiers import is_skill_contract_check_pass
+
+        assert is_skill_contract_check_pass("COMPLETE\n") is True
+        assert is_skill_contract_check_pass("Complete, everything is done.") is False
+
+    def test_tool_evidence_fallback_prefers_user_summary_marker(self):
+        """Fallback cleanup should use user-facing evidence, not raw tool transcript."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        tx_hash = "0x" + "ab" * 32
+        answer = build_user_facing_tool_evidence_answer([
+            (
+                f"JOINED game=116 tx={tx_hash}\n"
+                "Read it aloud: SETTLEMENT game=116 result=WIN rank=1/4 spot=A score=10."
+            ),
+        ])
+
+        assert answer == "Completed.\n\nSETTLEMENT game=116 result=WIN rank=1/4 spot=A score=10."
+        assert tx_hash not in answer
+        assert "Tool `" not in answer
+
+    def test_tool_event_summary_marker_distinguishes_completion_from_status(self):
+        """Verifier acceptance should depend on explicit user-facing tool evidence."""
+        from spoon_bot.agent.turn_verifiers import tool_events_have_user_summary_marker
+
+        status_events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": "SUCCESS: setup complete\nGames 19 settled / 19 total",
+            },
+        }]
+        completion_events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": "Read it aloud: workflow finished with result=WIN.",
+            },
+        }]
+
+        assert tool_events_have_user_summary_marker(status_events) is False
+        assert tool_events_have_user_summary_marker(completion_events) is True
+
+    def test_instruction_text_is_not_user_facing_completion_evidence(self):
+        """Instruction-only skill text should not become a completed fallback."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer([
+            (
+                "RULE settlement_reporting:\n"
+                "  run $CLI settlement {gameId}\n"
+                "  use backend settlement detail only after the game has finished\n"
+                "  after settlement appears, report both the result and the reason\n"
+            )
+        ])
+
+        assert "Completed from the latest tool evidence" not in answer
+        assert "Internal tool details were suppressed" in answer
+
+    def test_latest_tool_event_has_next_command_detects_pending_continuation(self):
+        """A latest NEXT command keeps a skill workflow open until evidence completes."""
+        from spoon_bot.agent.turn_verifiers import latest_tool_event_has_next_command
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "CHALLENGE PASSED\nNEXT: node tool join 119 A",
+                },
+            }
+        ]
+
+        assert latest_tool_event_has_next_command(events) is True
+
+    def test_skill_contract_resolves_answer_placeholder_next_command(self):
+        """Verifier should expose a resolved NEXT command after a scalar calculation."""
+        from spoon_bot.agent.turn_verifiers import (
+            extract_resolved_tool_next_commands,
+            has_pending_placeholder_next_command,
+        )
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "QUESTION: What is the answer?\n"
+                        "NEXT: node tool challenge-answer 123 \"<answer>\""
+                    ),
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {"name": "shell", "result": "18"},
+            },
+        ]
+
+        commands = extract_resolved_tool_next_commands(events)
+
+        assert commands[-1] == 'node tool challenge-answer 123 "18"'
+        assert has_pending_placeholder_next_command(events) is True
+
+        events.append({
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": "CHALLENGE PASSED\nNEXT: node tool join 123 A",
+            },
+        })
+        assert has_pending_placeholder_next_command(events) is False
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
@@ -1858,16 +2124,10 @@ API base: http://13.251.72.206:8080/api/agent/games
         emitted_content = [c for c in chunks if c["type"] == "content"]
         assert emitted_content
         assert all("Step 1: Observed output" not in c["delta"] for c in emitted_content)
-        assert (
-            "could not turn the latest tool results into a clean final answer"
-            in emitted_content[0]["delta"]
-        )
+        assert "Completed from the latest tool evidence" in emitted_content[0]["delta"]
         assert "raw tool transcript" not in emitted_content[0]["delta"]
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert (
-            "could not turn the latest tool results into a clean final answer"
-            in done_chunks[0]["metadata"]["content"]
-        )
+        assert "Completed from the latest tool evidence" in done_chunks[0]["metadata"]["content"]
         assert "raw tool transcript" not in done_chunks[0]["metadata"]["content"]
         assert "Step 1: Observed output" not in done_chunks[0]["metadata"]["content"]
 

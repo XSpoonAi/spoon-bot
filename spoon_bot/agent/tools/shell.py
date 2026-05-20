@@ -523,6 +523,8 @@ class ShellTool(Tool):
             "wrappers such as echo/printf or dry-run/no-op flags. "
             "Commands exceeding the budget keep running in the background — "
             "use job_status to monitor and terminate_job to stop if stuck. "
+            "Do not install skills by cloning directly into workspace/skills; "
+            "use the skill management tool for skill packages. "
             f"Security mode: {mode}. "
             "Actions: execute, list_jobs, job_status, job_output, terminate_job. "
             "Dangerous commands and injection patterns are blocked."
@@ -1303,17 +1305,22 @@ class ShellTool(Tool):
             if wait_time > 0.1:
                 logger.info(f"Shell command rate limited, waited {wait_time:.2f}s")
 
-        # Validate command
-        is_valid, error_msg = self.validator.validate(command)
-        if not is_valid:
-            safe_cmd = self.validator.sanitize_for_display(command)
-            return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
-
         cwd = self._resolve_working_dir(working_dir)
 
         # Verify working directory exists and is accessible
         if not os.path.isdir(cwd):
             return f"Error: Working directory not found: {cwd}"
+
+        skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
+        if skill_clone_rejection is not None:
+            capture_tool_output(skill_clone_rejection, skill_clone_rejection)
+            return skill_clone_rejection
+
+        # Validate command
+        is_valid, error_msg = self.validator.validate(command)
+        if not is_valid:
+            safe_cmd = self.validator.sanitize_for_display(command)
+            return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
 
         try:
             owner_key = get_tool_owner()
@@ -1361,6 +1368,79 @@ class ShellTool(Tool):
     @staticmethod
     def _normalize_exact_command(command: str | None) -> str:
         return " ".join(str(command or "").strip().split())
+
+    def _reject_workspace_skill_clone(self, command: str, cwd: str) -> str | None:
+        """Reject manual git clone installs into workspace/skills."""
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            command_tokens = str(command or "").split()
+        command_words = [token.casefold() for token in command_tokens]
+        if len(command_words) < 2 or command_words[:2] != ["git", "clone"]:
+            return None
+
+        positionals: list[str] = []
+        options_with_values = {
+            "-b",
+            "--branch",
+            "--depth",
+            "--filter",
+            "--origin",
+            "-o",
+            "--config",
+            "-c",
+            "--reference",
+            "--separate-git-dir",
+            "--upload-pack",
+            "--template",
+            "--jobs",
+            "--server-option",
+        }
+        skip_next = False
+        for token in command_tokens[2:]:
+            if skip_next:
+                skip_next = False
+                continue
+            lowered = token.casefold()
+            if lowered in options_with_values:
+                skip_next = True
+                continue
+            if any(lowered.startswith(option + "=") for option in options_with_values):
+                continue
+            if token.startswith("-"):
+                continue
+            positionals.append(token)
+
+        if not positionals:
+            return None
+
+        source = positionals[0]
+        if len(positionals) >= 2:
+            destination = positionals[1]
+        else:
+            source_tail = source.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            destination = source_tail.removesuffix(".git") or "repo"
+
+        workspace_root = Path(self.working_dir or cwd).resolve()
+        skills_root = (workspace_root / "skills").resolve()
+        destination_path = Path(destination)
+        if not destination_path.is_absolute():
+            destination_path = Path(cwd) / destination_path
+        destination_path = destination_path.resolve()
+
+        try:
+            destination_path.relative_to(skills_root)
+        except ValueError:
+            return None
+
+        return (
+            "Rejected: workspace skills must be installed through the skill "
+            "management toolchain, not by cloning directly into workspace/skills. "
+            "For a GitHub skill source, call "
+            "skill_marketplace(action='install_skill', url='<source_url>'); "
+            "the installer validates SKILL.md and installs the correct skill "
+            "directory. For ordinary repository work, clone outside workspace/skills."
+        )
 
     def _maybe_stop_after_exact_command_failure(self, command: str, result: str) -> str:
         """Stop the tool loop after a user-specified exact command fails clearly."""

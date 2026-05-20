@@ -97,6 +97,21 @@ from spoon_bot.agent.tools.execution_context import (
     normalize_tool_arguments,
     track_tool_invocations,
 )
+from spoon_bot.agent.request_hints import (
+    build_request_execution_hints,
+    format_exact_shell_command_context,
+)
+from spoon_bot.agent.turn_verifiers import (
+    DEFAULT_SKILL_CONTRACT_CHECK_LIMIT,
+    build_skill_contract_check_prompt,
+    build_user_facing_tool_event_answer,
+    build_user_facing_tool_evidence_answer,
+    has_pending_placeholder_next_command,
+    is_skill_contract_check_pass,
+    latest_tool_event_has_next_command,
+    should_run_skill_contract_check,
+    tool_events_have_user_summary_marker,
+)
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
     SelfConfigTool,
@@ -180,6 +195,13 @@ _EXTERNAL_SIDE_EFFECT_BOUNDARY = (
     "as written; never remove protective wrappers such as echo/printf or "
     "dry-run/no-op flags, and never convert a simulated command into a live "
     "side-effecting command.\n"
+)
+_EXACT_COMMAND_BOUNDARY = (
+    "[EXACT COMMAND BOUNDARY]: If the newest user request provides exact shell "
+    "commands to run, run those commands exactly, in order, unless a command is "
+    "unsafe or cannot be executed. Do not replace an exact requested command with "
+    "a nearby or suggested command. If an exact command fails, report that command's "
+    "failure directly instead of switching to a different command.\n"
 )
 _TURN_STATE_PENDING = "pending"
 _TURN_STATE_COMPLETED = "completed"
@@ -802,7 +824,11 @@ class AgentLoop:
             system_prompt += (
                 "\nUse this catalog as available context, not as a hidden router. "
                 "When a skill is directly relevant, read its SKILL.md and follow "
-                "the skill's own procedures. Otherwise use the normal tools.\n"
+                "the skill's own procedures. Treat those procedures, rules, and "
+                "negative instructions as the execution contract for that task. "
+                "If the skill tells you to decide autonomously or not ask the user, "
+                "continue with the skill flow instead of asking for input. Otherwise "
+                "use the normal tools.\n"
             )
 
         system_prompt += (
@@ -810,7 +836,8 @@ class AgentLoop:
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
             "1. Decide the next action from the latest user request and available context.\n"
             "2. If an installed skill is directly relevant, `read_file` its SKILL.md path, "
-            "then execute its procedure.\n"
+            "then execute its procedure exactly, including its rules about when to ask "
+            "the user and when to decide autonomously.\n"
             "3. Run commands from SKILL.md directly via shell. Do NOT write script files unless requested.\n"
             "4. When done, return the user-facing result in the format the latest user requested. "
             "Only summarize if the user explicitly asked for a summary.\n\n"
@@ -935,8 +962,9 @@ class AgentLoop:
             self._skill_manager = SkillManager(**_sm_kwargs)
             # Load skill tools into the ToolRegistry (inactive by default)
             self._register_skill_tools()
-            # Only auto-activate skill tools when no skills are shown in prompt
-            # (prevents agent from calling skill_marketplace instead of reading SKILL.md)
+            # Only auto-activate ordinary skill tools when no skills are shown in
+            # the prompt. Core skill-management tools remain governed by the
+            # selected tool profile.
             if not self._build_skills_for_prompt():
                 for skill_tool_name in self._skill_tool_names:
                     self.tools.activate_tool(skill_tool_name)
@@ -3002,6 +3030,7 @@ class AgentLoop:
             ):
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
+            self._activate_tools_for_request_hints(request_execution_hints)
             with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
@@ -4770,12 +4799,7 @@ class AgentLoop:
         return f"{head}\n... (tool output truncated)\n{tail}"
 
     def _build_raw_tool_transcript_leak_response(self, start_index: int) -> str:
-        """Build a bounded fallback when raw tool transcript text leaks as final content."""
-        parts = [
-            "I could not turn the latest tool results into a clean final answer.",
-            "Recent tool summary:",
-        ]
-
+        """Build a user-facing fallback without exposing raw tool transcript text."""
         try:
             messages = AgentLoop._get_runtime_memory_messages(self)
         except Exception:
@@ -4785,29 +4809,17 @@ class AgentLoop:
         if isinstance(start_index, int) and start_index >= 0:
             messages = messages[start_index:]
 
-        tool_lines: list[str] = []
+        tool_outputs: list[str] = []
         for msg in messages:
             if AgentLoop._stream_message_role(msg).lower() != "tool":
                 continue
             content = AgentLoop._stream_message_attr(msg, "text_content", None)
             if content in (None, ""):
                 content = AgentLoop._stream_message_attr(msg, "content", "")
-            summary = AgentLoop._compact_tool_evidence_text(content)
-            if not summary:
-                continue
-            name = str(
-                AgentLoop._stream_message_attr(msg, "name", None)
-                or AgentLoop._stream_message_attr(msg, "tool_name", None)
-                or "tool"
-            )
-            tool_lines.append(f"Tool `{name}` output:\n{summary}")
+            if content not in (None, ""):
+                tool_outputs.append(str(content))
 
-        if tool_lines:
-            parts.extend(tool_lines[-3:])
-        else:
-            parts.append("No bounded tool evidence was captured before cleanup.")
-        parts.append("Please continue or retry so the agent can finish from this evidence.")
-        return "\n\n".join(parts)
+        return build_user_facing_tool_evidence_answer(tool_outputs[-8:])
 
     @staticmethod
     def _looks_like_internal_scratchpad_text(text: str) -> bool:
@@ -5497,6 +5509,7 @@ class AgentLoop:
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
         tool_loop_fallback_active = False
+        skill_contract_check_attempts = 0
         initial_content_passthrough_started = False
         stream_error_reason: BaseException | str | None = None
 
@@ -5560,6 +5573,7 @@ class AgentLoop:
             emitted_tool_result_ids: set[str] = set()
             tool_call_arguments_by_id: dict[str, str] = {}
             recent_tool_result_events: list[dict[str, Any]] = []
+            all_tool_result_events: list[dict[str, Any]] = []
             stream_tool_result_count = 0
             stream_tool_call_count = 0
             read_file_argument_counts: dict[str, int] = {}
@@ -5593,6 +5607,7 @@ class AgentLoop:
                             self._agent.output_queue.get_nowait()
 
                     request_execution_hints = self._build_request_execution_hints(authoritative_message)
+                    self._activate_tools_for_request_hints(request_execution_hints)
                     with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
                         result = await AgentLoop._run_agent_with_context_overflow_recovery(
                             self,
@@ -5718,6 +5733,13 @@ class AgentLoop:
                     or DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT
                 ),
             )
+            skill_contract_check_limit = max(
+                1,
+                AgentLoop._int_env(
+                    "SPOON_BOT_SKILL_CONTRACT_CHECK_LIMIT",
+                    DEFAULT_SKILL_CONTRACT_CHECK_LIMIT,
+                ),
+            )
 
             def _record_tool_result_events(events: list[dict[str, Any]]) -> None:
                 nonlocal last_tool_progress_at, last_tool_progress_kind, stream_tool_result_count
@@ -5727,6 +5749,7 @@ class AgentLoop:
                 last_tool_progress_kind = "tool_result"
                 stream_tool_result_count += len(events)
                 recent_tool_result_events.extend(events)
+                all_tool_result_events.extend(events)
                 del recent_tool_result_events[:-6]
 
             def _stop_tool_loop(reason: str) -> None:
@@ -5770,7 +5793,12 @@ class AgentLoop:
                 _stop_tool_loop("total_timeout")
                 return True
 
-            async def _run_pseudo_tool_call_repair(pseudo_content: str) -> tuple[str, list[dict[str, Any]]]:
+            async def _run_pseudo_tool_call_repair(
+                pseudo_content: str,
+                *,
+                repair_prompt_override: str | None = None,
+                repair_reason: str = "pseudo_tool_call_text",
+            ) -> tuple[str, list[dict[str, Any]]]:
                 """Retry once when the model wrote fake tool calls as text."""
                 nonlocal stream_tool_result_index
 
@@ -5781,7 +5809,7 @@ class AgentLoop:
                 AgentLoop._drain_agent_output_queue(self)
                 self._reset_agent_state_for_retry()
 
-                repair_prompt = AgentLoop._build_pseudo_tool_call_repair_prompt(
+                repair_prompt = repair_prompt_override or AgentLoop._build_pseudo_tool_call_repair_prompt(
                     authoritative_message,
                     pseudo_content,
                 )
@@ -5799,6 +5827,7 @@ class AgentLoop:
                     repair_kwargs["reasoning_effort"] = repair_reasoning_effort
 
                 request_execution_hints = self._build_request_execution_hints(authoritative_message)
+                self._activate_tools_for_request_hints(request_execution_hints)
                 with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
                     result = await AgentLoop._run_agent_with_context_overflow_recovery(
                         self,
@@ -5839,7 +5868,7 @@ class AgentLoop:
                                     "id": tc_id,
                                     "name": fn_name,
                                     "arguments": fn_args,
-                                    "repair": "pseudo_tool_call_text",
+                                    "repair": repair_reason,
                                 },
                             })
                         continue
@@ -5871,7 +5900,7 @@ class AgentLoop:
                             metadata.setdefault("tool_call_id", tool_call_id)
                             metadata.setdefault("id", tool_call_id)
                             emitted_tool_result_ids.add(tool_call_id)
-                        metadata["repair"] = "pseudo_tool_call_text"
+                        metadata["repair"] = repair_reason
                         metadata = AgentLoop._merge_stream_tool_result_metadata(
                             metadata,
                             streamed_result=serialized_result,
@@ -5907,7 +5936,7 @@ class AgentLoop:
                 )
                 for event in tool_result_events:
                     metadata = dict(event.get("metadata") or {})
-                    metadata["repair"] = "pseudo_tool_call_text"
+                    metadata["repair"] = repair_reason
                     repair_events.append({**event, "metadata": metadata})
 
                 return repair_text, repair_events
@@ -6464,10 +6493,16 @@ class AgentLoop:
                     tool_call_arguments_by_id=tool_call_arguments_by_id,
                 )
             )
+            _record_tool_result_events(tool_result_events)
             for event in tool_result_events:
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
+
+            if should_run_skill_contract_check(
+                all_tool_result_events,
+            ):
+                buffer_stream_content = True
 
             repeated_read_storm = (
                 _repeated_read_storm_active()
@@ -6609,6 +6644,119 @@ class AgentLoop:
                 pending_fallback_content_emit = True
                 pending_fallback_reason = "pseudo_tool_call_repair"
                 pending_fallback_delta = repair_text
+
+            while (
+                full_content.strip()
+                and should_run_skill_contract_check(
+                    all_tool_result_events,
+                )
+                and skill_contract_check_attempts < skill_contract_check_limit
+            ):
+                logger.warning(
+                    "Final stream content followed workspace skill activity; running "
+                    f"generic skill contract verifier pass "
+                    f"{skill_contract_check_attempts + 1}/"
+                    f"{skill_contract_check_limit}."
+                )
+                skill_contract_check_attempts += 1
+                tool_result_count_before_check = len(all_tool_result_events)
+                repair_prompt = build_skill_contract_check_prompt(
+                    authoritative_message,
+                    full_content,
+                    all_tool_result_events,
+                )
+                previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+                self._force_serial_tool_calls = True
+                try:
+                    repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                        full_content,
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="skill_contract_check",
+                    )
+                finally:
+                    if previous_force_serial:
+                        self._force_serial_tool_calls = True
+                    elif hasattr(self, "_force_serial_tool_calls"):
+                        delattr(self, "_force_serial_tool_calls")
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+
+                if is_skill_contract_check_pass(repair_text):
+                    if has_pending_placeholder_next_command(all_tool_result_events):
+                        full_content = (
+                            "A resolved structural NEXT command remains pending; "
+                            "continue with the skill contract."
+                        )
+                        pending_fallback_content_emit = False
+                        continue
+                    if (
+                        latest_tool_event_has_next_command(all_tool_result_events)
+                        and not tool_events_have_user_summary_marker(
+                            all_tool_result_events
+                        )
+                    ):
+                        full_content = (
+                            "A structural NEXT command remains pending; continue "
+                            "with the installed skill contract instead of treating "
+                            "the current tool result as final."
+                        )
+                        pending_fallback_content_emit = False
+                        continue
+                    if len(all_tool_result_events) > tool_result_count_before_check:
+                        new_tool_result_events = (
+                            all_tool_result_events[tool_result_count_before_check:]
+                        )
+                        if not tool_events_have_user_summary_marker(new_tool_result_events):
+                            full_content = (
+                                "The latest tool evidence did not include a "
+                                "user-facing completion summary. Continue the "
+                                "installed skill contract from the latest "
+                                "available evidence instead of treating setup, "
+                                "read-only inspection, or status output as final."
+                            )
+                            pending_fallback_content_emit = False
+                            continue
+                        full_content = build_user_facing_tool_event_answer(
+                            all_tool_result_events
+                        )
+                        pending_fallback_content_emit = True
+                        pending_fallback_reason = "skill_contract_check"
+                        pending_fallback_delta = full_content
+                    break
+                if repair_text.strip():
+                    full_content = repair_text
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "skill_contract_check"
+                    pending_fallback_delta = repair_text
+                if len(all_tool_result_events) <= tool_result_count_before_check:
+                    if (
+                        latest_tool_event_has_next_command(all_tool_result_events)
+                        and not tool_events_have_user_summary_marker(
+                            all_tool_result_events
+                        )
+                    ):
+                        full_content = (
+                            "A structural NEXT command remains pending; continue "
+                            "with the installed skill contract instead of treating "
+                            "the current tool result as final."
+                        )
+                        pending_fallback_content_emit = False
+                        continue
+                    break
+
+            if (
+                full_content.strip()
+                and should_run_skill_contract_check(all_tool_result_events)
+                and tool_events_have_user_summary_marker(all_tool_result_events)
+            ):
+                full_content = build_user_facing_tool_event_answer(
+                    all_tool_result_events
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "skill_summary"
+                pending_fallback_delta = full_content
 
             pre_finalize_full_content = full_content
             final_content = AgentLoop._finalize_response_content(
@@ -6851,6 +6999,7 @@ class AgentLoop:
             ):
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
+            self._activate_tools_for_request_hints(request_execution_hints)
             with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
@@ -7317,8 +7466,10 @@ class AgentLoop:
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
             f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
+            f"{_EXACT_COMMAND_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{format_exact_shell_command_context(message)}"
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
         )
@@ -7347,8 +7498,10 @@ class AgentLoop:
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
             f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
+            f"{_EXACT_COMMAND_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{format_exact_shell_command_context(message)}"
             f"[WORKSPACE]: {_ws}/\n"
         )
         skill_zip_context = self._current_turn_skill_zip_context()
@@ -7368,126 +7521,23 @@ class AgentLoop:
             prompt += env_section
         return prompt
 
-    @staticmethod
-    def _tokenize_request_matching_text(text: str) -> set[str]:
-        """Return normalized keyword tokens for lightweight skill matching."""
-        return {
-            token
-            for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}", str(text or "").lower())
-            if len(token) >= 2
-        }
-
-    @staticmethod
-    def _request_explicitly_needs_remote_lookup(message: str) -> bool:
-        """Return True when the latest request clearly asks for web/API lookup."""
-        text = str(message or "").lower()
-        if "http://" in text or "https://" in text:
-            return True
-        return bool(re.search(
-            r"(?i)\b(web_fetch|web_search|curl|http|https|api|docs?|documentation|"
-            r"search|browse|lookup|look up|fetch|官网|文档|接口|网页|搜索)\b",
-            text,
-        ))
-
-    @staticmethod
-    def _extract_exact_shell_commands_from_request(message: str) -> list[str]:
-        """Extract explicit shell commands quoted in the latest user request."""
-        commands: list[str] = []
-        seen: set[str] = set()
-        for match in re.findall(r"`([^`\n]{3,300})`", str(message or "")):
-            candidate = " ".join(match.strip().split())
-            if not candidate:
-                continue
-            if not re.match(r"(?i)^(node|python|uv|bash|sh|curl|cast|git|npm|pnpm|yarn)\b", candidate):
-                continue
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            commands.append(candidate)
-        return commands[:4]
-
-    @staticmethod
-    def _extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
-        """Extract runnable command hints and referenced URLs from a SKILL.md file."""
-        try:
-            content = skill_md.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return [], []
-
-        commands: list[str] = []
-        seen_commands: set[str] = set()
-
-        cli_match = re.search(r"CLI\s*:?=\s*(.+)", content)
-        cli_value = cli_match.group(1).strip() if cli_match else ""
-
-        def _push_command(command: str) -> None:
-            normalized = " ".join(str(command or "").strip().split())
-            if not normalized or normalized in seen_commands:
-                return
-            seen_commands.add(normalized)
-            commands.append(normalized)
-
-        if cli_value:
-            _push_command(cli_value)
-
-        for line in content.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith("$CLI "):
-                expanded = stripped.replace("$CLI", cli_value or "$CLI", 1)
-                _push_command(expanded)
-                continue
-            if stripped.startswith("node ") or stripped.startswith("python ") or stripped.startswith("uv "):
-                _push_command(stripped)
-
-        urls = list(dict.fromkeys(
-            match.rstrip(").,")
-            for match in re.findall(r"https?://[^\s`<>\"]+", content)
-        ))
-        return commands[:8], urls[:12]
-
     def _build_request_execution_hints(self, message: str) -> dict[str, Any]:
-        """Build request-scoped generic execution hints for tool-side guardrails."""
-        message_text = str(message or "")
-        request_tokens = AgentLoop._tokenize_request_matching_text(message_text)
-        local_executable_skills: list[dict[str, Any]] = []
-
+        """Build request hints from the newest message and current skill catalog."""
+        skill_candidates: list[dict[str, Any]] = []
         for name, _skill_dir, skill_md, is_organized in self._iter_skill_candidates(include_dormant=True):
             fm = self._parse_skill_frontmatter(skill_md)
-            name_tokens = AgentLoop._tokenize_request_matching_text(name.replace("-", " "))
-            desc_tokens = AgentLoop._tokenize_request_matching_text(
-                " ".join(
-                    part for part in (
-                        fm.get("description") or "",
-                        fm.get("when_to_use") or "",
-                    ) if part
-                )
-            )
-            overlap = len(request_tokens & (name_tokens | desc_tokens))
-            direct_name_match = name.lower() in message_text.lower()
-            if not direct_name_match and overlap < 2:
-                continue
-
-            commands, urls = AgentLoop._extract_skill_command_hints(skill_md)
-            if not commands:
-                continue
-
-            skill_rel = f"skills/{name}/SKILL.md" if is_organized else f"{name}/SKILL.md"
-            local_executable_skills.append({
+            skill_candidates.append({
                 "name": name,
-                "location": skill_rel,
-                "commands": commands,
-                "urls": urls,
-                "score": (100 if direct_name_match else 0) + overlap,
+                "skill_md": skill_md,
+                "is_organized": is_organized,
+                "description": fm.get("description") or "",
+                "when_to_use": fm.get("when_to_use") or "",
             })
+        return build_request_execution_hints(message, skill_candidates)
 
-        local_executable_skills.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
-        return {
-            "allow_remote_probe": AgentLoop._request_explicitly_needs_remote_lookup(message_text),
-            "exact_shell_commands": AgentLoop._extract_exact_shell_commands_from_request(message_text),
-            "local_executable_skills": local_executable_skills[:3],
-        }
+    def _activate_tools_for_request_hints(self, hints: dict[str, Any]) -> list[str]:
+        """Hook for request-scoped tool-profile activation."""
+        return []
 
     @staticmethod
     def _truncate_request_for_prompt(

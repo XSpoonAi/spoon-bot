@@ -156,6 +156,51 @@ class TestShellTool:
 
         assert result == "Exit code: 1"
 
+    def test_shell_rejects_git_clone_into_workspace_skills(self, shell_tool, tmp_path):
+        """Workspace skills must go through skill management, not manual clones."""
+        workspace = tmp_path / "workspace"
+        skills = workspace / "skills"
+        skills.mkdir(parents=True)
+        shell_tool.working_dir = str(workspace)
+
+        result = shell_tool._reject_workspace_skill_clone(
+            "git clone https://github.com/example-org/example-skill.git skills/example-skill",
+            str(workspace),
+        )
+
+        assert result is not None
+        assert not result.startswith("STOP_TOOL_LOOP:")
+        assert result.startswith("Rejected:")
+        assert "skill_marketplace(action='install_skill'" in result
+
+    def test_shell_allows_git_clone_outside_workspace_skills(self, shell_tool, tmp_path):
+        """Regular repository work outside workspace/skills remains allowed."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        shell_tool.working_dir = str(workspace)
+
+        result = shell_tool._reject_workspace_skill_clone(
+            "git clone https://github.com/example-org/example-repo.git repos/example-repo",
+            str(workspace),
+        )
+
+        assert result is None
+
+    def test_shell_rejects_implicit_clone_destination_inside_skills_cwd(self, shell_tool, tmp_path):
+        """A clone run from workspace/skills also counts as a manual skill install."""
+        workspace = tmp_path / "workspace"
+        skills = workspace / "skills"
+        skills.mkdir(parents=True)
+        shell_tool.working_dir = str(workspace)
+
+        result = shell_tool._reject_workspace_skill_clone(
+            "git clone https://github.com/example-org/example-skill.git",
+            str(skills),
+        )
+
+        assert result is not None
+        assert result.startswith("Rejected:")
+
     def test_shell_description_preserves_protective_wrappers(self, shell_tool):
         """Tool instructions should not invite converting a replay into a live command."""
         description = shell_tool.description

@@ -5,24 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
+from urllib.parse import urlparse
 
 from spoon_ai.tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
 
-# GitHub URL pattern: https://github.com/owner/repo[/tree/branch[/path]]
-_GITHUB_URL_RE = re.compile(
-    r"https?://github\.com/"
-    r"(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)"
-    r"(?:/tree/(?P<branch>[^/\s]+)(?:/(?P<path>[^\s]*))?)?"
-    r"\s*$"
-)
 _SKILLS_SH_API = "https://skills.sh/api/search"
+_GITHUB_HOST = "github.com"
+_T = TypeVar("_T")
 
 
 def _get_workspace() -> Path:
@@ -65,26 +60,82 @@ def _looks_like_github_repo_reference(value: str) -> bool:
     candidate = (value or "").strip()
     if not candidate:
         return False
-    if "github.com" in candidate:
+    parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
+    if parsed.netloc.casefold() == _GITHUB_HOST:
         return True
     if candidate.startswith(("/", "\\", ".", "~")):
         return False
-    if re.match(r"^[A-Za-z]:[\\/]", candidate):
+    if len(candidate) >= 3 and candidate[1] == ":" and candidate[2] in {"/", "\\"}:
         return False
-    return bool(re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/.*)?$", candidate))
+    parts = [part for part in candidate.replace("\\", "/").split("/") if part]
+    if len(parts) < 2:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+    return all(part and all(char in allowed for char in part) for part in parts[:2])
 
 
 def _parse_github_url(url: str) -> tuple[str, str, str, str]:
     """Parse a GitHub URL -> (owner, repo, branch, subpath)."""
-    m = _GITHUB_URL_RE.match(url.strip())
-    if not m:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != _GITHUB_HOST:
         raise ValueError(f"Not a recognised GitHub URL: {url!r}")
-    return (
-        m.group("owner"),
-        m.group("repo"),
-        m.group("branch") or "main",
-        (m.group("path") or "").rstrip("/"),
-    )
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        raise ValueError(f"Not a recognised GitHub URL: {url!r}")
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    branch = "main"
+    subpath_parts: list[str] = []
+    if len(parts) > 2:
+        if parts[2] != "tree" or len(parts) < 4:
+            raise ValueError(
+                "GitHub skill installs require a repository URL or tree URL "
+                f"pointing at a skill folder: {url!r}"
+            )
+        branch = parts[3]
+        subpath_parts = parts[4:]
+    return owner, repo, branch, "/".join(subpath_parts)
+
+
+def _is_safe_skill_name(value: str) -> bool:
+    """Return True when a frontmatter name is safe as a workspace directory."""
+    name = value.strip()
+    if not 1 <= len(name) <= 81:
+        return False
+    if name in {".", ".."} or ".." in name:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+    return name[0].isalnum() and all(char in allowed for char in name)
+
+
+def _read_skill_name_from_frontmatter(skill_md: Path, fallback: str) -> str:
+    """Read ``name:`` from SKILL.md frontmatter, falling back to the path-derived name."""
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return fallback
+
+    frontmatter: list[str] = []
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        frontmatter.append(line)
+    else:
+        return fallback
+
+    for line in frontmatter:
+        key, sep, raw_value = line.partition(":")
+        if not sep or key.strip() != "name":
+            continue
+        raw_name = raw_value.split("#", 1)[0].strip()
+        skill_name = raw_name.strip("'\"")
+        if _is_safe_skill_name(skill_name):
+            return skill_name
+
+    return fallback
 
 
 def _github_headers() -> dict[str, str]:
@@ -94,6 +145,65 @@ def _github_headers() -> dict[str, str]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _is_transient_install_error(exc: BaseException) -> bool:
+    """Return True for network/process timeouts worth retrying."""
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if isinstance(cause, BaseException) and cause is not exc:
+        if _is_transient_install_error(cause):
+            return True
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    exc_name = type(exc).__name__.casefold()
+    message = str(exc).casefold()
+    return (
+        "timeout" in exc_name
+        or "timedout" in exc_name
+        or "timed out" in message
+        or "timeout" in message
+        or "server disconnected" in message
+        or "connection reset" in message
+        or "connection aborted" in message
+        or "temporarily unavailable" in message
+    )
+
+
+def _format_install_error(exc: BaseException) -> str:
+    """Render installer failures with enough recovery context for the agent."""
+    message = str(exc).strip() or type(exc).__name__
+    if _is_transient_install_error(exc):
+        return (
+            "Error installing skill: transient network failure while resolving or "
+            "downloading the GitHub skill. Retry the same "
+            "skill_marketplace(action='install_skill', url=...) call once; "
+            "reading the GitHub page is not a substitute for installation."
+        )
+    return f"Error installing skill: {message}"
+
+
+async def _with_transient_retries(
+    label: str,
+    operation: Callable[[], Any],
+    *,
+    attempts: int = 2,
+) -> _T:
+    """Retry transient installer operations without changing install semantics."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_transient_install_error(exc):
+                raise
+            logger.warning(
+                "%s timed out during attempt %s/%s; retrying",
+                label,
+                attempt,
+                attempts,
+            )
+    raise RuntimeError(f"{label} failed") from last_exc
 
 
 def _build_git_clone_command(clone_url: str, branch: str, destination: Path, subpath: str) -> list[str]:
@@ -358,14 +468,42 @@ async def _download_skill_files(
     return count
 
 
+def _retarget_skill_dir(
+    workspace: Path,
+    current_target: Path,
+    fallback_name: str,
+    *,
+    overwrite_existing: bool = False,
+) -> tuple[str, Path, bool]:
+    """Move a downloaded skill to its frontmatter-declared directory name."""
+    skill_name = _read_skill_name_from_frontmatter(
+        current_target / "SKILL.md",
+        fallback_name,
+    )
+    final_target = workspace / "skills" / skill_name
+    if final_target == current_target:
+        return skill_name, current_target, False
+
+    if final_target.exists():
+        if not overwrite_existing and (final_target / "SKILL.md").exists():
+            shutil.rmtree(str(current_target), ignore_errors=True)
+            return skill_name, final_target, True
+        shutil.rmtree(str(final_target), ignore_errors=True)
+
+    final_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(current_target), str(final_target))
+    return skill_name, final_target, False
+
+
 class SkillMarketplaceTool(BaseTool):
     """Search, install, and remove skills from skills.sh / GitHub / local paths."""
 
     name: str = "skill_marketplace"
     description: str = (
         "Install, update, remove, or search skills. "
-        "Use install actions only when the user explicitly asks to install an Agent Skill "
-        "or after you have already confirmed the source contains a skill SKILL.md. "
+        "Use install_skill directly when the user explicitly asks to install an "
+        "Agent Skill from a GitHub repository; the installer validates SKILL.md "
+        "and rejects non-skill repositories. "
         "Do NOT call this tool for arbitrary GitHub repositories, GitHub files, or local files; "
         "inspect/review those first with the normal file, shell, or web tools. "
         "Actions: "
@@ -401,8 +539,9 @@ class SkillMarketplaceTool(BaseTool):
             "url": {
                 "type": "string",
                 "description": (
-                    "Confirmed skill GitHub URL to install from, or a local skill directory path "
-                    "for install_local. Do not pass generic repos/files before inspection. "
+                    "GitHub URL for an explicitly requested Agent Skill install, or a local "
+                    "skill directory path for install_local. Do not pass generic repos/files "
+                    "when the user only asked to inspect or clone a normal repository. "
                     "e.g. 'https://github.com/openclaw/skills/tree/main/skills/tezatezaz/clawcast-wallet' "
                     "or '/home/user/my-skills/my-skill' or 'C:\\Projects\\my-skill'."
                 ),
@@ -476,8 +615,9 @@ class SkillMarketplaceTool(BaseTool):
                 if _url.startswith(("http://", "https://")):
                     owner, repo, branch, subpath = _parse_github_url(_url)
                     subpath = _validate_subpath(subpath, allow_empty=True)
-                    branch, subpath, skill_name_derived = await _resolve_github_skill_source(
-                        owner, repo, branch, subpath
+                    branch, subpath, skill_name_derived = await _with_transient_retries(
+                        "resolve GitHub skill source",
+                        lambda: _resolve_github_skill_source(owner, repo, branch, subpath),
                     )
                 else:
                     parts = [p for p in url.split("/") if p]
@@ -498,28 +638,51 @@ class SkillMarketplaceTool(BaseTool):
                         branch = rest[1] if len(rest) > 1 else "main"
                         rest = rest[2:]
                     subpath = _validate_subpath("/".join(rest), allow_empty=True)
-                    branch, subpath, skill_name_derived = await _resolve_github_skill_source(
-                        owner, repo, branch, subpath
+                    branch, subpath, skill_name_derived = await _with_transient_retries(
+                        "resolve GitHub skill source",
+                        lambda: _resolve_github_skill_source(owner, repo, branch, subpath),
                     )
 
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
 
                 if target.exists() and (target / "SKILL.md").exists():
+                    skill_name_derived, target, _already_installed = _retarget_skill_dir(
+                        workspace,
+                        target,
+                        skill_name_derived,
+                    )
+                    _rel_path = f"skills/{skill_name_derived}"
                     return (
                         f"Skill '{skill_name_derived}' is already installed.\n"
                         "If the user asked to UPDATE, use action='update_skill' instead.\n"
-                        "Otherwise, proceed to USE the skill:\n"
+                        "Otherwise, read the skill instructions before proceeding:\n"
                         f"  read_file(path='{_rel_path}/SKILL.md')\n"
-                        "Then execute CLI commands from SKILL.md. Record in soul.md."
+                        "Then follow the commands and persistence rules described in SKILL.md."
                     )
                 elif target.exists():
                     shutil.rmtree(str(target), ignore_errors=True)
 
                 target.parent.mkdir(parents=True, exist_ok=True)
-                count = await _download_skill_files(
-                    owner, repo, branch, subpath, target
+                count = await _with_transient_retries(
+                    "download GitHub skill files",
+                    lambda: _download_skill_files(owner, repo, branch, subpath, target),
                 )
+                skill_name_derived, target, already_installed = _retarget_skill_dir(
+                    workspace,
+                    target,
+                    skill_name_derived,
+                )
+                _rel_path = f"skills/{skill_name_derived}"
+
+                if already_installed:
+                    return (
+                        f"Skill '{skill_name_derived}' is already installed.\n"
+                        "If the user asked to UPDATE, use action='update_skill' instead.\n"
+                        "Otherwise, read the skill instructions before proceeding:\n"
+                        f"  read_file(path='{_rel_path}/SKILL.md')\n"
+                        "Then follow the commands and persistence rules described in SKILL.md."
+                    )
 
                 installed_files = []
                 for f in sorted(target.rglob("*")):
@@ -535,8 +698,7 @@ class SkillMarketplaceTool(BaseTool):
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
                     f"2) read_file(path='{_rel_path}/SKILL.md') for instructions.\n"
-                    "3) Execute CLI commands from SKILL.md (cast, curl — NOT scripts).\n"
-                    "4) Record the result in soul.md."
+                    "3) Follow the commands and persistence rules described in SKILL.md."
                 )
 
             except Exception as e:
@@ -555,7 +717,7 @@ class SkillMarketplaceTool(BaseTool):
                         f"({message}). For a regular repository or file, inspect/review it first "
                         "with normal tools instead of copying it into workspace/skills."
                     )
-                return f"Error installing skill: {e}"
+                return _format_install_error(e)
 
         # ----------------------------------------------------------
         # install_local — copy/link a skill from a local directory
@@ -575,7 +737,10 @@ class SkillMarketplaceTool(BaseTool):
                 if not (source / "SKILL.md").exists():
                     return f"Error: '{url}' does not contain SKILL.md — not a valid skill"
 
-                skill_name_derived = source.name
+                skill_name_derived = _read_skill_name_from_frontmatter(
+                    source / "SKILL.md",
+                    source.name,
+                )
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
 
@@ -669,6 +834,13 @@ class SkillMarketplaceTool(BaseTool):
                 count = await _download_skill_files(
                     owner, repo, branch, subpath, target
                 )
+                skill_name_derived, target, _already_installed = _retarget_skill_dir(
+                    workspace,
+                    target,
+                    skill_name_derived,
+                    overwrite_existing=True,
+                )
+                _rel_path = f"skills/{skill_name_derived}"
 
                 return (
                     f"SUCCESS: Skill '{skill_name_derived}' updated ({count} files).\n\n"

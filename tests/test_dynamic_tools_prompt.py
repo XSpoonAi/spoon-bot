@@ -181,6 +181,27 @@ class TestActivateToolTool:
         assert "Error" in result
 
 
+class TestToolProfileSkillManagement:
+    """Skill management belongs to the default tool profile, not prompt routing."""
+
+    def test_core_profile_includes_skill_marketplace(self):
+        from spoon_bot.agent.tools.registry import CORE_TOOLS
+
+        assert "skill_marketplace" in CORE_TOOLS
+
+    def test_request_scoped_activation_hook_has_no_prompt_route(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+
+        activated = AgentLoop._activate_tools_for_request_hints(
+            loop,
+            {"arbitrary": "hint"},
+        )
+
+        assert activated == []
+
+
 # ---------------------------------------------------------------------------
 # Tests: No hardcoded config in registry
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ CORE_TOOLS: frozenset[str] = frozenset({
     "shell", "read_file", "write_file", "edit_file", "list_dir", "grep",
     "self_config", "memory", "activate_tool", "self_upgrade", "cron",
     "web_search", "web_fetch", "wallet", "balance_check",
+    "skill_marketplace",
 })
 
 AUTOMATION_TOOLS: frozenset[str] = frozenset({
@@ -25,6 +26,7 @@ AUTOMATION_TOOLS: frozenset[str] = frozenset({
     "self_config", "memory", "activate_tool", "self_upgrade",
     "search_history",
     "web_search", "web_fetch",
+    "skill_marketplace",
 })
 
 RISKY_LOCAL_TOOLS: frozenset[str] = frozenset({
@@ -64,7 +66,7 @@ TOOL_PROFILES: dict[str, frozenset[str]] = {
     "full": frozenset({
         "shell", "read_file", "write_file", "edit_file", "list_dir",
         "self_config", "memory", "self_upgrade", "activate_tool", "spawn",
-        "web_search", "web_fetch", "cron",
+        "web_search", "web_fetch", "cron", "skill_marketplace",
     }),
 }
 
