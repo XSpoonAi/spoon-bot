@@ -1771,6 +1771,40 @@ class AgentLoop:
             logger.debug(f"[{label}] Runtime tool-context normalization skipped: {exc}")
             return 0
 
+    async def _ensure_runtime_user_tail_before_run(self, label: str) -> int:
+        """Ensure provider-bound continuation requests end with a user turn."""
+        try:
+            messages = AgentLoop._get_runtime_memory_messages(self)
+        except Exception as exc:
+            logger.debug(f"[{label}] Runtime tail check skipped: {exc}")
+            return 0
+
+        if not isinstance(messages, list) or not messages:
+            return 0
+
+        last_role = str(AgentLoop._message_role_value(messages[-1]) or "").strip().lower()
+        if last_role == "user":
+            return 0
+
+        agent = getattr(self, "_agent", None)
+        add_message = getattr(agent, "add_message", None)
+        if not callable(add_message):
+            return 0
+
+        prompt = getattr(agent, "next_step_prompt", None)
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = (
+                "Continue from the current conversation state and answer the "
+                "latest user request."
+            )
+
+        await add_message("user", prompt.strip())
+        logger.info(
+            f"[{label}] Added continuation user turn before model run "
+            f"(previous_tail_role={last_role or 'unknown'})"
+        )
+        return 1
+
     @staticmethod
     def _truncate_runtime_memory(self, start_index: int) -> None:
         """Remove runtime-only messages appended by an aborted turn."""
@@ -2765,6 +2799,9 @@ class AgentLoop:
 
         async def _do_run() -> Any:
             with bind_tool_owner(self._current_tool_owner_key()):
+                request = run_kwargs.get("request")
+                if not (isinstance(request, str) and request.strip()):
+                    await AgentLoop._ensure_runtime_user_tail_before_run(self, label)
                 return await self._agent.run(**run_kwargs)
 
         def _on_retry(attempt: int, exc: Exception, delay: float) -> None:

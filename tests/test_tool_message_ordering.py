@@ -339,6 +339,65 @@ class TestNormalizeRuntimeToolContext:
         ] == ["user", "assistant", "tool", "user"]
         assert messages[-1].content == "current request"
 
+    @pytest.mark.asyncio
+    async def test_provider_run_adds_continuation_user_after_assistant_tail(self):
+        AgentLoop = _get_agent_loop_class()
+
+        class DummyAgent:
+            def __init__(self):
+                self.memory = SimpleNamespace(
+                    messages=[
+                        _msg("user", "previous request"),
+                        _msg("assistant", "previous answer"),
+                    ]
+                )
+                self.next_step_prompt = "Continue with the latest task."
+                self.run_tail_roles: list[str] = []
+
+            async def add_message(self, role: str, content: str, **kwargs):
+                self.memory.messages.append(_msg(role, content, **kwargs))
+
+            async def run(self, **kwargs):
+                self.run_tail_roles = [
+                    msg.role if isinstance(msg.role, str) else msg.role.value
+                    for msg in self.memory.messages
+                ]
+                return "ok"
+
+        agent = DummyAgent()
+        stub = SimpleNamespace(_agent=agent, session_key="tail-test", user_id=None)
+        stub._current_tool_owner_key = AgentLoop._current_tool_owner_key.__get__(stub)
+
+        result = await AgentLoop._run_agent_with_retry(stub, label="test")
+
+        assert result == "ok"
+        assert agent.run_tail_roles[-1] == "user"
+        assert agent.memory.messages[-1].content == "Continue with the latest task."
+
+    @pytest.mark.asyncio
+    async def test_provider_run_does_not_duplicate_existing_user_tail(self):
+        AgentLoop = _get_agent_loop_class()
+
+        class DummyAgent:
+            def __init__(self):
+                self.memory = SimpleNamespace(messages=[_msg("user", "current request")])
+                self.next_step_prompt = "Should not be added."
+
+            async def add_message(self, role: str, content: str, **kwargs):
+                self.memory.messages.append(_msg(role, content, **kwargs))
+
+            async def run(self, **kwargs):
+                return len(self.memory.messages)
+
+        agent = DummyAgent()
+        stub = SimpleNamespace(_agent=agent, session_key="tail-test", user_id=None)
+        stub._current_tool_owner_key = AgentLoop._current_tool_owner_key.__get__(stub)
+
+        result = await AgentLoop._run_agent_with_retry(stub, label="test")
+
+        assert result == 1
+        assert [msg.content for msg in agent.memory.messages] == ["current request"]
+
     def test_runtime_compaction_preserves_tool_trajectory_and_pending_calls(self):
         AgentLoop = _get_agent_loop_class()
         loop = AgentLoop.__new__(AgentLoop)
