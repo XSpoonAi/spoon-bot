@@ -138,13 +138,50 @@ def _read_skill_name_from_frontmatter(skill_md: Path, fallback: str) -> str:
     return fallback
 
 
-def _github_headers() -> dict[str, str]:
-    """Build GitHub API headers, including auth token if available."""
+def _github_headers(*, include_token: bool = True) -> dict[str, str]:
+    """Build GitHub API headers, optionally including auth token if available."""
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token:
+    if include_token and token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def _github_header_variants() -> list[dict[str, str]]:
+    """Return authenticated GitHub headers followed by a public fallback."""
+    headers = _github_headers()
+    if "Authorization" not in headers:
+        return [headers]
+    return [headers, _github_headers(include_token=False)]
+
+
+def _is_retryable_github_auth_failure(exc: BaseException) -> bool:
+    """Detect stale or rejected GitHub credentials that should not block public repos."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code == 401:
+        return True
+    if status_code != 403:
+        return False
+    text = str(getattr(response, "text", "")).casefold()
+    return "bad credentials" in text
+
+
+async def _github_api_get(client: Any, url: str, **request_kwargs: Any) -> Any:
+    """GET a GitHub API URL and retry without auth if local credentials are stale."""
+    for headers in _github_header_variants():
+        resp = await client.get(url, headers=headers, **request_kwargs)
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            if "Authorization" in headers and _is_retryable_github_auth_failure(exc):
+                logger.debug(
+                    "GitHub API token was rejected; retrying without authorization"
+                )
+                continue
+            raise
+        return resp
+    raise RuntimeError("GitHub API request failed after authentication fallback")
 
 
 def _is_transient_install_error(exc: BaseException) -> bool:
@@ -274,12 +311,11 @@ async def _resolve_github_skill_source(
     import httpx
 
     async def _fetch_repo_tree_paths(client: httpx.AsyncClient, candidate_branch: str) -> list[str]:
-        resp = await client.get(
+        resp = await _github_api_get(
+            client,
             f"https://api.github.com/repos/{owner}/{repo}/git/trees/{candidate_branch}",
             params={"recursive": "1"},
-            headers=_github_headers(),
         )
-        resp.raise_for_status()
         payload = resp.json()
         tree = payload.get("tree", [])
         if not isinstance(tree, list):
@@ -303,11 +339,10 @@ async def _resolve_github_skill_source(
                 should_retry_default_branch = exc.response.status_code == 404 and resolved_branch == "main"
                 if not should_retry_default_branch:
                     raise
-                repo_resp = await client.get(
+                repo_resp = await _github_api_get(
+                    client,
                     f"https://api.github.com/repos/{owner}/{repo}",
-                    headers=_github_headers(),
                 )
-                repo_resp.raise_for_status()
                 repo_data = repo_resp.json()
                 fallback_branch = str(repo_data.get("default_branch") or "").strip()
                 if not fallback_branch or fallback_branch == resolved_branch:
@@ -393,7 +428,6 @@ async def _download_via_api(
     """Download skill files via GitHub Contents API. Returns file count."""
     import httpx
 
-    headers = _github_headers()
     base_api = f"https://api.github.com/repos/{owner}/{repo}/contents"
     raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}"
     total_files = 0
@@ -403,8 +437,7 @@ async def _download_via_api(
     ) -> None:
         nonlocal total_files
         url = f"{base_api}/{api_path}?ref={branch}" if api_path else f"{base_api}?ref={branch}"
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
+        resp = await _github_api_get(client, url)
         items: list[dict[str, Any]] = resp.json()
         for item in items:
             itype = item.get("type")
@@ -658,7 +691,8 @@ class SkillMarketplaceTool(BaseTool):
                         "If the user asked to UPDATE, use action='update_skill' instead.\n"
                         "Otherwise, read the skill instructions before proceeding:\n"
                         f"  read_file(path='{_rel_path}/SKILL.md')\n"
-                        "Then follow the commands and persistence rules described in SKILL.md."
+                        "Complete any Setup/Prerequisites/Install/dependency steps first, "
+                        "then follow the commands and persistence rules described in SKILL.md."
                     )
                 elif target.exists():
                     shutil.rmtree(str(target), ignore_errors=True)
@@ -681,7 +715,8 @@ class SkillMarketplaceTool(BaseTool):
                         "If the user asked to UPDATE, use action='update_skill' instead.\n"
                         "Otherwise, read the skill instructions before proceeding:\n"
                         f"  read_file(path='{_rel_path}/SKILL.md')\n"
-                        "Then follow the commands and persistence rules described in SKILL.md."
+                        "Complete any Setup/Prerequisites/Install/dependency steps first, "
+                        "then follow the commands and persistence rules described in SKILL.md."
                     )
 
                 installed_files = []
@@ -698,7 +733,8 @@ class SkillMarketplaceTool(BaseTool):
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
                     f"2) read_file(path='{_rel_path}/SKILL.md') for instructions.\n"
-                    "3) Follow the commands and persistence rules described in SKILL.md."
+                    "3) Complete any Setup/Prerequisites/Install/dependency steps first, "
+                    "then follow the commands and persistence rules described in SKILL.md."
                 )
 
             except Exception as e:
@@ -775,7 +811,8 @@ class SkillMarketplaceTool(BaseTool):
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
                     f"2) read_file(path='{_rel_path}/SKILL.md') for instructions.\n"
-                    "3) Execute CLI commands from SKILL.md."
+                    "3) Complete any Setup/Prerequisites/Install/dependency steps first, "
+                    "then execute CLI commands from SKILL.md."
                 )
             except Exception as e:
                 logger.error(f"install_local failed: {e}")
@@ -850,7 +887,8 @@ class SkillMarketplaceTool(BaseTool):
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
                     f"2) read_file(path='{_rel_path}/SKILL.md') for updated instructions.\n"
-                    "3) Record the update in soul.md."
+                    "3) Complete any Setup/Prerequisites/Install/dependency steps before "
+                    "primary commands, then record the update in soul.md."
                 )
             except Exception as e:
                 logger.error(f"update_skill failed: {e}")

@@ -67,6 +67,116 @@ def test_skill_install_server_disconnect_is_retryable(skill_manager_module):
 
 
 @pytest.mark.asyncio
+async def test_resolve_github_skill_source_retries_public_api_after_bad_token(
+    skill_manager_module,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import httpx
+
+    monkeypatch.setenv("GITHUB_TOKEN", "stale-token")
+    calls: list[dict[str, str]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: int):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, **kwargs):
+            headers = kwargs.get("headers") or {}
+            calls.append(headers)
+            request = httpx.Request("GET", url)
+            if "Authorization" in headers:
+                return httpx.Response(
+                    401,
+                    request=request,
+                    json={"message": "Bad credentials"},
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                json={"tree": [{"type": "blob", "path": "SKILL.md"}]},
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    resolved = await skill_manager_module._resolve_github_skill_source(
+        "owner",
+        "repo",
+        "main",
+        "",
+    )
+
+    assert resolved == ("main", "", "repo")
+    assert calls[0]["Authorization"] == "Bearer stale-token"
+    assert "Authorization" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_download_via_api_retries_public_api_after_bad_token(
+    skill_manager_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import httpx
+
+    monkeypatch.setenv("GITHUB_TOKEN", "stale-token")
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: int):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, **kwargs):
+            headers = kwargs.get("headers") or {}
+            calls.append((url, headers))
+            request = httpx.Request("GET", url)
+            if url.startswith("https://api.github.com/") and "Authorization" in headers:
+                return httpx.Response(
+                    401,
+                    request=request,
+                    json={"message": "Bad credentials"},
+                )
+            if url.startswith("https://api.github.com/"):
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json=[{"type": "file", "path": "SKILL.md", "name": "SKILL.md"}],
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                content=b"---\nname: repo\n---\n# Repo\n",
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    target = tmp_path / "repo"
+    count = await skill_manager_module._download_via_api(
+        "owner",
+        "repo",
+        "main",
+        "",
+        target,
+    )
+
+    assert count == 1
+    assert (target / "SKILL.md").read_text(encoding="utf-8").startswith("---")
+    assert calls[0][1]["Authorization"] == "Bearer stale-token"
+    assert "Authorization" not in calls[1][1]
+
+
+@pytest.mark.asyncio
 async def test_install_skill_writes_into_workspace_skills_directory(
     skill_manager_module,
     monkeypatch: pytest.MonkeyPatch,
@@ -180,6 +290,7 @@ async def test_install_root_skill_repo_uses_skill_frontmatter_name(
     installed_dir = tmp_path / "skills" / "spot-agent-cypher"
     fallback_dir = tmp_path / "skills" / "agent-spot-cypher"
     assert "SUCCESS: Skill 'spot-agent-cypher' installed" in result
+    assert "Complete any Setup/Prerequisites/Install/dependency steps first" in result
     assert recorded_targets == [fallback_dir]
     assert installed_dir.exists()
     assert (installed_dir / "SKILL.md").exists()
