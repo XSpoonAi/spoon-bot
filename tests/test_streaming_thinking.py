@@ -585,6 +585,30 @@ class TestAgentLoopStream:
         assert "never remove protective wrappers" in prompt
         assert "never convert a simulated command into a live" in prompt
 
+    def test_build_request_context_prompt_routes_confirmed_github_skill_install(self):
+        """GitHub skill installs should use the skill installer after SKILL.md confirmation."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        message = (
+            "https://github.com/Agent-Cypher-Lab/agent-spot-cypher\n"
+            "Help me install the skill in the repo."
+        )
+
+        prompt = AgentLoop._build_request_context_prompt(loop, message)
+
+        assert "[GITHUB SKILL INSTALL REQUEST]:" in prompt
+        assert "validates SKILL.md and rejects non-skill repos" in prompt
+        assert "skill_marketplace(action='install_skill'" in prompt
+        assert "Do not use web_fetch or git clone only to confirm SKILL.md" in prompt
+        assert "Do not use plain git clone" in prompt
+        assert "If no SKILL.md exists" in prompt
+        assert "work beyond installation" in prompt
+        assert "complete the remaining request before final response" in prompt
+
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1206,6 +1230,100 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert any("join A" in command for command in skill_hint["commands"])
         assert "http://13.251.72.206:8080/api/agent/games" in skill_hint["urls"]
         assert hints["exact_shell_commands"] == []
+
+    def test_request_execution_hints_detect_github_skill_install_without_repo_specific_routing(self, tmp_path):
+        """GitHub skill-install intent should be generic and not tied to one repo name."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        message = (
+            "https://github.com/example-org/example-skill\n"
+            "Please install the skill in this repo."
+        )
+
+        hints = AgentLoop._build_request_execution_hints(loop, message)
+
+        assert hints["github_skill_install_request"] is True
+        assert hints["github_urls"] == ["https://github.com/example-org/example-skill"]
+        assert hints["local_executable_skills"] == []
+
+    def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
+        """A normal GitHub repo request should not be routed into workspace/skills."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        message = "Clone https://github.com/example-org/example-repo and inspect the README."
+
+        hints = AgentLoop._build_request_execution_hints(loop, message)
+
+        assert hints["github_skill_install_request"] is False
+        assert hints["github_urls"] == ["https://github.com/example-org/example-repo"]
+
+    def test_pure_github_skill_install_request_skips_compound_completion_check(self):
+        """Install-only requests can finish after the installer and reload complete."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        message = "https://github.com/example-org/example-skill\nHelp me install the skill in the repo."
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "skill_marketplace",
+                "result": "SUCCESS: Skill 'example-skill' installed (1 files).",
+            },
+        }]
+
+        assert AgentLoop._request_is_pure_github_skill_install(message) is True
+        assert AgentLoop._should_verify_compound_skill_install_completion(message, events) is False
+
+    def test_compound_github_skill_install_completion_check_uses_tool_evidence(self):
+        """Compound install requests get a generic verifier pass after install evidence."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        message = (
+            "https://github.com/example-org/example-skill\n"
+            "Please install the skill in this repo, then complete the remaining objective."
+        )
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "skill_marketplace",
+                "result": "SUCCESS: Skill 'example-skill' installed (1 files).",
+            },
+        }]
+
+        assert AgentLoop._request_is_pure_github_skill_install(message) is False
+        assert AgentLoop._should_verify_compound_skill_install_completion(message, events) is True
+
+        prompt = AgentLoop._build_compound_skill_completion_check_prompt(
+            message,
+            "Installation finished.",
+            events,
+        )
+
+        assert "[INTERNAL COMPLETION VERIFIER]" in prompt
+        assert "reply exactly COMPLETE" in prompt
+        assert "tool evidence" in prompt.lower()
+
+    def test_compound_skill_completion_pass_is_explicit_sentinel(self):
+        """The verifier preserves the existing answer only on the exact sentinel."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        assert AgentLoop._is_compound_skill_completion_pass("COMPLETE\n") is True
+        assert AgentLoop._is_compound_skill_completion_pass("Complete, everything is done.") is False
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):

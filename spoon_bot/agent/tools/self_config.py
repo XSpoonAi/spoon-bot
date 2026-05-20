@@ -575,7 +575,11 @@ class SelfUpgradeTool(Tool):
                 "Use ABSOLUTE paths when running scripts via `shell`, e.g.: "
                 f"bash {ws}/skills/{added[0]}/scripts/<script>.sh. "
                 "Use the `shell` tool to run any commands or scripts. "
-                "You do NOT need a special Python tool."
+                "You do NOT need a special Python tool. "
+                "If the user's latest request contains additional work beyond "
+                "installation, continue from the SKILL.md execution contract now. "
+                "Ask for confirmation only when SKILL.md or a real missing input "
+                "requires user input."
             )
 
         return "\n".join(parts)

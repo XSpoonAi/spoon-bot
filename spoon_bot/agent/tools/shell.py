@@ -1292,6 +1292,11 @@ class ShellTool(Tool):
         if not command or not str(command).strip():
             return "Error: 'command' is required for action='execute'"
 
+        skill_install_clone_rejection = self._reject_github_skill_install_clone(command)
+        if skill_install_clone_rejection is not None:
+            capture_tool_output(skill_install_clone_rejection, skill_install_clone_rejection)
+            return skill_install_clone_rejection
+
         # Resolve effective timeout: per-command override capped by max_timeout
         effective_timeout = self.timeout
         if timeout is not None:
@@ -1361,6 +1366,55 @@ class ShellTool(Tool):
     @staticmethod
     def _normalize_exact_command(command: str | None) -> str:
         return " ".join(str(command or "").strip().split())
+
+    @staticmethod
+    def _github_repo_keys_from_url(url: str) -> set[str]:
+        """Return comparable owner/repo keys for a GitHub URL."""
+        match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)", str(url or ""), re.IGNORECASE)
+        if not match:
+            return set()
+        owner = match.group(1).lower()
+        repo = match.group(2).lower().removesuffix(".git")
+        return {
+            f"github.com/{owner}/{repo}",
+            f"github.com/{owner}/{repo}.git",
+            f"{owner}/{repo}",
+            f"{owner}/{repo}.git",
+        }
+
+    def _reject_github_skill_install_clone(self, command: str) -> str | None:
+        """Reject plain git clones when a GitHub URL is being installed as a skill."""
+        hints = get_request_execution_hints()
+        if not isinstance(hints, dict) or not hints.get("github_skill_install_request"):
+            return None
+        if not re.search(r"(?i)\bgit\s+clone\b", str(command or "")):
+            return None
+
+        normalized_command = self._normalize_exact_command(command)
+        exact_commands = hints.get("exact_shell_commands")
+        if isinstance(exact_commands, list):
+            normalized_exact = {self._normalize_exact_command(item) for item in exact_commands}
+            if normalized_command in normalized_exact:
+                return None
+
+        command_lc = normalized_command.lower()
+        urls = hints.get("github_urls")
+        if not isinstance(urls, list):
+            urls = []
+        if urls:
+            keys = set().union(*(self._github_repo_keys_from_url(str(url)) for url in urls))
+            if keys and not any(key in command_lc for key in keys):
+                return None
+
+        return (
+            "Rejected: This request is installing an Agent Skill from a GitHub URL. "
+            "Do not finish that install with a plain git clone into the workspace. "
+            "Call skill_marketplace(action='install_skill', url='<github_url>'); "
+            "it validates SKILL.md and rejects non-skill repos. Then call "
+            "self_upgrade(action='reload_skills'). If the source has no SKILL.md, "
+            "report that it is not an Agent Skill instead of copying it into "
+            "workspace/skills."
+        )
 
     def _maybe_stop_after_exact_command_failure(self, command: str, result: str) -> str:
         """Stop the tool loop after a user-specified exact command fails clearly."""

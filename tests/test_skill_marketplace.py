@@ -136,6 +136,50 @@ async def test_install_root_skill_repo_writes_into_workspace_skills_directory(
 
 
 @pytest.mark.asyncio
+async def test_install_root_skill_repo_uses_skill_frontmatter_name(
+    skill_manager_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("SPOON_BOT_WORKSPACE_PATH", str(tmp_path))
+    recorded_targets: list[Path] = []
+
+    async def fake_resolve(owner, repo, branch, subpath):
+        return branch, "", "agent-spot-cypher"
+
+    monkeypatch.setattr(skill_manager_module, "_resolve_github_skill_source", fake_resolve)
+
+    async def fake_download(owner, repo, branch, subpath, target):
+        recorded_targets.append(target)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "SKILL.md").write_text(
+            "---\n"
+            "name: spot-agent-cypher\n"
+            "description: Use when playing SPOT games\n"
+            "---\n"
+            "# Spot Agent Cypher\n",
+            encoding="utf-8",
+        )
+        return 1
+
+    monkeypatch.setattr(skill_manager_module, "_download_skill_files", fake_download)
+
+    tool = skill_manager_module.SkillMarketplaceTool()
+    result = await tool.execute(
+        action="install_skill",
+        url="https://github.com/Agent-Cypher-Lab/agent-spot-cypher",
+    )
+
+    installed_dir = tmp_path / "skills" / "spot-agent-cypher"
+    fallback_dir = tmp_path / "skills" / "agent-spot-cypher"
+    assert "SUCCESS: Skill 'spot-agent-cypher' installed" in result
+    assert recorded_targets == [fallback_dir]
+    assert installed_dir.exists()
+    assert (installed_dir / "SKILL.md").exists()
+    assert not fallback_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_install_skill_missing_skill_md_does_not_install_generic_repo(
     skill_manager_module,
     monkeypatch: pytest.MonkeyPatch,

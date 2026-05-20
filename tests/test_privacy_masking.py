@@ -83,12 +83,12 @@ class TestBareHexPrivateKeyMasking:
         result = mask_secrets(text)
         assert key not in result
 
-    def test_ambiguous_tx_equals_is_masked(self):
-        """Bare 'tx=<hex>' is ambiguous and should be masked for safety."""
+    def test_tx_equals_context_preserved(self):
+        """CLI output like 'tx=0x...' should preserve transaction hashes."""
         key = "0x" + "cd" * 32
         text = f"tx= {key}"
         result = mask_secrets(text)
-        assert key not in result
+        assert key in result
 
     def test_parent_hash_preserved(self):
         h = "0x" + "99" * 32

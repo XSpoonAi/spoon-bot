@@ -23,6 +23,7 @@ _GITHUB_URL_RE = re.compile(
     r"\s*$"
 )
 _SKILLS_SH_API = "https://skills.sh/api/search"
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
 
 
 def _get_workspace() -> Path:
@@ -85,6 +86,43 @@ def _parse_github_url(url: str) -> tuple[str, str, str, str]:
         m.group("branch") or "main",
         (m.group("path") or "").rstrip("/"),
     )
+
+
+def _is_safe_skill_name(value: str) -> bool:
+    """Return True when a frontmatter name is safe as a workspace directory."""
+    name = value.strip()
+    return bool(_SKILL_NAME_RE.fullmatch(name)) and ".." not in name
+
+
+def _read_skill_name_from_frontmatter(skill_md: Path, fallback: str) -> str:
+    """Read ``name:`` from SKILL.md frontmatter, falling back to the path-derived name."""
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return fallback
+
+    frontmatter: list[str] = []
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        frontmatter.append(line)
+    else:
+        return fallback
+
+    for line in frontmatter:
+        match = re.match(r"^\s*name\s*:\s*(.+?)\s*$", line)
+        if not match:
+            continue
+        raw_name = match.group(1).split("#", 1)[0].strip()
+        skill_name = raw_name.strip("'\"")
+        if _is_safe_skill_name(skill_name):
+            return skill_name
+
+    return fallback
 
 
 def _github_headers() -> dict[str, str]:
@@ -358,6 +396,33 @@ async def _download_skill_files(
     return count
 
 
+def _retarget_skill_dir(
+    workspace: Path,
+    current_target: Path,
+    fallback_name: str,
+    *,
+    overwrite_existing: bool = False,
+) -> tuple[str, Path, bool]:
+    """Move a downloaded skill to its frontmatter-declared directory name."""
+    skill_name = _read_skill_name_from_frontmatter(
+        current_target / "SKILL.md",
+        fallback_name,
+    )
+    final_target = workspace / "skills" / skill_name
+    if final_target == current_target:
+        return skill_name, current_target, False
+
+    if final_target.exists():
+        if not overwrite_existing and (final_target / "SKILL.md").exists():
+            shutil.rmtree(str(current_target), ignore_errors=True)
+            return skill_name, final_target, True
+        shutil.rmtree(str(final_target), ignore_errors=True)
+
+    final_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(current_target), str(final_target))
+    return skill_name, final_target, False
+
+
 class SkillMarketplaceTool(BaseTool):
     """Search, install, and remove skills from skills.sh / GitHub / local paths."""
 
@@ -506,12 +571,18 @@ class SkillMarketplaceTool(BaseTool):
                 _rel_path = f"skills/{skill_name_derived}"
 
                 if target.exists() and (target / "SKILL.md").exists():
+                    skill_name_derived, target, _already_installed = _retarget_skill_dir(
+                        workspace,
+                        target,
+                        skill_name_derived,
+                    )
+                    _rel_path = f"skills/{skill_name_derived}"
                     return (
                         f"Skill '{skill_name_derived}' is already installed.\n"
                         "If the user asked to UPDATE, use action='update_skill' instead.\n"
-                        "Otherwise, proceed to USE the skill:\n"
+                        "Otherwise, read the skill instructions before proceeding:\n"
                         f"  read_file(path='{_rel_path}/SKILL.md')\n"
-                        "Then execute CLI commands from SKILL.md. Record in soul.md."
+                        "Then follow the commands and persistence rules described in SKILL.md."
                     )
                 elif target.exists():
                     shutil.rmtree(str(target), ignore_errors=True)
@@ -520,6 +591,21 @@ class SkillMarketplaceTool(BaseTool):
                 count = await _download_skill_files(
                     owner, repo, branch, subpath, target
                 )
+                skill_name_derived, target, already_installed = _retarget_skill_dir(
+                    workspace,
+                    target,
+                    skill_name_derived,
+                )
+                _rel_path = f"skills/{skill_name_derived}"
+
+                if already_installed:
+                    return (
+                        f"Skill '{skill_name_derived}' is already installed.\n"
+                        "If the user asked to UPDATE, use action='update_skill' instead.\n"
+                        "Otherwise, read the skill instructions before proceeding:\n"
+                        f"  read_file(path='{_rel_path}/SKILL.md')\n"
+                        "Then follow the commands and persistence rules described in SKILL.md."
+                    )
 
                 installed_files = []
                 for f in sorted(target.rglob("*")):
@@ -535,8 +621,7 @@ class SkillMarketplaceTool(BaseTool):
                     "NEXT STEPS:\n"
                     "1) Call `self_upgrade(action='reload_skills')` to activate.\n"
                     f"2) read_file(path='{_rel_path}/SKILL.md') for instructions.\n"
-                    "3) Execute CLI commands from SKILL.md (cast, curl — NOT scripts).\n"
-                    "4) Record the result in soul.md."
+                    "3) Follow the commands and persistence rules described in SKILL.md."
                 )
 
             except Exception as e:
@@ -575,7 +660,10 @@ class SkillMarketplaceTool(BaseTool):
                 if not (source / "SKILL.md").exists():
                     return f"Error: '{url}' does not contain SKILL.md — not a valid skill"
 
-                skill_name_derived = source.name
+                skill_name_derived = _read_skill_name_from_frontmatter(
+                    source / "SKILL.md",
+                    source.name,
+                )
                 target = workspace / "skills" / skill_name_derived
                 _rel_path = f"skills/{skill_name_derived}"
 
@@ -669,6 +757,13 @@ class SkillMarketplaceTool(BaseTool):
                 count = await _download_skill_files(
                     owner, repo, branch, subpath, target
                 )
+                skill_name_derived, target, _already_installed = _retarget_skill_dir(
+                    workspace,
+                    target,
+                    skill_name_derived,
+                    overwrite_existing=True,
+                )
+                _rel_path = f"skills/{skill_name_derived}"
 
                 return (
                     f"SUCCESS: Skill '{skill_name_derived}' updated ({count} files).\n\n"

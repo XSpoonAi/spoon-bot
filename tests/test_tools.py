@@ -156,6 +156,51 @@ class TestShellTool:
 
         assert result == "Exit code: 1"
 
+    def test_shell_rejects_plain_clone_for_github_skill_install_request(self, shell_tool):
+        """GitHub skill installs should go through skill_marketplace, not root workspace clones."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+
+        with bind_request_execution_hints({
+            "github_skill_install_request": True,
+            "github_urls": ["https://github.com/example-org/example-skill"],
+        }):
+            result = shell_tool._reject_github_skill_install_clone(
+                "git clone https://github.com/example-org/example-skill.git"
+            )
+
+        assert result is not None
+        assert not result.startswith("STOP_TOOL_LOOP:")
+        assert result.startswith("Rejected:")
+        assert "skill_marketplace(action='install_skill'" in result
+
+    def test_shell_allows_plain_clone_for_regular_repo_request(self, shell_tool):
+        """Regular GitHub repo work must not be forced into the skill installer."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+
+        with bind_request_execution_hints({
+            "github_skill_install_request": False,
+            "github_urls": ["https://github.com/example-org/example-repo"],
+        }):
+            result = shell_tool._reject_github_skill_install_clone(
+                "git clone https://github.com/example-org/example-repo.git"
+            )
+
+        assert result is None
+
+    def test_shell_allows_exact_user_clone_even_when_skill_install_intent_exists(self, shell_tool):
+        """Exact shell commands still win when the user explicitly provided them."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+
+        command = "git clone https://github.com/example-org/example-skill.git"
+        with bind_request_execution_hints({
+            "github_skill_install_request": True,
+            "github_urls": ["https://github.com/example-org/example-skill"],
+            "exact_shell_commands": [command],
+        }):
+            result = shell_tool._reject_github_skill_install_clone(command)
+
+        assert result is None
+
     def test_shell_description_preserves_protective_wrappers(self, shell_tool):
         """Tool instructions should not invite converting a replay into a live command."""
         description = shell_tool.description

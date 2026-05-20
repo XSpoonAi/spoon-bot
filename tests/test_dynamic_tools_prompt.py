@@ -181,6 +181,62 @@ class TestActivateToolTool:
         assert "Error" in result
 
 
+class TestRequestScopedToolActivation:
+    """Request hints can activate generic tools without repo-name routing."""
+
+    def test_github_skill_install_activates_skill_marketplace(self):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.tools.registry import ToolRegistry
+
+        class DummyTool:
+            name = "skill_marketplace"
+            description = "Install skills"
+            parameters = {"type": "object", "properties": {}}
+
+            async def execute(self, **kwargs):
+                return "ok"
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.tools = ToolRegistry()
+        loop.tools.register(DummyTool())
+        loop.tools.set_tool_filter(enabled_tools={"shell"})
+        loop._agent = None
+
+        activated = AgentLoop._activate_tools_for_request_hints(
+            loop,
+            {"github_skill_install_request": True},
+        )
+
+        assert activated == ["skill_marketplace"]
+        assert "skill_marketplace" in loop.tools.get_active_tools()
+
+    def test_regular_repo_request_does_not_activate_skill_marketplace(self):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.tools.registry import ToolRegistry
+
+        class DummyTool:
+            name = "skill_marketplace"
+            description = "Install skills"
+            parameters = {"type": "object", "properties": {}}
+
+            async def execute(self, **kwargs):
+                return "ok"
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.tools = ToolRegistry()
+        loop.tools.register(DummyTool())
+        loop.tools.set_tool_filter(enabled_tools={"shell"})
+        loop._agent = None
+
+        activated = AgentLoop._activate_tools_for_request_hints(
+            loop,
+            {"github_skill_install_request": False},
+        )
+
+        assert activated == []
+        assert "skill_marketplace" not in loop.tools.get_active_tools()
+
+
 # ---------------------------------------------------------------------------
 # Tests: No hardcoded config in registry
 # ---------------------------------------------------------------------------
