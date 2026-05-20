@@ -1291,7 +1291,7 @@ API base: http://13.251.72.206:8080/api/agent/games
             "Continue the SPOT game with spot-agent-cypher and finish the round.",
         )
 
-        assert hints["allow_remote_probe"] is False
+        assert hints["explicit_request_urls"] == []
         assert len(hints["local_executable_skills"]) == 1
         skill_hint = hints["local_executable_skills"][0]
         assert skill_hint["name"] == "spot-agent-cypher"
@@ -1321,6 +1321,7 @@ API base: http://13.251.72.206:8080/api/agent/games
 
         assert "github_skill_install_request" not in hints
         assert "github_urls" not in hints
+        assert hints["explicit_request_urls"] == ["https://github.com/example-org/example-skill"]
         assert hints["local_executable_skills"] == []
 
     def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
@@ -1341,6 +1342,7 @@ API base: http://13.251.72.206:8080/api/agent/games
 
         assert "github_skill_install_request" not in hints
         assert "github_urls" not in hints
+        assert hints["explicit_request_urls"] == ["https://github.com/example-org/example-repo"]
 
     def test_skill_contract_check_uses_tool_evidence(self):
         """Skill workflows get a generic verifier pass from tool evidence."""

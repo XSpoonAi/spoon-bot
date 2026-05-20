@@ -693,8 +693,25 @@ class WebFetchTool(Tool):
     def _build_local_skill_fetch_blocker(url: str) -> str | None:
         """Defer skill-derived remote probes until a local executable path is tried."""
         hints = get_request_execution_hints()
-        if not hints or hints.get("allow_remote_probe"):
+        if not hints:
             return None
+
+        parsed = urlparse(str(url or ""))
+        target_host = (parsed.hostname or "").lower().strip()
+        target_url = str(url or "").strip().lower()
+        if not target_host and not target_url:
+            return None
+
+        explicit_urls = hints.get("explicit_request_urls")
+        if isinstance(explicit_urls, list):
+            for explicit_url in explicit_urls:
+                explicit_candidate = str(explicit_url or "").strip().lower()
+                explicit_parsed = urlparse(explicit_candidate)
+                explicit_host = (explicit_parsed.hostname or "").lower().strip()
+                if explicit_candidate and target_url.startswith(explicit_candidate.rstrip("/")):
+                    return None
+                if explicit_host and explicit_host == target_host:
+                    return None
 
         local_skills = hints.get("local_executable_skills")
         if not isinstance(local_skills, list) or not local_skills:
@@ -702,12 +719,6 @@ class WebFetchTool(Tool):
 
         invocation_counts = get_tracked_tool_invocation_counts()
         if invocation_counts.get("shell", 0) > 0:
-            return None
-
-        parsed = urlparse(str(url or ""))
-        target_host = (parsed.hostname or "").lower().strip()
-        target_url = str(url or "").strip().lower()
-        if not target_host and not target_url:
             return None
 
         for skill in local_skills:

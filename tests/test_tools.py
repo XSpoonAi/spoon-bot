@@ -1156,7 +1156,7 @@ class TestWebFetchTool:
         )
 
         hints = {
-            "allow_remote_probe": False,
+            "explicit_request_urls": [],
             "local_executable_skills": [
                 {
                     "name": "spot-agent-cypher",
@@ -1187,7 +1187,7 @@ class TestWebFetchTool:
         )
 
         hints = {
-            "allow_remote_probe": False,
+            "explicit_request_urls": [],
             "local_executable_skills": [
                 {
                     "name": "spot-agent-cypher",
@@ -1225,6 +1225,41 @@ class TestWebFetchTool:
 
         with bind_request_execution_hints(hints), track_tool_invocations():
             await _StubShell()()
+            with patch("spoon_bot.agent.tools.web._get_http_client", return_value=fake_client):
+                result = await web_fetch_tool.execute("http://13.251.72.206:8080/api/agent/games")
+
+        assert result == '{\n  "ok": true\n}'
+
+    @pytest.mark.asyncio
+    async def test_web_fetch_allows_user_explicit_endpoint_before_shell(self, web_fetch_tool):
+        """A URL the user supplied directly is not an accidental skill-backend probe."""
+        from spoon_bot.agent.tools.execution_context import (
+            bind_request_execution_hints,
+            track_tool_invocations,
+        )
+
+        hints = {
+            "explicit_request_urls": ["http://13.251.72.206:8080/api/agent/games"],
+            "local_executable_skills": [
+                {
+                    "name": "spot-agent-cypher",
+                    "location": "skills/spot-agent-cypher/SKILL.md",
+                    "commands": ["node skills/spot-agent-cypher/cli/index.js join A"],
+                    "urls": ["http://13.251.72.206:8080/api/agent/games"],
+                }
+            ],
+        }
+
+        fake_response = MagicMock()
+        fake_response.headers = {"content-type": "application/json"}
+        fake_response.text = '{"ok":true}'
+        fake_response.json.return_value = {"ok": True}
+        fake_response.raise_for_status.return_value = None
+
+        fake_client = AsyncMock()
+        fake_client.request = AsyncMock(return_value=fake_response)
+
+        with bind_request_execution_hints(hints), track_tool_invocations():
             with patch("spoon_bot.agent.tools.web._get_http_client", return_value=fake_client):
                 result = await web_fetch_tool.execute("http://13.251.72.206:8080/api/agent/games")
 
