@@ -15,6 +15,7 @@ from loguru import logger
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
     capture_tool_output,
+    current_session_fact_check_blocker,
     get_request_execution_hints,
     get_tracked_tool_invocation_counts,
 )
@@ -184,6 +185,11 @@ class WebSearchTool(Tool):
         provider: str | None = None,
         **kwargs: Any,
     ) -> str:
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+
         explicit_provider = (provider or "").strip().lower()
         max_results = min(max_results or self._max_results, 20)
 
@@ -618,6 +624,11 @@ class WebFetchTool(Tool):
         Returns:
             Fetched content or error message.
         """
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+
         # Validate URL
         is_valid, error_msg = self._validate_url(url)
         if not is_valid:
@@ -869,6 +880,11 @@ class WebBrowserTool(Tool):
         Returns:
             Page content or error message.
         """
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+
         # Basic URL validation
         try:
             parsed = urlparse(url)

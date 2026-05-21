@@ -20,6 +20,7 @@ from loguru import logger
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
     capture_tool_output,
+    current_session_fact_check_blocker,
     get_request_execution_hints,
     get_tool_owner,
 )
@@ -411,6 +412,20 @@ class _BackgroundShellJob:
 
     def append_stderr(self, text: str) -> None:
         self.stderr_text = _append_capped_text(self.stderr_text, text, self.buffer_limit)
+
+
+@dataclass(frozen=True)
+class _SkillCommandTemplate:
+    """Documented command shape parsed from a skill's SKILL.md."""
+
+    prefix_tokens: tuple[str, ...]
+    fixed_tokens: tuple[str, ...]
+    positional_labels: tuple[str, ...]
+    max_positionals: int
+    allowed_flags: frozenset[str]
+    flags_with_values: frozenset[str]
+    flag_value_labels: tuple[tuple[str, str], ...]
+    display: str
 
 
 def _append_capped_text(existing: str, addition: str, limit: int) -> str:
@@ -1318,6 +1333,11 @@ class ShellTool(Tool):
         Returns:
             Command output or error message.
         """
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+
         if action != "execute":
             return await self._handle_background_action(
                 action,
@@ -1350,6 +1370,14 @@ class ShellTool(Tool):
         if skill_clone_rejection is not None:
             capture_tool_output(skill_clone_rejection, skill_clone_rejection)
             return skill_clone_rejection
+
+        skill_command_rejection = self._reject_undocumented_skill_cli_arguments(
+            command,
+            cwd,
+        )
+        if skill_command_rejection is not None:
+            capture_tool_output(skill_command_rejection, skill_command_rejection)
+            return skill_command_rejection
 
         # Validate command
         is_valid, error_msg = self.validator.validate(command)
@@ -1404,15 +1432,28 @@ class ShellTool(Tool):
     def _normalize_exact_command(command: str | None) -> str:
         return " ".join(str(command or "").strip().split())
 
-    def _reject_workspace_skill_clone(self, command: str, cwd: str) -> str | None:
-        """Reject manual git clone installs into workspace/skills."""
-        try:
-            command_tokens = shlex.split(str(command or ""))
-        except ValueError:
-            command_tokens = str(command or "").split()
-        command_words = [token.casefold() for token in command_tokens]
-        if len(command_words) < 2 or command_words[:2] != ["git", "clone"]:
-            return None
+    @staticmethod
+    def _split_shell_segments(tokens: list[str]) -> list[list[str]]:
+        """Split a shell token list into simple command segments."""
+        segments: list[list[str]] = []
+        current: list[str] = []
+        separators = {"&&", "||", ";"}
+        for token in tokens:
+            if token in separators:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(token)
+        if current:
+            segments.append(current)
+        return segments
+
+    @staticmethod
+    def _clone_positionals(tokens: list[str]) -> list[str]:
+        """Return git clone positional arguments from a git-clone segment."""
+        if len(tokens) < 2 or [token.casefold() for token in tokens[:2]] != ["git", "clone"]:
+            return []
 
         positionals: list[str] = []
         options_with_values = {
@@ -1432,7 +1473,7 @@ class ShellTool(Tool):
             "--server-option",
         }
         skip_next = False
-        for token in command_tokens[2:]:
+        for token in tokens[2:]:
             if skip_next:
                 skip_next = False
                 continue
@@ -1445,37 +1486,545 @@ class ShellTool(Tool):
             if token.startswith("-"):
                 continue
             positionals.append(token)
+        return positionals
 
-        if not positionals:
+    @staticmethod
+    def _resolve_cd_segment(current_dir: Path, tokens: list[str]) -> Path:
+        """Resolve a simple cd segment for clone-target analysis."""
+        if not tokens or tokens[0].casefold() != "cd" or len(tokens) < 2:
+            return current_dir
+        target = Path(tokens[1]).expanduser()
+        if not target.is_absolute():
+            target = current_dir / target
+        try:
+            return target.resolve()
+        except OSError:
+            return target.absolute()
+
+    def _reject_workspace_skill_clone(self, command: str, cwd: str) -> str | None:
+        """Reject manual git clone installs into workspace/skills."""
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            command_tokens = str(command or "").split()
+        if not command_tokens:
             return None
-
-        source = positionals[0]
-        if len(positionals) >= 2:
-            destination = positionals[1]
-        else:
-            source_tail = source.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            destination = source_tail.removesuffix(".git") or "repo"
 
         workspace_root = Path(self.working_dir or cwd).resolve()
         skills_root = (workspace_root / "skills").resolve()
-        destination_path = Path(destination)
-        if not destination_path.is_absolute():
-            destination_path = Path(cwd) / destination_path
-        destination_path = destination_path.resolve()
+        current_dir = Path(cwd).resolve()
 
+        for segment in self._split_shell_segments(command_tokens):
+            if not segment:
+                continue
+            if segment[0].casefold() == "cd":
+                current_dir = self._resolve_cd_segment(current_dir, segment)
+                continue
+            positionals = self._clone_positionals(segment)
+            if not positionals:
+                continue
+
+            source = positionals[0]
+            if len(positionals) >= 2:
+                destination = positionals[1]
+            else:
+                source_tail = source.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                destination = source_tail.removesuffix(".git") or "repo"
+
+            destination_path = Path(destination)
+            if not destination_path.is_absolute():
+                destination_path = current_dir / destination_path
+            destination_path = destination_path.resolve()
+
+            try:
+                destination_path.relative_to(skills_root)
+            except ValueError:
+                continue
+
+            return (
+                "Rejected: workspace skills must be installed through the skill "
+                "management toolchain, not by cloning directly into workspace/skills. "
+                "For a GitHub skill source, call "
+                "skill_marketplace(action='install_skill', url='<source_url>'); "
+                "the installer validates SKILL.md and installs the correct skill "
+                "directory. For ordinary repository work, clone outside workspace/skills."
+            )
+
+        return None
+
+    @staticmethod
+    def _strip_template_token(token: str) -> str:
+        return str(token or "").strip().strip("[]")
+
+    @classmethod
+    def _template_token_is_placeholder(cls, token: str) -> bool:
+        raw = str(token or "").strip()
+        stripped = cls._strip_template_token(raw)
+        return (
+            not stripped
+            or (raw.startswith("[") and raw.endswith("]") and not stripped.startswith("-"))
+            or stripped.startswith("<")
+            or stripped.endswith(">")
+            or "<" in stripped
+            or ">" in stripped
+        )
+
+    @classmethod
+    def _template_placeholder_label(cls, token: str) -> str:
+        stripped = cls._strip_template_token(token)
+        stripped = stripped.strip("<>").strip()
+        normalized = re.sub(r"[^A-Za-z0-9_-]+", "", stripped)
+        return normalized.casefold()
+
+    @staticmethod
+    def _skill_cli_assignment(content: str) -> str:
+        for line in str(content or "").splitlines():
+            stripped = line.strip()
+            if not stripped[:3].casefold() == "cli":
+                continue
+            rest = stripped[3:].lstrip()
+            if rest.startswith(":"):
+                rest = rest[1:].lstrip()
+            if not rest.startswith("="):
+                continue
+            return rest[1:].strip()
+        return ""
+
+    @staticmethod
+    def _strip_markdown_command_prefix(line: str) -> str:
+        stripped = str(line or "").strip()
+        stripped = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+|>\s*)+", "", stripped).strip()
+        return stripped.strip("`").strip()
+
+    @classmethod
+    def _normalize_skill_command_template_line(
+        cls,
+        line: str,
+        cli_value: str,
+    ) -> str:
+        stripped = cls._strip_markdown_command_prefix(line)
+        if not stripped:
+            return ""
+
+        lower = stripped.casefold()
+        if lower.startswith("run "):
+            stripped = stripped[4:].strip()
+            lower = stripped.casefold()
+
+        if stripped.startswith("$CLI"):
+            command_line = stripped
+        elif cli_value and stripped.startswith(cli_value):
+            command_line = stripped
+        else:
+            return ""
+
+        expanded = command_line.replace("$CLI", cli_value or "$CLI", 1)
+        parseable = expanded.replace("{", "<").replace("}", ">")
         try:
-            destination_path.relative_to(skills_root)
+            tokens = shlex.split(parseable)
         except ValueError:
+            tokens = parseable.split()
+        if tokens and tokens[-1].casefold() == "again":
+            tokens = tokens[:-1]
+        return " ".join(tokens)
+
+    @classmethod
+    def _iter_skill_command_template_lines(
+        cls,
+        content: str,
+        cli_value: str,
+    ) -> list[str]:
+        lines = str(content or "").splitlines()
+        command_section_lines: list[str] = []
+        in_commands_section = False
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if re.match(r"^#{1,6}\s+commands\b", stripped, re.IGNORECASE):
+                in_commands_section = True
+                continue
+            if in_commands_section and re.match(r"^#{1,6}\s+\S", stripped):
+                break
+            if in_commands_section:
+                normalized = cls._normalize_skill_command_template_line(
+                    raw_line,
+                    cli_value,
+                )
+                if normalized:
+                    command_section_lines.append(normalized)
+
+        if command_section_lines:
+            return command_section_lines
+
+        fallback_lines: list[str] = []
+        for raw_line in lines:
+            normalized = cls._normalize_skill_command_template_line(
+                raw_line,
+                cli_value,
+            )
+            if normalized:
+                fallback_lines.append(normalized)
+        return fallback_lines
+
+    @classmethod
+    def _parse_skill_command_templates(
+        cls,
+        skill_md: Path,
+    ) -> list[_SkillCommandTemplate]:
+        try:
+            content = skill_md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return []
+
+        templates: list[_SkillCommandTemplate] = []
+        seen_templates: set[tuple[Any, ...]] = set()
+        cli_value = cls._skill_cli_assignment(content)
+        for expanded in cls._iter_skill_command_template_lines(content, cli_value):
+            parseable = expanded.replace("{", "<").replace("}", ">")
+            try:
+                tokens = shlex.split(parseable)
+            except ValueError:
+                tokens = parseable.split()
+            if not tokens:
+                continue
+
+            prefix_tokens: tuple[str, ...] = ()
+            tail = list(tokens)
+            if cli_value:
+                try:
+                    cli_tokens = shlex.split(cli_value)
+                except ValueError:
+                    cli_tokens = cli_value.split()
+                if len(tail) >= len(cli_tokens):
+                    prefix_tokens = tuple(tail[: len(cli_tokens)])
+                    tail = tail[len(cli_tokens):]
+            elif tail and tail[0] == "$CLI":
+                tail = tail[1:]
+
+            fixed_tokens: list[str] = []
+            positional_labels: list[str] = []
+            allowed_flags: set[str] = set()
+            flags_with_values: set[str] = set()
+            flag_value_labels: dict[str, str] = {}
+            max_positionals = 0
+            index = 0
+            while index < len(tail):
+                raw_token = tail[index]
+                token = cls._strip_template_token(raw_token)
+                if not token:
+                    index += 1
+                    continue
+                if token.startswith("-"):
+                    flag = token.split("=", 1)[0]
+                    allowed_flags.add(flag)
+                    next_token = (
+                        cls._strip_template_token(tail[index + 1])
+                        if index + 1 < len(tail)
+                        else ""
+                    )
+                    if next_token and cls._template_token_is_placeholder(next_token):
+                        flags_with_values.add(flag)
+                        label = cls._template_placeholder_label(next_token)
+                        if label:
+                            flag_value_labels[flag] = label
+                        index += 2
+                    else:
+                        index += 1
+                    continue
+                if cls._template_token_is_placeholder(raw_token):
+                    max_positionals += 1
+                    label = cls._template_placeholder_label(raw_token)
+                    positional_labels.append(label or f"arg{max_positionals}")
+                    index += 1
+                    continue
+                fixed_tokens.append(token)
+                index += 1
+
+            if not fixed_tokens:
+                continue
+            key = tuple(fixed_tokens)
+            fingerprint = (
+                tuple(cls._normalize_skill_cli_prefix_tokens(prefix_tokens)),
+                key,
+                tuple(positional_labels),
+                max_positionals,
+                tuple(sorted(allowed_flags)),
+                tuple(sorted(flags_with_values)),
+                tuple(sorted(flag_value_labels.items())),
+            )
+            if fingerprint in seen_templates:
+                continue
+            seen_templates.add(fingerprint)
+            templates.append(
+                _SkillCommandTemplate(
+                    prefix_tokens=prefix_tokens,
+                    fixed_tokens=key,
+                    positional_labels=tuple(positional_labels),
+                    max_positionals=max_positionals,
+                    allowed_flags=frozenset(allowed_flags),
+                    flags_with_values=frozenset(flags_with_values),
+                    flag_value_labels=tuple(sorted(flag_value_labels.items())),
+                    display=expanded,
+                )
+            )
+
+        return templates
+
+    @staticmethod
+    def _segment_before_redirection_or_pipe(tokens: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for token in tokens:
+            if token == "|" or token.startswith((">", "<", "1>", "2>", "&>")):
+                break
+            if re.fullmatch(r"\d?>&\d+", token):
+                break
+            cleaned.append(token)
+        return cleaned
+
+    @staticmethod
+    def _extract_skill_cli_invocation(
+        tokens: list[str],
+    ) -> tuple[str, list[str], list[str]] | None:
+        for index, token in enumerate(tokens):
+            normalized = str(token or "").replace("\\", "/").strip("'\"")
+            if normalized.startswith("skills/"):
+                parts = normalized.split("/")
+                if len(parts) >= 3:
+                    return parts[1], tokens[index + 1 :], tokens[: index + 1]
+            marker_index = normalized.find("/skills/")
+            if marker_index >= 0:
+                remainder = normalized[marker_index + 1 :]
+                parts = remainder.split("/")
+                if len(parts) >= 3 and parts[0] == "skills":
+                    return parts[1], tokens[index + 1 :], tokens[: index + 1]
+        return None
+
+    @staticmethod
+    def _normalize_skill_cli_prefix_token(token: str) -> str:
+        value = str(token or "").strip().strip("'\"").replace("\\", "/")
+        marker_index = value.find("/skills/")
+        if marker_index >= 0:
+            value = value[marker_index + 1 :]
+        while value.startswith("./"):
+            value = value[2:]
+        return value.casefold()
+
+    @classmethod
+    def _normalize_skill_cli_prefix_tokens(cls, tokens: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        return tuple(
+            cls._normalize_skill_cli_prefix_token(token)
+            for token in tokens
+            if str(token or "").strip()
+        )
+
+    @staticmethod
+    def _flag_name(token: str) -> str:
+        return str(token or "").split("=", 1)[0]
+
+    @staticmethod
+    def _label_accepts_explicit_code(label: str) -> bool:
+        normalized = str(label or "").casefold()
+        return any(
+            marker in normalized
+            for marker in ("code", "invite", "invitation", "referral")
+        )
+
+    @staticmethod
+    def _request_explicit_code_values() -> set[str]:
+        hints = get_request_execution_hints()
+        values = hints.get("explicit_code_values") if isinstance(hints, dict) else None
+        if not isinstance(values, list):
+            return set()
+        return {
+            str(value).strip()
+            for value in values
+            if isinstance(value, str) and value.strip()
+        }
+
+    @classmethod
+    def _validate_skill_cli_args_against_template(
+        cls,
+        skill_name: str,
+        prefix_tokens: list[str],
+        args: list[str],
+        template: _SkillCommandTemplate,
+        explicit_code_values: set[str],
+    ) -> str | None:
+        if template.prefix_tokens:
+            observed_prefix = cls._normalize_skill_cli_prefix_tokens(prefix_tokens)
+            documented_prefix = cls._normalize_skill_cli_prefix_tokens(
+                template.prefix_tokens
+            )
+            if observed_prefix != documented_prefix:
+                return (
+                    "Rejected: this skill CLI entrypoint is not documented in "
+                    f"skills/{skill_name}/SKILL.md. Use the documented "
+                    f"entrypoint from this command form: {template.display}. "
+                    "Do not invent nearby build output paths or alternate "
+                    "wrappers inside the skill directory."
+                )
+
+        remaining = args[len(template.fixed_tokens) :]
+        if remaining in (["--help"], ["-h"]):
             return None
 
-        return (
-            "Rejected: workspace skills must be installed through the skill "
-            "management toolchain, not by cloning directly into workspace/skills. "
-            "For a GitHub skill source, call "
-            "skill_marketplace(action='install_skill', url='<source_url>'); "
-            "the installer validates SKILL.md and installs the correct skill "
-            "directory. For ordinary repository work, clone outside workspace/skills."
-        )
+        positionals = 0
+        index = 0
+        flag_value_labels = dict(template.flag_value_labels)
+        while index < len(remaining):
+            token = remaining[index]
+            if not token:
+                index += 1
+                continue
+            if token.startswith("-"):
+                flag = cls._flag_name(token)
+                if flag not in template.allowed_flags:
+                    allowed = ", ".join(sorted(template.allowed_flags)) or "none"
+                    return (
+                        "Rejected: unsupported option "
+                        f"{flag!r} for skill command "
+                        f"{' '.join(template.fixed_tokens)!r}. "
+                        f"Follow skills/{skill_name}/SKILL.md exactly; do not "
+                        "invent CLI flags from user wording. "
+                        f"Documented form: {template.display}. "
+                        f"Allowed options: {allowed}."
+                    )
+                if flag in template.flags_with_values and "=" not in token:
+                    value = remaining[index + 1] if index + 1 < len(remaining) else ""
+                    label = flag_value_labels.get(flag, "")
+                    if (
+                        value in explicit_code_values
+                        and not cls._label_accepts_explicit_code(label)
+                    ):
+                        return (
+                            "Rejected: this argument is a user-supplied code, "
+                            f"but skill command {' '.join(template.fixed_tokens)!r} "
+                            f"does not document {flag!r} as a code/invite/referral "
+                            f"parameter. Documented form: {template.display}."
+                        )
+                    index += 2
+                else:
+                    index += 1
+                continue
+            label = (
+                template.positional_labels[positionals]
+                if positionals < len(template.positional_labels)
+                else ""
+            )
+            if (
+                token in explicit_code_values
+                and not cls._label_accepts_explicit_code(label)
+            ):
+                return (
+                    "Rejected: this argument is a user-supplied code, but "
+                    f"skill command {' '.join(template.fixed_tokens)!r} does "
+                    "not document that positional as a code/invite/referral "
+                    f"parameter. Documented form: {template.display}."
+                )
+            positionals += 1
+            index += 1
+
+        if positionals > template.max_positionals:
+            return (
+                "Rejected: too many positional arguments for skill command "
+                f"{' '.join(template.fixed_tokens)!r}. Follow "
+                f"skills/{skill_name}/SKILL.md exactly; do not pass values from "
+                "the user request unless the documented command form includes a "
+                f"matching placeholder. Documented form: {template.display}."
+            )
+        return None
+
+    @classmethod
+    def _validate_skill_cli_args_against_templates(
+        cls,
+        skill_name: str,
+        prefix_tokens: list[str],
+        args: list[str],
+        templates: list[_SkillCommandTemplate],
+    ) -> str | None:
+        if not args or not templates:
+            return None
+
+        matching_templates = [
+            template
+            for template in templates
+            if tuple(args[: len(template.fixed_tokens)]) == template.fixed_tokens
+        ]
+        if not matching_templates:
+            documented = ", ".join(template.display for template in templates[:6])
+            return (
+                "Rejected: this skill CLI invocation is not documented in "
+                f"skills/{skill_name}/SKILL.md. Use one of the documented command "
+                f"forms instead. Documented forms: {documented}"
+            )
+
+        explicit_code_values = cls._request_explicit_code_values()
+        violations: list[str] = []
+        for template in sorted(
+            matching_templates,
+            key=lambda item: (len(item.fixed_tokens), item.max_positionals),
+            reverse=True,
+        ):
+            violation = cls._validate_skill_cli_args_against_template(
+                skill_name,
+                prefix_tokens,
+                args,
+                template,
+                explicit_code_values,
+            )
+            if violation is None:
+                return None
+            violations.append(violation)
+        return violations[0] if violations else None
+
+    def _reject_undocumented_skill_cli_arguments(
+        self,
+        command: str,
+        cwd: str,
+    ) -> str | None:
+        """Reject invented flags/positionals for installed skill CLI commands."""
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            command_tokens = str(command or "").split()
+        if not command_tokens:
+            return None
+
+        workspace_root = Path(self.working_dir or cwd).resolve()
+        current_dir = Path(cwd).resolve()
+        template_cache: dict[str, list[_SkillCommandTemplate]] = {}
+
+        for segment in self._split_shell_segments(command_tokens):
+            if not segment:
+                continue
+            if segment[0].casefold() == "cd":
+                current_dir = self._resolve_cd_segment(current_dir, segment)
+                continue
+            cleaned_segment = self._segment_before_redirection_or_pipe(segment)
+            invocation = self._extract_skill_cli_invocation(cleaned_segment)
+            if invocation is None:
+                continue
+            skill_name, args, prefix_tokens = invocation
+            if not args:
+                continue
+
+            skill_md = workspace_root / "skills" / skill_name / "SKILL.md"
+            if not skill_md.exists():
+                fallback_skill_md = current_dir / "skills" / skill_name / "SKILL.md"
+                if fallback_skill_md.exists():
+                    skill_md = fallback_skill_md
+            templates = template_cache.get(skill_name)
+            if templates is None:
+                templates = self._parse_skill_command_templates(skill_md)
+                template_cache[skill_name] = templates
+            violation = self._validate_skill_cli_args_against_templates(
+                skill_name,
+                prefix_tokens,
+                args,
+                templates,
+            )
+            if violation:
+                return violation
+        return None
 
     def _maybe_stop_after_exact_command_failure(self, command: str, result: str) -> str:
         """Stop the tool loop after a user-specified exact command fails clearly."""

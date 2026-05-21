@@ -164,7 +164,13 @@ class ReadFileTool(Tool):
             except ValueError:
                 display_path = file_path.name
 
-            if self._max_output and total_size > self._max_output:
+            if is_skill_file and file_path.name.casefold() == "skill.md":
+                content = self._extract_skill_cli_content(
+                    full_content,
+                    budget=self._max_output or 6000,
+                )
+                visible_line_count = content.count("\n") + 1 if content else 0
+            elif self._max_output and total_size > self._max_output:
                 visible_prefix = full_content[:self._max_output]
                 visible_line_count = visible_prefix.count("\n")
                 content = visible_prefix + f"\n... (truncated, {total_size - self._max_output} more chars)"
@@ -192,9 +198,10 @@ class ReadFileTool(Tool):
 
             summary_result = _build_result(content)
             full_result = _build_result(full_content)
-            capture_tool_output(summary_result, full_result)
             if duplicate_read is not None:
-                return summary_result
+                capture_tool_output(duplicate_read, duplicate_read)
+                return duplicate_read
+            capture_tool_output(summary_result, full_result)
             return summary_result
 
         except PermissionError:
@@ -204,54 +211,81 @@ class ReadFileTool(Tool):
 
     @staticmethod
     def _extract_skill_cli_content(content: str, budget: int = 2500) -> str:
-        """Extract CLI-relevant content from SKILL.md, stripping JS code blocks.
-
-        Keeps: frontmatter, headings, text, tables, `cast`/`curl`/`bash` code blocks.
-        Strips: `js`/`javascript`/`typescript` code blocks (replaced with one-line stub).
-        This steers the agent toward direct CLI usage.
-        """
+        """Extract a compact execution contract from SKILL.md."""
         import re
+
         lines = content.split("\n")
-        out: list[str] = []
-        total = 0
-        in_code = False
-        code_lang = ""
-        skip_block = False
-        js_langs = {"js", "javascript", "typescript", "ts", "mjs"}
+        budget = max(800, int(budget or 2500))
 
-        for line in lines:
-            if total > budget:
-                out.append(f"\n... [SKILL.md truncated at {budget} chars — use CLI examples above]")
+        def _dedupe(values: list[str], *, limit: int) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for value in values:
+                normalized = " ".join(str(value or "").strip().split())
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                out.append(normalized)
+                if len(out) >= limit:
+                    break
+            return out
+
+        frontmatter: list[str] = []
+        if lines and lines[0].strip() == "---":
+            for line in lines[1:40]:
+                if line.strip() == "---":
+                    break
+                if line.strip():
+                    frontmatter.append(line.strip())
+
+        cli_lines = _dedupe(
+            [
+                line.strip()
+                for line in lines
+                if re.match(r"^\s*CLI\s*:?\s*=", line, re.IGNORECASE)
+            ],
+            limit=3,
+        )
+
+        command_section: list[str] = []
+        in_commands_section = False
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if re.match(r"^#{1,6}\s+commands\b", stripped, re.IGNORECASE):
+                in_commands_section = True
+                continue
+            if in_commands_section and re.match(r"^#{1,6}\s+\S", stripped):
                 break
+            if not in_commands_section:
+                continue
+            if not stripped or stripped.startswith("```"):
+                continue
+            if stripped.startswith("$CLI") or re.match(r"^[A-Za-z0-9_.\\/-]+\s+", stripped):
+                command_section.append(stripped)
 
-            if not in_code:
-                m = re.match(r'^```(\w*)', line)
-                if m:
-                    in_code = True
-                    code_lang = m.group(1).lower()
-                    skip_block = code_lang in js_langs
-                    if skip_block:
-                        stub = f"```{code_lang}\n// [JS code block omitted — use cast/curl CLI equivalent below]\n```"
-                        out.append(stub)
-                        total += len(stub)
-                    else:
-                        out.append(line)
-                        total += len(line) + 1
-                else:
-                    out.append(line)
-                    total += len(line) + 1
-            else:
-                if line.strip().startswith("```"):
-                    in_code = False
-                    if not skip_block:
-                        out.append(line)
-                        total += len(line) + 1
-                    skip_block = False
-                elif not skip_block:
-                    out.append(line)
-                    total += len(line) + 1
+        rule_lines = _dedupe(
+            [
+                line.strip()
+                for line in lines
+                if line.strip().casefold().startswith("rule ")
+            ],
+            limit=12,
+        )
 
-        return "\n".join(out)
+        sections: list[str] = ["[SKILL.md execution summary]"]
+        if frontmatter:
+            sections.append("Metadata:\n" + "\n".join(frontmatter[:12]))
+        if cli_lines:
+            sections.append("CLI entrypoint:\n" + "\n".join(cli_lines))
+        if command_section:
+            sections.append("Documented commands:\n" + "\n".join(command_section[:24]))
+        if rule_lines:
+            sections.append("Execution rules:\n" + "\n".join(rule_lines))
+
+        summary = "\n\n".join(sections).strip()
+        if len(summary) <= budget:
+            return summary
+        return summary[:budget].rstrip() + "\n... (SKILL.md execution summary truncated)"
 
 
 class WriteFileTool(Tool):

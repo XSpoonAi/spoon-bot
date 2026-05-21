@@ -565,6 +565,26 @@ class TestAgentLoopStream:
         assert "[TURN PRIORITY]:" in prompt
         assert "Execute only the newest user request." in prompt
         assert "stale tool sequence" in prompt
+        assert "[HISTORY VERIFICATION]:" in prompt
+        assert "search_history(scope='current')" in prompt
+
+    def test_build_request_context_prompt_marks_prior_action_fact_check_required(self):
+        """Prior-action follow-ups should not use live tools as prior-action proof."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(
+            loop,
+            "不是啊，你刚刚不是已经运行过很多次，你忘记了吗？",
+        )
+
+        assert "[CURRENT SESSION FACT CHECK REQUIRED]:" in prompt
+        assert "External or live-state tools" in prompt
+        assert "long-term memory" in prompt
+        assert "search_history(scope='current')" in prompt
 
     def test_build_request_context_prompt_bounds_external_side_effects(self):
         """A single request must not turn into an unbounded external side-effect loop."""
@@ -1303,8 +1323,77 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert "http://13.251.72.206:8080/api/agent/games" in skill_hint["urls"]
         assert hints["exact_shell_commands"] == []
 
-    def test_request_execution_hints_do_not_route_github_skill_install(self, tmp_path):
-        """Request hints should not classify GitHub URLs into skill-install routes."""
+    def test_request_execution_hints_prefer_documented_commands_section(self, tmp_path):
+        """Local skill hints should expose downstream command forms, not setup loops."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.request_hints import format_local_executable_skill_context
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description: Play the SPOT game through the local CLI
+when_to_use: Use when the user wants to play SPOT or continue a SPOT game.
+---
+# Spot Agent
+
+CLI := node skills/spot-agent-cypher/cli/index.js
+
+## Setup
+
+```text
+RUN $CLI wallet
+MATCH output: "No wallet" -> run $CLI wallet again
+RUN $CLI join {gameId} {spot} again
+```
+
+## Commands
+
+```bash
+$CLI wallet
+$CLI faucet [-c <code>]
+$CLI faucet-answer <challengeId> <answer> [-c <code>]
+$CLI invitation-code
+$CLI game status <gameId>
+$CLI game context <gameId>
+$CLI game snapshot <gameId>
+$CLI challenge-start <gameId>
+$CLI challenge-answer <gameId> [challengeId] "<answer>"
+$CLI join [gameId] [spot]
+$CLI wait <gameId>
+$CLI reveal <gameId>
+$CLI settlement <gameId>
+$CLI history
+$CLI summary
+$CLI stats
+```
+""",
+            encoding="utf-8",
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        hints = AgentLoop._build_request_execution_hints(
+            loop,
+            "Use spot-agent-cypher to join and finish the SPOT game.",
+        )
+        commands = hints["local_executable_skills"][0]["commands"]
+        context = format_local_executable_skill_context(hints)
+
+        assert any("join [gameId] [spot]" in command for command in commands)
+        assert any("settlement <gameId>" in command for command in commands)
+        assert not any("wallet again" in command for command in commands)
+        assert "join [gameId] [spot]" in context
+        assert "settlement <gameId>" in context
+        assert "repeating setup/status commands" in context
+        assert "use that documented flow" in context
+
+    def test_request_execution_hints_mark_explicit_github_skill_install(self, tmp_path):
+        """Explicit GitHub skill installs should get a generic toolchain hint."""
         from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_path / "workspace"
@@ -1322,10 +1411,45 @@ API base: http://13.251.72.206:8080/api/agent/games
 
         hints = AgentLoop._build_request_execution_hints(loop, message)
 
-        assert "github_skill_install_request" not in hints
-        assert "github_urls" not in hints
+        assert hints["github_skill_install_request"] == {
+            "urls": ["https://github.com/example-org/example-skill"],
+            "preferred_tool": "skill_marketplace",
+            "action": "install_skill",
+        }
         assert hints["explicit_request_urls"] == ["https://github.com/example-org/example-skill"]
         assert hints["local_executable_skills"] == []
+
+    def test_exact_spot_prompt_marks_github_skill_install_without_rewriting_prompt(self, tmp_path):
+        """The user-provided SPOT prompt should route install via the skill toolchain."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        message = (
+            "https://github.com/Agent-Cypher-Lab/agent-spot-cypher\n"
+            "Help me install the skill in the repo, use the faucet, register 8004 agent id, "
+            "and then join the latest spot game.\n"
+            "use this invite code 3KK57S"
+        )
+
+        hints = AgentLoop._build_request_execution_hints(loop, message)
+
+        assert hints["github_skill_install_request"] == {
+            "urls": ["https://github.com/Agent-Cypher-Lab/agent-spot-cypher"],
+            "preferred_tool": "skill_marketplace",
+            "action": "install_skill",
+        }
+        assert hints["explicit_request_urls"] == [
+            "https://github.com/Agent-Cypher-Lab/agent-spot-cypher"
+        ]
+        assert hints["explicit_code_values"] == ["3KK57S"]
+        assert message.endswith("use this invite code 3KK57S")
 
     def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
         """A normal GitHub repo request should not be routed into workspace/skills."""
@@ -1344,7 +1468,6 @@ API base: http://13.251.72.206:8080/api/agent/games
         hints = AgentLoop._build_request_execution_hints(loop, message)
 
         assert "github_skill_install_request" not in hints
-        assert "github_urls" not in hints
         assert hints["explicit_request_urls"] == ["https://github.com/example-org/example-repo"]
 
     def test_skill_contract_check_uses_tool_evidence(self):
@@ -1403,11 +1526,60 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert "[INTERNAL COMPLETION VERIFIER]" in prompt
         assert "reply exactly COMPLETE" in prompt
         assert "tool evidence" in prompt.lower()
-        assert "[STRUCTURAL NEXT COMMANDS]" in prompt
+        assert "[STRUCTURAL FOLLOW-UP COMMANDS]" in prompt
         assert "node skills/example-skill/cli/index.js run" in prompt
         assert "do not copy long 0x values" in prompt
         assert "Do not append optional follow-up questions" in prompt
         assert "does not prove downstream requested actions are complete" in prompt
+        assert "Do not infer extra flags or arguments" in prompt
+        assert "do not carry those codes into unrelated" in prompt
+        assert "nonzero GAS/GLD balances and an AgentID value other than none" in prompt
+
+    def test_skill_read_summary_remains_model_visible(self):
+        """SKILL.md execution summaries should help recovery without leaking to clients."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        summary = (
+            "[file: skills/spot-agent-cypher/SKILL.md | 200 chars | skill-ref]\n"
+            "[SKILL.md execution summary]\n"
+            "CLI entrypoint:\n"
+            "CLI := node skills/spot-agent-cypher/cli/index.js\n\n"
+            "Documented commands:\n"
+            "$CLI join [gameId] [spot]\n"
+            "$CLI settlement <gameId>"
+        )
+
+        metadata = AgentLoop._merge_stream_tool_result_metadata(
+            {"name": "read_file"},
+            streamed_result=summary,
+            captured_output=None,
+        )
+
+        assert metadata["result"] == (
+            "[file: skills/spot-agent-cypher/SKILL.md | 200 chars | skill-ref] "
+            "content body omitted from user-visible tool result"
+        )
+        assert "join [gameId] [spot]" in metadata["model_result"]
+        assert "settlement <gameId>" in metadata["model_result"]
+        assert metadata["result_body_omitted"] is True
+        assert "model_result_body_omitted" not in metadata
+
+    def test_repeated_read_recovery_prompt_includes_skill_context(self):
+        """Duplicate SKILL.md reads should recover toward documented commands."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_repeated_read_recovery_prompt(
+            "Use the skill to finish the workflow.",
+            request_context=(
+                "[LOCAL SKILL EXECUTION CONTEXT]:\n"
+                "- demo-skill at skills/demo-skill/SKILL.md; commands: "
+                "node skills/demo-skill/cli/index.js | "
+                "node skills/demo-skill/cli/index.js run"
+            ),
+        )
+
+        assert "installed SKILL.md" in prompt
+        assert "node skills/demo-skill/cli/index.js run" in prompt
 
     def test_skill_contract_evidence_summary_preserves_head_and_tail(self):
         """Long skill/tool evidence should preserve both setup and later contract rules."""
@@ -1521,7 +1693,7 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert "Internal tool details were suppressed" in answer
 
     def test_latest_tool_event_has_next_command_detects_pending_continuation(self):
-        """A latest NEXT command keeps a skill workflow open until evidence completes."""
+        """A latest follow-up command keeps a skill workflow open until evidence completes."""
         from spoon_bot.agent.turn_verifiers import latest_tool_event_has_next_command
 
         events = [
@@ -1536,8 +1708,23 @@ API base: http://13.251.72.206:8080/api/agent/games
 
         assert latest_tool_event_has_next_command(events) is True
 
+        action_required_events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "ACTION REQUIRED: choose a spot and run: "
+                        "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
+                    ),
+                },
+            }
+        ]
+
+        assert latest_tool_event_has_next_command(action_required_events) is True
+
     def test_skill_contract_resolves_answer_placeholder_next_command(self):
-        """Verifier should expose a resolved NEXT command after a scalar calculation."""
+        """Verifier should expose a resolved follow-up command after a scalar calculation."""
         from spoon_bot.agent.turn_verifiers import (
             extract_resolved_tool_next_commands,
             has_pending_placeholder_next_command,
@@ -1574,6 +1761,56 @@ API base: http://13.251.72.206:8080/api/agent/games
         })
         assert has_pending_placeholder_next_command(events) is False
 
+    def test_skill_contract_extracts_embedded_followup_command_without_next_prefix(self):
+        """Continuation extraction should not depend on a NEXT prefix."""
+        from spoon_bot.agent.turn_verifiers import (
+            extract_resolved_tool_next_commands,
+            has_pending_placeholder_next_command,
+        )
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "ACTION REQUIRED: decide a spot and run: "
+                        "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
+                    ),
+                },
+            }
+        ]
+
+        commands = extract_resolved_tool_next_commands(events)
+
+        assert commands[-1] == "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
+        assert has_pending_placeholder_next_command(events) is True
+
+    def test_pending_followup_recovery_prompt_is_generic(self):
+        """Placeholder recovery prompt should rely on evidence, not route literals."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": (
+                    "Game=145\n"
+                    "ACTION REQUIRED: decide a spot and run: "
+                    "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
+                ),
+            },
+        }]
+
+        prompt = AgentLoop._build_pending_followup_recovery_prompt(
+            "continue the workflow",
+            events,
+        )
+
+        assert "[INTERNAL FOLLOW-UP PLACEHOLDER RECOVERY]" in prompt
+        assert "node skills/example/cli/index.js join 145 <A|B|C|D|E>" in prompt
+        assert "Do not read the same SKILL.md again" in prompt
+
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
         """stream() should yield dicts with type, delta, metadata keys."""
@@ -1597,13 +1834,13 @@ API base: http://13.251.72.206:8080/api/agent/games
         async for chunk in AgentLoop.stream(agent, message="test"):
             chunks.append(chunk)
 
-        # Should have content chunks + done
+        # Should have content chunks + done. Initial content may be buffered
+        # and emitted as a validated segment, so do not require original chunk
+        # boundaries to be preserved.
         content_chunks = [c for c in chunks if c["type"] == "content"]
         done_chunks = [c for c in chunks if c["type"] == "done"]
 
-        assert len(content_chunks) == 2
-        assert content_chunks[0]["delta"] == "Hello"
-        assert content_chunks[1]["delta"] == " World"
+        assert "".join(c["delta"] for c in content_chunks) == "Hello World"
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Hello World"
 
@@ -1721,9 +1958,7 @@ API base: http://13.251.72.206:8080/api/agent/games
             chunks.append(chunk)
 
         content_chunks = [c for c in chunks if c["type"] == "content"]
-        assert len(content_chunks) == 2
-        assert content_chunks[0]["delta"] == "Hello"
-        assert content_chunks[1]["delta"] == " World"
+        assert "".join(chunk["delta"] for chunk in content_chunks) == "Hello World"
 
     @pytest.mark.asyncio
     async def test_stream_masks_private_key_content_chunks(self):
@@ -2452,6 +2687,38 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert "tool guardrail" not in cleaned
         assert "duplicate tool invocation suppressed" not in cleaned
 
+    def test_duplicate_suppression_preserves_fact_check_blocker_without_skip_prose(self):
+        """Fact-check sequencing blockers should not be wrapped as duplicate-action output."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        blocker = (
+            "Current-session fact check required: this request asks about prior "
+            "actions/results in the conversation. Call search_history(scope='current') first."
+        )
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {"name": "shell", "result": blocker},
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. "
+                        "The same tool and arguments already executed in this request."
+                    ),
+                },
+            },
+        ]
+
+        cleaned = AgentLoop._build_tool_loop_fallback_response(events, reason="tool_suppression")
+
+        assert cleaned.startswith("Current-session fact check required")
+        assert "search_history(scope='current')" in cleaned
+        assert "I skipped a repeated action" not in cleaned
+        assert "STOP_TOOL_LOOP" not in cleaned
+
     @pytest.mark.asyncio
     async def test_stream_buffers_split_pre_tool_scratchpad_prefix(self):
         """Tiny split scratchpad chunks before the first tool call should not leak."""
@@ -2836,7 +3103,7 @@ API base: http://13.251.72.206:8080/api/agent/games
         assert len(metadata["result"]) < 13_000
         assert len(metadata["model_result"]) < 13_000
         assert len(visible_delta) < 4_500
-        assert "stream output truncated" in metadata["result"]
+        assert "stream output middle truncated" in metadata["result"]
 
     @pytest.mark.asyncio
     async def test_stream_recovers_repeated_read_file_storm_before_tool_budget(self):
@@ -2961,10 +3228,81 @@ API base: http://13.251.72.206:8080/api/agent/games
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "stopped the tool loop" in content
+        assert "The tool workflow stopped before a final answer" in content
+        assert "Latest blocker" in content
         assert "remote endpoint did not respond" in content
+        assert "stopped the tool loop" not in content
         done_chunks = [c for c in chunks if c["type"] == "done"]
         assert done_chunks[0]["metadata"]["content"] == content
+
+    @pytest.mark.asyncio
+    async def test_stream_runtime_error_after_tools_returns_latest_evidence(self):
+        """Provider errors after tool progress should not collapse to a generic empty response."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"run workflow"}'
+
+        agent = self._make_stream_agent(
+            [
+                {"tool_calls": [tool_call]},
+                {
+                    "type": "tool_result",
+                    "metadata": {"id": "call_1", "name": "shell"},
+                    "result": (
+                        "CHALLENGE PASSED task=42\n"
+                        "NEXT: node skills/example/cli/index.js finish 42"
+                    ),
+                },
+            ],
+            run_error=RuntimeError(
+                "provider failed with secret key URL https://example.com/keys/abcdef"
+            ),
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="continue workflow"):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        errors = [c for c in chunks if c["type"] == "error"]
+
+        assert "The tool workflow stopped before a final answer" in content
+        assert "CHALLENGE PASSED task=42" in content
+        assert "Pending next step" in content
+        assert "node skills/example/cli/index.js finish 42" in content
+        assert "secret key URL" not in "".join(str(c.get("delta", "")) for c in chunks)
+        assert errors and errors[0]["delta"] == "An unexpected error occurred. Please try again."
+
+    def test_tool_loop_fallback_summarizes_runtime_errors_without_stacktrace(self):
+        """Timeout fallback should not expose raw internal transcript details."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        event = {
+            "type": "tool_result",
+            "metadata": {"name": "shell"},
+            "result": (
+                "STDERR:\n"
+                "node:events:502\n"
+                "Error: listen EADDRINUSE: address already in use :::3000\n"
+                "    at Server.setupListenHandle [as _listen2] (node:net:1902:16)\n"
+                "Node.js v20.19.2"
+            ),
+        }
+
+        cleaned = AgentLoop._build_tool_loop_fallback_response(
+            [event],
+            reason="total_timeout",
+        )
+
+        assert "The tool workflow stopped before a final answer" in cleaned
+        assert "Latest blocker" in cleaned
+        assert "EADDRINUSE" in cleaned
+        assert "Server.setupListenHandle" not in cleaned
+        assert "Recent tool evidence" not in cleaned
 
     @pytest.mark.asyncio
     async def test_stream_stops_after_too_many_tool_results_without_final_content(self):
@@ -3013,9 +3351,9 @@ API base: http://13.251.72.206:8080/api/agent/games
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "stopped the tool loop" in content
-        assert "Step one returned no actionable result" in content
-        assert "Step two returned the same error" in content
+        assert "The tool workflow stopped before a final answer" in content
+        assert "Internal tool details were suppressed" in content
+        assert "stopped the tool loop" not in content
 
     @pytest.mark.asyncio
     async def test_stream_total_timeout_uses_recent_tool_evidence(self):
@@ -3052,8 +3390,10 @@ API base: http://13.251.72.206:8080/api/agent/games
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "response time budget" in content
-        assert "tokenAddress = ***masked***" in content
+        assert "The tool workflow stopped before a final answer" in content
+        assert "Internal tool details were suppressed" in content
+        assert "response time budget" not in content
+        assert "tokenAddress" not in content
         assert [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"] == content
 
     @pytest.mark.asyncio
@@ -3735,13 +4075,15 @@ API base: http://13.251.72.206:8080/api/agent/games
         async for chunk in AgentLoop.stream(agent, message="test"):
             chunks.append(chunk)
 
-        # Should get the partial content + error event
-        assert chunks[0]["type"] == "content"
-        assert chunks[0]["delta"] == "partial"
-        assert chunks[-2]["type"] == "error"
-        assert "Connection lost" in chunks[-2]["metadata"]["error"]
+        # Depending on scheduling, the buffered partial may be released before
+        # the terminal done chunk, but the error must be surfaced and the done
+        # content must match what was actually emitted.
+        error_chunks = [chunk for chunk in chunks if chunk["type"] == "error"]
+        emitted = "".join(chunk["delta"] for chunk in chunks if chunk["type"] == "content")
+        assert len(error_chunks) == 1
+        assert "Connection lost" in error_chunks[0]["metadata"]["error"]
         assert chunks[-1]["type"] == "done"
-        assert chunks[-1]["metadata"]["content"] == "partial"
+        assert chunks[-1]["metadata"]["content"] == emitted
 
     @pytest.mark.asyncio
     async def test_stream_persists_user_turn_on_error_without_assistant(self):
@@ -3791,9 +4133,10 @@ API base: http://13.251.72.206:8080/api/agent/games
         from spoon_bot.session.manager import Session
 
         run_cancelled = asyncio.Event()
+        emitted_text = "hello " * 70
 
         async def mock_run(**kwargs):
-            await agent._agent.output_queue.put({"content": "hello"})
+            await agent._agent.output_queue.put({"content": emitted_text})
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
@@ -3827,7 +4170,7 @@ API base: http://13.251.72.206:8080/api/agent/games
         first_chunk = await stream.__anext__()
 
         assert first_chunk["type"] == "content"
-        assert first_chunk["delta"] == "hello"
+        assert first_chunk["delta"] == emitted_text
 
         await stream.aclose()
         await asyncio.wait_for(run_cancelled.wait(), timeout=1.0)
@@ -4556,8 +4899,8 @@ class TestBackwardCompatibility:
         assert "thinking_content" in data["data"]
         assert data["data"]["thinking_content"] is None
 
-    def test_session_key_still_works(self):
-        """Session key in request should still be handled."""
+    def test_non_default_session_key_requires_runtime_clone_support(self):
+        """Non-default sessions must not reuse a mock/default runtime unsafely."""
         mock_agent = MagicMock()
         mock_agent.process = AsyncMock(return_value="ok")
         mock_agent.sessions = MagicMock()
@@ -4573,7 +4916,11 @@ class TestBackwardCompatibility:
             json={"message": "hello", "session_key": "custom-session"},
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail["code"] == "AGENT_ERROR"
+        assert "Session runtime cloning is unavailable" in detail["message"]
+        mock_agent.process.assert_not_called()
 
     def test_media_field_still_works(self, tmp_path: Path):
         """Media field should still work in non-streaming mode."""

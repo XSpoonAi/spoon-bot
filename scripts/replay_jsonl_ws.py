@@ -317,6 +317,9 @@ def start_gateway(
     env["GATEWAY_AUTH_REQUIRED"] = "false"
     env["SPOON_BOT_CONFIG"] = str(config_path)
     env["GATEWAY_PORT"] = str(port)
+    env.setdefault("SPOON_BOT_WS_STALE_SECONDS", "3600")
+    server_ws_ping_interval = os.environ.get("SPOON_REPLAY_UVICORN_WS_PING_INTERVAL", "60")
+    server_ws_ping_timeout = os.environ.get("SPOON_REPLAY_UVICORN_WS_PING_TIMEOUT", "600")
     fd, log_name = tempfile.mkstemp(prefix="spoon-replay-gateway-", suffix=".log")
     os.close(fd)
     log_path = Path(log_name)
@@ -332,6 +335,10 @@ def start_gateway(
             "127.0.0.1",
             "--port",
             str(port),
+            "--ws-ping-interval",
+            server_ws_ping_interval,
+            "--ws-ping-timeout",
+            server_ws_ping_timeout,
         ],
         cwd=str(repo_root),
         env=env,

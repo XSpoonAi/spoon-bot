@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import io
 import importlib.util
 import sys
 import types
+import zipfile
 from pathlib import Path
 
 import pytest
+
+
+def _zip_bytes(files: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        for path, content in files.items():
+            zf.writestr(path, content)
+    return buffer.getvalue()
 
 
 @pytest.fixture
@@ -174,6 +184,116 @@ async def test_download_via_api_retries_public_api_after_bad_token(
     assert (target / "SKILL.md").read_text(encoding="utf-8").startswith("---")
     assert calls[0][1]["Authorization"] == "Bearer stale-token"
     assert "Authorization" not in calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_resolve_github_skill_source_falls_back_to_public_archive_after_api_rate_limit(
+    skill_manager_module,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import httpx
+
+    archive = _zip_bytes({
+        "agent-spot-cypher-main/SKILL.md": "---\nname: spot-agent-cypher\n---\n",
+        "agent-spot-cypher-main/cli/index.js": "console.log('ok')",
+    })
+    calls: list[str] = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: int, follow_redirects: bool = False):
+            self.timeout = timeout
+            self.follow_redirects = follow_redirects
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, **kwargs):
+            calls.append(url)
+            request = httpx.Request("GET", url)
+            if url.startswith("https://api.github.com/"):
+                return httpx.Response(
+                    403,
+                    request=request,
+                    json={"message": "rate limit exceeded"},
+                )
+            if url.startswith("https://codeload.github.com/"):
+                return httpx.Response(200, request=request, content=archive)
+            return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    resolved = await skill_manager_module._resolve_github_skill_source(
+        "Agent-Cypher-Lab",
+        "agent-spot-cypher",
+        "main",
+        "",
+    )
+
+    assert resolved == ("main", "", "agent-spot-cypher")
+    assert any(url.startswith("https://api.github.com/") for url in calls)
+    assert any(url.startswith("https://codeload.github.com/") for url in calls)
+
+
+@pytest.mark.asyncio
+async def test_download_skill_files_uses_public_archive_without_git_or_api_token(
+    skill_manager_module,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import httpx
+
+    archive = _zip_bytes({
+        "repo-main/README.md": "# Repo",
+        "repo-main/skills/demo/SKILL.md": "---\nname: demo\n---\n# Demo\n",
+        "repo-main/skills/demo/cli/index.js": "console.log('ok')",
+    })
+    calls: list[str] = []
+
+    async def git_missing(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    async def api_must_not_run(*args, **kwargs):
+        raise AssertionError("GitHub Contents API should not be required")
+
+    class FakeAsyncClient:
+        def __init__(self, timeout: int, follow_redirects: bool = False):
+            self.timeout = timeout
+            self.follow_redirects = follow_redirects
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url: str, **kwargs):
+            calls.append(url)
+            request = httpx.Request("GET", url)
+            if url.startswith("https://codeload.github.com/"):
+                return httpx.Response(200, request=request, content=archive)
+            return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(skill_manager_module, "_download_via_git", git_missing)
+    monkeypatch.setattr(skill_manager_module, "_download_via_api", api_must_not_run)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    target = tmp_path / "demo"
+    count = await skill_manager_module._download_skill_files(
+        "owner",
+        "repo",
+        "main",
+        "skills/demo",
+        target,
+    )
+
+    assert count == 2
+    assert (target / "SKILL.md").exists()
+    assert (target / "cli" / "index.js").exists()
+    assert not (target / "README.md").exists()
+    assert any(url.startswith("https://codeload.github.com/") for url in calls)
 
 
 @pytest.mark.asyncio

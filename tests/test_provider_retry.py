@@ -18,6 +18,7 @@ from spoon_bot.exceptions import (
     LLMTimeoutError,
     ContextOverflowError,
     APIKeyMissingError,
+    user_friendly_error,
 )
 
 
@@ -184,6 +185,21 @@ class TestIsContextOverflowError:
             status_code = 413
 
         assert is_context_overflow_error(FakeError("payload too large")) is True
+
+
+class TestUserFriendlyProviderErrors:
+    def test_provider_credit_limit_is_actionable_without_raw_url(self):
+        message = (
+            "[openrouter] Request failed: Error code: 403 - "
+            "Key limit exceeded (total limit). Manage it using "
+            "https://openrouter.ai/workspaces/default/keys/secret-key-url"
+        )
+
+        friendly = user_friendly_error(RuntimeError(message))
+
+        assert "quota or credit limit" in friendly
+        assert "openrouter.ai" not in friendly
+        assert "secret-key-url" not in friendly
 
 
 # ---------------------------------------------------------------------------

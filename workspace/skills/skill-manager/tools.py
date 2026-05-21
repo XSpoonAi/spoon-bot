@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from spoon_ai.tools.base import BaseTool
 
@@ -301,6 +303,87 @@ def _select_skill_root_subpath(skill_md_paths: list[str], requested_subpath: str
     )
 
 
+def _github_archive_branch_candidates(branch: str) -> list[str]:
+    """Return branch names to try without asking the GitHub API for defaults."""
+    requested = (branch or "main").strip() or "main"
+    candidates = [requested]
+    if requested == "main":
+        candidates.append("master")
+
+    seen: set[str] = set()
+    return [value for value in candidates if value and not (value in seen or seen.add(value))]
+
+
+async def _download_github_archive_bytes(
+    owner: str,
+    repo: str,
+    branch: str,
+) -> tuple[str, bytes]:
+    """Download a public GitHub archive without gh CLI, git, token, or API quota."""
+    import httpx
+
+    last_error: BaseException | None = None
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for candidate in _github_archive_branch_candidates(branch):
+            encoded_branch = quote(candidate, safe="")
+            urls = [
+                f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{encoded_branch}",
+                f"https://github.com/{owner}/{repo}/archive/refs/heads/{encoded_branch}.zip",
+            ]
+            for archive_url in urls:
+                try:
+                    resp = await client.get(
+                        archive_url,
+                        headers={"Accept": "application/zip"},
+                    )
+                    if resp.status_code == 404:
+                        continue
+                    resp.raise_for_status()
+                    return candidate, bytes(resp.content)
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+    raise RuntimeError(
+        f"Could not download public GitHub archive for {owner}/{repo}@{branch}"
+    ) from last_error
+
+
+def _archive_skill_md_paths(archive_bytes: bytes) -> list[str]:
+    """List SKILL.md paths inside a GitHub archive, normalized without archive root."""
+    paths: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            parts = [part for part in info.filename.replace("\\", "/").split("/") if part]
+            if len(parts) < 2 or parts[-1] != "SKILL.md":
+                continue
+            paths.append("/".join(parts[1:]))
+    return paths
+
+
+async def _resolve_github_skill_source_via_archive(
+    owner: str,
+    repo: str,
+    branch: str,
+    subpath: str,
+) -> tuple[str, str, str]:
+    """Resolve a skill root by inspecting a public GitHub archive locally."""
+    resolved_branch, archive_bytes = await _download_github_archive_bytes(
+        owner,
+        repo,
+        branch,
+    )
+    skill_md_paths = _archive_skill_md_paths(archive_bytes)
+    resolved_subpath = _select_skill_root_subpath(
+        skill_md_paths,
+        _normalize_subpath(subpath),
+    )
+    skill_name = resolved_subpath.rsplit("/", 1)[-1] if resolved_subpath else repo
+    return resolved_branch, resolved_subpath, skill_name
+
+
 async def _resolve_github_skill_source(
     owner: str,
     repo: str,
@@ -350,9 +433,26 @@ async def _resolve_github_skill_source(
                 resolved_branch = fallback_branch
                 skill_md_paths = await _fetch_repo_tree_paths(client, resolved_branch)
     except Exception as exc:
-        raise RuntimeError(
-            f"Failed to resolve skill root for {owner}/{repo}@{branch}: {exc}"
-        ) from exc
+        logger.debug(
+            "GitHub API skill-root resolution failed for %s/%s@%s (%s); "
+            "trying public archive fallback",
+            owner,
+            repo,
+            branch,
+            exc,
+        )
+        try:
+            return await _resolve_github_skill_source_via_archive(
+                owner,
+                repo,
+                branch,
+                subpath,
+            )
+        except Exception as archive_exc:
+            raise RuntimeError(
+                f"Failed to resolve skill root for {owner}/{repo}@{branch}: "
+                f"{exc}; archive fallback failed: {archive_exc}"
+            ) from archive_exc
 
     resolved_subpath = _select_skill_root_subpath(skill_md_paths, requested_subpath)
     skill_name = resolved_subpath.rsplit("/", 1)[-1] if resolved_subpath else repo
@@ -422,6 +522,68 @@ async def _download_via_git(
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
+def _archive_relative_member_path(filename: str, subpath: str) -> Path | None:
+    """Return a safe target-relative path for a GitHub archive member."""
+    parts = [part for part in filename.replace("\\", "/").split("/") if part]
+    if len(parts) < 2:
+        return None
+
+    rel_parts = parts[1:]
+    subpath_parts = [part for part in _normalize_subpath(subpath).split("/") if part]
+    if subpath_parts:
+        if rel_parts[: len(subpath_parts)] != subpath_parts:
+            return None
+        rel_parts = rel_parts[len(subpath_parts) :]
+
+    if not rel_parts:
+        return None
+    if any(part in {"", ".", ".."} for part in rel_parts):
+        return None
+    if ".git" in rel_parts:
+        return None
+
+    return Path(*rel_parts)
+
+
+async def _download_via_archive(
+    owner: str, repo: str, branch: str, subpath: str, target: Path
+) -> int:
+    """Download skill files from a public GitHub archive without API quota."""
+    resolved_branch, archive_bytes = await _download_github_archive_bytes(
+        owner,
+        repo,
+        branch,
+    )
+    if resolved_branch != branch:
+        logger.debug(
+            "GitHub archive download used fallback branch %s for %s/%s",
+            resolved_branch,
+            owner,
+            repo,
+        )
+
+    target.mkdir(parents=True, exist_ok=True)
+    total_files = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                rel_path = _archive_relative_member_path(info.filename, subpath)
+                if rel_path is None:
+                    continue
+                dest = target / rel_path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as src, dest.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                total_files += 1
+    except Exception:
+        shutil.rmtree(str(target), ignore_errors=True)
+        raise
+
+    return total_files
+
+
 async def _download_via_api(
     owner: str, repo: str, branch: str, subpath: str, target: Path
 ) -> int:
@@ -469,9 +631,10 @@ async def _download_via_api(
 async def _download_skill_files(
     owner: str, repo: str, branch: str, subpath: str, target: Path
 ) -> int:
-    """Download skill files. Tries git sparse-checkout first, falls back to API."""
+    """Download skill files without requiring GitHub CLI or a token."""
 
-    # Try git clone first (avoids API rate limits)
+    # Git is fastest when available, but public archive fallback is required
+    # for minimal Linux hosts without git/gh or GitHub API quota.
     try:
         count = await _download_via_git(owner, repo, branch, subpath, target)
         if count > 0 and (target / "SKILL.md").exists():
@@ -485,7 +648,19 @@ async def _download_skill_files(
         if target.exists():
             shutil.rmtree(str(target), ignore_errors=True)
 
-    # Fallback: GitHub Contents API
+    try:
+        count = await _download_via_archive(owner, repo, branch, subpath, target)
+        if count > 0 and (target / "SKILL.md").exists():
+            logger.info(f"Downloaded {count} files via public GitHub archive")
+            return count
+        if target.exists():
+            shutil.rmtree(str(target), ignore_errors=True)
+    except Exception as e:
+        logger.debug(f"archive download failed ({e}), falling back to API")
+        if target.exists():
+            shutil.rmtree(str(target), ignore_errors=True)
+
+    # Final fallback: GitHub Contents API.
     count = await _download_via_api(owner, repo, branch, subpath, target)
 
     if count == 0:

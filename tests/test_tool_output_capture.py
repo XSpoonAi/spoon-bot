@@ -39,6 +39,47 @@ async def test_read_file_tool_records_full_output_for_stream_capture(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_redundant_read_capture_records_cache_hit(tmp_path: Path):
+    from spoon_bot.agent.tools.execution_context import (
+        bind_tool_invocation,
+        capture_tool_outputs,
+        consume_captured_tool_output,
+        finalize_tool_invocation,
+        track_tool_invocations,
+    )
+    from spoon_bot.agent.tools.filesystem import ReadFileTool
+
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("alpha\nbeta\n", encoding="utf-8")
+    tool = ReadFileTool(workspace=tmp_path, max_output=40)
+
+    with capture_tool_outputs() as scope_id:
+        with track_tool_invocations():
+            with bind_tool_invocation("read_file", {"path": str(file_path)}):
+                first = await tool.execute(path=str(file_path))
+                finalize_tool_invocation(first)
+            with bind_tool_invocation("read_file", {"path": str(file_path)}):
+                second = await tool.execute(path=str(file_path))
+                finalize_tool_invocation(second)
+
+        consume_captured_tool_output(
+            scope_id,
+            tool_name="read_file",
+            arguments={"path": str(file_path)},
+        )
+        captured_second = consume_captured_tool_output(
+            scope_id,
+            tool_name="read_file",
+            arguments={"path": str(file_path)},
+        )
+
+    assert "READ_FILE_CACHE_HIT" in second
+    assert captured_second is not None
+    assert captured_second.summary_output == second
+    assert captured_second.full_output == second
+
+
+@pytest.mark.asyncio
 async def test_capture_defaults_to_returned_result_when_tool_does_not_publish_full_output():
     from spoon_bot.agent.tools.execution_context import (
         bind_tool_invocation,

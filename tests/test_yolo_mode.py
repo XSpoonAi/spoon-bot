@@ -144,3 +144,13 @@ class TestYoloContextBuilder:
         assert "If no available tool or installed skill can safely perform" in prompt
         assert "irreversible" in prompt
         assert "do not create ad-hoc scripts" in prompt
+
+    def test_system_prompt_requires_history_search_for_prior_action_disputes(self, tmp_path):
+        from spoon_bot.agent.context import ContextBuilder
+
+        ctx = ContextBuilder(tmp_path)
+        prompt = ctx.build_system_prompt()
+
+        assert "Prior-action dispute rule" in prompt
+        assert "search_history" in prompt
+        assert "scope='current'" in prompt

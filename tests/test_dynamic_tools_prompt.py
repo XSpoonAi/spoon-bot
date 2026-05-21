@@ -189,6 +189,78 @@ class TestToolProfileSkillManagement:
 
         assert "skill_marketplace" in CORE_TOOLS
 
+    def test_core_profile_includes_search_history_for_prior_fact_checks(self):
+        from spoon_bot.agent.tools.registry import CORE_TOOLS
+
+        assert "search_history" in CORE_TOOLS
+
+    def test_prior_action_dispute_sets_current_session_fact_check_hint(self):
+        from spoon_bot.agent.request_hints import build_request_execution_hints
+
+        hints = build_request_execution_hints(
+            "不是啊，你刚刚不是已经运行过很多次，你忘记了吗？",
+            [],
+        )
+
+        assert hints["current_session_fact_check_required"] is True
+
+    def test_local_skill_context_uses_distinctive_name_token_without_route(self, tmp_path):
+        from spoon_bot.agent.request_hints import (
+            build_request_execution_hints,
+            format_local_executable_skill_context,
+        )
+
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(
+            "---\n"
+            "name: spot-agent-cypher\n"
+            "description: Play a local game workflow through its CLI.\n"
+            "---\n"
+            "CLI = node skills/spot-agent-cypher/cli/index.js\n"
+            "$CLI wallet\n"
+            "$CLI join <spot>\n",
+            encoding="utf-8",
+        )
+
+        hints = build_request_execution_hints(
+            "继续加入spot游戏",
+            [
+                {
+                    "name": "spot-agent-cypher",
+                    "skill_md": skill_md,
+                    "is_organized": True,
+                    "description": "Play a local game workflow through its CLI.",
+                    "when_to_use": "",
+                }
+            ],
+        )
+        context = format_local_executable_skill_context(hints)
+
+        assert hints["local_executable_skills"][0]["name"] == "spot-agent-cypher"
+        assert "[LOCAL SKILL EXECUTION CONTEXT]:" in context
+        assert "skills/spot-agent-cypher/SKILL.md" in context
+        assert "neighboring subcommands" in context
+        assert "Agent-Cypher-Lab" not in context
+
+    def test_github_skill_install_context_points_to_skill_manager(self):
+        from spoon_bot.agent.request_hints import (
+            build_request_execution_hints,
+            format_github_skill_install_context,
+        )
+
+        hints = build_request_execution_hints(
+            "https://github.com/example-org/example-skill install the skill in this repo",
+            [],
+        )
+        context = format_github_skill_install_context(hints)
+
+        assert hints["github_skill_install_request"]["urls"] == [
+            "https://github.com/example-org/example-skill"
+        ]
+        assert "skill_marketplace(action='install_skill'" in context
+        assert "do not clone directly into workspace/skills" in context
+        assert "example-org/example-skill" in context
+
     def test_request_scoped_activation_hook_has_no_prompt_route(self):
         from spoon_bot.agent.loop import AgentLoop
 

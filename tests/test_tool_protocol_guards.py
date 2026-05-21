@@ -65,7 +65,7 @@ async def test_openrouter_strict_tool_guard_disables_parallel_and_serializes_res
     loop.provider = "openrouter"
     loop.model = "anthropic/claude-sonnet-4.6"
     loop.base_url = "https://openrouter.ai/api/v1"
-    loop._agent = SimpleNamespace(llm=FakeLLM())
+    loop._agent = SimpleNamespace(llm=FakeLLM(), next_step_prompt="Check completion.")
 
     loop._install_tool_call_protocol_guards()
     response = await loop._agent.llm.ask_tool(messages=[], tools=[])
@@ -91,7 +91,7 @@ async def test_tool_guard_retries_without_parallel_flag_when_provider_rejects_it
     loop.provider = "openrouter"
     loop.model = "anthropic/claude-sonnet-4.6"
     loop.base_url = "https://openrouter.ai/api/v1"
-    loop._agent = SimpleNamespace(llm=FakeLLM())
+    loop._agent = SimpleNamespace(llm=FakeLLM(), next_step_prompt="Check completion.")
 
     loop._install_tool_call_protocol_guards()
     response = await loop._agent.llm.ask_tool(messages=[], tools=[])
@@ -245,6 +245,47 @@ async def test_tool_guard_can_force_serial_calls_for_recovery_on_native_provider
     assert response.metadata["serial_tool_calls_enforced"] is True
 
 
+def test_skill_request_hints_require_serial_tool_calls():
+    assert AgentLoop._request_hints_require_serial_tool_calls(
+        {"github_skill_install_request": {"urls": ["https://github.com/org/repo"]}}
+    )
+    assert AgentLoop._request_hints_require_serial_tool_calls(
+        {"local_executable_skills": [{"name": "spot-agent-cypher"}]}
+    )
+    assert not AgentLoop._request_hints_require_serial_tool_calls({})
+
+
+def test_skill_request_serial_context_restores_force_serial_state():
+    loop = AgentLoop.__new__(AgentLoop)
+
+    with loop._serial_tool_calls_for_request_hints(
+        {"local_executable_skills": [{"name": "spot-agent-cypher"}]}
+    ):
+        assert loop._force_serial_tool_calls is True
+
+    assert not hasattr(loop, "_force_serial_tool_calls")
+
+    loop._force_serial_tool_calls = True
+    with loop._serial_tool_calls_for_request_hints({}):
+        assert loop._force_serial_tool_calls is True
+    assert loop._force_serial_tool_calls is True
+
+
+def test_serial_tool_guard_coerces_tuple_tool_calls():
+    tool_a = SimpleNamespace(id="call_a")
+    tool_b = SimpleNamespace(id="call_b")
+    response = SimpleNamespace(
+        tool_calls=(tool_a, tool_b),
+        metadata={},
+    )
+
+    dropped = AgentLoop._coerce_response_to_single_tool_call(response)
+
+    assert dropped == 1
+    assert response.tool_calls == [tool_a]
+    assert response.metadata["serial_tool_calls_enforced"] is True
+
+
 @pytest.mark.asyncio
 async def test_openrouter_tool_guard_textualizes_completed_tool_history():
     captured_messages = []
@@ -259,15 +300,21 @@ async def test_openrouter_tool_guard_textualizes_completed_tool_history():
     loop.provider = "openrouter"
     loop.model = "anthropic/claude-sonnet-4.6"
     loop.base_url = "https://openrouter.ai/api/v1"
-    loop._agent = SimpleNamespace(llm=FakeLLM())
+    loop._agent = SimpleNamespace(llm=FakeLLM(), next_step_prompt="Check completion.")
 
     loop._install_tool_call_protocol_guards()
     await loop._agent.llm.ask_tool(messages=original_messages, tools=[])
 
-    assert [msg.role for msg in captured_messages] == ["user", "assistant", "assistant"]
+    assert [msg.role for msg in captured_messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "user",
+    ]
     assert all(getattr(msg, "tool_calls", None) is None for msg in captured_messages)
     assert "skill header" in captured_messages[1].content
     assert "EXISTS" in captured_messages[2].content
+    assert captured_messages[-1].content == "Check completion."
     assert original_messages[1]["tool_calls"][0]["id"] == "call_read"
 
 
@@ -327,8 +374,16 @@ async def test_gemini_textualizes_history_without_openai_parallel_flag():
 
     captured_messages = captured_kwargs[0]["messages"]
     assert "parallel_tool_calls" not in captured_kwargs[0]
-    assert [msg.role for msg in captured_messages] == ["user", "assistant", "assistant"]
+    assert [msg.role for msg in captured_messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "user",
+    ]
     assert all(getattr(msg, "tool_calls", None) is None for msg in captured_messages)
+    assert captured_messages[-1].content.startswith(
+        "Continue from the current conversation state"
+    )
 
 
 @pytest.mark.asyncio

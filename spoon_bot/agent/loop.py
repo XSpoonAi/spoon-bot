@@ -16,6 +16,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
@@ -94,18 +95,23 @@ from spoon_bot.agent.tools.execution_context import (
     clear_captured_tool_outputs,
     capture_tool_outputs,
     consume_captured_tool_output,
+    get_request_execution_hints,
     normalize_tool_arguments,
     track_tool_invocations,
 )
 from spoon_bot.agent.request_hints import (
     build_request_execution_hints,
     format_exact_shell_command_context,
+    format_current_session_fact_check_context,
+    format_github_skill_install_context,
+    format_local_executable_skill_context,
 )
 from spoon_bot.agent.turn_verifiers import (
     DEFAULT_SKILL_CONTRACT_CHECK_LIMIT,
     build_skill_contract_check_prompt,
     build_user_facing_tool_event_answer,
     build_user_facing_tool_evidence_answer,
+    extract_resolved_tool_next_commands,
     has_pending_placeholder_next_command,
     is_skill_contract_check_pass,
     latest_tool_event_has_next_command,
@@ -3072,7 +3078,11 @@ class AgentLoop:
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
             self._activate_tools_for_request_hints(request_execution_hints)
-            with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+            with (
+                self._serial_tool_calls_for_request_hints(request_execution_hints),
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(),
+            ):
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
                     label="process",
@@ -3112,7 +3122,11 @@ class AgentLoop:
                 )
                 await self._agent.add_message("user", repair_prompt)
                 self._agent.next_step_prompt = repair_prompt
-                with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                with (
+                    self._serial_tool_calls_for_request_hints(request_execution_hints),
+                    bind_request_execution_hints(request_execution_hints),
+                    track_tool_invocations(),
+                ):
                     result = await AgentLoop._run_agent_with_context_overflow_recovery(
                         self,
                         label="process_tool_call_repair",
@@ -3124,6 +3138,60 @@ class AgentLoop:
                     _extracted = self._extract_last_assistant_content()
                     if _extracted:
                         final_content = _extracted
+
+            tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                _pre_turn_memory_index
+            )
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
+            ):
+                final_content = await self._run_process_repeated_read_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and has_pending_placeholder_next_command(tool_result_events)
+                and not tool_events_have_user_summary_marker(tool_result_events)
+            ):
+                final_content = await self._run_process_pending_followup_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_pending_followup_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and latest_tool_event_has_next_command(tool_result_events)
+                and not has_pending_placeholder_next_command(tool_result_events)
+                and not tool_events_have_user_summary_marker(tool_result_events)
+            ):
+                await self._execute_structural_followup_commands_for_process(
+                    tool_result_events,
+                    reason="process_structural_followup",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and tool_events_have_user_summary_marker(tool_result_events)
+            ):
+                final_content = build_user_facing_tool_event_answer(tool_result_events)
 
             final_content = AgentLoop._finalize_response_content(
                 self,
@@ -4090,6 +4158,46 @@ class AgentLoop:
             agent_loop._compress_runtime_context()
 
             desired_next_step_prompt = agent.next_step_prompt or base_prompt
+            request_execution_hints = get_request_execution_hints()
+            runtime_tool_events = agent_loop._collect_runtime_tool_result_events_from_memory()
+            if (
+                request_execution_hints
+                and should_run_skill_contract_check(runtime_tool_events)
+                and tool_events_have_user_summary_marker(runtime_tool_events)
+            ):
+                summary = build_user_facing_tool_event_answer(runtime_tool_events)
+                agent.state = AgentState.FINISHED
+                await agent.add_message("assistant", summary)
+                agent._finish_reason_terminated = True
+                agent._final_response_content = summary
+                _log_agent_reasoning()
+                _log_tool_calls()
+                return False
+            if (
+                request_execution_hints
+                and should_run_skill_contract_check(runtime_tool_events)
+                and AgentLoop._tool_events_have_repeated_read_guardrail(runtime_tool_events[-3:])
+                and not tool_events_have_user_summary_marker(runtime_tool_events)
+            ):
+                runtime_messages = AgentLoop._get_runtime_memory_messages(agent_loop)
+                latest_user_index = agent_loop._latest_real_user_message_index(runtime_messages)
+                latest_user_text = ""
+                if latest_user_index is not None and latest_user_index < len(runtime_messages):
+                    latest_user_text = AgentLoop._stringify_stream_payload(
+                        AgentLoop._stream_message_attr(
+                            runtime_messages[latest_user_index],
+                            "content",
+                            "",
+                        )
+                    )
+                recovery_context = (
+                    f"{format_github_skill_install_context(request_execution_hints)}"
+                    f"{format_local_executable_skill_context(request_execution_hints)}"
+                )
+                desired_next_step_prompt = AgentLoop._build_repeated_read_recovery_prompt(
+                    latest_user_text or base_prompt,
+                    request_context=recovery_context,
+                )
             suppress_runtime_prompt = AgentLoop._should_skip_runtime_next_step_prompt(agent_loop)
             if suppress_runtime_prompt:
                 logger.info(
@@ -4180,6 +4288,19 @@ class AgentLoop:
                 elif call_args:
                     call_args[0] = AgentLoop._textualize_tool_history(call_args[0])
 
+            if agent_loop._provider_requires_user_tail():
+                continuation_prompt = getattr(agent, "next_step_prompt", None)
+                if "messages" in call_kwargs:
+                    call_kwargs["messages"] = AgentLoop._ensure_provider_messages_end_with_user(
+                        call_kwargs["messages"],
+                        continuation_prompt,
+                    )
+                elif call_args:
+                    call_args[0] = AgentLoop._ensure_provider_messages_end_with_user(
+                        call_args[0],
+                        continuation_prompt,
+                    )
+
             injected_parallel_flag = False
             if should_disable_parallel and "parallel_tool_calls" not in call_kwargs:
                 call_kwargs["parallel_tool_calls"] = False
@@ -4258,6 +4379,38 @@ class AgentLoop:
             return raw.strip().lower() in {"0", "false", "no", "off"}
         return self._uses_strict_tool_turn_order() and self._uses_openai_compatible_tool_api()
 
+    @staticmethod
+    def _request_hints_require_serial_tool_calls(
+        request_execution_hints: Any,
+    ) -> bool:
+        """Skill install/execution turns are stateful, so run one tool at a time."""
+        if not isinstance(request_execution_hints, dict):
+            return False
+        return bool(
+            request_execution_hints.get("github_skill_install_request")
+            or request_execution_hints.get("local_executable_skills")
+        )
+
+    @contextmanager
+    def _serial_tool_calls_for_request_hints(self, request_execution_hints: Any):
+        """Temporarily force serial tool calls for stateful skill workflows."""
+        should_force = AgentLoop._request_hints_require_serial_tool_calls(
+            request_execution_hints
+        )
+        had_attr = hasattr(self, "_force_serial_tool_calls")
+        previous_value = bool(getattr(self, "_force_serial_tool_calls", False))
+        if should_force:
+            self._force_serial_tool_calls = True
+        try:
+            yield
+        finally:
+            if not should_force:
+                return
+            if had_attr:
+                self._force_serial_tool_calls = previous_value
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
     def _should_textualize_tool_history_for_provider(self) -> bool:
         """Avoid replaying native completed tool-result blocks to strict providers."""
         import os as _os
@@ -4267,6 +4420,53 @@ class AgentLoop:
             return raw.strip().lower() in {"1", "true", "yes", "on", "always"}
 
         return self._uses_strict_tool_turn_order()
+
+    def _provider_requires_user_tail(self) -> bool:
+        """Return true for providers that reject assistant-prefill style tails."""
+        provider_raw = getattr(self, "provider", None)
+        base_url_raw = getattr(self, "base_url", None)
+        provider = provider_raw.strip().lower() if isinstance(provider_raw, str) else ""
+        base_url = base_url_raw.strip().lower() if isinstance(base_url_raw, str) else ""
+
+        if provider in {
+            "openrouter",
+            "gemini",
+            "google",
+            "google_ai_studio",
+            "google-ai-studio",
+        }:
+            return True
+        return "openrouter.ai" in base_url or "generativelanguage.googleapis.com" in base_url
+
+    @classmethod
+    def _ensure_provider_messages_end_with_user(
+        cls,
+        messages: Any,
+        continuation_prompt: str | None = None,
+    ) -> Any:
+        """Return provider-bound messages ending in a user turn when required."""
+        if not isinstance(messages, list) or not messages:
+            return messages
+
+        for message in reversed(messages):
+            role = str(cls._message_role_value(message) or "").strip().lower()
+            if role == "system":
+                continue
+            if role == "user":
+                return messages
+            break
+        else:
+            return messages
+
+        prompt = (
+            continuation_prompt.strip()
+            if isinstance(continuation_prompt, str) and continuation_prompt.strip()
+            else (
+                "Continue from the current conversation state and answer the "
+                "latest user request."
+            )
+        )
+        return [*messages, Message(role="user", content=prompt)]
 
     @classmethod
     def _textualize_tool_history(cls, messages: Any) -> Any:
@@ -4390,12 +4590,18 @@ class AgentLoop:
     def _coerce_response_to_single_tool_call(response: Any) -> int:
         """Keep one tool call when the transport requires serial tool-result turns."""
         tool_calls = getattr(response, "tool_calls", None)
-        if not isinstance(tool_calls, list) or len(tool_calls) <= 1:
+        if isinstance(tool_calls, tuple):
+            tool_call_list = list(tool_calls)
+        elif isinstance(tool_calls, list):
+            tool_call_list = tool_calls
+        else:
+            return 0
+        if len(tool_call_list) <= 1:
             return 0
 
-        dropped = len(tool_calls) - 1
+        dropped = len(tool_call_list) - 1
         try:
-            response.tool_calls = tool_calls[:1]
+            response.tool_calls = tool_call_list[:1]
         except Exception:
             return 0
 
@@ -4414,11 +4620,11 @@ class AgentLoop:
         """Return the default completion budget for tool-producing turns."""
         raw = os.getenv("SPOON_BOT_TOOL_CALL_MAX_TOKENS")
         if raw is None:
-            return 16_384
+            return 12_000
         try:
             return max(1_024, min(200_000, int(raw.strip())))
         except (TypeError, ValueError):
-            return 16_384
+            return 12_000
 
     @staticmethod
     def _tool_call_retry_token_budget(current: int | None = None) -> int:
@@ -4747,8 +4953,18 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _build_repeated_read_recovery_prompt(user_request: str) -> str:
+    def _build_repeated_read_recovery_prompt(
+        user_request: str,
+        *,
+        request_context: str = "",
+    ) -> str:
         """Build an internal continuation prompt after repeated duplicate reads."""
+        context_block = (
+            "\n\nRelevant request-scoped execution context:\n"
+            f"{request_context.strip()}"
+            if request_context.strip()
+            else ""
+        )
         return (
             "[INTERNAL REPEATED-READ RECOVERY]\n"
             "The previous tool loop repeatedly called read_file for the same file "
@@ -4757,10 +4973,57 @@ class AgentLoop:
             "Continue the latest user request from the next non-read step. Do not "
             "call read_file again for that same path and range. If the user asked "
             "for an edit, use the editing tool directly from the existing context. "
+            "If the repeated read was for an installed SKILL.md, treat the skill "
+            "contract as already inspected and continue with a documented "
+            "non-read command that advances the user's workflow. "
+            "Do not treat a numeric id or label from the user's natural-language "
+            "request as an extra CLI argument unless the documented command form "
+            "explicitly supports that parameter. "
             "Call at most one file mutation tool for each unique replacement. "
             "After a successful file mutation, do not repeat the same mutation; "
             "one verification read is allowed before the final answer.\n\n"
             f"Latest user request:\n{user_request}"
+            f"{context_block}"
+        )
+
+    @staticmethod
+    def _build_pending_followup_recovery_prompt(
+        user_request: str,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        request_context: str = "",
+    ) -> str:
+        """Build an internal continuation prompt for unresolved follow-up placeholders."""
+        followup_commands = extract_resolved_tool_next_commands(tool_result_events, limit=4)
+        followup_block = "\n".join(
+            f"{index}. {command}"
+            for index, command in enumerate(followup_commands, start=1)
+        ) or "No structural follow-up command found."
+        evidence_block = "\n\n".join(
+            AgentLoop._stream_tool_result_event_summary(event, limit=1800)
+            for event in tool_result_events[-6:]
+        ) or "No tool evidence captured."
+        context_block = (
+            "\n\nRelevant request-scoped execution context:\n"
+            f"{request_context.strip()}"
+            if request_context.strip()
+            else ""
+        )
+        return (
+            "[INTERNAL FOLLOW-UP PLACEHOLDER RECOVERY]\n"
+            "The latest tool evidence already contains the continuation, but at "
+            "least one structural follow-up command still has unresolved "
+            "placeholders. Use the existing tool evidence and the installed skill "
+            "contract to choose concrete placeholder values, then continue the "
+            "workflow by calling real tools. Do not read the same SKILL.md again. "
+            "Do not treat a numeric id or label from the user's natural-language "
+            "request as an extra CLI argument unless the documented command form "
+            "explicitly supports that parameter. "
+            "Do not ask the user for confirmation unless a required value is "
+            "genuinely absent from the evidence.\n\n"
+            f"Latest user request:\n{user_request}{context_block}\n\n"
+            f"Pending structural follow-up commands:\n{followup_block}\n\n"
+            f"Latest tool evidence:\n{evidence_block}"
         )
 
     @staticmethod
@@ -5128,6 +5391,32 @@ class AgentLoop:
         return text, False
 
     @staticmethod
+    def _model_visible_tool_result_text(value: Any) -> tuple[str, bool]:
+        """Return model-side stream metadata without exposing generic file bodies."""
+        text = AgentLoop._stringify_stream_payload(value).strip()
+        text = AgentLoop._mask_user_visible_text(text)
+        file_header = re.match(r"^(\[file:\s*[^\]\n]+\])\s*\n", text)
+        if file_header:
+            header = file_header.group(1)
+            body = text[file_header.end():].strip()
+            if "skill-ref" in header and "[SKILL.md execution summary]" in body:
+                return f"{header}\n{body}", False
+            return (
+                f"{header} content body omitted from user-visible tool result",
+                True,
+            )
+        observed_header = re.match(
+            r"^Observed output of cmd [^\n]* execution:\s*(\[file:\s*[^\]\n]+\])\s*\n",
+            text,
+        )
+        if observed_header:
+            return (
+                f"{observed_header.group(1)} content body omitted from user-visible tool result",
+                True,
+            )
+        return text, False
+
+    @staticmethod
     def _merge_stream_tool_result_metadata(
         metadata: dict[str, Any],
         *,
@@ -5154,6 +5443,9 @@ class AgentLoop:
         client_summary, omitted_summary_body = AgentLoop._client_visible_tool_result_text(
             summary_result or client_result
         )
+        model_summary, omitted_model_summary_body = AgentLoop._model_visible_tool_result_text(
+            summary_result or client_summary or client_result
+        )
 
         if guardrail_message:
             merged["guardrail_stop"] = True
@@ -5176,17 +5468,17 @@ class AgentLoop:
             if stream_truncated:
                 merged["stream_output_truncated"] = True
                 merged["stream_output_original_chars"] = stream_original_len
-        if client_summary:
+        if model_summary:
             stream_summary, summary_truncated, summary_original_len = (
                 AgentLoop._cap_stream_metadata_text(
-                    client_summary,
+                    model_summary,
                     limit=_CLIENT_STREAM_TOOL_RESULT_LIMIT,
                 )
             )
             merged["model_result"] = stream_summary
             merged["model_content"] = stream_summary
             merged["model_output"] = stream_summary
-            if omitted_summary_body:
+            if omitted_model_summary_body:
                 merged["model_result_body_omitted"] = True
             if summary_truncated:
                 merged["model_output_truncated"] = True
@@ -5336,6 +5628,24 @@ class AgentLoop:
         return AgentLoop._tool_loop_suppression_message_from_text(payload)
 
     @staticmethod
+    def _extract_current_session_fact_check_blocker(text: str) -> str | None:
+        """Extract the user-facing current-session fact-check blocker."""
+        value = str(text or "").strip()
+        lower = value.casefold()
+        marker = "current-session fact check required"
+        index = lower.find(marker)
+        if index < 0:
+            return None
+        blocker = value[index:].strip()
+        blocker = re.sub(r"\s+", " ", blocker).strip()
+        if not blocker:
+            return None
+        return (
+            f"{blocker} No external/live-state lookup was used as proof of "
+            "the prior action."
+        )
+
+    @staticmethod
     def _extract_tool_suppression_user_response(
         tool_result_events: list[dict[str, Any]],
     ) -> str | None:
@@ -5354,6 +5664,11 @@ class AgentLoop:
                 continue
             summary = AgentLoop._stream_tool_result_event_summary(event)
             if summary:
+                fact_check_blocker = (
+                    AgentLoop._extract_current_session_fact_check_blocker(summary)
+                )
+                if fact_check_blocker:
+                    return fact_check_blocker
                 return (
                     f"{suppression_message}\n\n"
                     "Latest available result:\n\n"
@@ -5381,29 +5696,10 @@ class AgentLoop:
             if suppression_response:
                 return suppression_response
 
-        if reason == "tool_followup_timeout":
-            reason_text = "the agent kept running tools without producing a final answer"
-        elif reason == "tool_suppression":
-            reason_text = "a tool guardrail suppressed repeated work for the same action"
-        else:
-            reason_text = "the request reached the response time budget while tools were still active"
-        parts = [
-            f"The agent stopped the tool loop because {reason_text}.",
-            "Recent tool evidence:",
-        ]
-        summaries = [
-            AgentLoop._stream_tool_result_event_summary(event)
-            for event in tool_result_events[-3:]
-        ]
-        if summaries:
-            parts.extend(summaries)
-        else:
-            parts.append("No tool result text was captured before the stop condition.")
-        if reason == "tool_suppression":
-            parts.append("Stop here and report the latest result or blocker; do not retry the same tool action.")
-        else:
-            parts.append("Continue the task to let the agent proceed from this tool evidence.")
-        return "\n\n".join(parts)
+        return build_user_facing_tool_event_answer(
+            tool_result_events[-6:],
+            incomplete=True,
+        )
 
     def _get_runtime_memory_messages(self) -> list[Any]:
         """Return runtime memory messages exposed by the active inner agent."""
@@ -5421,6 +5717,240 @@ class AgentLoop:
 
         messages = getattr(memory, "messages", None)
         return messages if isinstance(messages, list) else []
+
+    def _collect_runtime_tool_result_events_from_memory(
+        self,
+        start_index: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Collect tool result events from runtime memory for non-stream flows."""
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if start_index < 0 or start_index > len(messages):
+            start_index = 0
+
+        events: list[dict[str, Any]] = []
+        for msg in messages[start_index:]:
+            if AgentLoop._stream_message_role(msg) != "tool":
+                continue
+
+            tool_call_id = (
+                AgentLoop._stream_message_attr(msg, "tool_call_id", "")
+                or AgentLoop._stream_message_attr(msg, "id", "")
+            )
+            result_payload = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if result_payload in (None, ""):
+                result_payload = AgentLoop._stream_message_attr(msg, "content", "")
+            serialized_result = AgentLoop._stringify_stream_payload(result_payload)
+            tool_name = AgentLoop._stream_message_attr(msg, "name", "")
+            metadata: dict[str, Any] = {
+                "name": tool_name,
+                "result": serialized_result,
+                "content": serialized_result,
+                "output": serialized_result,
+                "full_result": serialized_result,
+                "full_content": serialized_result,
+                "full_output": serialized_result,
+                "model_result": serialized_result,
+                "model_content": serialized_result,
+                "model_output": serialized_result,
+            }
+            if tool_call_id:
+                metadata["id"] = tool_call_id
+                metadata["tool_call_id"] = tool_call_id
+            events.append({
+                "type": "tool_result",
+                "delta": serialized_result,
+                "metadata": metadata,
+            })
+        return events
+
+    @staticmethod
+    def _tool_events_have_repeated_read_guardrail(
+        events: list[dict[str, Any]],
+    ) -> bool:
+        """Return True when tool evidence shows repeated read suppression."""
+        for event in events:
+            metadata = dict(event.get("metadata") or {})
+            if str(metadata.get("name") or "").strip() != "read_file":
+                continue
+            payload = (
+                metadata.get("model_result")
+                or metadata.get("model_output")
+                or metadata.get("model_content")
+                or metadata.get("output")
+                or metadata.get("result")
+                or metadata.get("content")
+                or event.get("delta")
+            )
+            text = AgentLoop._stringify_stream_payload(payload).lower()
+            if (
+                "repeated redundant read_file suppressed" in text
+                or "requested file range was already provided" in text
+            ):
+                return True
+        return False
+
+    async def _run_process_repeated_read_recovery(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+    ) -> str:
+        """Retry once for non-stream flows when repeated read_file consumed the loop."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        recovery_context = (
+            f"{format_github_skill_install_context(request_execution_hints)}"
+            f"{format_local_executable_skill_context(request_execution_hints)}"
+        )
+        repair_prompt = AgentLoop._build_repeated_read_recovery_prompt(
+            authoritative_message,
+            request_context=recovery_context,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label="process_repeated_read_recovery",
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
+        return AgentLoop._extract_run_result_text(result)
+
+    async def _run_process_pending_followup_recovery(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        label: str,
+    ) -> str:
+        """Retry once for non-stream flows when a follow-up command still has placeholders."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        recovery_context = (
+            f"{format_github_skill_install_context(request_execution_hints)}"
+            f"{format_local_executable_skill_context(request_execution_hints)}"
+        )
+        repair_prompt = AgentLoop._build_pending_followup_recovery_prompt(
+            authoritative_message,
+            tool_result_events,
+            request_context=recovery_context,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label=label,
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
+        return AgentLoop._extract_run_result_text(result)
+
+    async def _execute_structural_followup_commands_for_process(
+        self,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        reason: str,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Execute resolved follow-up shell commands in non-stream flows."""
+        executed: set[str] = set()
+        emitted: list[dict[str, Any]] = []
+        workspace = self._workspace_posix_path()
+
+        for _ in range(max(1, limit)):
+            commands = extract_resolved_tool_next_commands(tool_result_events, limit=3)
+            command = next(
+                (
+                    candidate
+                    for candidate in reversed(commands)
+                    if candidate not in executed
+                ),
+                "",
+            )
+            normalized = " ".join(command.split())
+            if not normalized or ("<" in normalized and ">" in normalized):
+                break
+            executed.add(normalized)
+
+            shell_command = normalized
+            if not normalized.casefold().startswith(("cd ", "source ", ". ")):
+                shell_command = (
+                    f"cd {workspace} && source .env.local && {normalized}"
+                )
+
+            try:
+                result = await self.tools.execute(
+                    "shell",
+                    {
+                        "command": shell_command,
+                        "timeout": max(
+                            120,
+                            int(getattr(self, "shell_timeout", 120) or 120),
+                        ),
+                    },
+                )
+            except Exception as exc:
+                result = f"Error executing structural follow-up command: {exc}"
+
+            result_text = AgentLoop._stringify_stream_payload(result)
+            event = {
+                "type": "tool_result",
+                "delta": result_text,
+                "metadata": {
+                    "name": "shell",
+                    "result": result_text,
+                    "content": result_text,
+                    "output": result_text,
+                    "full_result": result_text,
+                    "full_content": result_text,
+                    "full_output": result_text,
+                    "model_result": result_text,
+                    "model_content": result_text,
+                    "model_output": result_text,
+                    "repair": reason,
+                },
+            }
+            emitted.append(event)
+            tool_result_events.append(event)
+            if tool_events_have_user_summary_marker(tool_result_events):
+                break
+            if not latest_tool_event_has_next_command(tool_result_events):
+                break
+
+        return emitted
 
     def _collect_stream_tool_result_events(
         self,
@@ -5631,6 +6161,7 @@ class AgentLoop:
             read_file_argument_counts: dict[str, int] = {}
             non_read_tool_call_count = 0
             repeated_read_recovery_attempted = False
+            repeated_read_guardrail_seen = False
             # 2. Start run() in background
             run_result_text = ""
             provider_silence_retry_count = 0
@@ -5660,7 +6191,11 @@ class AgentLoop:
 
                     request_execution_hints = self._build_request_execution_hints(authoritative_message)
                     self._activate_tools_for_request_hints(request_execution_hints)
-                    with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                    with (
+                        self._serial_tool_calls_for_request_hints(request_execution_hints),
+                        bind_request_execution_hints(request_execution_hints),
+                        track_tool_invocations(),
+                    ):
                         result = await AgentLoop._run_agent_with_context_overflow_recovery(
                             self,
                             label="stream",
@@ -5677,11 +6212,15 @@ class AgentLoop:
                 except Exception as exc:
                     stream_error_reason = exc
                     logger.error(f"Background agent run failed: {exc}")
+                    friendly_error = user_friendly_error(exc)
                     try:
                         await self._agent.output_queue.put({
                             "type": "error",
-                            "delta": str(exc),
-                            "metadata": {"error": str(exc), "error_code": type(exc).__name__},
+                            "delta": friendly_error,
+                            "metadata": {
+                                "error": friendly_error,
+                                "error_code": type(exc).__name__,
+                            },
                         })
                     except Exception:
                         pass
@@ -5808,15 +6347,16 @@ class AgentLoop:
                 nonlocal run_result_text, pre_tool_scratchpad_events, pre_tool_scratchpad_buffer
                 nonlocal post_tool_content_events, post_tool_content_buffer
                 nonlocal tool_loop_fallback_active
-                if recent_tool_result_events:
+                evidence_events = recent_tool_result_events or all_tool_result_events
+                if evidence_events:
                     run_result_text = AgentLoop._build_tool_loop_fallback_response(
-                        recent_tool_result_events,
+                        evidence_events,
                         reason=reason,
                     )
                 else:
                     run_result_text = (
-                        "The task did not reach a final answer before the request "
-                        "timeout. Please retry or continue this task."
+                        "The tool workflow stopped before a final answer, and no "
+                        "tool result was captured before the stop condition."
                     )
                 tool_loop_fallback_active = True
                 if bg_task is not None and not bg_task.done():
@@ -5880,7 +6420,11 @@ class AgentLoop:
 
                 request_execution_hints = self._build_request_execution_hints(authoritative_message)
                 self._activate_tools_for_request_hints(request_execution_hints)
-                with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                with (
+                    self._serial_tool_calls_for_request_hints(request_execution_hints),
+                    bind_request_execution_hints(request_execution_hints),
+                    track_tool_invocations(),
+                ):
                     result = await AgentLoop._run_agent_with_context_overflow_recovery(
                         self,
                         label="stream_tool_call_repair",
@@ -6007,8 +6551,14 @@ class AgentLoop:
                     logger.debug(f"Repeated-read recovery memory normalization skipped: {exc}")
                 self._reset_agent_state_for_retry()
 
+                request_execution_hints = self._build_request_execution_hints(authoritative_message)
+                recovery_context = (
+                    f"{format_github_skill_install_context(request_execution_hints)}"
+                    f"{format_local_executable_skill_context(request_execution_hints)}"
+                )
                 repair_prompt = AgentLoop._build_repeated_read_recovery_prompt(
-                    authoritative_message
+                    authoritative_message,
+                    request_context=recovery_context,
                 )
                 await self._agent.add_message("user", repair_prompt)
                 self._agent.next_step_prompt = repair_prompt
@@ -6023,7 +6573,6 @@ class AgentLoop:
                 ):
                     repair_kwargs["reasoning_effort"] = repair_reasoning_effort
 
-                request_execution_hints = self._build_request_execution_hints(authoritative_message)
                 previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
                 self._force_serial_tool_calls = True
                 try:
@@ -6148,6 +6697,100 @@ class AgentLoop:
 
                 return repair_text, repair_events
 
+            async def _run_structural_next_command(
+                command: str,
+                *,
+                reason: str,
+            ) -> list[dict[str, Any]]:
+                """Execute a resolved structural NEXT command through shell guards."""
+                normalized_command = " ".join(str(command or "").strip().split())
+                if not normalized_command or "<" in normalized_command or ">" in normalized_command:
+                    return []
+
+                workspace = self._workspace_posix_path()
+                shell_command = normalized_command
+                lowered = shell_command.strip().casefold()
+                if not lowered.startswith(("cd ", "source ", ". ")):
+                    shell_command = f"cd {workspace} && source .env.local && {normalized_command} 2>&1"
+
+                tool_call_id = f"internal_next_{uuid.uuid4().hex[:12]}"
+                arguments = {
+                    "command": shell_command,
+                    "timeout": max(120, int(getattr(self, "shell_timeout", 120) or 120)),
+                }
+                tool_call_arguments_by_id[tool_call_id] = AgentLoop._tool_call_arguments_key(
+                    json.dumps(arguments, ensure_ascii=False)
+                )
+                events = [{
+                    "type": "tool_call",
+                    "delta": "",
+                    "metadata": {
+                        "id": tool_call_id,
+                        "name": "shell",
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                        "repair": reason,
+                    },
+                }]
+                try:
+                    result = await self.tools.execute("shell", arguments)
+                except Exception as exc:
+                    result = f"Error executing structural NEXT command: {exc}"
+                result_text = AgentLoop._stringify_stream_payload(result)
+                metadata = {
+                    "name": "shell",
+                    "id": tool_call_id,
+                    "tool_call_id": tool_call_id,
+                    "result": result_text,
+                    "content": result_text,
+                    "output": result_text,
+                    "full_result": result_text,
+                    "full_content": result_text,
+                    "full_output": result_text,
+                    "model_result": result_text,
+                    "model_content": result_text,
+                    "model_output": result_text,
+                    "repair": reason,
+                }
+                events.append({
+                    "type": "tool_result",
+                    "delta": result_text,
+                    "metadata": metadata,
+                })
+                return events
+
+            async def _run_pending_structural_next_commands(
+                *,
+                reason: str,
+                limit: int = 3,
+            ) -> list[dict[str, Any]]:
+                events: list[dict[str, Any]] = []
+                executed: set[str] = set()
+                for _ in range(max(1, limit)):
+                    commands = extract_resolved_tool_next_commands(
+                        all_tool_result_events,
+                        limit=1,
+                    )
+                    if not commands:
+                        break
+                    command = commands[-1]
+                    command_key = " ".join(command.split())
+                    if command_key in executed or "<" in command_key or ">" in command_key:
+                        break
+                    executed.add(command_key)
+                    next_events = await _run_structural_next_command(
+                        command,
+                        reason=reason,
+                    )
+                    if not next_events:
+                        break
+                    events.extend(next_events)
+                    for event in next_events:
+                        if event.get("type") == "tool_result":
+                            _record_tool_result_events([event])
+                    if not latest_tool_event_has_next_command(all_tool_result_events):
+                        break
+                return events
+
             def _active_tool_within_budget(now: float | None = None) -> bool:
                 if not saw_tool_call or last_tool_progress_kind != "tool_call":
                     return False
@@ -6163,6 +6806,30 @@ class AgentLoop:
                         for count in read_file_argument_counts.values()
                     )
                 )
+
+            def _events_have_repeated_read_guardrail(
+                events: list[dict[str, Any]],
+            ) -> bool:
+                for event in events:
+                    metadata = dict(event.get("metadata") or {})
+                    if str(metadata.get("name") or "").strip() != "read_file":
+                        continue
+                    payload = (
+                        metadata.get("model_result")
+                        or metadata.get("model_output")
+                        or metadata.get("model_content")
+                        or metadata.get("output")
+                        or metadata.get("result")
+                        or metadata.get("content")
+                        or event.get("delta")
+                    )
+                    text = AgentLoop._stringify_stream_payload(payload).lower()
+                    if (
+                        "repeated redundant read_file suppressed" in text
+                        or "requested file range was already provided" in text
+                    ):
+                        return True
+                return False
 
             def _stop_current_run_for_repeated_read_recovery() -> None:
                 if bg_task is not None and not bg_task.done():
@@ -6189,6 +6856,8 @@ class AgentLoop:
                     )
                 )
                 _record_tool_result_events(tool_result_events)
+                if _events_have_repeated_read_guardrail(tool_result_events):
+                    repeated_read_guardrail_seen = True
                 for event in tool_result_events:
                     yield _decorate_stream_event(event)
                 if any(AgentLoop._is_tool_loop_suppression_event(event) for event in tool_result_events):
@@ -6336,6 +7005,13 @@ class AgentLoop:
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
+                        if self._should_disable_parallel_tool_calls() and isinstance(
+                            chunk.get("tool_calls"), (list, tuple)
+                        ):
+                            raw_tool_calls = list(chunk.get("tool_calls") or [])
+                            if len(raw_tool_calls) > 1:
+                                chunk = dict(chunk)
+                                chunk["tool_calls"] = raw_tool_calls[:1]
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
                         last_tool_progress_at = time.monotonic()
@@ -6558,6 +7234,10 @@ class AgentLoop:
 
             repeated_read_storm = (
                 _repeated_read_storm_active()
+                or (
+                    not repeated_read_recovery_attempted
+                    and repeated_read_guardrail_seen
+                )
             )
             if repeated_read_storm:
                 logger.warning(
@@ -6697,6 +7377,55 @@ class AgentLoop:
                 pending_fallback_reason = "pseudo_tool_call_repair"
                 pending_fallback_delta = repair_text
 
+            if (
+                should_run_skill_contract_check(all_tool_result_events)
+                and latest_tool_event_has_next_command(all_tool_result_events)
+                and not has_pending_placeholder_next_command(all_tool_result_events)
+                and not tool_events_have_user_summary_marker(all_tool_result_events)
+            ):
+                next_events = await _run_pending_structural_next_commands(
+                    reason="structural_next",
+                )
+                for event in next_events:
+                    yield _decorate_stream_event(event)
+                if next_events and not latest_tool_event_has_next_command(
+                    all_tool_result_events
+                ):
+                    full_content = build_user_facing_tool_event_answer(
+                        all_tool_result_events
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "structural_next"
+                    pending_fallback_delta = full_content
+
+            if (
+                should_run_skill_contract_check(all_tool_result_events)
+                and has_pending_placeholder_next_command(all_tool_result_events)
+                and not tool_events_have_user_summary_marker(all_tool_result_events)
+            ):
+                request_context = (
+                    f"{format_github_skill_install_context(request_execution_hints)}"
+                    f"{format_local_executable_skill_context(request_execution_hints)}"
+                )
+                repair_prompt = AgentLoop._build_pending_followup_recovery_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                    request_context=request_context,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    full_content or "A structural follow-up command is still pending.",
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="pending_followup_recovery",
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                full_content = repair_text
+                pending_fallback_content_emit = True
+                pending_fallback_reason = "pending_followup_recovery"
+                pending_fallback_delta = repair_text
+
             while (
                 full_content.strip()
                 and should_run_skill_contract_check(
@@ -6809,6 +7538,25 @@ class AgentLoop:
                 pending_fallback_content_emit = True
                 pending_fallback_reason = pending_fallback_reason or "skill_summary"
                 pending_fallback_delta = full_content
+
+            if not full_content.strip() and stream_error_reason is not None:
+                if all_tool_result_events:
+                    full_content = build_user_facing_tool_event_answer(
+                        all_tool_result_events,
+                        incomplete=True,
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "runtime_error_tool_evidence"
+                    pending_fallback_delta = full_content
+                else:
+                    if isinstance(stream_error_reason, Exception):
+                        friendly_error = user_friendly_error(stream_error_reason)
+                    else:
+                        friendly_error = "An unexpected error occurred. Please try again."
+                    full_content = friendly_error
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "runtime_error"
+                    pending_fallback_delta = full_content
 
             pre_finalize_full_content = full_content
             final_content = AgentLoop._finalize_response_content(
@@ -7052,7 +7800,11 @@ class AgentLoop:
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
             self._activate_tools_for_request_hints(request_execution_hints)
-            with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+            with (
+                self._serial_tool_calls_for_request_hints(request_execution_hints),
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(),
+            ):
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
                     label="process_with_thinking",
@@ -7091,7 +7843,11 @@ class AgentLoop:
                 )
                 await self._agent.add_message("user", repair_prompt)
                 self._agent.next_step_prompt = repair_prompt
-                with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                with (
+                    self._serial_tool_calls_for_request_hints(request_execution_hints),
+                    bind_request_execution_hints(request_execution_hints),
+                    track_tool_invocations(),
+                ):
                     result = await AgentLoop._run_agent_with_context_overflow_recovery(
                         self,
                         label="process_with_thinking_tool_call_repair",
@@ -7109,6 +7865,62 @@ class AgentLoop:
                         result.metadata.get("thinking")
                         or result.metadata.get("reasoning")
                     )
+
+            tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                _pre_turn_memory_index
+            )
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
+            ):
+                final_content = await self._run_process_repeated_read_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                thinking_content = None
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and has_pending_placeholder_next_command(tool_result_events)
+                and not tool_events_have_user_summary_marker(tool_result_events)
+            ):
+                final_content = await self._run_process_pending_followup_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_with_thinking_pending_followup_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                thinking_content = None
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and latest_tool_event_has_next_command(tool_result_events)
+                and not has_pending_placeholder_next_command(tool_result_events)
+                and not tool_events_have_user_summary_marker(tool_result_events)
+            ):
+                await self._execute_structural_followup_commands_for_process(
+                    tool_result_events,
+                    reason="process_with_thinking_structural_followup",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and tool_events_have_user_summary_marker(tool_result_events)
+            ):
+                final_content = build_user_facing_tool_event_answer(tool_result_events)
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
             final_content = AgentLoop._finalize_response_content(
@@ -7511,16 +8323,25 @@ class AgentLoop:
         """
         _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
+        request_hints = self._build_request_execution_hints(message)
         prompt = (
             "[TURN PRIORITY]: Execute only the newest user request. "
             "Any unfinished plan, stale tool sequence, or previous task assumption is superseded "
             "unless the newest user message explicitly says to continue it.\n"
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            "[HISTORY VERIFICATION]: If the newest request asks what happened earlier, "
+            "mentions previous actions/results, or challenges your prior answer, verify exact "
+            "current-session user/tool facts with search_history(scope='current') before stating "
+            "what happened. If exact evidence is absent, say what is absent instead of filling "
+            "the gap from memory or inference.\n"
             f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
             f"{_EXACT_COMMAND_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{format_current_session_fact_check_context(message)}"
+            f"{format_github_skill_install_context(request_hints)}"
+            f"{format_local_executable_skill_context(request_hints)}"
             f"{format_exact_shell_command_context(message)}"
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
@@ -7534,6 +8355,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        session_recall = self._build_session_recall_context(message)
+        if isinstance(session_recall, str) and session_recall.strip():
+            prompt = f"{session_recall.strip()}\n" + prompt
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -7543,16 +8367,25 @@ class AgentLoop:
         """Build the compact request context block used for thinking runs."""
         _truncated = self._truncate_request_for_prompt(message)
         _ws = self._workspace_posix_path()
+        request_hints = self._build_request_execution_hints(message)
         prompt = (
             "[TURN PRIORITY]: Execute only the newest user request. "
             "Any unfinished plan, stale tool sequence, or previous task assumption is superseded "
             "unless the newest user message explicitly says to continue it.\n"
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            "[HISTORY VERIFICATION]: If the newest request asks what happened earlier, "
+            "mentions previous actions/results, or challenges your prior answer, verify exact "
+            "current-session user/tool facts with search_history(scope='current') before stating "
+            "what happened. If exact evidence is absent, say what is absent instead of filling "
+            "the gap from memory or inference.\n"
             f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
             f"{_EXACT_COMMAND_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{format_current_session_fact_check_context(message)}"
+            f"{format_github_skill_install_context(request_hints)}"
+            f"{format_local_executable_skill_context(request_hints)}"
             f"{format_exact_shell_command_context(message)}"
             f"[WORKSPACE]: {_ws}/\n"
         )
@@ -7576,7 +8409,11 @@ class AgentLoop:
     def _build_request_execution_hints(self, message: str) -> dict[str, Any]:
         """Build request hints from the newest message and current skill catalog."""
         skill_candidates: list[dict[str, Any]] = []
-        for name, _skill_dir, skill_md, is_organized in self._iter_skill_candidates(include_dormant=True):
+        try:
+            candidates = self._iter_skill_candidates(include_dormant=True)
+        except Exception:
+            candidates = []
+        for name, _skill_dir, skill_md, is_organized in candidates:
             fm = self._parse_skill_frontmatter(skill_md)
             skill_candidates.append({
                 "name": name,

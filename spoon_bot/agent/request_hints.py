@@ -8,6 +8,7 @@ catalog without classifying product-specific routes.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 from pathlib import Path
@@ -20,6 +21,11 @@ _EXECUTABLE_SUFFIXES = tuple(
     .replace(";", os.pathsep)
     .split(os.pathsep)
     if suffix
+)
+
+_EXPLICIT_CODE_VALUE_RE = re.compile(
+    r"\b(?:invite|invitation|referral|access)\s+code\s+([A-Za-z0-9_-]{3,80})\b",
+    re.IGNORECASE,
 )
 
 
@@ -53,6 +59,99 @@ def extract_urls_from_text(text: str) -> list[str]:
         seen.add(candidate)
         urls.append(candidate)
     return urls[:12]
+
+
+def extract_explicit_code_values_from_text(text: str) -> list[str]:
+    """Extract user-supplied invite/referral/access code values."""
+    values: list[str] = []
+    seen: set[str] = set()
+    source = str(text or "")
+    for match in _EXPLICIT_CODE_VALUE_RE.finditer(source):
+        value = match.group(1).strip("`'\"<>()[]{}").rstrip(".,;:，。；")
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    for marker in ("邀请码", "邀請碼"):
+        if marker not in source:
+            continue
+        tail = source.split(marker, 1)[1]
+        for raw in tail.replace("：", " ").replace(":", " ").split():
+            value = raw.strip("`'\"<>()[]{}").rstrip(".,;:，。；")
+            if len(value) < 3 or value in seen:
+                continue
+            seen.add(value)
+            values.append(value)
+            break
+    return values[:6]
+
+
+def _extract_github_urls(urls: list[str]) -> list[str]:
+    """Return GitHub repository-like URLs from an explicit URL list."""
+    github_urls: list[str] = []
+    for url in urls:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if parsed.netloc.casefold() not in {"github.com", "www.github.com"}:
+            continue
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if len(parts) < 2:
+            continue
+        github_urls.append(url)
+    return github_urls
+
+
+def _request_mentions_skill_install(message: str) -> bool:
+    """Return True for explicit requests to install/add a skill from a source."""
+    text = str(message or "")
+    lowered = text.casefold()
+    tokens = tokenize_request_matching_text(text)
+    mentions_skill = "skill" in tokens or "skills" in tokens or "技能" in text
+    if not mentions_skill:
+        return False
+
+    install_verbs = {
+        "install",
+        "installed",
+        "setup",
+        "set",
+        "add",
+        "load",
+        "import",
+        "use",
+    }
+    if tokens & install_verbs:
+        return True
+    return any(marker in lowered for marker in ("安装", "装一下", "添加", "导入", "加载", "使用"))
+
+
+def format_github_skill_install_context(hints: dict[str, Any]) -> str:
+    """Format request-scoped guidance for explicit GitHub skill installs."""
+    request = hints.get("github_skill_install_request") if isinstance(hints, dict) else None
+    if not isinstance(request, dict):
+        return ""
+    urls = request.get("urls")
+    if not isinstance(urls, list) or not urls:
+        return ""
+
+    lines = [
+        "[GITHUB SKILL INSTALL CONTEXT]: The newest request explicitly asks to "
+        "install an Agent Skill from a GitHub source. Use the skill management "
+        "toolchain for installation; do not clone directly into workspace/skills. "
+        "Call skill_marketplace(action='install_skill', url='<github_url>') for "
+        "the requested source, then reload skills if the tool result asks for it. "
+        "After installation, read the installed SKILL.md and continue any "
+        "downstream user-requested workflow from that skill contract instead of "
+        "treating installation as the final result. Pass user-supplied invite, "
+        "referral, or access codes only to commands whose SKILL.md form "
+        "documents a code/invite/referral parameter; do not carry those codes "
+        "into unrelated downstream commands.",
+    ]
+    for url in urls[:3]:
+        lines.append(f"- {url}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _split_shell_words(command: str) -> list[str]:
@@ -168,8 +267,23 @@ def _iter_structural_command_candidates(text: str):
             yield candidate, True
 
 
-def extract_exact_shell_commands_from_request(message: str) -> list[str]:
-    """Extract shell commands that the user explicitly wrote in the request."""
+def _iter_embedded_command_candidates(line: str):
+    """Yield colon-delimited suffixes that may contain an executable command."""
+    stripped = " ".join(str(line or "").strip().split())
+    if not stripped:
+        return
+    yield stripped
+    search = stripped
+    while ":" in search:
+        _, _, tail = search.partition(":")
+        candidate = tail.strip()
+        if candidate:
+            yield candidate
+        search = candidate
+
+
+def extract_shell_command_candidates(text: str, *, limit: int = 8) -> list[str]:
+    """Extract shell-like command candidates from free-form text generically."""
     commands: list[str] = []
     seen: set[str] = set()
 
@@ -185,10 +299,22 @@ def extract_exact_shell_commands_from_request(message: str) -> list[str]:
         seen.add(candidate)
         commands.append(candidate)
 
-    for candidate, explicit in _iter_structural_command_candidates(message):
-        if 3 <= len(candidate) <= 300:
+    for candidate, explicit in _iter_structural_command_candidates(text):
+        if 3 <= len(candidate) <= 400:
             _add(candidate, explicit=explicit)
-    return commands[:4]
+        for embedded in _iter_embedded_command_candidates(candidate):
+            if embedded == candidate:
+                continue
+            if 3 <= len(embedded) <= 400:
+                _add(embedded, explicit=True)
+        if len(commands) >= limit:
+            break
+    return commands[:limit]
+
+
+def extract_exact_shell_commands_from_request(message: str) -> list[str]:
+    """Extract shell commands that the user explicitly wrote in the request."""
+    return extract_shell_command_candidates(message, limit=4)
 
 
 def request_restricts_to_exact_shell_commands(
@@ -203,6 +329,105 @@ def request_restricts_to_exact_shell_commands(
         remaining = remaining.replace(command, " ")
     leftovers = tokenize_request_matching_text(remaining)
     return not leftovers
+
+
+def request_needs_current_session_fact_check(message: str) -> bool:
+    """Return True when the user is asking about this conversation's prior actions."""
+    text = str(message or "").casefold()
+    if not text.strip():
+        return False
+
+    tokens = tokenize_request_matching_text(text)
+    has_actor_cue = (
+        "你" in text
+        or bool(tokens & {"you", "assistant", "agent", "bot"})
+    )
+    temporal_or_dispute_cues = (
+        "刚刚",
+        "刚才",
+        "刚",
+        "之前",
+        "前面",
+        "上面",
+        "忘记",
+        "不是",
+        "previous",
+        "earlier",
+        "before",
+        "last turn",
+        "just did",
+        "you said",
+        "forgot",
+        "contradict",
+        "what happened",
+        "what did",
+    )
+    return has_actor_cue and any(cue in text for cue in temporal_or_dispute_cues)
+
+
+def format_current_session_fact_check_context(message: str) -> str:
+    """Format the fact-check boundary for prior-action follow-up requests."""
+    if not request_needs_current_session_fact_check(message):
+        return ""
+    return (
+        "[CURRENT SESSION FACT CHECK REQUIRED]: This request asks about prior "
+        "actions/results in the current conversation. First use "
+        "search_history(scope='current') for exact same-session user/tool facts. "
+        "`search_history` is an active tool in the default tool set; call it "
+        "directly and do not search the filesystem for it. Do not claim it is "
+        "unavailable unless an actual tool call returns that error. "
+        "Do not use long-term memory as a substitute for the session transcript. "
+        "External or live-state tools may be used afterward for current state, "
+        "but they do not prove what happened earlier unless the matching "
+        "tool call/result is found in current-session history.\n"
+    )
+
+
+def format_local_executable_skill_context(hints: dict[str, Any]) -> str:
+    """Format request-scoped guidance for matched local executable skills."""
+    local_skills = hints.get("local_executable_skills") if isinstance(hints, dict) else None
+    if not isinstance(local_skills, list) or not local_skills:
+        return ""
+
+    lines = [
+        "[LOCAL SKILL EXECUTION CONTEXT]: The newest request matches installed "
+        "local skill procedures. Use these as execution contracts, not hidden "
+        "routes. Read the listed SKILL.md before primary commands unless that "
+        "same file is already present in this turn's current context. Prefer "
+        "documented commands from SKILL.md and structural NEXT commands returned "
+        "by tools. If a command is unsupported, recover from the skill docs or "
+        "help output; do not invent neighboring subcommands. Do not turn "
+        "numbers or labels from the user's natural-language request into CLI "
+        "flags or positional arguments unless SKILL.md documents that exact "
+        "parameter shape. If the user mentions a numeric id or label but the "
+        "documented command only exposes a no-argument register/status flow, "
+        "use that documented flow and judge success from the resulting tool "
+        "evidence instead of trying to pass the number as an extra argument. "
+        "Pass user-supplied invite, referral, or access codes "
+        "only to commands whose SKILL.md form documents a code/invite/referral "
+        "parameter. If setup/status evidence already satisfies prerequisites, "
+        "continue to a downstream command matching the request instead of "
+        "repeating setup/status commands.",
+    ]
+    for skill in local_skills[:3]:
+        if not isinstance(skill, dict):
+            continue
+        name = str(skill.get("name") or "local skill")
+        location = str(skill.get("location") or "").strip()
+        commands = skill.get("commands")
+        command_text = ""
+        if isinstance(commands, list) and commands:
+            compact_commands = [
+                " ".join(str(command or "").strip().split())
+                for command in commands[:16]
+                if str(command or "").strip()
+            ]
+            if compact_commands:
+                command_text = "; commands: " + " | ".join(compact_commands)
+        location_text = f" at {location}" if location else ""
+        lines.append(f"- {name}{location_text}{command_text}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def format_exact_shell_command_context(message: str) -> str:
@@ -262,7 +487,20 @@ def extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
     if cli_value:
         _push_command(cli_value)
 
-    for candidate, explicit in _iter_structural_command_candidates(content):
+    command_section: list[str] = []
+    in_commands_section = False
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if re.match(r"^#{1,6}\s+commands\b", stripped, re.IGNORECASE):
+            in_commands_section = True
+            continue
+        if in_commands_section and re.match(r"^#{1,6}\s+\S", stripped):
+            break
+        if in_commands_section:
+            command_section.append(raw_line)
+
+    scan_text = "\n".join(command_section).strip() or content
+    for candidate, explicit in _iter_structural_command_candidates(scan_text):
         stripped = candidate.strip()
         if not stripped:
             continue
@@ -274,7 +512,7 @@ def extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
             _push_command(stripped)
 
     urls = extract_urls_from_text(content)
-    return commands[:8], urls[:12]
+    return commands[:16], urls[:12]
 
 
 def build_request_execution_hints(
@@ -303,7 +541,11 @@ def build_request_execution_hints(
         )
         overlap = len(request_tokens & (name_tokens | desc_tokens))
         direct_name_match = name.casefold() in message_text.casefold()
-        if not direct_name_match and overlap < 2:
+        distinctive_name_match = any(
+            len(token) >= 4 and token in name_tokens
+            for token in request_tokens
+        )
+        if not direct_name_match and overlap < 2 and not distinctive_name_match:
             continue
 
         skill_md = candidate.get("skill_md")
@@ -320,20 +562,45 @@ def build_request_execution_hints(
             "location": skill_rel,
             "commands": commands,
             "urls": urls,
-            "score": (100 if direct_name_match else 0) + overlap,
+            "score": (
+                (100 if direct_name_match else 0)
+                + (25 if distinctive_name_match else 0)
+                + overlap
+            ),
         })
 
     local_executable_skills.sort(
         key=lambda item: int(item.get("score") or 0),
         reverse=True,
     )
+    explicit_urls = extract_urls_from_text(message_text)
+    explicit_code_values = extract_explicit_code_values_from_text(message_text)
+    github_urls = _extract_github_urls(explicit_urls)
+    github_skill_install_request = (
+        {
+            "urls": github_urls,
+            "preferred_tool": "skill_marketplace",
+            "action": "install_skill",
+        }
+        if github_urls and _request_mentions_skill_install(message_text)
+        else None
+    )
     exact_commands = extract_exact_shell_commands_from_request(message_text)
     return {
-        "explicit_request_urls": extract_urls_from_text(message_text),
+        "explicit_request_urls": explicit_urls,
+        "explicit_code_values": explicit_code_values,
         "exact_shell_commands": exact_commands,
         "restrict_to_exact_shell_commands": request_restricts_to_exact_shell_commands(
             message_text,
             exact_commands,
         ),
+        "current_session_fact_check_required": (
+            request_needs_current_session_fact_check(message_text)
+        ),
         "local_executable_skills": local_executable_skills[:3],
+        **(
+            {"github_skill_install_request": github_skill_install_request}
+            if github_skill_install_request
+            else {}
+        ),
     }

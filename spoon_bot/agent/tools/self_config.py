@@ -9,6 +9,10 @@ from typing import Any, Callable
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import (
+    capture_tool_output,
+    current_session_fact_check_blocker,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +433,17 @@ class MemoryManagementTool(Tool):
         content = kwargs.get("content")
         query = kwargs.get("query")
         category = kwargs.get("category", "Facts")
+
+        if action in {"search", "summary"}:
+            fact_check_blocker = current_session_fact_check_blocker()
+            if fact_check_blocker is not None:
+                blocker = (
+                    f"{fact_check_blocker} Long-term memory is not the "
+                    "current-session transcript; do not call memory again for "
+                    "this fact check."
+                )
+                capture_tool_output(blocker, blocker)
+                return blocker
 
         if action == "remember":
             if not content:

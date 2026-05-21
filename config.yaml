@@ -3,7 +3,7 @@
 
 # Agent Configuration
 agent:
-  model: "anthropic/claude-sonnet-4"
+  model: "anthropic/claude-sonnet-4.6"
   provider: "openrouter"
   workspace: "~/.spoon-bot/workspace"
   max_iterations: 20

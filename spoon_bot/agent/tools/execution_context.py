@@ -64,6 +64,11 @@ _REDUNDANT_FILE_READ_MESSAGE = (
     "request. Treat this read as complete and continue the user's remaining "
     "instructions without calling read_file again for the same path and range."
 )
+_REPEATED_REDUNDANT_FILE_READ_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: repeated redundant read_file suppressed. The requested "
+    "file range was already provided earlier in this request; use the previous "
+    "file content and continue with the next non-read action."
+)
 _CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
     "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "
     "has failed repeatedly in this request without producing progress; report "
@@ -292,6 +297,11 @@ def suppress_redundant_file_read(
 
     for existing_start, existing_end, _existing_fingerprint in ranges:
         if int(existing_start) <= start and end <= int(existing_end):
+            redundant_counts = state.setdefault("redundant_file_read_counts", defaultdict(int))
+            redundant_key = f"{normalized_path}\x1f{start}\x1f{end}\x1f{fingerprint}"
+            redundant_counts[redundant_key] += 1
+            if redundant_counts[redundant_key] >= 2:
+                return _REPEATED_REDUNDANT_FILE_READ_MESSAGE
             return _REDUNDANT_FILE_READ_MESSAGE
 
     ranges.append((start, end, fingerprint))
@@ -437,6 +447,28 @@ def get_request_execution_hints() -> dict[str, Any]:
     if isinstance(hints, dict):
         return hints
     return {}
+
+
+def current_session_fact_check_blocker() -> str | None:
+    """Return a blocker when prior-action requests have not searched history yet."""
+    hints = get_request_execution_hints()
+    if not bool(hints.get("current_session_fact_check_required")):
+        return None
+
+    invocation_counts = get_tracked_tool_invocation_counts()
+    if invocation_counts.get("search_history", 0) > 0:
+        return None
+
+    return (
+        "Current-session fact check required: this request asks about prior "
+        "actions/results in the conversation. Call search_history(scope='current') "
+        "first and answer from same-session user/tool facts. If the Current "
+        "Session Compact already shows the relevant facts, answer from that "
+        "compact instead of calling external tools. External or live-state "
+        "tools may be used afterward for current state, but they do not prove "
+        "what happened earlier unless matching current-session tool evidence "
+        "exists."
+    )
 
 
 @contextmanager

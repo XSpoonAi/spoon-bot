@@ -18,7 +18,7 @@ CORE_TOOLS: frozenset[str] = frozenset({
     "shell", "read_file", "write_file", "edit_file", "list_dir", "grep",
     "self_config", "memory", "activate_tool", "self_upgrade", "cron",
     "web_search", "web_fetch", "wallet", "balance_check",
-    "skill_marketplace",
+    "skill_marketplace", "search_history",
 })
 
 AUTOMATION_TOOLS: frozenset[str] = frozenset({
