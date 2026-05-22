@@ -245,30 +245,12 @@ async def test_tool_guard_can_force_serial_calls_for_recovery_on_native_provider
     assert response.metadata["serial_tool_calls_enforced"] is True
 
 
-def test_skill_request_hints_require_serial_tool_calls():
-    assert AgentLoop._request_hints_require_serial_tool_calls(
-        {"github_skill_install_request": {"urls": ["https://github.com/org/repo"]}}
-    )
-    assert AgentLoop._request_hints_require_serial_tool_calls(
-        {"local_executable_skills": [{"name": "spot-agent-cypher"}]}
-    )
-    assert not AgentLoop._request_hints_require_serial_tool_calls({})
+def test_request_hints_do_not_control_tool_protocol():
+    assert not hasattr(AgentLoop, "_request_hints_require_serial_tool_calls")
+    assert not hasattr(AgentLoop, "_serial_tool_calls_for_request_hints")
 
-
-def test_skill_request_serial_context_restores_force_serial_state():
     loop = AgentLoop.__new__(AgentLoop)
-
-    with loop._serial_tool_calls_for_request_hints(
-        {"local_executable_skills": [{"name": "spot-agent-cypher"}]}
-    ):
-        assert loop._force_serial_tool_calls is True
-
     assert not hasattr(loop, "_force_serial_tool_calls")
-
-    loop._force_serial_tool_calls = True
-    with loop._serial_tool_calls_for_request_hints({}):
-        assert loop._force_serial_tool_calls is True
-    assert loop._force_serial_tool_calls is True
 
 
 def test_serial_tool_guard_coerces_tuple_tool_calls():

@@ -7,7 +7,6 @@ from typing import Any
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool, ToolSchema
-from spoon_bot.agent.tools.execution_context import bind_tool_invocation, finalize_tool_invocation
 
 # ---------------------------------------------------------------------------
 # Core tools: the minimal set loaded into the agent by default.
@@ -339,18 +338,15 @@ class ToolRegistry:
                 logger.warning(f"Parameter validation failed for {name}: {error_msg}")
                 return f"Error: Invalid parameters for tool '{name}': {error_msg}"
 
-        with bind_tool_invocation(name, arguments):
-            try:
-                result = await tool.execute(**arguments)
-            except TypeError as e:
-                # Handle missing or extra arguments
-                logger.error(f"Type error executing tool {name}: {e}")
-                result = f"Error: Invalid arguments for tool '{name}': {str(e)}"
-            except Exception as e:
-                logger.error(f"Error executing tool {name}: {e}")
-                result = f"Error executing tool {name}: {str(e)}"
-            finally:
-                finalize_tool_invocation(locals().get("result"))
+        try:
+            result = await tool(**arguments)
+        except TypeError as e:
+            # Handle missing or extra arguments
+            logger.error(f"Type error executing tool {name}: {e}")
+            result = f"Error: Invalid arguments for tool '{name}': {str(e)}"
+        except Exception as e:
+            logger.error(f"Error executing tool {name}: {e}")
+            result = f"Error executing tool {name}: {str(e)}"
         return result
 
     def list_tools(self) -> list[str]:

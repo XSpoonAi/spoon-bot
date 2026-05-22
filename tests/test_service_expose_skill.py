@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import socket
 import subprocess
@@ -259,6 +260,45 @@ def test_service_expose_clears_old_tunnel_log_before_reuse(tmp_path: Path) -> No
 
     assert log_path.read_text(encoding="utf-8") == ""
     assert module._parse_public_url(log_path) is None
+
+
+def test_service_expose_auto_downloads_cloudflared_when_missing(tmp_path: Path, monkeypatch) -> None:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("service_expose_script", SCRIPT)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.delenv("CLOUDFLARED_PATH", raising=False)
+    monkeypatch.setenv("SPOON_BOT_AUTO_INSTALL_CLOUDFLARED", "1")
+    monkeypatch.setattr(module, "_state_root", lambda: tmp_path)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(module.platform, "machine", lambda: "x86_64")
+    requested_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=0):
+        requested_urls.append(req.full_url)
+        return FakeResponse(b"#!/bin/sh\n")
+
+    monkeypatch.setattr(module, "urlopen", fake_urlopen)
+
+    path, error = module._resolve_cloudflared()
+
+    assert error is None
+    assert path == str(tmp_path / "bin" / "cloudflared")
+    assert Path(path).exists()
+    assert requested_urls == [
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    ]
 
 
 def test_service_expose_hides_unverified_public_url(monkeypatch) -> None:

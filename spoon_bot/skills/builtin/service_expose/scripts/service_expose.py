@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -22,6 +23,9 @@ WINDOWS_DETACHED_PROCESS = 0x00000008
 WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
 TRYCLOUDFLARE_RE = re.compile(r"https://[-a-zA-Z0-9]+\.trycloudflare\.com")
+CLOUDFLARED_LATEST_BASE_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/latest/download"
+)
 
 
 def _state_root() -> Path:
@@ -37,8 +41,85 @@ def _logs_dir() -> Path:
     return _state_root() / "logs"
 
 
+def _bin_dir() -> Path:
+    return _state_root() / "bin"
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _cloudflared_asset_name() -> str | None:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    arch = ""
+    if machine in {"x86_64", "amd64"}:
+        arch = "amd64"
+    elif machine in {"aarch64", "arm64"}:
+        arch = "arm64"
+    elif machine.startswith("arm"):
+        arch = "arm"
+    if not arch:
+        return None
+    if system == "linux":
+        return f"cloudflared-linux-{arch}"
+    if system == "darwin":
+        return f"cloudflared-darwin-{arch}.tgz"
+    if system == "windows" and arch == "amd64":
+        return "cloudflared-windows-amd64.exe"
+    return None
+
+
+def _cloudflared_executable_name() -> str:
+    return "cloudflared.exe" if platform.system().lower() == "windows" else "cloudflared"
+
+
+def _download_cloudflared(destination: Path) -> str | None:
+    asset_name = _cloudflared_asset_name()
+    if not asset_name:
+        return f"unsupported platform for automatic cloudflared install: {platform.system()} {platform.machine()}"
+    if asset_name.endswith(".tgz"):
+        return "automatic cloudflared install is not supported for archive assets yet; install cloudflared or set CLOUDFLARED_PATH"
+    url = f"{CLOUDFLARED_LATEST_BASE_URL}/{asset_name}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        req = Request(url, headers={"User-Agent": "spoon-bot-service-expose/1.0"})
+        with urlopen(req, timeout=60) as response, tmp.open("wb") as handle:  # noqa: S310 - official Cloudflare release asset
+            shutil.copyfileobj(response, handle)
+        tmp.replace(destination)
+        if os.name != "nt":
+            destination.chmod(0o755)
+    except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return f"failed to download cloudflared from {url}: {exc}"
+    return None
+
+
+def _resolve_cloudflared() -> tuple[str | None, str | None]:
+    explicit = os.environ.get("CLOUDFLARED_PATH")
+    if explicit:
+        return explicit, None
+    discovered = shutil.which("cloudflared")
+    if discovered:
+        return discovered, None
+    if str(os.environ.get("SPOON_BOT_AUTO_INSTALL_CLOUDFLARED", "1")).strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return None, "cloudflared not found. Install cloudflared, set CLOUDFLARED_PATH, or enable SPOON_BOT_AUTO_INSTALL_CLOUDFLARED."
+    destination = _bin_dir() / _cloudflared_executable_name()
+    if destination.exists():
+        return str(destination), None
+    error = _download_cloudflared(destination)
+    if error:
+        return None, error
+    return str(destination), None
 
 
 def _json_result(payload: dict[str, Any]) -> None:
@@ -407,11 +488,12 @@ def _start_tunnel_for_entry(
     entry: dict[str, Any],
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    cloudflared = os.environ.get("CLOUDFLARED_PATH") or shutil.which("cloudflared")
+    cloudflared, cloudflared_error = _resolve_cloudflared()
     if not cloudflared:
         return {
             "success": False,
-            "error": "cloudflared not found. Install cloudflared or set CLOUDFLARED_PATH.",
+            "error": cloudflared_error
+            or "cloudflared not found. Install cloudflared or set CLOUDFLARED_PATH.",
         }
 
     local_url = _local_url(params, entry)

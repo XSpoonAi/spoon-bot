@@ -51,6 +51,8 @@ class ActivateToolTool(Tool):
     def description(self) -> str:
         return (
             "Dynamically load inactive tools at runtime. "
+            "If a tool is already present in your callable tool list, call it "
+            "directly instead of activating it. "
             "Use action='list' to see all available inactive tools and their "
             "descriptions, then action='activate' with tool_name to load the "
             "ones you need. You can activate multiple tools by calling this "

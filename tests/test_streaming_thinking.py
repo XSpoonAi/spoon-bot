@@ -86,6 +86,22 @@ class TestChatOptionsModel:
         assert restored.reasoning_effort == "high"
 
 
+class TestStreamErrorFallback:
+    def test_provider_error_replaces_pre_tool_preamble_when_tools_ran(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        assert AgentLoop._should_replace_stream_error_preamble(
+            "I'll check",
+            saw_tool_call=True,
+            saw_content_after_tool_call=False,
+        )
+        assert not AgentLoop._should_replace_stream_error_preamble(
+            "Completed from tool evidence.",
+            saw_tool_call=True,
+            saw_content_after_tool_call=True,
+        )
+
+
 class TestStreamChunkModel:
     """Test StreamChunk model."""
 
@@ -1392,8 +1408,8 @@ $CLI stats
         assert "repeating setup/status commands" in context
         assert "use that documented flow" in context
 
-    def test_request_execution_hints_mark_explicit_github_skill_install(self, tmp_path):
-        """Explicit GitHub skill installs should get a generic toolchain hint."""
+    def test_request_execution_hints_keep_github_urls_as_plain_evidence(self, tmp_path):
+        """Explicit GitHub URLs stay evidence, not request-routed workflows."""
         from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_path / "workspace"
@@ -1411,17 +1427,14 @@ $CLI stats
 
         hints = AgentLoop._build_request_execution_hints(loop, message)
 
-        assert hints["github_skill_install_request"] == {
-            "urls": ["https://github.com/example-org/example-skill"],
-            "preferred_tool": "skill_marketplace",
-            "action": "install_skill",
-            "install_only": True,
-        }
         assert hints["explicit_request_urls"] == ["https://github.com/example-org/example-skill"]
         assert hints["local_executable_skills"] == []
+        assert "github_skill_install_request" not in hints
+        assert "execution_workflows" not in hints
+        assert "tool_call_mode" not in hints
 
-    def test_exact_spot_prompt_marks_github_skill_install_without_rewriting_prompt(self, tmp_path):
-        """The user-provided SPOT prompt should route install via the skill toolchain."""
+    def test_exact_spot_prompt_keeps_original_request_data_without_route(self, tmp_path):
+        """The SPOT prompt keeps explicit facts without rewriting or route policy."""
         from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_path / "workspace"
@@ -1441,16 +1454,13 @@ $CLI stats
 
         hints = AgentLoop._build_request_execution_hints(loop, message)
 
-        assert hints["github_skill_install_request"] == {
-            "urls": ["https://github.com/Agent-Cypher-Lab/agent-spot-cypher"],
-            "preferred_tool": "skill_marketplace",
-            "action": "install_skill",
-            "install_only": False,
-        }
         assert hints["explicit_request_urls"] == [
             "https://github.com/Agent-Cypher-Lab/agent-spot-cypher"
         ]
         assert hints["explicit_code_values"] == ["3KK57S"]
+        assert "github_skill_install_request" not in hints
+        assert "execution_workflows" not in hints
+        assert "tool_call_mode" not in hints
         assert message.endswith("use this invite code 3KK57S")
 
     def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
@@ -1549,11 +1559,16 @@ $CLI stats
         assert "[STRUCTURAL FOLLOW-UP COMMANDS]" in prompt
         assert "node skills/example-skill/cli/index.js run" in prompt
         assert "do not copy long 0x values" in prompt
+        assert "do not shorten a documented command hierarchy" in prompt
         assert "Do not append optional follow-up questions" in prompt
         assert "does not prove downstream requested actions are complete" in prompt
         assert "Do not infer extra flags or arguments" in prompt
         assert "do not carry those codes into unrelated" in prompt
+        assert "missing optional code as skippable" in prompt
+        assert "running the documented no-code path" in prompt
         assert "nonzero GAS/GLD balances and an AgentID value other than none" in prompt
+        assert "only asked to install" in prompt
+        assert "unless the latest user request also asks to use the skill" in prompt
 
     def test_skill_read_summary_remains_model_visible(self):
         """SKILL.md execution summaries should help recovery without leaking to clients."""

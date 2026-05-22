@@ -109,6 +109,25 @@ class TestShellTool:
             }
         ) is None
 
+    def test_shell_loads_workspace_env_for_skill_commands(self, tmp_path):
+        """Installed skill CLIs should receive workspace .env.local automatically."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        (workspace / ".env.local").write_text("AGENT_ID=8004\n", encoding="utf-8")
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        command = "node skills/demo-skill/cli/index.js wallet"
+        result = shell_tool._prepend_workspace_env_for_skill_command(
+            command,
+            str(workspace),
+        )
+
+        assert result.startswith("set -a; . ")
+        assert ".env.local" in result
+        assert result.endswith(command)
+
     def test_shell_formats_idempotent_conflict_as_state(self, shell_tool):
         """HTTP 409 already-state output should not look like a failed command."""
         result = shell_tool._build_output_result(
@@ -512,6 +531,31 @@ class TestShellTool:
         assert "job_id: sh_polljob" in first
         assert "job_id: sh_polljob" in second
         assert "STOP_TOOL_LOOP" not in second
+
+    @pytest.mark.asyncio
+    async def test_refresh_completed_job_does_not_hang_on_open_child_pipes(self, shell_tool):
+        """Detached child processes should not keep a completed shell call open forever."""
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob
+
+        class _CompletedProcess:
+            returncode = 0
+
+        job = _BackgroundShellJob(
+            job_id="sh_orphanpipe",
+            command="node server.js &",
+            cwd=os.getcwd(),
+            process=_CompletedProcess(),
+            stdout_task=asyncio.create_task(asyncio.sleep(60)),
+            stderr_task=asyncio.create_task(asyncio.sleep(60)),
+            buffer_limit=1000,
+        )
+
+        refreshed = await shell_tool._refresh_background_job(job)
+
+        assert refreshed.status == "completed"
+        assert refreshed.returncode == 0
+        assert job.stdout_task.cancelled()
+        assert job.stderr_task.cancelled()
 
     def test_shell_stops_after_exact_requested_command_failure(self, shell_tool):
         """Exact user-requested shell commands should fail fast without extra tool detours."""
@@ -1443,6 +1487,42 @@ class TestFilesystemTools:
             result = await tool.execute(path="/etc/passwd")
             assert "Security Error" in result or "outside" in result.lower()
 
+    def test_workspace_under_blocklisted_parent_can_read_workspace_files(self, tmp_path):
+        """A Linux workspace under /root should not block its own skill files."""
+        from pathlib import PurePosixPath
+
+        from spoon_bot.agent.tools.path_validator import PathValidator
+
+        validator = PathValidator(workspace=tmp_path)
+        validator._is_windows = False
+        validator._workspace = PurePosixPath("/root/.spoon-bot/workspace")
+        validator._blocklist = {"/root", "/.ssh"}
+
+        blocked, reason = validator._is_blocked_path(
+            PurePosixPath("/root/.spoon-bot/workspace/skills/demo/SKILL.md")
+        )
+
+        assert blocked is False
+        assert reason is None
+
+    def test_sensitive_child_path_inside_root_workspace_stays_blocked(self, tmp_path):
+        """Only the workspace parent prefix is exempted, not sensitive children."""
+        from pathlib import PurePosixPath
+
+        from spoon_bot.agent.tools.path_validator import PathValidator
+
+        validator = PathValidator(workspace=tmp_path)
+        validator._is_windows = False
+        validator._workspace = PurePosixPath("/root/.spoon-bot/workspace")
+        validator._blocklist = {"/root", "/.ssh"}
+
+        blocked, reason = validator._is_blocked_path(
+            PurePosixPath("/root/.spoon-bot/workspace/.ssh/id_rsa")
+        )
+
+        assert blocked is True
+        assert "/.ssh" in (reason or "")
+
 
 class TestToolRegistry:
     """Tests for the ToolRegistry."""
@@ -1457,20 +1537,30 @@ class TestToolRegistry:
     @pytest.fixture
     def mock_tool(self):
         """Create a mock tool."""
-        tool = MagicMock()
+        class MockTool:
+            name = "test_tool"
+            description = "A test tool"
+            parameters = {"type": "object", "properties": {}}
+
+            def __init__(self) -> None:
+                self.execute = AsyncMock(return_value="test result")
+                self.validate_parameters = MagicMock(return_value=[])
+                self.to_schema = MagicMock(return_value={
+                    "type": "function",
+                    "function": {
+                        "name": "test_tool",
+                        "description": "A test tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                })
+
+            async def __call__(self, **kwargs):
+                return await self.execute(**kwargs)
+
+        tool = MockTool()
         tool.name = "test_tool"
         tool.description = "A test tool"
         tool.parameters = {"type": "object", "properties": {}}
-        tool.execute = AsyncMock(return_value="test result")
-        tool.validate_parameters = MagicMock(return_value=[])  # No validation errors
-        tool.to_schema.return_value = {
-            "type": "function",
-            "function": {
-                "name": "test_tool",
-                "description": "A test tool",
-                "parameters": {"type": "object", "properties": {}},
-            }
-        }
         return tool
 
     def test_register_tool(self, registry, mock_tool):
@@ -1509,7 +1599,49 @@ class TestToolRegistry:
         registry.register(mock_tool)
         result = await registry.execute("test_tool", {"arg": "value"})
         assert result == "test result"
-        mock_tool.execute.assert_called_once_with(arg="value")
+        mock_tool.execute.assert_awaited_once_with(arg="value")
+
+    @pytest.mark.asyncio
+    async def test_execute_uses_base_tool_invocation_guardrails(self, registry):
+        """Registry execution should share Tool.__call__ loop guardrails."""
+        from typing import Any
+
+        from spoon_bot.agent.tools.base import Tool
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+
+        class CountingTool(Tool):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            @property
+            def name(self) -> str:
+                return "counting"
+
+            @property
+            def description(self) -> str:
+                return "Count executions"
+
+            @property
+            def parameters(self) -> dict[str, Any]:
+                return {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                }
+
+            async def execute(self, **kwargs: Any) -> str:
+                self.calls += 1
+                return f"call-{self.calls}"
+
+        tool = CountingTool()
+        registry.register(tool)
+
+        with track_tool_invocations(max_repeats=1):
+            first = await registry.execute("counting", {"value": "same"})
+            second = await registry.execute("counting", {"value": "same"})
+
+        assert first == "call-1"
+        assert "STOP_TOOL_LOOP" in second
+        assert tool.calls == 1
 
     @pytest.mark.asyncio
     async def test_execute_unknown_tool(self, registry):

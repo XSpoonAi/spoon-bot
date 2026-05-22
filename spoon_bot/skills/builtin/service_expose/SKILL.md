@@ -77,7 +77,7 @@ Prefer `service_expose` over one-off shell backgrounding for preview services be
 
 ## Rules
 
-Use `replace=true` only when the user wants to restart/replace the existing named service. Quick Tunnels require `cloudflared` in `PATH` or `CLOUDFLARED_PATH`.
+Use `replace=true` only when the user wants to restart/replace the existing named service. Quick Tunnels use `cloudflared` from `CLOUDFLARED_PATH` or `PATH`; when it is missing on Linux/Windows, this skill can download the official latest Cloudflare binary into `~/.spoon-bot/service-expose/bin` unless `SPOON_BOT_AUTO_INSTALL_CLOUDFLARED=0`.
 
 When creating a new preview service, pick a free port. Passing `port=0` asks this skill to choose an available port and inject it as `PORT` for the service command. Do not report a link until the local URL returns app-specific content. If a port is occupied, update the app command/config to use a free port and restart; do not treat an unrelated HTTP 200 on that port as success.
 

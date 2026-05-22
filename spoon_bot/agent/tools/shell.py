@@ -794,6 +794,20 @@ class ShellTool(Tool):
 
         return os.path.abspath(os.path.expanduser(cwd))
 
+    def _prepend_workspace_env_for_skill_command(self, command: str, cwd: str) -> str:
+        """Load workspace-local env only for installed skill CLI commands."""
+        if ".env.local" in command:
+            return command
+        try:
+            workspace_root = Path(self.working_dir or cwd).expanduser().resolve()
+            env_file = workspace_root / ".env.local"
+        except Exception:
+            return command
+        if not env_file.is_file():
+            return command
+        quoted_env = shlex.quote(str(env_file))
+        return f"set -a; . {quoted_env}; set +a; {command}"
+
     def _run_sync(
         self,
         command: str,
@@ -1276,7 +1290,21 @@ class ShellTool(Tool):
             job.status = "completed" if job.returncode == 0 else "failed"
             job.finished_at = time.time()
         if returncode is not None:
-            await asyncio.gather(job.stdout_task, job.stderr_task, return_exceptions=True)
+            stream_tasks = [job.stdout_task, job.stderr_task]
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*stream_tasks, return_exceptions=True),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                # A command like `node server.js &` can let the shell exit while
+                # a child process keeps stdout/stderr pipes open. The shell
+                # command has already reached a terminal status, so do not let
+                # orphaned pipe readers block the tool result forever.
+                for task in stream_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*stream_tasks, return_exceptions=True)
         return job
 
     @staticmethod
@@ -1498,7 +1526,8 @@ class ShellTool(Tool):
         if not os.path.isdir(cwd):
             return f"Error: Working directory not found: {cwd}"
 
-        if self._command_invokes_workspace_skill(command, cwd):
+        invokes_workspace_skill = self._command_invokes_workspace_skill(command, cwd)
+        if invokes_workspace_skill:
             effective_timeout = max(effective_timeout, self.timeout)
 
         skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
@@ -1520,9 +1549,19 @@ class ShellTool(Tool):
             safe_cmd = self.validator.sanitize_for_display(command)
             return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
 
+        execution_command = (
+            self._prepend_workspace_env_for_skill_command(command, cwd)
+            if invokes_workspace_skill
+            else command
+        )
+
         try:
             owner_key = get_tool_owner()
-            job = await self._start_background_job(command, cwd, owner_key=owner_key)
+            job = await self._start_background_job(
+                execution_command,
+                cwd,
+                owner_key=owner_key,
+            )
             try:
                 await asyncio.wait_for(self._wait_for_process(job.process), timeout=effective_timeout)
                 await self._refresh_background_job(job)

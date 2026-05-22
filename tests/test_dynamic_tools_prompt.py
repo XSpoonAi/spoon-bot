@@ -258,36 +258,42 @@ class TestToolProfileSkillManagement:
         assert "neighboring subcommands" in context
         assert "Agent-Cypher-Lab" not in context
 
-    def test_github_skill_install_context_points_to_skill_manager(self):
-        from spoon_bot.agent.request_hints import (
-            build_request_execution_hints,
-            format_github_skill_install_context,
-        )
+    def test_github_skill_install_is_not_request_routed(self):
+        from spoon_bot.agent.request_hints import build_request_execution_hints
 
         hints = build_request_execution_hints(
             "https://github.com/example-org/example-skill install the skill in this repo",
             [],
         )
-        context = format_github_skill_install_context(hints)
 
-        assert hints["github_skill_install_request"]["urls"] == [
+        assert hints["explicit_request_urls"] == [
             "https://github.com/example-org/example-skill"
         ]
-        assert "skill_marketplace(action='install_skill'" in context
-        assert "do not clone directly into workspace/skills" in context
-        assert "example-org/example-skill" in context
+        assert "github_skill_install_request" not in hints
+        assert "execution_workflows" not in hints
+        assert "tool_call_mode" not in hints
 
-    def test_request_scoped_activation_hook_has_no_prompt_route(self):
+    def test_agent_loop_has_no_request_scoped_activation_hook(self):
         from spoon_bot.agent.loop import AgentLoop
 
-        loop = AgentLoop.__new__(AgentLoop)
+        assert not hasattr(AgentLoop, "_activate_tools_for_request_hints")
 
-        activated = AgentLoop._activate_tools_for_request_hints(
-            loop,
-            {"arbitrary": "hint"},
-        )
+    def test_dynamic_tool_prompt_exposes_catalog_without_request_route(self):
+        from spoon_bot.agent.loop import AgentLoop
 
-        assert activated == []
+        class FakeTool:
+            name = "service_expose"
+            description = (
+                "Start local frontend/backend services and expose public "
+                "preview links through Cloudflare tunnels."
+            )
+
+        prompt = AgentLoop._build_dynamic_tools_prompt({"service_expose": FakeTool()})
+
+        assert "`service_expose`" in prompt
+        assert "Cloudflare tunnels" in prompt
+        assert "there is no hidden prompt router" in prompt
+        assert "hand-rolled shell workflows" in prompt
 
 
 # ---------------------------------------------------------------------------

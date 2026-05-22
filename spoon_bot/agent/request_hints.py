@@ -8,7 +8,6 @@ catalog without classifying product-specific routes.
 from __future__ import annotations
 
 import os
-import re
 import shlex
 import shutil
 from pathlib import Path
@@ -21,11 +20,6 @@ _EXECUTABLE_SUFFIXES = tuple(
     .replace(";", os.pathsep)
     .split(os.pathsep)
     if suffix
-)
-
-_EXPLICIT_CODE_VALUE_RE = re.compile(
-    r"\b(?:invite|invitation|referral|access)\s+code\s+([A-Za-z0-9_-]{3,80})\b",
-    re.IGNORECASE,
 )
 
 
@@ -61,137 +55,42 @@ def extract_urls_from_text(text: str) -> list[str]:
     return urls[:12]
 
 
+def _clean_extracted_value(value: str) -> str:
+    return str(value or "").strip("`'\"<>()[]{}").rstrip(".,;:，。；")
+
+
+def _looks_like_user_supplied_code(value: str) -> bool:
+    if not 3 <= len(value) <= 80:
+        return False
+    return all(char.isalnum() or char in {"_", "-"} for char in value)
+
+
 def extract_explicit_code_values_from_text(text: str) -> list[str]:
     """Extract user-supplied invite/referral/access code values."""
     values: list[str] = []
     seen: set[str] = set()
     source = str(text or "")
-    for match in _EXPLICIT_CODE_VALUE_RE.finditer(source):
-        value = match.group(1).strip("`'\"<>()[]{}").rstrip(".,;:，。；")
-        if not value or value in seen:
+    normalized = source
+    for separator in (":", "：", "=", "\n", "\t", ",", "，", ";", "；"):
+        normalized = normalized.replace(separator, " ")
+    words = [_clean_extracted_value(word) for word in normalized.split()]
+    code_nouns = {"code", "邀请码", "邀請碼"}
+    code_qualifiers = {"invite", "invitation", "referral", "access"}
+    for index, word in enumerate(words):
+        lowered = word.casefold()
+        previous = words[index - 1].casefold() if index else ""
+        if lowered not in code_nouns and word not in code_nouns:
+            continue
+        if word not in {"邀请码", "邀請碼"} and previous not in code_qualifiers:
+            continue
+        if index + 1 >= len(words):
+            continue
+        value = _clean_extracted_value(words[index + 1])
+        if not _looks_like_user_supplied_code(value) or value in seen:
             continue
         seen.add(value)
         values.append(value)
-    for marker in ("邀请码", "邀請碼"):
-        if marker not in source:
-            continue
-        tail = source.split(marker, 1)[1]
-        for raw in tail.replace("：", " ").replace(":", " ").split():
-            value = raw.strip("`'\"<>()[]{}").rstrip(".,;:，。；")
-            if len(value) < 3 or value in seen:
-                continue
-            seen.add(value)
-            values.append(value)
-            break
     return values[:6]
-
-
-def _extract_github_urls(urls: list[str]) -> list[str]:
-    """Return GitHub repository-like URLs from an explicit URL list."""
-    github_urls: list[str] = []
-    for url in urls:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
-            continue
-        if parsed.netloc.casefold() not in {"github.com", "www.github.com"}:
-            continue
-        parts = [part for part in parsed.path.strip("/").split("/") if part]
-        if len(parts) < 2:
-            continue
-        github_urls.append(url)
-    return github_urls
-
-
-def _request_mentions_skill_install(message: str) -> bool:
-    """Return True for explicit requests to install/add a skill from a source."""
-    text = str(message or "")
-    lowered = text.casefold()
-    tokens = tokenize_request_matching_text(text)
-    mentions_skill = "skill" in tokens or "skills" in tokens or "技能" in text
-    if not mentions_skill:
-        return False
-
-    install_verbs = {
-        "install",
-        "installed",
-        "setup",
-        "set",
-        "add",
-        "load",
-        "import",
-        "use",
-    }
-    if tokens & install_verbs:
-        return True
-    return any(marker in lowered for marker in ("安装", "装一下", "添加", "导入", "加载", "使用"))
-
-
-def _request_is_skill_install_only(message: str) -> bool:
-    """Return True when the request stops at installing a skill."""
-    text = str(message or "")
-    if not _request_mentions_skill_install(text):
-        return False
-    tokens = tokenize_request_matching_text(
-        " ".join(
-            part
-            for part in text.replace("\n", " ").split()
-            if not part.startswith(("http://", "https://"))
-        )
-    )
-    downstream_action_tokens = {
-        "use",
-        "run",
-        "execute",
-        "call",
-        "start",
-        "launch",
-        "build",
-        "create",
-        "serve",
-        "expose",
-        "deploy",
-        "test",
-        "play",
-        "continue",
-        "complete",
-        "register",
-        "join",
-        "open",
-        "fetch",
-        "inspect",
-        "analyze",
-    }
-    if tokens & downstream_action_tokens:
-        return False
-    return not any(marker in text.casefold() for marker in ("然后", "接着", "并且", "and then", "then "))
-
-
-def format_github_skill_install_context(hints: dict[str, Any]) -> str:
-    """Format request-scoped guidance for explicit GitHub skill installs."""
-    request = hints.get("github_skill_install_request") if isinstance(hints, dict) else None
-    if not isinstance(request, dict):
-        return ""
-    urls = request.get("urls")
-    if not isinstance(urls, list) or not urls:
-        return ""
-
-    lines = [
-        "[GITHUB SKILL INSTALL CONTEXT]: The newest request explicitly asks to "
-        "install an Agent Skill from a GitHub source. Use the skill management "
-        "toolchain for installation; do not clone directly into workspace/skills. "
-        "Call skill_marketplace(action='install_skill', url='<github_url>') for "
-        "the requested source, then reload skills if the tool result asks for it. "
-        "After installation, read the installed SKILL.md and continue any "
-        "downstream user-requested workflow from that skill contract instead of "
-        "treating installation as the final result. Pass user-supplied invite, "
-        "referral, or access codes only to commands whose SKILL.md form "
-        "documents a code/invite/referral parameter; do not carry those codes "
-        "into unrelated downstream commands.",
-    ]
-    for url in urls[:3]:
-        lines.append(f"- {url}")
-    lines.append("")
-    return "\n".join(lines)
 
 
 def _split_shell_words(command: str) -> list[str]:
@@ -527,14 +426,26 @@ def extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
     if cli_value:
         _push_command(cli_value)
 
+    def _markdown_heading_text(line: str) -> str | None:
+        stripped_line = line.strip()
+        level = 0
+        while level < len(stripped_line) and stripped_line[level] == "#":
+            level += 1
+        if not 1 <= level <= 6:
+            return None
+        if level >= len(stripped_line) or stripped_line[level] not in {" ", "\t"}:
+            return None
+        return stripped_line[level:].strip()
+
     command_section: list[str] = []
     in_commands_section = False
     for raw_line in content.splitlines():
         stripped = raw_line.strip()
-        if re.match(r"^#{1,6}\s+commands\b", stripped, re.IGNORECASE):
+        heading = _markdown_heading_text(stripped)
+        if heading and heading.casefold().split()[:1] == ["commands"]:
             in_commands_section = True
             continue
-        if in_commands_section and re.match(r"^#{1,6}\s+\S", stripped):
+        if in_commands_section and heading:
             break
         if in_commands_section:
             command_section.append(raw_line)
@@ -615,17 +526,6 @@ def build_request_execution_hints(
     )
     explicit_urls = extract_urls_from_text(message_text)
     explicit_code_values = extract_explicit_code_values_from_text(message_text)
-    github_urls = _extract_github_urls(explicit_urls)
-    github_skill_install_request = (
-        {
-                "urls": github_urls,
-                "preferred_tool": "skill_marketplace",
-                "action": "install_skill",
-                "install_only": _request_is_skill_install_only(message_text),
-            }
-        if github_urls and _request_mentions_skill_install(message_text)
-        else None
-    )
     exact_commands = extract_exact_shell_commands_from_request(message_text)
     return {
         "explicit_request_urls": explicit_urls,
@@ -639,9 +539,4 @@ def build_request_execution_hints(
             request_needs_current_session_fact_check(message_text)
         ),
         "local_executable_skills": local_executable_skills[:3],
-        **(
-            {"github_skill_install_request": github_skill_install_request}
-            if github_skill_install_request
-            else {}
-        ),
     }

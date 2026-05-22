@@ -25,6 +25,20 @@ from spoon_bot.agent.loop import AgentLoop
 
 # -- helpers --
 
+class _FakeLLMManager:
+    def __init__(self):
+        self.default_provider = "openai"
+        self.fallback_chain = ["openai", "openrouter"]
+
+    def set_fallback_chain(self, providers):
+        self.fallback_chain = list(providers)
+
+
+class _FakeChatBot:
+    def __init__(self):
+        self.llm_manager = _FakeLLMManager()
+
+
 def _make_mock_tool(name: str, description: str) -> MagicMock:
     tool = MagicMock()
     tool.name = name
@@ -37,6 +51,24 @@ def _inactive_tools_from_names(nd: dict[str, str]) -> dict[str, MagicMock]:
 
 
 class TestBuildDynamicToolsPrompt:
+
+    def test_align_chatbot_manager_provider_pins_internal_fallback(self, monkeypatch):
+        monkeypatch.delenv("LLM_FALLBACK_CHAIN", raising=False)
+        chatbot = _FakeChatBot()
+
+        AgentLoop._align_chatbot_manager_provider(chatbot, "openrouter")
+
+        assert chatbot.llm_manager.default_provider == "openrouter"
+        assert chatbot.llm_manager.fallback_chain == ["openrouter"]
+
+    def test_align_chatbot_manager_provider_preserves_explicit_fallback_chain(self, monkeypatch):
+        monkeypatch.setenv("LLM_FALLBACK_CHAIN", "openrouter,gemini")
+        chatbot = _FakeChatBot()
+
+        AgentLoop._align_chatbot_manager_provider(chatbot, "openrouter")
+
+        assert chatbot.llm_manager.default_provider == "openrouter"
+        assert chatbot.llm_manager.fallback_chain == ["openai", "openrouter"]
 
     def test_header_present(self):
         inactive = _inactive_tools_from_names({"some_tool": "Does something"})
