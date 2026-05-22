@@ -4,6 +4,7 @@ description: Run user-created frontend or backend services in the background and
 version: 1.0.0
 author: XSpoon Team
 tags: [service, frontend, backend, cloudflare, tunnel, background]
+default_active: true
 triggers:
   - type: keyword
     keywords: [background service, run service, expose service, cloudflare tunnel, trycloudflare, frontend preview, backend preview, websocket, public link]

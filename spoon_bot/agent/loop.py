@@ -102,15 +102,13 @@ from spoon_bot.agent.request_hints import (
     build_request_execution_hints,
     format_exact_shell_command_context,
     format_current_session_fact_check_context,
+    format_explicit_request_values_context,
 )
 from spoon_bot.agent.turn_verifiers import (
-    DEFAULT_SKILL_CONTRACT_CHECK_LIMIT,
-    build_skill_contract_check_prompt,
     build_user_facing_tool_event_answer,
     build_user_facing_tool_evidence_answer,
     extract_resolved_tool_next_commands,
     has_pending_placeholder_next_command,
-    is_skill_contract_check_pass,
     latest_tool_event_has_next_command,
     should_run_skill_contract_check,
     tool_events_have_user_summary_marker,
@@ -858,10 +856,6 @@ class AgentLoop:
                 "Before running skill-provided primary commands, complete any "
                 "Setup, Prerequisites, Install, or dependency steps declared in "
                 "the skill. "
-                "Skill instructions to ask for invite, referral, access, or "
-                "bonus codes are optional input collection, not blockers, when "
-                "the latest user request already asks you to proceed with "
-                "setup, faucet, run, or gameplay. "
                 "If the skill tells you to decide autonomously or not ask the user, "
                 "continue with the skill flow instead of asking for input. Otherwise "
                 "use the normal tools.\n"
@@ -874,9 +868,8 @@ class AgentLoop:
             "2. If an installed skill or dynamically loadable tool is directly relevant, "
             "prefer the most specific available tool for that workflow. If the skill has "
             "no tool, `read_file` its SKILL.md path, then execute its procedure exactly, "
-            "including its rules about when to decide autonomously. Do not let "
-            "optional invite/referral/access/bonus-code questions block a user-requested "
-            "setup, faucet, run, or gameplay flow. Complete any Setup, Prerequisites, Install, or dependency "
+            "including its rules about when to ask the user and when to decide "
+            "autonomously. Complete any Setup, Prerequisites, Install, or dependency "
             "steps before primary commands. When a skill defines conditional setup "
             "checks, run the check first and perform setup actions only when the "
             "documented condition is met. Do not read optional reference files unless "
@@ -888,20 +881,9 @@ class AgentLoop:
             "Only summarize if the user explicitly asked for a summary.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
-            "- Do not call memory summary/search during ordinary task execution "
-            "unless the newest user request asks about memory, notes, or prior "
-            "conversation facts. Relevant memory context is already injected.\n"
             "- Memory, recent replies, and conversation history are stale hints. "
             "For current workspace, skill, account, balance, job, or external-system state, "
             "verify with tools before answering.\n"
-            "- For installed skill CLI commands, the shell tool loads workspace "
-            "`.env.local` automatically when present. For other commands that "
-            "need env vars, use the POSIX form `. ./.env.local` rather than "
-            "shell-specific `source`.\n"
-            "- Treat invite/referral/access bonus codes as optional unless the "
-            "latest user request explicitly requires one. If the user already "
-            "asked to proceed with a faucet, setup, or installation flow, do not "
-            "stop just to ask for an optional bonus code.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
             "- If `write_file` reports an existing file and the task requires a "
             "generated whole-file replacement, retry that same write with "
@@ -910,15 +892,6 @@ class AgentLoop:
             "continuous workflow, set a timeout long enough for the command to reach "
             "its documented terminal state. If a command is moved to the background, "
             "monitor that job to completion before issuing related commands.\n"
-            "- Do not append shell background operators such as `&` to start local "
-            "services. Run the service command in the foreground with a bounded "
-            "timeout so the shell tool can return a managed job_id, then verify it "
-            "with job_status/job_output or service-specific probes.\n"
-            "- For user-created background services or preview links, do not infer success "
-            "from EADDRINUSE or an arbitrary HTTP 200. Probe or choose a free "
-            "localhost port for generated preview services, pass that port through "
-            "the service's documented env/config when possible, and verify "
-            "app-specific content before reporting a URL.\n"
             "- Follow user instructions exactly - respect specific IDs, names, actions.\n"
             "- Use web search when the task needs live external facts or installed skills/tools are insufficient.\n"
         )
@@ -1238,6 +1211,8 @@ class AgentLoop:
                             bridge = SkillToolBridge(base_tool)
                             self.tools.register(bridge)
                             self._skill_tool_names.add(base_tool.name)
+                            if self._skill_tool_default_active(skill_dir):
+                                self.tools.activate_tool(base_tool.name)
                 except Exception as exc:
                     logger.debug(f"Skill tools from {skill_dir.name}: {exc}")
 
@@ -1246,6 +1221,28 @@ class AgentLoop:
                 f"Registered {len(self._skill_tool_names)} skill tool(s): "
                 f"{sorted(self._skill_tool_names)}"
             )
+
+    @staticmethod
+    def _skill_tool_default_active(skill_dir: Path) -> bool:
+        """Return whether a skill asks its tool wrapper to be active by default."""
+        skill_md = skill_dir / "SKILL.md"
+        try:
+            lines = skill_md.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return False
+        if not lines or lines[0].strip() != "---":
+            return False
+        for raw_line in lines[1:80]:
+            line = raw_line.strip()
+            if line == "---":
+                return False
+            if ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            if key.strip().casefold() != "default_active":
+                continue
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return False
 
     async def _init_mcp_tools(self) -> None:
         """Discover and create MCP tools from ``self._mcp_config``.
@@ -5916,14 +5913,13 @@ class AgentLoop:
             executed.add(normalized)
 
             shell_command = normalized
-            if not normalized.casefold().startswith(("cd ", "source ", ". ")):
-                shell_command = f"cd {workspace} && {normalized}"
 
             try:
                 result = await self.tools.execute(
                     "shell",
                     {
                         "command": shell_command,
+                        "working_dir": workspace,
                         "timeout": max(
                             120,
                             int(getattr(self, "shell_timeout", 120) or 120),
@@ -6099,7 +6095,6 @@ class AgentLoop:
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
         tool_loop_fallback_active = False
-        skill_contract_check_attempts = 0
         initial_content_passthrough_started = False
         stream_error_reason: BaseException | str | None = None
 
@@ -6330,14 +6325,6 @@ class AgentLoop:
                     or DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT
                 ),
             )
-            skill_contract_check_limit = max(
-                1,
-                AgentLoop._int_env(
-                    "SPOON_BOT_SKILL_CONTRACT_CHECK_LIMIT",
-                    DEFAULT_SKILL_CONTRACT_CHECK_LIMIT,
-                ),
-            )
-
             def _record_tool_result_events(events: list[dict[str, Any]]) -> None:
                 nonlocal last_tool_progress_at, last_tool_progress_kind, stream_tool_result_count
                 if not events:
@@ -6727,13 +6714,11 @@ class AgentLoop:
 
                 workspace = self._workspace_posix_path()
                 shell_command = normalized_command
-                lowered = shell_command.strip().casefold()
-                if not lowered.startswith(("cd ", "source ", ". ")):
-                    shell_command = f"cd {workspace} && source .env.local && {normalized_command} 2>&1"
 
                 tool_call_id = f"internal_next_{uuid.uuid4().hex[:12]}"
                 arguments = {
                     "command": shell_command,
+                    "working_dir": workspace,
                     "timeout": max(120, int(getattr(self, "shell_timeout", 120) or 120)),
                 }
                 tool_call_arguments_by_id[tool_call_id] = AgentLoop._tool_call_arguments_key(
@@ -7440,108 +7425,6 @@ class AgentLoop:
                 pending_fallback_content_emit = True
                 pending_fallback_reason = "pending_followup_recovery"
                 pending_fallback_delta = repair_text
-
-            while (
-                full_content.strip()
-                and stream_error_reason is None
-                and should_run_skill_contract_check(
-                    all_tool_result_events,
-                )
-                and skill_contract_check_attempts < skill_contract_check_limit
-            ):
-                logger.warning(
-                    "Final stream content followed workspace skill activity; running "
-                    f"generic skill contract verifier pass "
-                    f"{skill_contract_check_attempts + 1}/"
-                    f"{skill_contract_check_limit}."
-                )
-                skill_contract_check_attempts += 1
-                tool_result_count_before_check = len(all_tool_result_events)
-                repair_prompt = build_skill_contract_check_prompt(
-                    authoritative_message,
-                    full_content,
-                    all_tool_result_events,
-                )
-                previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
-                self._force_serial_tool_calls = True
-                try:
-                    repair_text, repair_events = await _run_pseudo_tool_call_repair(
-                        full_content,
-                        repair_prompt_override=repair_prompt,
-                        repair_reason="skill_contract_check",
-                    )
-                finally:
-                    if previous_force_serial:
-                        self._force_serial_tool_calls = True
-                    elif hasattr(self, "_force_serial_tool_calls"):
-                        delattr(self, "_force_serial_tool_calls")
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
-
-                if is_skill_contract_check_pass(repair_text):
-                    if has_pending_placeholder_next_command(all_tool_result_events):
-                        full_content = (
-                            "A resolved structural NEXT command remains pending; "
-                            "continue with the skill contract."
-                        )
-                        pending_fallback_content_emit = False
-                        continue
-                    if (
-                        latest_tool_event_has_next_command(all_tool_result_events)
-                        and not tool_events_have_user_summary_marker(
-                            all_tool_result_events
-                        )
-                    ):
-                        full_content = (
-                            "A structural NEXT command remains pending; continue "
-                            "with the installed skill contract instead of treating "
-                            "the current tool result as final."
-                        )
-                        pending_fallback_content_emit = False
-                        continue
-                    if len(all_tool_result_events) > tool_result_count_before_check:
-                        new_tool_result_events = (
-                            all_tool_result_events[tool_result_count_before_check:]
-                        )
-                        if not tool_events_have_user_summary_marker(new_tool_result_events):
-                            full_content = (
-                                "The latest tool evidence did not include a "
-                                "user-facing completion summary. Continue the "
-                                "installed skill contract from the latest "
-                                "available evidence instead of treating setup, "
-                                "read-only inspection, or status output as final."
-                            )
-                            pending_fallback_content_emit = False
-                            continue
-                        full_content = build_user_facing_tool_event_answer(
-                            all_tool_result_events
-                        )
-                        pending_fallback_content_emit = True
-                        pending_fallback_reason = "skill_contract_check"
-                        pending_fallback_delta = full_content
-                    break
-                if repair_text.strip():
-                    full_content = repair_text
-                    pending_fallback_content_emit = True
-                    pending_fallback_reason = "skill_contract_check"
-                    pending_fallback_delta = repair_text
-                if len(all_tool_result_events) <= tool_result_count_before_check:
-                    if (
-                        latest_tool_event_has_next_command(all_tool_result_events)
-                        and not tool_events_have_user_summary_marker(
-                            all_tool_result_events
-                        )
-                    ):
-                        full_content = (
-                            "A structural NEXT command remains pending; continue "
-                            "with the installed skill contract instead of treating "
-                            "the current tool result as final."
-                        )
-                        pending_fallback_content_emit = False
-                        continue
-                    break
 
             if (
                 full_content.strip()
@@ -8450,6 +8333,7 @@ class AgentLoop:
             f"{_EXACT_COMMAND_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{format_explicit_request_values_context(message)}"
             f"{format_current_session_fact_check_context(message)}"
             f"{format_exact_shell_command_context(message)}"
             f"[WORKSPACE]: {_ws}/\n\n"
@@ -8491,6 +8375,7 @@ class AgentLoop:
             f"{_EXACT_COMMAND_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{format_explicit_request_values_context(message)}"
             f"{format_current_session_fact_check_context(message)}"
             f"{format_exact_shell_command_context(message)}"
             f"[WORKSPACE]: {_ws}/\n"
@@ -8528,7 +8413,30 @@ class AgentLoop:
                 "description": fm.get("description") or "",
                 "when_to_use": fm.get("when_to_use") or "",
             })
-        return build_request_execution_hints(message, skill_candidates)
+        hints = build_request_execution_hints(message, skill_candidates)
+        AgentLoop._bind_request_execution_hints_to_tools(self, hints)
+        return hints
+
+    def _bind_request_execution_hints_to_tools(self, hints: dict[str, Any]) -> None:
+        """Make request hints available to tool calls that lose contextvars."""
+        tool_sources: list[Any] = []
+        registry_tools = getattr(getattr(self, "tools", None), "_tools", {})
+        if isinstance(registry_tools, dict):
+            tool_sources.extend(registry_tools.values())
+        manager_tools = getattr(getattr(getattr(self, "_agent", None), "available_tools", None), "tool_map", {})
+        if isinstance(manager_tools, dict):
+            tool_sources.extend(manager_tools.values())
+        normalized = hints if isinstance(hints, dict) else {}
+        seen: set[int] = set()
+        for tool in tool_sources:
+            identity = id(tool)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                setattr(tool, "_request_execution_hints", normalized)
+            except Exception:
+                continue
 
     def _tool_activation_status(self, name: str) -> str:
         """Return whether a registered tool is active, inactive, or missing."""
@@ -8621,8 +8529,7 @@ class AgentLoop:
     def _extract_env_for_prompt(self) -> str:
         """Extract env vars from .env.local for the step prompt.
 
-        Non-sensitive values shown directly. Private keys masked -
-        agent told to use ``source .env.local`` then ``$VAR``.
+        Non-sensitive values are shown directly while private keys are masked.
         Persists across short-term memory pruning.
         """
         env_file = self.workspace / ".env.local"
@@ -8724,9 +8631,9 @@ class AgentLoop:
             "If the needed capability is not in the callable tool list, inspect this "
             "inactive catalog and call `activate_tool(action='activate', "
             "tool_name='<name>')` for the matching capability. Tool names and "
-            "descriptions are the source of truth; there is no hidden prompt router. "
-            "Prefer specialized tools over broad search or hand-rolled shell "
-            "workflows when their descriptions match.\n"
+            "descriptions are the source of truth. Do not recreate a cataloged "
+            "capability with generic shell commands before activating the matching "
+            "tool; use shell only when no listed tool fits or tool activation fails.\n"
         ]
 
         for tool in inactive_tools.values():

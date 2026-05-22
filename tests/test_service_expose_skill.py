@@ -245,6 +245,23 @@ def test_service_expose_parses_cloudflare_url_from_tunnel_log(tmp_path: Path) ->
     assert module._parse_public_url(log_path) == "https://sample-demo.trycloudflare.com"
 
 
+def test_service_expose_infers_port_from_service_log(tmp_path: Path) -> None:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("service_expose_script", SCRIPT)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    log_path = tmp_path / "service.log"
+    log_path.write_text(
+        "WebSocket Chat Server running on port 3456\n",
+        encoding="utf-8",
+    )
+
+    assert module._infer_port_from_log(log_path) == 3456
+
+
 def test_service_expose_clears_old_tunnel_log_before_reuse(tmp_path: Path) -> None:
     from importlib.util import module_from_spec, spec_from_file_location
 
@@ -326,6 +343,35 @@ def test_service_expose_hides_unverified_public_url(monkeypatch) -> None:
         "demo",
         {"local_url": "http://127.0.0.1:1234"},
         {"verify_text": "READY", "verify_wait_seconds": 0, "tunnel_wait_seconds": 1},
+    )
+
+    assert result["success"] is False
+    assert result["public_url"] is None
+    assert result["public_url_omitted_reason"] == "unverified"
+    assert stopped == [12345]
+
+
+def test_service_expose_requires_registered_tunnel(monkeypatch) -> None:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("service_expose_script", SCRIPT)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    stopped: list[int] = []
+    monkeypatch.setenv("CLOUDFLARED_PATH", "cloudflared")
+    monkeypatch.setattr(module, "_spawn_argv", lambda *args, **kwargs: 12345)
+    monkeypatch.setattr(module, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(module, "_parse_public_url", lambda log_path: "https://early.trycloudflare.com")
+    monkeypatch.setattr(module, "_tunnel_registered", lambda log_path: False)
+    monkeypatch.setattr(module, "_verify_url", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(module, "_stop_pid", lambda pid: stopped.append(pid) or True)
+
+    result = module._start_tunnel_for_entry(
+        "demo",
+        {"local_url": "http://127.0.0.1:1234"},
+        {"tunnel_wait_seconds": 1},
     )
 
     assert result["success"] is False

@@ -468,6 +468,23 @@ def _parse_public_url(log_path: Path) -> str | None:
     return match.group(0) if match else None
 
 
+def _infer_port_from_log(log_path: Path) -> int | None:
+    text = _tail(str(log_path), 20000)
+    candidates: list[int] = []
+    for pattern in (
+        r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?):(\d{2,5})",
+        r"\bport\s+(\d{2,5})\b",
+    ):
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            try:
+                port = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                candidates.append(port)
+    return candidates[-1] if candidates else None
+
+
 def _tunnel_registered(log_path: Path) -> bool:
     text = _tail(str(log_path), 20000)
     return "Registered tunnel connection" in text
@@ -502,7 +519,7 @@ def _start_tunnel_for_entry(
     pid = _spawn_argv([cloudflared, "tunnel", "--url", local_url], Path.cwd(), tunnel_log)
     public_url = None
     registered = False
-    for _ in range(int(params.get("tunnel_wait_seconds", 25)) * 2):
+    for _ in range(int(params.get("tunnel_wait_seconds", 60)) * 2):
         public_url = _parse_public_url(tunnel_log)
         registered = _tunnel_registered(tunnel_log)
         if public_url and registered:
@@ -520,20 +537,34 @@ def _start_tunnel_for_entry(
         "started_at": _now(),
         "status": "running" if _pid_alive(pid) else "exited",
     }
+    if not local_url and params.get("start_tunnel"):
+        inferred_port = _infer_port_from_log(log_path)
+        if inferred_port:
+            port = inferred_port
+            params["port"] = inferred_port
+            entry["port"] = inferred_port
+            entry["local_url"] = _local_url(params)
+            local_url = entry["local_url"]
+
     verify_text = params.get("verify_text")
     if not verify_text and isinstance(entry.get("verification"), dict):
         verify_text = entry["verification"].get("expected_text")
-    if public_url and verify_text:
+    if public_url:
         tunnel["verification"] = _verify_url(
             public_url,
-            expected_text=str(verify_text),
+            expected_text=str(verify_text) if verify_text else None,
             wait_seconds=float(params.get("verify_wait_seconds") or 10),
         )
         if not tunnel["verification"].get("ok"):
             tunnel["verification_error"] = tunnel["verification"].get("error")
     entry["tunnel"] = tunnel
-    success = public_url is not None and tunnel["status"] == "running"
-    if verify_text and tunnel.get("verification") and not tunnel["verification"].get("ok"):
+    success = (
+        public_url is not None
+        and registered
+        and tunnel["status"] == "running"
+        and bool(tunnel.get("verification", {}).get("ok"))
+    )
+    if tunnel.get("verification") and not tunnel["verification"].get("ok"):
         success = False
     if not success:
         tunnel["public_url"] = None
@@ -644,12 +675,25 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
             }
 
     verify_text = params.get("verify_text")
-    if local_url and verify_text:
+    if local_url and (verify_text or params.get("start_tunnel")):
         entry["verification"] = _verify_url(
             local_url,
-            expected_text=str(verify_text),
+            expected_text=str(verify_text) if verify_text else None,
             wait_seconds=float(params.get("verify_wait_seconds") or 10),
         )
+        if not entry["verification"].get("ok"):
+            inferred_port = _infer_port_from_log(log_path)
+            if inferred_port and inferred_port != port:
+                port = inferred_port
+                params["port"] = inferred_port
+                entry["port"] = inferred_port
+                entry["local_url"] = _local_url(params)
+                local_url = entry["local_url"]
+                entry["verification"] = _verify_url(
+                    local_url,
+                    expected_text=str(verify_text) if verify_text else None,
+                    wait_seconds=float(params.get("verify_wait_seconds") or 10),
+                )
         if not entry["verification"].get("ok"):
             services[name] = entry
             _save_registry(registry)

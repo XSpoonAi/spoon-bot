@@ -92,6 +92,10 @@ class TestShellTool:
             "node scripts/build.js",
             str(workspace),
         ) is False
+        assert shell_tool._command_invokes_workspace_skill(
+            "cd skills/demo-skill/cli && node index.js run",
+            str(workspace),
+        ) is True
 
     def test_shell_skips_exact_dedup_for_workspace_skill_commands(self, tmp_path):
         """Skill-owned retry/idempotency should not be blocked by shell dedup."""
@@ -110,12 +114,15 @@ class TestShellTool:
         ) is None
 
     def test_shell_loads_workspace_env_for_skill_commands(self, tmp_path):
-        """Installed skill CLIs should receive workspace .env.local automatically."""
+        """Installed skill CLIs should receive non-sensitive workspace env values."""
         from spoon_bot.agent.tools.shell import ShellTool
 
         workspace = tmp_path / "workspace"
         (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
-        (workspace / ".env.local").write_text("AGENT_ID=8004\n", encoding="utf-8")
+        (workspace / ".env.local").write_text(
+            "AGENT_ID=8004\nAGENT_PRIVATE_KEY=0x" + "11" * 32 + "\n",
+            encoding="utf-8",
+        )
         shell_tool = ShellTool(working_dir=str(workspace))
 
         command = "node skills/demo-skill/cli/index.js wallet"
@@ -124,8 +131,9 @@ class TestShellTool:
             str(workspace),
         )
 
-        assert result.startswith("set -a; . ")
-        assert ".env.local" in result
+        assert result.startswith("export AGENT_ID=8004; ")
+        assert "AGENT_PRIVATE_KEY" not in result
+        assert "0x" + "11" * 32 not in result
         assert result.endswith(command)
 
     def test_shell_formats_idempotent_conflict_as_state(self, shell_tool):
@@ -212,7 +220,7 @@ class TestShellTool:
 
         result = shell_tool._reject_undocumented_skill_cli_arguments(
             (
-                "cd /workspace && source .env.local && "
+                "cd /workspace && "
                 "node skills/spot-agent-cypher/cli/index.js register --agent-id 8004 2>&1"
             ),
             str(workspace),
@@ -222,6 +230,36 @@ class TestShellTool:
         assert "unsupported option '--agent-id'" in result
         assert "skills/spot-agent-cypher/SKILL.md" in result
         assert "do not invent CLI flags" in result
+
+    def test_shell_rejects_undocumented_skill_cli_flag_after_cd(self, tmp_path):
+        """Skill CLI guards follow a cd into the skill entrypoint directory."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        (skill_dir / "cli").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "## Commands",
+                "$CLI register",
+                "$CLI join [gameId] [spot]",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        result = shell_tool._reject_undocumented_skill_cli_arguments(
+            "cd skills/spot-agent-cypher/cli && node index.js register --agent-id 8004",
+            str(workspace),
+        )
+
+        assert result is not None
+        assert "unsupported option '--agent-id'" in result
+        assert "Documented form: node skills/spot-agent-cypher/cli/index.js register" in result
 
     def test_shell_rejects_extra_skill_cli_positional_arg(self, tmp_path):
         """Values from the user request are allowed only when SKILL.md has placeholders."""
@@ -415,8 +453,8 @@ class TestShellTool:
         assert "unsupported option '--invite'" in result
         assert "Allowed options: -c" in result
 
-    def test_shell_rejects_user_code_on_unrelated_skill_cli_parameter(self, tmp_path):
-        """Invite/referral codes should not be carried into unrelated command args."""
+    def test_shell_rejects_labeled_request_value_on_unrelated_skill_cli_parameter(self, tmp_path):
+        """User-labeled values should match the command parameter label."""
         from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
         from spoon_bot.agent.tools.shell import ShellTool
 
@@ -437,7 +475,13 @@ class TestShellTool:
         )
         shell_tool = ShellTool(working_dir=str(workspace))
 
-        with bind_request_execution_hints({"explicit_code_values": ["3KK57S"]}):
+        with bind_request_execution_hints({
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invited"],
+                "label": "Invited Code",
+            }]
+        }):
             rejected = shell_tool._reject_undocumented_skill_cli_arguments(
                 "node skills/spot-agent-cypher/cli/index.js join A 3KK57S",
                 str(workspace),
@@ -452,9 +496,76 @@ class TestShellTool:
             )
 
         assert rejected is not None
-        assert "user-supplied code" in rejected
+        assert "labeled value from the user request" in rejected
         assert allowed_code is None
         assert allowed_join is None
+
+    def test_shell_augments_skill_cli_from_matching_labeled_request_value(self, tmp_path):
+        """Documented value flags can be filled from structured request facts."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "$CLI faucet [-c <code>]",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._request_execution_hints = {
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invited"],
+                "label": "Invited Code",
+            }]
+        }
+
+        augmented = shell_tool._augment_skill_cli_labeled_values(
+            "node skills/spot-agent-cypher/cli/index.js faucet",
+            str(workspace),
+        )
+
+        assert augmented.endswith("faucet -c 3KK57S")
+
+    def test_shell_allows_long_flag_alias_matching_documented_value_label(self, tmp_path):
+        """Skill-emitted long flag aliases are accepted when their label matches."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "$CLI faucet-answer <challengeId> <answer> [-c <code>]",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        with bind_request_execution_hints({
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invited"],
+                "label": "Invited Code",
+            }]
+        }):
+            rejection = shell_tool._reject_undocumented_skill_cli_arguments(
+                "node skills/spot-agent-cypher/cli/index.js faucet-answer abc 4 --invitation-code 3KK57S",
+                str(workspace),
+            )
+
+        assert rejection is None
 
     def test_shell_allows_help_for_documented_skill_cli_command(self, tmp_path):
         """Help flags are harmless command introspection, not invented workflow args."""
@@ -556,6 +667,14 @@ class TestShellTool:
         assert refreshed.returncode == 0
         assert job.stdout_task.cancelled()
         assert job.stderr_task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_shell_rejects_unmanaged_background_operator(self, shell_tool):
+        """Long-lived commands should use managed jobs or dedicated service tools."""
+        result = await shell_tool(command="node server.js &")
+
+        assert "unmanaged shell background operator" in result
+        assert "managed background jobs" in result
 
     def test_shell_stops_after_exact_requested_command_failure(self, shell_tool):
         """Exact user-requested shell commands should fail fast without extra tool detours."""

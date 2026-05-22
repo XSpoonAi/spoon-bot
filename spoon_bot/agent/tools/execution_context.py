@@ -25,10 +25,16 @@ _TOOL_INVOCATION_DEDUP_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
     "tool_invocation_dedup_state",
     default=None,
 )
+_TOOL_INVOCATION_STATE_BY_OWNER: dict[str, dict[str, Any]] = {}
+_TOOL_INVOCATION_STATE_FALLBACK: dict[str, Any] | None = None
+_TOOL_INVOCATION_STATE_LOCK = Lock()
 _REQUEST_EXECUTION_HINTS: ContextVar[dict[str, Any] | None] = ContextVar(
     "request_execution_hints",
     default=None,
 )
+_REQUEST_EXECUTION_HINTS_BY_OWNER: dict[str, dict[str, Any]] = {}
+_REQUEST_EXECUTION_HINTS_FALLBACK: dict[str, Any] | None = None
+_REQUEST_EXECUTION_HINTS_LOCK = Lock()
 
 
 @dataclass
@@ -202,16 +208,44 @@ def track_tool_invocations(
         "max_series_repeats": max(1, int(max_series_repeats or 1)),
         "max_consecutive_failures": max(1, int(max_consecutive_failures or 1)),
     }
+    global _TOOL_INVOCATION_STATE_FALLBACK
+    owner = get_tool_owner()
+    missing = object()
+    with _TOOL_INVOCATION_STATE_LOCK:
+        previous_owner_state = _TOOL_INVOCATION_STATE_BY_OWNER.get(owner, missing)
+        previous_fallback = _TOOL_INVOCATION_STATE_FALLBACK
+        _TOOL_INVOCATION_STATE_BY_OWNER[owner] = state
+        _TOOL_INVOCATION_STATE_FALLBACK = state
     token = _TOOL_INVOCATION_DEDUP_STATE.set(state)
     try:
         yield state
     finally:
         _TOOL_INVOCATION_DEDUP_STATE.reset(token)
+        with _TOOL_INVOCATION_STATE_LOCK:
+            if previous_owner_state is missing:
+                _TOOL_INVOCATION_STATE_BY_OWNER.pop(owner, None)
+            else:
+                _TOOL_INVOCATION_STATE_BY_OWNER[owner] = previous_owner_state
+            _TOOL_INVOCATION_STATE_FALLBACK = previous_fallback
+
+
+def _current_tool_invocation_state() -> dict[str, Any] | None:
+    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    if isinstance(state, dict):
+        return state
+    owner = get_tool_owner()
+    with _TOOL_INVOCATION_STATE_LOCK:
+        owner_state = _TOOL_INVOCATION_STATE_BY_OWNER.get(owner)
+        if isinstance(owner_state, dict):
+            return owner_state
+        if isinstance(_TOOL_INVOCATION_STATE_FALLBACK, dict):
+            return _TOOL_INVOCATION_STATE_FALLBACK
+    return None
 
 
 def suppress_repeated_tool_invocation(tool_name: str, arguments: Any) -> str | None:
     """Return a compact duplicate result when the same call already ran."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
 
@@ -236,7 +270,7 @@ def suppress_repeated_tool_invocation(tool_name: str, arguments: Any) -> str | N
 
 def suppress_repeated_tool_series(tool_name: str, series_key: str | None) -> str | None:
     """Return a compact result when one request repeats the same side-effect series."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
     if not isinstance(series_key, str) or not series_key.strip():
@@ -263,7 +297,7 @@ def suppress_redundant_file_read(
     content_fingerprint: str | None = None,
 ) -> str | None:
     """Return a compact result when a request re-reads covered file content."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
 
@@ -333,7 +367,7 @@ def _normalize_file_tracking_path(path_key: Any) -> str:
 
 def invalidate_file_read_tracking(*path_keys: Any) -> None:
     """Invalidate read coverage and exact read counts after a file changes."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return
 
@@ -372,7 +406,7 @@ def invalidate_file_read_tracking(*path_keys: Any) -> None:
 
 def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:
     """Return a compact result when one tool keeps failing without progress."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
 
@@ -392,7 +426,7 @@ def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:
 
 def record_tool_invocation_result(tool_name: str, result: Any) -> None:
     """Record generic success/failure outcome for per-request failure-loop guards."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return
 
@@ -412,7 +446,7 @@ def record_tool_invocation_result(tool_name: str, result: Any) -> None:
 
 def get_tracked_tool_invocation_counts() -> dict[str, int]:
     """Return per-tool execution counts for the current request."""
-    state = _TOOL_INVOCATION_DEDUP_STATE.get()
+    state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return {}
 
@@ -433,12 +467,26 @@ def get_tracked_tool_invocation_counts() -> dict[str, int]:
 @contextmanager
 def bind_request_execution_hints(hints: dict[str, Any] | None) -> Iterator[dict[str, Any]]:
     """Bind request-scoped execution hints for tool-side guardrails."""
+    global _REQUEST_EXECUTION_HINTS_FALLBACK
     normalized = hints if isinstance(hints, dict) else {}
+    owner = get_tool_owner()
+    missing = object()
+    with _REQUEST_EXECUTION_HINTS_LOCK:
+        previous_owner_hints = _REQUEST_EXECUTION_HINTS_BY_OWNER.get(owner, missing)
+        previous_fallback = _REQUEST_EXECUTION_HINTS_FALLBACK
+        _REQUEST_EXECUTION_HINTS_BY_OWNER[owner] = normalized
+        _REQUEST_EXECUTION_HINTS_FALLBACK = normalized
     token = _REQUEST_EXECUTION_HINTS.set(normalized)
     try:
         yield normalized
     finally:
         _REQUEST_EXECUTION_HINTS.reset(token)
+        with _REQUEST_EXECUTION_HINTS_LOCK:
+            if previous_owner_hints is missing:
+                _REQUEST_EXECUTION_HINTS_BY_OWNER.pop(owner, None)
+            else:
+                _REQUEST_EXECUTION_HINTS_BY_OWNER[owner] = previous_owner_hints
+            _REQUEST_EXECUTION_HINTS_FALLBACK = previous_fallback
 
 
 def get_request_execution_hints() -> dict[str, Any]:
@@ -446,6 +494,13 @@ def get_request_execution_hints() -> dict[str, Any]:
     hints = _REQUEST_EXECUTION_HINTS.get()
     if isinstance(hints, dict):
         return hints
+    owner = get_tool_owner()
+    with _REQUEST_EXECUTION_HINTS_LOCK:
+        owner_hints = _REQUEST_EXECUTION_HINTS_BY_OWNER.get(owner)
+        if isinstance(owner_hints, dict):
+            return owner_hints
+        if isinstance(_REQUEST_EXECUTION_HINTS_FALLBACK, dict):
+            return _REQUEST_EXECUTION_HINTS_FALLBACK
     return {}
 
 

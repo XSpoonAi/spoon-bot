@@ -59,38 +59,54 @@ def _clean_extracted_value(value: str) -> str:
     return str(value or "").strip("`'\"<>()[]{}").rstrip(".,;:，。；")
 
 
-def _looks_like_user_supplied_code(value: str) -> bool:
+def _looks_like_user_supplied_value(value: str) -> bool:
     if not 3 <= len(value) <= 80:
         return False
     return all(char.isalnum() or char in {"_", "-"} for char in value)
 
 
-def extract_explicit_code_values_from_text(text: str) -> list[str]:
-    """Extract user-supplied invite/referral/access code values."""
-    values: list[str] = []
+def _last_label_fragment(label: str) -> str:
+    fragment = str(label or "").strip()
+    for separator in (".", "。", ";", "；", "\n", "\r"):
+        if separator in fragment:
+            fragment = fragment.rsplit(separator, 1)[-1].strip()
+    return fragment
+
+
+def extract_explicit_request_values_from_text(text: str) -> list[dict[str, Any]]:
+    """Extract user-labeled values from simple ``label: value`` request facts."""
+    values: list[dict[str, Any]] = []
     seen: set[str] = set()
     source = str(text or "")
-    normalized = source
-    for separator in (":", "：", "=", "\n", "\t", ",", "，", ";", "；"):
-        normalized = normalized.replace(separator, " ")
-    words = [_clean_extracted_value(word) for word in normalized.split()]
-    code_nouns = {"code", "邀请码", "邀請碼"}
-    code_qualifiers = {"invite", "invitation", "referral", "access"}
-    for index, word in enumerate(words):
-        lowered = word.casefold()
-        previous = words[index - 1].casefold() if index else ""
-        if lowered not in code_nouns and word not in code_nouns:
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
-        if word not in {"邀请码", "邀請碼"} and previous not in code_qualifiers:
-            continue
-        if index + 1 >= len(words):
-            continue
-        value = _clean_extracted_value(words[index + 1])
-        if not _looks_like_user_supplied_code(value) or value in seen:
-            continue
-        seen.add(value)
-        values.append(value)
-    return values[:6]
+        for separator in (":", "：", "="):
+            if separator not in line:
+                continue
+            label, _, tail = line.partition(separator)
+            label = _last_label_fragment(label)
+            labels = sorted(tokenize_request_matching_text(label))
+            if not labels:
+                break
+            tail_words = tail.strip().split()
+            if not tail_words:
+                break
+            value = _clean_extracted_value(tail_words[0])
+            if not _looks_like_user_supplied_value(value):
+                break
+            key = value.casefold()
+            if key in seen:
+                break
+            seen.add(key)
+            values.append({
+                "value": value,
+                "labels": labels,
+                "label": label,
+            })
+            break
+    return values[:12]
 
 
 def _split_shell_words(command: str) -> list[str]:
@@ -322,6 +338,26 @@ def format_current_session_fact_check_context(message: str) -> str:
     )
 
 
+def format_explicit_request_values_context(message: str) -> str:
+    """Format user-labeled request facts without classifying their meaning."""
+    values = extract_explicit_request_values_from_text(message)
+    if not values:
+        return ""
+    lines = ["[STRUCTURED USER REQUEST FACTS]:"]
+    for entry in values[:8]:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "").strip()
+        value = str(entry.get("value") or "").strip()
+        if not label or not value:
+            continue
+        lines.append(f"- {label}: {value}")
+    if len(lines) == 1:
+        return ""
+    lines.append("")
+    return "\n".join(lines)
+
+
 def format_local_executable_skill_context(hints: dict[str, Any]) -> str:
     """Format request-scoped guidance for matched local executable skills."""
     local_skills = hints.get("local_executable_skills") if isinstance(hints, dict) else None
@@ -330,23 +366,9 @@ def format_local_executable_skill_context(hints: dict[str, Any]) -> str:
 
     lines = [
         "[LOCAL SKILL EXECUTION CONTEXT]: The newest request matches installed "
-        "local skill procedures. Use these as execution contracts, not hidden "
-        "routes. Read the listed SKILL.md before primary commands unless that "
-        "same file is already present in this turn's current context. Prefer "
-        "documented commands from SKILL.md and structural NEXT commands returned "
-        "by tools. If a command is unsupported, recover from the skill docs or "
-        "help output; do not invent neighboring subcommands. Do not turn "
-        "numbers or labels from the user's natural-language request into CLI "
-        "flags or positional arguments unless SKILL.md documents that exact "
-        "parameter shape. If the user mentions a numeric id or label but the "
-        "documented command only exposes a no-argument register/status flow, "
-        "use that documented flow and judge success from the resulting tool "
-        "evidence instead of trying to pass the number as an extra argument. "
-        "Pass user-supplied invite, referral, or access codes "
-        "only to commands whose SKILL.md form documents a code/invite/referral "
-        "parameter. If setup/status evidence already satisfies prerequisites, "
-        "continue to a downstream command matching the request instead of "
-        "repeating setup/status commands.",
+        "local skill procedures. Candidate SKILL.md files and extracted command "
+        "forms are listed below as request-scoped context. Treat the listed "
+        "metadata as evidence, not a hidden route.",
     ]
     for skill in local_skills[:3]:
         if not isinstance(skill, dict):
@@ -525,11 +547,11 @@ def build_request_execution_hints(
         reverse=True,
     )
     explicit_urls = extract_urls_from_text(message_text)
-    explicit_code_values = extract_explicit_code_values_from_text(message_text)
+    explicit_request_values = extract_explicit_request_values_from_text(message_text)
     exact_commands = extract_exact_shell_commands_from_request(message_text)
     return {
         "explicit_request_urls": explicit_urls,
-        "explicit_code_values": explicit_code_values,
+        "explicit_request_values": explicit_request_values,
         "exact_shell_commands": exact_commands,
         "restrict_to_exact_shell_commands": request_restricts_to_exact_shell_commands(
             message_text,

@@ -69,13 +69,14 @@ class TestBuildDynamicToolsPrompt:
         assert "activate_tool" in prompt
         assert "action='activate'" in prompt
 
-    def test_prefer_specialized_hint(self):
-        """Prompt should hint to prefer specialized tools over web_search."""
+    def test_tool_descriptions_are_source_of_truth(self):
+        """Prompt should expose catalog metadata without forced routing hints."""
         inactive = _inactive_tools_from_names({
             "get_token_price": "Price data",
         })
         prompt = AgentLoop._build_dynamic_tools_prompt(inactive)
-        assert "prefer specialized tools" in prompt.lower()
+        assert "descriptions are the source of truth" in prompt
+        assert "prefer specialized tools" not in prompt.lower()
 
     def test_empty_inactive_returns_minimal(self):
         """With no inactive tools, still has header but no tool entries."""
@@ -255,7 +256,7 @@ class TestToolProfileSkillManagement:
         assert hints["local_executable_skills"][0]["name"] == "spot-agent-cypher"
         assert "[LOCAL SKILL EXECUTION CONTEXT]:" in context
         assert "skills/spot-agent-cypher/SKILL.md" in context
-        assert "neighboring subcommands" in context
+        assert "extracted command forms" in context
         assert "Agent-Cypher-Lab" not in context
 
     def test_github_skill_install_is_not_request_routed(self):
@@ -292,8 +293,8 @@ class TestToolProfileSkillManagement:
 
         assert "`service_expose`" in prompt
         assert "Cloudflare tunnels" in prompt
-        assert "there is no hidden prompt router" in prompt
-        assert "hand-rolled shell workflows" in prompt
+        assert "descriptions are the source of truth" in prompt
+        assert "Do not recreate a cataloged capability with generic shell commands" in prompt
 
 
 # ---------------------------------------------------------------------------

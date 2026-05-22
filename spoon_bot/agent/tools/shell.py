@@ -542,6 +542,8 @@ class ShellTool(Tool):
             "use job_status to monitor and terminate_job to stop if there is "
             "evidence it is stuck. Silent running jobs are not stuck evidence; "
             "keep polling unless the caller explicitly abandons the job. "
+            "Do not append unmanaged shell background operators such as '&'; "
+            "run long-lived commands in the foreground so this tool can manage them. "
             "Do not install skills by cloning directly into workspace/skills; "
             "use the skill management tool for skill packages. "
             f"Security mode: {mode}. "
@@ -805,8 +807,39 @@ class ShellTool(Tool):
             return command
         if not env_file.is_file():
             return command
-        quoted_env = shlex.quote(str(env_file))
-        return f"set -a; . {quoted_env}; set +a; {command}"
+        exports = self._workspace_env_exports(env_file)
+        if not exports:
+            return command
+        return f"{exports}; {command}"
+
+    @staticmethod
+    def _workspace_env_exports(env_file: Path) -> str:
+        """Return shell exports for non-sensitive workspace env values."""
+        try:
+            lines = env_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return ""
+
+        exports: list[str] = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
+            if key in SCRUBBED_ENV_VARS or is_sensitive_env_var(key):
+                continue
+            value = value.strip()
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+            exports.append(f"export {key}={shlex.quote(value)}")
+        return "; ".join(exports)
 
     def _run_sync(
         self,
@@ -1509,6 +1542,15 @@ class ShellTool(Tool):
         if not command or not str(command).strip():
             return "Error: 'command' is required for action='execute'"
 
+        if self._has_unmanaged_background_operator(str(command)):
+            return (
+                "Rejected: unmanaged shell background operator '&' is not supported. "
+                "Run long-lived commands in the foreground with an appropriate timeout "
+                "so the shell tool can keep them as managed background jobs, or "
+                "activate and use a matching dynamic service/tool capability when one "
+                "is listed in the inactive catalog."
+            )
+
         # Resolve effective timeout: per-command override capped by max_timeout
         effective_timeout = self.timeout
         if timeout is not None:
@@ -1534,6 +1576,8 @@ class ShellTool(Tool):
         if skill_clone_rejection is not None:
             capture_tool_output(skill_clone_rejection, skill_clone_rejection)
             return skill_clone_rejection
+
+        command = self._augment_skill_cli_labeled_values(command, cwd)
 
         skill_command_rejection = self._reject_undocumented_skill_cli_arguments(
             command,
@@ -1622,6 +1666,14 @@ class ShellTool(Tool):
         if current:
             segments.append(current)
         return segments
+
+    @staticmethod
+    def _has_unmanaged_background_operator(command: str) -> bool:
+        try:
+            tokens = shlex.split(str(command or ""))
+        except ValueError:
+            tokens = str(command or "").split()
+        return any(token == "&" for token in tokens)
 
     @staticmethod
     def _clone_positionals(tokens: list[str]) -> list[str]:
@@ -1973,6 +2025,60 @@ class ShellTool(Tool):
         return None
 
     @staticmethod
+    def _workspace_skill_relative_path(
+        candidate: Path,
+        workspace_root: Path,
+    ) -> tuple[str, str] | None:
+        try:
+            resolved = candidate.resolve(strict=False)
+            relative = resolved.relative_to(workspace_root.resolve())
+        except Exception:
+            return None
+
+        parts = relative.parts
+        if len(parts) < 3 or parts[0] != "skills":
+            return None
+        skill_name = parts[1]
+        return skill_name, "/".join(parts)
+
+    @classmethod
+    def _extract_skill_cli_invocation_for_segment(
+        cls,
+        tokens: list[str],
+        current_dir: Path,
+        workspace_root: Path,
+    ) -> tuple[str, list[str], list[str]] | None:
+        invocation = cls._extract_skill_cli_invocation(tokens)
+        if invocation is not None:
+            return invocation
+
+        for index, token in enumerate(tokens):
+            normalized = str(token or "").replace("\\", "/").strip("'\"")
+            if (
+                not normalized
+                or normalized.startswith("-")
+                or normalized in {"node", "python", "python3", "bash", "sh"}
+            ):
+                continue
+            if "/" not in normalized and not re.search(
+                r"\.(?:cjs|mjs|js|py|sh)$",
+                normalized,
+                re.IGNORECASE,
+            ):
+                continue
+
+            skill_path = cls._workspace_skill_relative_path(
+                current_dir / normalized,
+                workspace_root,
+            )
+            if skill_path is None:
+                continue
+            skill_name, relative_path = skill_path
+            return skill_name, tokens[index + 1 :], [*tokens[:index], relative_path]
+
+        return None
+
+    @staticmethod
     def _normalize_skill_cli_prefix_token(token: str) -> str:
         value = str(token or "").strip().strip("'\"").replace("\\", "/")
         marker_index = value.find("/skills/")
@@ -1995,24 +2101,66 @@ class ShellTool(Tool):
         return str(token or "").split("=", 1)[0]
 
     @staticmethod
-    def _label_accepts_explicit_code(label: str) -> bool:
-        normalized = str(label or "").casefold()
-        return any(
-            marker in normalized
-            for marker in ("code", "invite", "invitation", "referral")
-        )
+    def _label_tokens(label: str) -> set[str]:
+        tokens: set[str] = set()
+        buffer: list[str] = []
+        for char in str(label or "").casefold():
+            if char.isascii() and (char.isalnum() or char == "_"):
+                buffer.append(char)
+                continue
+            if len(buffer) >= 2 and buffer[0].isalnum():
+                tokens.add("".join(buffer))
+            buffer = []
+        if len(buffer) >= 2 and buffer[0].isalnum():
+            tokens.add("".join(buffer))
+        return tokens
 
-    @staticmethod
-    def _request_explicit_code_values() -> set[str]:
+    @classmethod
+    def _label_accepts_request_value(
+        cls,
+        template_label: str,
+        request_labels: set[str],
+    ) -> bool:
+        template_labels = cls._label_tokens(template_label)
+        return bool(template_labels and request_labels and template_labels & request_labels)
+
+    @classmethod
+    def _flag_alias_value_label(
+        cls,
+        flag: str,
+        template: _SkillCommandTemplate,
+    ) -> str:
+        flag_tokens = cls._label_tokens(flag.lstrip("-"))
+        if not flag_tokens:
+            return ""
+        for label in dict(template.flag_value_labels).values():
+            if flag_tokens & cls._label_tokens(label):
+                return label
+        return ""
+
+    def _request_explicit_labeled_values(self) -> dict[str, set[str]]:
         hints = get_request_execution_hints()
-        values = hints.get("explicit_code_values") if isinstance(hints, dict) else None
+        if not hints:
+            hints = getattr(self, "_request_execution_hints", {})
+        values = hints.get("explicit_request_values") if isinstance(hints, dict) else None
         if not isinstance(values, list):
-            return set()
-        return {
-            str(value).strip()
-            for value in values
-            if isinstance(value, str) and value.strip()
-        }
+            return {}
+        result: dict[str, set[str]] = {}
+        for entry in values:
+            if not isinstance(entry, dict):
+                continue
+            value = str(entry.get("value") or "").strip()
+            labels = entry.get("labels")
+            if not value or not isinstance(labels, list):
+                continue
+            label_set = {
+                str(label).strip().casefold()
+                for label in labels
+                if isinstance(label, str) and label.strip()
+            }
+            if label_set:
+                result[value] = label_set
+        return result
 
     @classmethod
     def _validate_skill_cli_args_against_template(
@@ -2021,7 +2169,7 @@ class ShellTool(Tool):
         prefix_tokens: list[str],
         args: list[str],
         template: _SkillCommandTemplate,
-        explicit_code_values: set[str],
+        explicit_request_values: dict[str, set[str]],
     ) -> str | None:
         if template.prefix_tokens:
             observed_prefix = cls._normalize_skill_cli_prefix_tokens(prefix_tokens)
@@ -2051,7 +2199,10 @@ class ShellTool(Tool):
                 continue
             if token.startswith("-"):
                 flag = cls._flag_name(token)
+                alias_label = ""
                 if flag not in template.allowed_flags:
+                    alias_label = cls._flag_alias_value_label(flag, template)
+                if flag not in template.allowed_flags and not alias_label:
                     allowed = ", ".join(sorted(template.allowed_flags)) or "none"
                     return (
                         "Rejected: unsupported option "
@@ -2062,18 +2213,23 @@ class ShellTool(Tool):
                         f"Documented form: {template.display}. "
                         f"Allowed options: {allowed}."
                     )
-                if flag in template.flags_with_values and "=" not in token:
+                if (
+                    (flag in template.flags_with_values or alias_label)
+                    and "=" not in token
+                ):
                     value = remaining[index + 1] if index + 1 < len(remaining) else ""
-                    label = flag_value_labels.get(flag, "")
+                    label = flag_value_labels.get(flag, "") or alias_label
+                    request_labels = explicit_request_values.get(value)
                     if (
-                        value in explicit_code_values
-                        and not cls._label_accepts_explicit_code(label)
+                        request_labels
+                        and not cls._label_accepts_request_value(label, request_labels)
                     ):
                         return (
-                            "Rejected: this argument is a user-supplied code, "
-                            f"but skill command {' '.join(template.fixed_tokens)!r} "
-                            f"does not document {flag!r} as a code/invite/referral "
-                            f"parameter. Documented form: {template.display}."
+                            "Rejected: this argument is a labeled value from "
+                            "the user request, but skill command "
+                            f"{' '.join(template.fixed_tokens)!r} does not "
+                            f"document {flag!r} with a matching parameter "
+                            f"label. Documented form: {template.display}."
                         )
                     index += 2
                 else:
@@ -2084,15 +2240,17 @@ class ShellTool(Tool):
                 if positionals < len(template.positional_labels)
                 else ""
             )
+            request_labels = explicit_request_values.get(token)
             if (
-                token in explicit_code_values
-                and not cls._label_accepts_explicit_code(label)
+                request_labels
+                and not cls._label_accepts_request_value(label, request_labels)
             ):
                 return (
-                    "Rejected: this argument is a user-supplied code, but "
+                    "Rejected: this argument is a labeled value from the "
+                    "user request, but "
                     f"skill command {' '.join(template.fixed_tokens)!r} does "
-                    "not document that positional as a code/invite/referral "
-                    f"parameter. Documented form: {template.display}."
+                    "not document that positional with a matching parameter "
+                    f"label. Documented form: {template.display}."
                 )
             positionals += 1
             index += 1
@@ -2114,6 +2272,7 @@ class ShellTool(Tool):
         prefix_tokens: list[str],
         args: list[str],
         templates: list[_SkillCommandTemplate],
+        explicit_request_values: dict[str, set[str]],
     ) -> str | None:
         if not args or not templates:
             return None
@@ -2131,7 +2290,6 @@ class ShellTool(Tool):
                 f"forms instead. Documented forms: {documented}"
             )
 
-        explicit_code_values = cls._request_explicit_code_values()
         violations: list[str] = []
         for template in sorted(
             matching_templates,
@@ -2143,12 +2301,86 @@ class ShellTool(Tool):
                 prefix_tokens,
                 args,
                 template,
-                explicit_code_values,
+                explicit_request_values,
             )
             if violation is None:
                 return None
             violations.append(violation)
         return violations[0] if violations else None
+
+    def _augment_skill_cli_labeled_values(self, command: str, cwd: str) -> str:
+        """Fill documented skill CLI value flags from structured request facts."""
+        explicit_request_values = self._request_explicit_labeled_values()
+        if not explicit_request_values:
+            return command
+
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            return command
+        if not command_tokens:
+            return command
+        if any(token in {"&&", "||", ";", "|"} for token in command_tokens):
+            return command
+        if any(str(token).startswith((">", "1>", "2>")) for token in command_tokens):
+            return command
+
+        workspace_root = Path(self.working_dir or cwd).resolve()
+        invocation = self._extract_skill_cli_invocation_for_segment(
+            command_tokens,
+            Path(cwd).resolve(),
+            workspace_root,
+        )
+        if invocation is None:
+            return command
+        skill_name, args, prefix_tokens = invocation
+        if not args:
+            return command
+
+        skill_md = workspace_root / "skills" / skill_name / "SKILL.md"
+        if not skill_md.exists():
+            fallback_skill_md = Path(cwd).resolve() / "skills" / skill_name / "SKILL.md"
+            if fallback_skill_md.exists():
+                skill_md = fallback_skill_md
+        templates = self._parse_skill_command_templates(skill_md)
+        matching_templates = [
+            template
+            for template in templates
+            if tuple(args[: len(template.fixed_tokens)]) == template.fixed_tokens
+        ]
+        if not matching_templates:
+            return command
+
+        existing_flags = {
+            self._flag_name(token)
+            for token in args
+            if str(token or "").startswith("-")
+        }
+        existing_values = set(args)
+        for template in sorted(
+            matching_templates,
+            key=lambda item: (len(item.fixed_tokens), item.max_positionals),
+            reverse=True,
+        ):
+            for flag, label in dict(template.flag_value_labels).items():
+                if flag in existing_flags:
+                    continue
+                for value, request_labels in explicit_request_values.items():
+                    if value in existing_values:
+                        continue
+                    if not self._label_accepts_request_value(label, request_labels):
+                        continue
+                    prefix_len = len(prefix_tokens)
+                    insert_at = prefix_len + len(template.fixed_tokens)
+                    updated = list(command_tokens)
+                    updated[insert_at:insert_at] = [flag, value]
+                    augmented = shlex.join(updated)
+                    logger.info(
+                        "Augmented skill CLI command with structured request "
+                        f"value for skills/{skill_name}/SKILL.md parameter {flag}."
+                    )
+                    return augmented
+        return command
 
     def _reject_undocumented_skill_cli_arguments(
         self,
@@ -2174,7 +2406,11 @@ class ShellTool(Tool):
                 current_dir = self._resolve_cd_segment(current_dir, segment)
                 continue
             cleaned_segment = self._segment_before_redirection_or_pipe(segment)
-            invocation = self._extract_skill_cli_invocation(cleaned_segment)
+            invocation = self._extract_skill_cli_invocation_for_segment(
+                cleaned_segment,
+                current_dir,
+                workspace_root,
+            )
             if invocation is None:
                 continue
             skill_name, args, prefix_tokens = invocation
@@ -2195,6 +2431,7 @@ class ShellTool(Tool):
                 prefix_tokens,
                 args,
                 templates,
+                self._request_explicit_labeled_values(),
             )
             if violation:
                 return violation
@@ -2209,6 +2446,7 @@ class ShellTool(Tool):
         if not command_tokens:
             return False
 
+        workspace_root = Path(self.working_dir or cwd).resolve()
         current_dir = Path(cwd).resolve()
         for segment in self._split_shell_segments(command_tokens):
             if not segment:
@@ -2217,7 +2455,11 @@ class ShellTool(Tool):
                 current_dir = self._resolve_cd_segment(current_dir, segment)
                 continue
             cleaned_segment = self._segment_before_redirection_or_pipe(segment)
-            invocation = self._extract_skill_cli_invocation(cleaned_segment)
+            invocation = self._extract_skill_cli_invocation_for_segment(
+                cleaned_segment,
+                current_dir,
+                workspace_root,
+            )
             if invocation is not None:
                 return True
 

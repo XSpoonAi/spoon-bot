@@ -1405,8 +1405,7 @@ $CLI stats
         assert not any("wallet again" in command for command in commands)
         assert "join [gameId] [spot]" in context
         assert "settlement <gameId>" in context
-        assert "repeating setup/status commands" in context
-        assert "use that documented flow" in context
+        assert "extracted command forms" in context
 
     def test_request_execution_hints_keep_github_urls_as_plain_evidence(self, tmp_path):
         """Explicit GitHub URLs stay evidence, not request-routed workflows."""
@@ -1436,6 +1435,7 @@ $CLI stats
     def test_exact_spot_prompt_keeps_original_request_data_without_route(self, tmp_path):
         """The SPOT prompt keeps explicit facts without rewriting or route policy."""
         from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.request_hints import format_explicit_request_values_context
 
         workspace = tmp_path / "workspace"
         workspace.mkdir()
@@ -1448,8 +1448,7 @@ $CLI stats
         message = (
             "https://github.com/Agent-Cypher-Lab/agent-spot-cypher\n"
             "Help me install the skill in the repo, use the faucet, register 8004 agent id, "
-            "and then join the latest spot game.\n"
-            "use this invite code 3KK57S"
+            "and then join the latest spot game. Invited Code: 3KK57S."
         )
 
         hints = AgentLoop._build_request_execution_hints(loop, message)
@@ -1457,11 +1456,19 @@ $CLI stats
         assert hints["explicit_request_urls"] == [
             "https://github.com/Agent-Cypher-Lab/agent-spot-cypher"
         ]
-        assert hints["explicit_code_values"] == ["3KK57S"]
+        assert hints["explicit_request_values"] == [{
+            "value": "3KK57S",
+            "labels": ["code", "invited"],
+            "label": "Invited Code",
+        }]
         assert "github_skill_install_request" not in hints
         assert "execution_workflows" not in hints
         assert "tool_call_mode" not in hints
-        assert message.endswith("use this invite code 3KK57S")
+        assert message.endswith("Invited Code: 3KK57S.")
+
+        context = format_explicit_request_values_context(message)
+        assert "[STRUCTURED USER REQUEST FACTS]:" in context
+        assert "Invited Code: 3KK57S" in context
 
     def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
         """A normal GitHub repo request should not be routed into workspace/skills."""
@@ -1528,48 +1535,6 @@ $CLI stats
 
         assert should_run_skill_contract_check(events) is False
 
-    def test_skill_contract_check_prompt_is_generic(self):
-        """The verifier prompt compares request and evidence without task-specific routing."""
-        from spoon_bot.agent.turn_verifiers import build_skill_contract_check_prompt
-
-        message = (
-            "https://github.com/example-org/example-skill\n"
-            "Please install the skill in this repo, then complete the remaining objective."
-        )
-        events = [{
-            "type": "tool_result",
-            "metadata": {
-                "name": "skill_marketplace",
-                "result": (
-                    "SUCCESS: Skill 'example-skill' installed (1 files).\n"
-                    "NEXT: node skills/example-skill/cli/index.js run"
-                ),
-            },
-        }]
-
-        prompt = build_skill_contract_check_prompt(
-            message,
-            "Installation finished.",
-            events,
-        )
-
-        assert "[INTERNAL COMPLETION VERIFIER]" in prompt
-        assert "reply exactly COMPLETE" in prompt
-        assert "tool evidence" in prompt.lower()
-        assert "[STRUCTURAL FOLLOW-UP COMMANDS]" in prompt
-        assert "node skills/example-skill/cli/index.js run" in prompt
-        assert "do not copy long 0x values" in prompt
-        assert "do not shorten a documented command hierarchy" in prompt
-        assert "Do not append optional follow-up questions" in prompt
-        assert "does not prove downstream requested actions are complete" in prompt
-        assert "Do not infer extra flags or arguments" in prompt
-        assert "do not carry those codes into unrelated" in prompt
-        assert "missing optional code as skippable" in prompt
-        assert "running the documented no-code path" in prompt
-        assert "nonzero GAS/GLD balances and an AgentID value other than none" in prompt
-        assert "only asked to install" in prompt
-        assert "unless the latest user request also asks to use the skill" in prompt
-
     def test_skill_read_summary_remains_model_visible(self):
         """SKILL.md execution summaries should help recovery without leaking to clients."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1615,38 +1580,6 @@ $CLI stats
 
         assert "installed SKILL.md" in prompt
         assert "node skills/demo-skill/cli/index.js run" in prompt
-
-    def test_skill_contract_evidence_summary_preserves_head_and_tail(self):
-        """Long skill/tool evidence should preserve both setup and later contract rules."""
-        from spoon_bot.agent.turn_verifiers import build_skill_contract_check_prompt
-
-        long_contract = (
-            "SKILL HEAD: setup and wallet\n"
-            + ("middle instructions\n" * 300)
-            + "SKILL TAIL: after join, continue until settlement\n"
-        )
-        prompt = build_skill_contract_check_prompt(
-            "Install the skill and complete the workflow.",
-            "Setup completed.",
-            [{
-                "type": "tool_result",
-                "metadata": {
-                    "name": "self_upgrade",
-                    "result": long_contract,
-                },
-            }],
-        )
-
-        assert "SKILL HEAD: setup and wallet" in prompt
-        assert "SKILL TAIL: after join, continue until settlement" in prompt
-        assert "tool output middle omitted" in prompt
-
-    def test_skill_contract_check_pass_is_explicit_sentinel(self):
-        """The verifier preserves the existing answer only on the exact sentinel."""
-        from spoon_bot.agent.turn_verifiers import is_skill_contract_check_pass
-
-        assert is_skill_contract_check_pass("COMPLETE\n") is True
-        assert is_skill_contract_check_pass("Complete, everything is done.") is False
 
     def test_tool_evidence_fallback_prefers_user_summary_marker(self):
         """Fallback cleanup should use user-facing evidence, not raw tool transcript."""
@@ -1927,6 +1860,9 @@ $CLI stats
         assert emitted
         assert tool_events_have_user_summary_marker(events) is True
         assert "settlement 152" in agent.tools.execute.await_args.args[1]["command"]
+        forbidden_env_source = "source " + ".env.local"
+        assert forbidden_env_source not in agent.tools.execute.await_args.args[1]["command"]
+        assert agent.tools.execute.await_args.args[1]["working_dir"] == "/workspace"
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):

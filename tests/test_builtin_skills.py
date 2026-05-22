@@ -23,6 +23,9 @@ def test_ensure_builtin_skills_installs_builtin_skill_set(tmp_path):
     assert (workspace / "skills" / "skill-manager" / ".spoon-bot-builtin").exists()
     assert not (workspace / "skills" / "wallet" / "scripts").exists()
     assert not (workspace / "skills" / "wallet" / "assets").exists()
+    assert AgentLoop._skill_tool_default_active(
+        workspace / "skills" / "service_expose"
+    ) is True
 
 
 def test_ensure_builtin_skills_does_not_overwrite_existing_skill(tmp_path):

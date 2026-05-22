@@ -117,8 +117,12 @@ class ServiceExposeTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> str:
         timeout = 90
-        if kwargs.get("action") == "start" and kwargs.get("start_tunnel"):
-            timeout = 120
+        action = str(kwargs.get("action") or "").strip().lower()
+        if action in {"start", "tunnel", "expose", "start_tunnel"} or kwargs.get("start_tunnel"):
+            tunnel_wait = int(kwargs.get("tunnel_wait_seconds") or 60)
+            verify_wait = int(kwargs.get("verify_wait_seconds") or 10)
+            startup_wait = int(float(kwargs.get("startup_wait_seconds") or 2))
+            timeout = max(timeout, tunnel_wait + verify_wait + startup_wait + 30)
         payload = {k: v for k, v in kwargs.items() if v is not None}
 
         def _run() -> subprocess.CompletedProcess[str]:
