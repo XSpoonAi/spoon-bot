@@ -263,6 +263,69 @@ class ReadFileTool(Tool):
             if stripped.startswith("$CLI") or re.match(r"^[A-Za-z0-9_.\\/-]+\s+", stripped):
                 command_section.append(stripped)
 
+        contract_headings = (
+            "setup",
+            "prerequisite",
+            "primary flow",
+            "workflow",
+            "procedure",
+            "execution rule",
+            "rule",
+            "steps",
+        )
+        directive_prefixes = (
+            "procedure ",
+            "step ",
+            "run ",
+            "match ",
+            "if ",
+            "else",
+            "otherwise",
+            "ask ",
+            "before ",
+            "after ",
+            "once ",
+            "when ",
+            "decide ",
+            "use ",
+            "prefer ",
+            "complete ",
+            "do not ",
+            "don't ",
+            "stop ",
+            "return ",
+            "report ",
+            "keep ",
+            "rule ",
+            "- ",
+            "$cli",
+        )
+        contract_lines: list[str] = []
+        in_contract_section = False
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if stripped.startswith("#"):
+                title = stripped.lstrip("#").strip().casefold()
+                in_contract_section = any(
+                    heading in title for heading in contract_headings
+                )
+                continue
+            if not in_contract_section:
+                continue
+            if stripped.startswith("```"):
+                continue
+            if not stripped:
+                continue
+            lowered = stripped.casefold()
+            if (
+                lowered.startswith(directive_prefixes)
+                or "$cli" in lowered
+                or stripped.startswith('"')
+            ):
+                contract_lines.append(raw_line.rstrip()[:220])
+
+        contract_lines = _dedupe(contract_lines, limit=90)
+
         rule_lines = _dedupe(
             [
                 line.strip()
@@ -277,6 +340,8 @@ class ReadFileTool(Tool):
             sections.append("Metadata:\n" + "\n".join(frontmatter[:12]))
         if cli_lines:
             sections.append("CLI entrypoint:\n" + "\n".join(cli_lines))
+        if contract_lines:
+            sections.append("Operational contract:\n" + "\n".join(contract_lines))
         if command_section:
             sections.append("Documented commands:\n" + "\n".join(command_section[:24]))
         if rule_lines:
@@ -379,7 +444,9 @@ class WriteFileTool(Tool):
                         f"Error: File already exists: {path}. "
                         "Use edit_file for targeted changes, or call write_file "
                         "with overwrite=true only when the whole-file replacement "
-                        "is intentional."
+                        "is intentional. This is recoverable: if you just generated "
+                        "the complete replacement content for this same file, retry "
+                        "the same write_file call with overwrite=true."
                     )
 
             # Create parent directories (already validated to be within workspace)

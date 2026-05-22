@@ -126,6 +126,46 @@ def _request_mentions_skill_install(message: str) -> bool:
     return any(marker in lowered for marker in ("安装", "装一下", "添加", "导入", "加载", "使用"))
 
 
+def _request_is_skill_install_only(message: str) -> bool:
+    """Return True when the request stops at installing a skill."""
+    text = str(message or "")
+    if not _request_mentions_skill_install(text):
+        return False
+    tokens = tokenize_request_matching_text(
+        " ".join(
+            part
+            for part in text.replace("\n", " ").split()
+            if not part.startswith(("http://", "https://"))
+        )
+    )
+    downstream_action_tokens = {
+        "use",
+        "run",
+        "execute",
+        "call",
+        "start",
+        "launch",
+        "build",
+        "create",
+        "serve",
+        "expose",
+        "deploy",
+        "test",
+        "play",
+        "continue",
+        "complete",
+        "register",
+        "join",
+        "open",
+        "fetch",
+        "inspect",
+        "analyze",
+    }
+    if tokens & downstream_action_tokens:
+        return False
+    return not any(marker in text.casefold() for marker in ("然后", "接着", "并且", "and then", "then "))
+
+
 def format_github_skill_install_context(hints: dict[str, Any]) -> str:
     """Format request-scoped guidance for explicit GitHub skill installs."""
     request = hints.get("github_skill_install_request") if isinstance(hints, dict) else None
@@ -578,10 +618,11 @@ def build_request_execution_hints(
     github_urls = _extract_github_urls(explicit_urls)
     github_skill_install_request = (
         {
-            "urls": github_urls,
-            "preferred_tool": "skill_marketplace",
-            "action": "install_skill",
-        }
+                "urls": github_urls,
+                "preferred_tool": "skill_marketplace",
+                "action": "install_skill",
+                "install_only": _request_is_skill_install_only(message_text),
+            }
         if github_urls and _request_mentions_skill_install(message_text)
         else None
     )

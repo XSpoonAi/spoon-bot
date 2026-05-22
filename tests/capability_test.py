@@ -20,7 +20,7 @@ from uuid import uuid4
 import websockets
 
 
-WS_URL = "ws://127.0.0.1:8080/v1/ws"
+WS_URL = "ws://127.0.0.1:16600/v1/ws"
 TIMEOUT = 90  # seconds per test
 
 
@@ -571,7 +571,7 @@ async def test_rest_api(results: list[TestResult]):
     try:
         import aiohttp
 
-        url = "http://127.0.0.1:8080/v1/agent/chat"
+        url = "http://127.0.0.1:16600/v1/agent/chat"
         payload = {"message": "What is the capital of France? Reply in one word."}
 
         async with aiohttp.ClientSession() as session:
@@ -644,7 +644,7 @@ async def test_agent_status(results: list[TestResult]):
     try:
         import aiohttp
 
-        url = "http://127.0.0.1:8080/v1/agent/status"
+        url = "http://127.0.0.1:16600/v1/agent/status"
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:

@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+DEFAULT_GATEWAY_PORT = 16600
+
+
 @dataclass
 class CORSConfig:
     """CORS configuration."""
@@ -85,7 +88,7 @@ class GatewayConfig:
 
     # Server settings
     host: str = "127.0.0.1"
-    port: int = 8080
+    port: int = DEFAULT_GATEWAY_PORT
     debug: bool = False
 
     # API settings
@@ -123,7 +126,7 @@ class GatewayConfig:
         """Create config from environment variables."""
         return cls(
             host=os.environ.get("GATEWAY_HOST", "127.0.0.1"),
-            port=int(os.environ.get("GATEWAY_PORT", "8080")),
+            port=int(os.environ.get("GATEWAY_PORT", str(DEFAULT_GATEWAY_PORT))),
             debug=os.environ.get("GATEWAY_DEBUG", "").lower() == "true",
             jwt=JWTConfig(
                 secret_key=os.environ.get("JWT_SECRET", ""),

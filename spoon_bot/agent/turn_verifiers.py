@@ -54,6 +54,28 @@ _ERROR_LINE_MARKERS = (
 )
 
 
+def _contains_workspace_skill_path(text: str) -> bool:
+    """Return True for normalized workspace paths under skills/<skill-name>/."""
+    marker = "skills/"
+    start = 0
+    while True:
+        index = text.find(marker, start)
+        if index < 0:
+            return False
+
+        suffix = text[index + len(marker):]
+        slash_index = suffix.find("/")
+        if slash_index > 0:
+            skill_name = suffix[:slash_index]
+            if skill_name not in {".", ".."} and all(
+                char.isalnum() or char in {"-", "_", "."}
+                for char in skill_name
+            ):
+                return True
+
+        start = index + len(marker)
+
+
 def _stringify_stream_payload(payload: Any) -> str:
     if payload is None:
         return ""
@@ -121,7 +143,7 @@ def _tool_result_indicates_workspace_skill_activity(event: dict[str, Any]) -> bo
             for word in ("installed", "already installed", "updated", "removed")
         )
 
-    if "skills/" in normalized and "skill.md" in normalized:
+    if _contains_workspace_skill_path(normalized):
         return True
 
     return False
@@ -273,6 +295,64 @@ def tool_events_have_user_summary_marker(tool_result_events: list[dict[str, Any]
         _stream_tool_event_text(event)
         for event in tool_result_events
     ]))
+
+
+def latest_tool_event_has_user_summary_marker(
+    tool_result_events: list[dict[str, Any]],
+) -> bool:
+    """Return True when the latest non-empty tool result carries a final summary."""
+    for event in reversed(tool_result_events):
+        text = _stream_tool_event_text(event)
+        if not text.strip():
+            continue
+        return bool(_iter_user_summary_lines([text]))
+    return False
+
+
+def tool_events_have_skill_install_completion(
+    tool_result_events: list[dict[str, Any]],
+) -> bool:
+    """Return True when skill-management evidence proves installation is done."""
+    for event in tool_result_events:
+        if _stream_tool_event_name(event) != "skill_marketplace":
+            continue
+        text = _stream_tool_event_text(event).casefold()
+        if "skill " not in text:
+            continue
+        if "success:" in text and "installed" in text:
+            return True
+        if "already installed" in text or "is already installed" in text:
+            return True
+    return False
+
+
+def build_skill_install_completion_answer(
+    tool_result_events: list[dict[str, Any]],
+) -> str:
+    """Build a concise answer from skill installation evidence."""
+    for event in reversed(tool_result_events):
+        if _stream_tool_event_name(event) != "skill_marketplace":
+            continue
+        text = _stream_tool_event_text(event)
+        lowered = text.casefold()
+        if "skill " not in lowered:
+            continue
+        if not (
+            ("success:" in lowered and "installed" in lowered)
+            or "already installed" in lowered
+            or "is already installed" in lowered
+        ):
+            continue
+
+        skill_name = ""
+        match = re.search(r"Skill\s+'([^']+)'", text)
+        if match:
+            skill_name = match.group(1).strip()
+        status = "already installed" if "already installed" in lowered else "installed"
+        if skill_name:
+            return f"Completed.\n\nSkill '{skill_name}' {status}."
+        return f"Completed.\n\nSkill {status}."
+    return "Completed.\n\nSkill installation completed."
 
 
 def _iter_status_evidence_lines(tool_outputs: list[str], *, limit: int = 5) -> list[str]:

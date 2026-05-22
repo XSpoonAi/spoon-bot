@@ -37,7 +37,7 @@ from fastapi.testclient import TestClient
 
 from spoon_bot.gateway.app import create_app, set_agent
 from spoon_bot.gateway import app as app_module
-from spoon_bot.gateway.config import GatewayConfig
+from spoon_bot.gateway.config import DEFAULT_GATEWAY_PORT, GatewayConfig
 from spoon_bot.gateway.auth.jwt import (
     create_access_token,
     verify_token,
@@ -122,7 +122,7 @@ def config():
     """Create test gateway config with auth disabled."""
     cfg = GatewayConfig(
         host="127.0.0.1",
-        port=8080,
+        port=DEFAULT_GATEWAY_PORT,
         debug=True,
     )
     return cfg
@@ -133,7 +133,7 @@ def auth_config():
     """Create test gateway config with auth ENABLED."""
     cfg = GatewayConfig(
         host="127.0.0.1",
-        port=8080,
+        port=DEFAULT_GATEWAY_PORT,
         debug=True,
     )
     cfg.api_keys["sk_test_valid_key_12345678"] = "test-user"

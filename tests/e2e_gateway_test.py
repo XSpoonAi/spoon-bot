@@ -4,7 +4,7 @@ End-to-end gateway test script for spoon-bot.
 
 Tests all API endpoints against a running gateway instance.
 Start the gateway first:
-    python -m uvicorn spoon_bot.gateway.server:create_app --factory --host 127.0.0.1 --port 8080
+    python -m uvicorn spoon_bot.gateway.server:create_app --factory --host 127.0.0.1 --port 16600
 """
 
 import json

@@ -108,14 +108,17 @@ from spoon_bot.agent.request_hints import (
 )
 from spoon_bot.agent.turn_verifiers import (
     DEFAULT_SKILL_CONTRACT_CHECK_LIMIT,
+    build_skill_install_completion_answer,
     build_skill_contract_check_prompt,
     build_user_facing_tool_event_answer,
     build_user_facing_tool_evidence_answer,
     extract_resolved_tool_next_commands,
     has_pending_placeholder_next_command,
+    latest_tool_event_has_user_summary_marker,
     is_skill_contract_check_pass,
     latest_tool_event_has_next_command,
     should_run_skill_contract_check,
+    tool_events_have_skill_install_completion,
     tool_events_have_user_summary_marker,
 )
 from spoon_bot.agent.tools.self_config import (
@@ -411,6 +414,9 @@ class AgentLoop:
         "Treat the latest real user request as authoritative, even if earlier history was compacted. "
         "Prior conversation is reference only; do not continue, finish, or repair an earlier task unless the latest request explicitly asks for that. "
         "Do NOT repeat previous actions. Do NOT fabricate output. "
+        "If `write_file` reports that a file already exists and you intentionally "
+        "generated a full replacement for that same file, retry that exact write "
+        "with `overwrite=true`; otherwise use `edit_file`. "
         "Make autonomous choices when input is needed. "
         "Do NOT summarize prior work unless the user explicitly asked for a summary. "
         "If the task can be completed now, return the final user-facing answer in the format the user requested and stop. "
@@ -844,11 +850,18 @@ class AgentLoop:
             "\n## Workflow\n"
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
             "1. Decide the next action from the latest user request and available context.\n"
-            "2. If an installed skill is directly relevant, `read_file` its SKILL.md path, "
-            "then execute its procedure exactly, including its rules about when to ask "
-            "the user and when to decide autonomously. Complete any Setup, "
-            "Prerequisites, Install, or dependency steps before primary commands.\n"
-            "3. Run commands from SKILL.md directly via shell. Do NOT write script files unless requested.\n"
+            "2. If an installed skill or dynamically loadable tool is directly relevant, "
+            "prefer the most specific available tool for that workflow. If the skill has "
+            "no tool, `read_file` its SKILL.md path, then execute its procedure exactly, "
+            "including its rules about when to ask the user and when to decide "
+            "autonomously. Complete any Setup, Prerequisites, Install, or dependency "
+            "steps before primary commands. When a skill defines conditional setup "
+            "checks, run the check first and perform setup actions only when the "
+            "documented condition is met. Do not read optional reference files unless "
+            "the SKILL.md summary lacks enough information for the next action or a "
+            "tool result points to a specific reference for recovery.\n"
+            "3. Run commands from SKILL.md directly via shell only when there is no "
+            "matching specialized tool. Do NOT write script files unless requested.\n"
             "4. When done, return the user-facing result in the format the latest user requested. "
             "Only summarize if the user explicitly asked for a summary.\n\n"
             "### Rules\n"
@@ -858,6 +871,16 @@ class AgentLoop:
             "verify with tools before answering.\n"
             "- `source .env.local` before commands that need env vars.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
+            "- If `write_file` reports an existing file and the task requires a "
+            "generated whole-file replacement, retry that same write with "
+            "`overwrite=true`; use `edit_file` only for targeted changes.\n"
+            "- For long-running skill commands that must stay in foreground or run a "
+            "continuous workflow, set a timeout long enough for the command to reach "
+            "its documented terminal state. If a command is moved to the background, "
+            "monitor that job to completion before issuing related commands.\n"
+            "- For user-created background services or preview links, do not infer success "
+            "from EADDRINUSE or an arbitrary HTTP 200. Use a free port when needed and "
+            "verify app-specific content before reporting a URL.\n"
             "- Follow user instructions exactly - respect specific IDs, names, actions.\n"
             "- Use web search when the task needs live external facts or installed skills/tools are insufficient.\n"
         )
@@ -963,7 +986,7 @@ class AgentLoop:
             import inspect
             _sm_sig = inspect.signature(SkillManager.__init__)
             _sm_kwargs: dict[str, Any] = {
-                "skill_paths": [str(p) for p in self._skill_paths],
+                "skill_paths": [str(p) for p in self._skill_manager_discovery_paths()],
                 "llm": self._chatbot,
                 "auto_discover": True,
             }
@@ -1097,6 +1120,7 @@ class AgentLoop:
                 {"name": t.name, "description": t.description}
                 for t in self.tools.get_inactive_tools().values()
             ],
+            tool_status_fn=self._tool_activation_status,
         ))
 
         cron_tool = CronTool()
@@ -1247,7 +1271,7 @@ class AgentLoop:
         import inspect
         _sm_sig = inspect.signature(SkillManager.__init__)
         _sm_kwargs: dict[str, Any] = {
-            "skill_paths": [str(p) for p in self._skill_paths],
+            "skill_paths": [str(p) for p in self._skill_manager_discovery_paths()],
             "llm": self._chatbot,
             "auto_discover": True,
         }
@@ -3182,9 +3206,6 @@ class AgentLoop:
                 await self._execute_structural_followup_commands_for_process(
                     tool_result_events,
                     reason="process_structural_followup",
-                )
-                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
-                    _pre_turn_memory_index
                 )
 
             if (
@@ -6170,6 +6191,8 @@ class AgentLoop:
                 int(getattr(self, "provider_silence_retries", 1) or 0),
             )
             retry_reasoning_effort: str | None = None
+            request_execution_hints = self._build_request_execution_hints(authoritative_message)
+            self._activate_tools_for_request_hints(request_execution_hints)
 
             async def _run_and_signal() -> None:
                 nonlocal run_result_text, stream_error_reason
@@ -6189,8 +6212,6 @@ class AgentLoop:
                         while not self._agent.output_queue.empty():
                             self._agent.output_queue.get_nowait()
 
-                    request_execution_hints = self._build_request_execution_hints(authoritative_message)
-                    self._activate_tools_for_request_hints(request_execution_hints)
                     with (
                         self._serial_tool_calls_for_request_hints(request_execution_hints),
                         bind_request_execution_hints(request_execution_hints),
@@ -6369,6 +6390,38 @@ class AgentLoop:
                     td.set()
                 except Exception:
                     pass
+
+            def _install_only_skill_request_done() -> bool:
+                github_install_request = (
+                    request_execution_hints.get("github_skill_install_request")
+                    if isinstance(request_execution_hints, dict)
+                    else None
+                )
+                return (
+                    isinstance(github_install_request, dict)
+                    and bool(github_install_request.get("install_only"))
+                    and tool_events_have_skill_install_completion(all_tool_result_events)
+                )
+
+            def _stop_with_install_only_skill_completion() -> bool:
+                nonlocal run_result_text, pre_tool_scratchpad_events, pre_tool_scratchpad_buffer
+                nonlocal post_tool_content_events, post_tool_content_buffer
+                if not _install_only_skill_request_done():
+                    return False
+                run_result_text = build_skill_install_completion_answer(
+                    all_tool_result_events,
+                )
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                pre_tool_scratchpad_events = []
+                pre_tool_scratchpad_buffer = ""
+                post_tool_content_events = []
+                post_tool_content_buffer = ""
+                try:
+                    td.set()
+                except Exception:
+                    pass
+                return True
 
             def _stop_if_total_timeout() -> bool:
                 now = time.monotonic()
@@ -6860,6 +6913,8 @@ class AgentLoop:
                     repeated_read_guardrail_seen = True
                 for event in tool_result_events:
                     yield _decorate_stream_event(event)
+                if _stop_with_install_only_skill_completion():
+                    break
                 if any(AgentLoop._is_tool_loop_suppression_event(event) for event in tool_result_events):
                     logger.warning("Stopping tool loop after repeated-tool guardrail result.")
                     _stop_tool_loop("tool_suppression")
@@ -7134,6 +7189,8 @@ class AgentLoop:
                         "metadata": metadata,
                     }
                     yield _decorate_stream_event(tool_result_event)
+                    if _stop_with_install_only_skill_completion():
+                        break
                     if AgentLoop._is_tool_loop_suppression_event(tool_result_event):
                         logger.warning("Stopping tool loop after repeated-tool guardrail result.")
                         _stop_tool_loop("tool_suppression")
@@ -7378,7 +7435,8 @@ class AgentLoop:
                 pending_fallback_delta = repair_text
 
             if (
-                should_run_skill_contract_check(all_tool_result_events)
+                stream_error_reason is None
+                and should_run_skill_contract_check(all_tool_result_events)
                 and latest_tool_event_has_next_command(all_tool_result_events)
                 and not has_pending_placeholder_next_command(all_tool_result_events)
                 and not tool_events_have_user_summary_marker(all_tool_result_events)
@@ -7399,7 +7457,8 @@ class AgentLoop:
                     pending_fallback_delta = full_content
 
             if (
-                should_run_skill_contract_check(all_tool_result_events)
+                stream_error_reason is None
+                and should_run_skill_contract_check(all_tool_result_events)
                 and has_pending_placeholder_next_command(all_tool_result_events)
                 and not tool_events_have_user_summary_marker(all_tool_result_events)
             ):
@@ -7426,9 +7485,31 @@ class AgentLoop:
                 pending_fallback_reason = "pending_followup_recovery"
                 pending_fallback_delta = repair_text
 
+            github_install_request = (
+                request_execution_hints.get("github_skill_install_request")
+                if isinstance(request_execution_hints, dict)
+                else None
+            )
+            install_only_skill_request_done = (
+                isinstance(github_install_request, dict)
+                and bool(github_install_request.get("install_only"))
+                and tool_events_have_skill_install_completion(all_tool_result_events)
+            )
+            if install_only_skill_request_done:
+                full_content = build_skill_install_completion_answer(
+                    all_tool_result_events,
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = "skill_install_completion"
+                pending_fallback_delta = full_content
             while (
                 full_content.strip()
+                and stream_error_reason is None
                 and should_run_skill_contract_check(
+                    all_tool_result_events,
+                )
+                and not install_only_skill_request_done
+                and not latest_tool_event_has_user_summary_marker(
                     all_tool_result_events,
                 )
                 and skill_contract_check_attempts < skill_contract_check_limit
@@ -7912,9 +7993,6 @@ class AgentLoop:
                     tool_result_events,
                     reason="process_with_thinking_structural_followup",
                 )
-                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
-                    _pre_turn_memory_index
-                )
 
             if (
                 should_run_skill_contract_check(tool_result_events)
@@ -8128,12 +8206,53 @@ class AgentLoop:
             return result
 
         fm_text = fm.group(1)
+        try:
+            import yaml
+
+            parsed = yaml.safe_load(fm_text) or {}
+        except Exception:
+            parsed = {}
+
+        if isinstance(parsed, dict):
+            description = parsed.get("description")
+            when_to_use = parsed.get("when_to_use", parsed.get("whenToUse", ""))
+            paths = parsed.get("paths")
+            triggers = parsed.get("triggers")
+
+            if isinstance(description, str):
+                result["description"] = description
+            if isinstance(when_to_use, str):
+                result["when_to_use"] = when_to_use
+            if isinstance(paths, list):
+                result["paths"] = [str(path) for path in paths if str(path).strip()]
+
+            trigger_fragments: list[str] = []
+
+            def _collect_strings(value: object) -> None:
+                if isinstance(value, str):
+                    trigger_fragments.append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        _collect_strings(item)
+                elif isinstance(value, dict):
+                    for item in value.values():
+                        _collect_strings(item)
+
+            _collect_strings(triggers)
+            result["triggers"] = "|".join(trigger_fragments)
+
+            if result["description"]:
+                result["description"] = str(result["description"]).strip()[:300]
+                result["when_to_use"] = str(result["when_to_use"]).strip()[:200]
+                return result
+
         in_multiline = ""
         in_paths_list = False
         trigger_fragments: list[str] = []
         paths_list: list[str] = []
 
         for line in fm_text.split("\n"):
+            is_top_level = bool(line.strip()) and not line.startswith((" ", "\t"))
             stripped = line.strip()
 
             if in_paths_list:
@@ -8157,21 +8276,21 @@ class AgentLoop:
                 else:
                     in_multiline = ""
 
-            if stripped.startswith("description:"):
+            if is_top_level and stripped.startswith("description:"):
                 val = stripped.split(":", 1)[1].strip().strip("'\"")
                 if val and val not in (">", "|"):
                     result["description"] = val
                 elif val in (">", "|"):
                     in_multiline = "description"
 
-            elif stripped.startswith(("when_to_use:", "whenToUse:")):
+            elif is_top_level and stripped.startswith(("when_to_use:", "whenToUse:")):
                 val = stripped.split(":", 1)[1].strip().strip("'\"")
                 if val and val not in (">", "|"):
                     result["when_to_use"] = val
                 elif val in (">", "|"):
                     in_multiline = "when_to_use"
 
-            elif stripped.startswith("paths:"):
+            elif is_top_level and stripped.startswith("paths:"):
                 inline = stripped.split(":", 1)[1].strip()
                 if inline.startswith("[") and inline.endswith("]"):
                     for p in inline[1:-1].split(","):
@@ -8181,7 +8300,7 @@ class AgentLoop:
                 else:
                     in_paths_list = True
 
-            elif "triggers" in stripped.lower() or "trigger" in stripped.lower():
+            elif is_top_level and ("triggers" in stripped.lower() or "trigger" in stripped.lower()):
                 trigger_fragments.extend(_re.findall(r'"([^"]+)"', stripped))
 
         if not result["description"]:
@@ -8196,6 +8315,56 @@ class AgentLoop:
         result["triggers"] = "|".join(trigger_fragments)
         result["paths"] = paths_list
         return result
+
+    @staticmethod
+    def _has_valid_skill_frontmatter(skill_md: Path) -> bool:
+        """Return True when a SKILL.md starts with a YAML frontmatter block."""
+        try:
+            lines = skill_md.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return False
+        if not lines or lines[0].strip() != "---":
+            return False
+        return any(line.strip() == "---" for line in lines[1:80])
+
+    def _skill_manager_discovery_paths(self) -> list[Path]:
+        """Return valid skill directories for the spoon-core SkillManager.
+
+        spoon-core logs an error for every invalid SKILL.md it sees.  The local
+        prompt builder can tolerate stale user folders, but the runtime manager
+        should only receive directories that contain parseable skill metadata.
+        """
+        paths: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                return
+            key = str(resolved)
+            if key in seen:
+                return
+            seen.add(key)
+            paths.append(resolved)
+
+        for base in getattr(self, "_skill_paths", []):
+            root = Path(base)
+            if not root.is_dir():
+                continue
+            direct_skill_md = root / "SKILL.md"
+            if direct_skill_md.exists():
+                if self._has_valid_skill_frontmatter(direct_skill_md):
+                    add(root)
+                continue
+            for child in root.iterdir():
+                if not child.is_dir():
+                    continue
+                skill_md = child / "SKILL.md"
+                if self._has_valid_skill_frontmatter(skill_md):
+                    add(child)
+
+        return paths
 
     def _iter_skill_candidates(
         self, *, include_dormant: bool = False,
@@ -8427,6 +8596,15 @@ class AgentLoop:
     def _activate_tools_for_request_hints(self, hints: dict[str, Any]) -> list[str]:
         """Hook for request-scoped tool-profile activation."""
         return []
+
+    def _tool_activation_status(self, name: str) -> str:
+        """Return whether a registered tool is active, inactive, or missing."""
+        tool_name = str(name or "").strip()
+        if not tool_name or tool_name not in self.tools:
+            return "missing"
+        if tool_name in self.tools.get_active_tools():
+            return "active"
+        return "inactive"
 
     @staticmethod
     def _truncate_request_for_prompt(

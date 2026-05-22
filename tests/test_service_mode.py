@@ -29,10 +29,10 @@ def test_http_gateway_command_uses_uvicorn_and_config_env(tmp_path):
         "--host",
         "127.0.0.1",
         "--port",
-        "8080",
+        "16600",
     ]
     assert env_overrides["GATEWAY_HOST"] == "127.0.0.1"
-    assert env_overrides["GATEWAY_PORT"] == "8080"
+    assert env_overrides["GATEWAY_PORT"] == "16600"
     assert env_overrides["SPOON_BOT_CONFIG"] == str(config.resolve())
 
 
@@ -136,7 +136,7 @@ def test_windows_manual_start_reports_real_http_gateway_exit(tmp_path, monkeypat
     ok, msg = daemon.start(config=config, mode=daemon.ServiceMode.HTTP_GATEWAY)
 
     assert ok is False
-    assert "exited before binding http://127.0.0.1:8080" in msg
+    assert "exited before binding http://127.0.0.1:16600" in msg
     assert "Check logs:" in msg
 
 
@@ -248,7 +248,7 @@ def test_windows_status_reports_supervisor_and_url(tmp_path, monkeypatch):
     monkeypatch.setattr(
         daemon,
         "_is_http_gateway_listening",
-        lambda host="127.0.0.1", port=8080: True,
+        lambda host="127.0.0.1", port=16600: True,
     )
     monkeypatch.setattr(daemon, "_find_windows_listener_pid", lambda port: 9001)
     monkeypatch.setattr(
@@ -274,7 +274,7 @@ def test_windows_status_reports_supervisor_and_url(tmp_path, monkeypatch):
     assert info["pid"] == 9001
     assert info["task_name"] == "SpoonBot HTTP Gateway"
     assert info["task_status"] == "Running"
-    assert info["url"] == "http://127.0.0.1:8080"
+    assert info["url"] == "http://127.0.0.1:16600"
     assert info["gateway_health"] == "degraded"
     assert info["channels_health"] == "unhealthy"
     assert "telegram:Irene_spoon_bot" in info["channels_message"]
@@ -317,7 +317,7 @@ def test_service_status_command_passes_mode(monkeypatch):
             "auto_start": False,
             "installed": False,
             "supervisor": daemon.SUPERVISOR_NONE,
-            "url": "http://127.0.0.1:8080",
+            "url": "http://127.0.0.1:16600",
         }
 
     monkeypatch.setattr("spoon_bot.services.daemon.get_status", fake_status)
@@ -328,7 +328,7 @@ def test_service_status_command_passes_mode(monkeypatch):
     assert calls["mode"] == daemon.ServiceMode.HTTP_GATEWAY
     assert "http-gateway" in result.output
     assert "manual-detached" not in result.output
-    assert "http://127.0.0.1:8080" in result.output
+    assert "http://127.0.0.1:16600" in result.output
 
 
 def test_service_stop_and_restart_commands_pass_mode(monkeypatch, tmp_path):

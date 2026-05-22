@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from spoon_bot.agent.loop import AgentLoop
 from spoon_bot.skills.builtin import builtin_skills_root, ensure_builtin_skills
 
 
@@ -17,6 +18,7 @@ def test_ensure_builtin_skills_installs_builtin_skill_set(tmp_path):
     assert (workspace / "skills" / "service_expose" / "SKILL.md").exists()
     assert (workspace / "skills" / "skill-manager" / "SKILL.md").exists()
     assert (workspace / "skills" / "skill-manager" / "tools.py").exists()
+    assert (workspace / "skills" / "service_expose" / "tools.py").exists()
     assert (workspace / "skills" / "service_expose" / "scripts" / "service_expose.py").exists()
     assert (workspace / "skills" / "skill-manager" / ".spoon-bot-builtin").exists()
     assert not (workspace / "skills" / "wallet" / "scripts").exists()
@@ -73,6 +75,38 @@ def test_builtin_skills_root_contains_builtin_skill_set():
     assert (root / "service_expose" / "SKILL.md").exists()
     assert (root / "skill-manager" / "SKILL.md").exists()
     assert (root / "skill-manager" / "tools.py").exists()
+    assert (root / "service_expose" / "tools.py").exists()
     assert (root / "service_expose" / "scripts" / "service_expose.py").exists()
     assert not (root / "wallet" / "scripts").exists()
     assert not (root / "wallet" / "assets").exists()
+
+
+def test_skill_frontmatter_uses_top_level_description(tmp_path):
+    skill_md = tmp_path / "SKILL.md"
+    skill_md.write_text(
+        """---
+name: preview
+description: Run preview services in the background.
+triggers:
+  - type: keyword
+    keywords: [preview service, public link]
+scripts:
+  definitions:
+    - name: preview
+      input_schema:
+        type: object
+        properties:
+          tail_chars:
+            description: Log tail size
+---
+
+# Preview
+""",
+        encoding="utf-8",
+    )
+
+    parsed = AgentLoop._parse_skill_frontmatter(skill_md)
+
+    assert parsed["description"] == "Run preview services in the background."
+    assert "Log tail size" not in parsed["description"]
+    assert "preview service" in parsed["triggers"]

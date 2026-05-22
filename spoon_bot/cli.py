@@ -20,6 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from spoon_bot.gateway.config import DEFAULT_GATEWAY_PORT
 from spoon_bot.utils.errors import (
     SpoonBotError,
     ConfigurationError,
@@ -1559,7 +1560,8 @@ def _default_gateway_url() -> str:
     host = os.environ.get("GATEWAY_HOST", "127.0.0.1").strip() or "127.0.0.1"
     if host == "0.0.0.0":
         host = "127.0.0.1"
-    port = os.environ.get("GATEWAY_PORT", "8080").strip() or "8080"
+    default_port = str(DEFAULT_GATEWAY_PORT)
+    port = os.environ.get("GATEWAY_PORT", default_port).strip() or default_port
     return f"http://{host}:{port}"
 
 
@@ -1601,7 +1603,7 @@ def cron_status(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,
@@ -1637,7 +1639,7 @@ def cron_list(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,
@@ -1699,7 +1701,7 @@ def cron_create(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,
@@ -1762,7 +1764,7 @@ def cron_delete(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,
@@ -1806,7 +1808,7 @@ def cron_update(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,
@@ -1885,7 +1887,7 @@ def cron_run(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,
@@ -1916,7 +1918,7 @@ def cron_runs(
     gateway_url: Optional[str] = typer.Option(
         None,
         "--gateway-url",
-        help="Gateway base URL, e.g. http://127.0.0.1:8080",
+        help=f"Gateway base URL, e.g. http://127.0.0.1:{DEFAULT_GATEWAY_PORT}",
     ),
     gateway_api_key: Optional[str] = typer.Option(
         None,

@@ -76,6 +76,65 @@ class TestShellTool:
         """Shell should not guess business side effects from command words."""
         assert not callable(getattr(shell_tool, "tool_invocation_series_key", None))
 
+    def test_shell_detects_workspace_skill_commands_for_timeout_floor(self, tmp_path):
+        """Workspace skill CLI commands should keep the default foreground budget."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill").mkdir(parents=True)
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        assert shell_tool._command_invokes_workspace_skill(
+            "node skills/demo-skill/cli/index.js run",
+            str(workspace),
+        ) is True
+        assert shell_tool._command_invokes_workspace_skill(
+            "node scripts/build.js",
+            str(workspace),
+        ) is False
+
+    def test_shell_skips_exact_dedup_for_workspace_skill_commands(self, tmp_path):
+        """Skill-owned retry/idempotency should not be blocked by shell dedup."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        assert shell_tool.tool_invocation_dedup_key(
+            {
+                "action": "execute",
+                "command": "node skills/demo-skill/cli/index.js join A",
+                "working_dir": str(workspace),
+            }
+        ) is None
+
+    def test_shell_formats_idempotent_conflict_as_state(self, shell_tool):
+        """HTTP 409 already-state output should not look like a failed command."""
+        result = shell_tool._build_output_result(
+            "",
+            'HTTP 409 POST /v1/faucet: {"error":"Address already claimed in this round"}',
+            1,
+        )
+
+        assert "already satisfied" in result
+        assert "Address already claimed in this round" in result
+        assert "STDERR" not in result
+        assert "Exit code" not in result
+
+    def test_shell_normalizes_windows_python3_store_alias(self, shell_tool):
+        """Windows Store python3 alias should fall back to installed python."""
+        with patch("spoon_bot.agent.tools.shell.shutil.which") as which:
+            which.side_effect = lambda name: {
+                "python": r"C:\Python313\python.exe",
+                "python3": r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\python3.exe",
+            }.get(name)
+
+            result = shell_tool._normalize_windows_python_command("python3 -c \"print(1)\"")
+
+        assert result == "python -c \"print(1)\""
+        assert shell_tool._is_git_bash(r"C:\Program Files\Git\bin\bash.exe") is True
+
     def test_shell_rejects_chained_git_clone_into_workspace_skills(self, tmp_path):
         """Skill installs must go through the skill manager even when clone is chained."""
         from spoon_bot.agent.tools.shell import ShellTool
@@ -536,6 +595,58 @@ class TestShellTool:
         assert "search_history(scope='current')" in result
         assert "Long-term memory is not the current-session transcript" in result
         assert "stale long-term note" not in result
+
+    @pytest.mark.asyncio
+    async def test_memory_allows_repeated_read_only_actions_in_request_scope(self):
+        """Read-only memory checks should not trip exact duplicate suppression."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.self_config import MemoryManagementTool
+
+        class _Store:
+            def __init__(self):
+                self.added = 0
+
+            def get_summary(self):
+                return "Long-term memory: 0 entries"
+
+            def search(self, query):
+                return [f"hit:{query}"]
+
+            def add_memory(self, content, category):
+                self.added += 1
+
+        tool = MemoryManagementTool(_Store())
+
+        assert tool.tool_invocation_dedup_key({"action": "summary"}) is None
+        assert tool.tool_invocation_dedup_key({"action": "search", "query": "x"}) is None
+        assert tool.tool_invocation_dedup_key({"action": "remember", "content": "x"}) == {
+            "action": "remember",
+            "content": "x",
+        }
+        assert tool.tool_invocation_dedup_key({"action": "note", "content": "x"}) == {
+            "action": "note",
+            "content": "x",
+        }
+        assert tool.tool_invocation_dedup_key({"action": "forget", "content": "x"}) == {
+            "action": "forget",
+            "content": "x",
+        }
+
+        with track_tool_invocations(max_repeats=1):
+            first_summary = await tool(action="summary")
+            second_summary = await tool(action="summary")
+            first_search = await tool(action="search", query="install")
+            second_search = await tool(action="search", query="install")
+            first_write = await tool(action="remember", content="install done")
+            duplicate_write = await tool(action="remember", content="install done")
+
+        assert first_summary == "Long-term memory: 0 entries"
+        assert second_summary == "Long-term memory: 0 entries"
+        assert "hit:install" in first_search
+        assert "hit:install" in second_search
+        assert "Remembered: install done..." == first_write
+        assert "STOP_TOOL_LOOP" in duplicate_write
+        assert tool._memory_store.added == 1
 
     def test_shell_rejects_git_clone_into_workspace_skills(self, shell_tool, tmp_path):
         """Workspace skills must go through skill management, not manual clones."""
@@ -1202,9 +1313,10 @@ class TestFilesystemTools:
         assert "skill-ref" in result
         assert "[SKILL.md execution summary]" in result
         assert "node skills/spot-agent-cypher/cli/index.js" in result
+        assert "Operational contract:" in result
+        assert "RUN $CLI join {spot} again so backend can assign a fresh room" in result
         assert "$CLI join [gameId] [spot]" in result
         assert "$CLI settlement <gameId>" in result
-        assert "backend can assign a fresh room" not in result
 
     @pytest.mark.asyncio
     async def test_repeated_read_returns_cache_hit(self, temp_dir):
@@ -1222,9 +1334,9 @@ class TestFilesystemTools:
             third = await tool.execute(path=str(target))
 
         assert "alpha" in first
-        assert "READ_FILE_CACHE_HIT" in second
+        assert "File content already available" in second
         assert "without calling read_file again" in second
-        assert "STOP_TOOL_LOOP" in third
+        assert "Repeated read skipped" in third
         assert "next non-read action" in third
 
     @pytest.mark.asyncio

@@ -30,6 +30,8 @@ from typing import Optional
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from spoon_bot.gateway.config import DEFAULT_GATEWAY_PORT
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -48,6 +50,8 @@ WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
 WINDOWS_CREATE_NO_WINDOW = 0x08000000
 HTTP_GATEWAY_STARTUP_TIMEOUT_SEC = 30.0
 HTTP_GATEWAY_STARTUP_GRACE_SEC = 5.0
+DEFAULT_HTTP_GATEWAY_HOST = "127.0.0.1"
+DEFAULT_HTTP_GATEWAY_URL = f"http://{DEFAULT_HTTP_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}"
 
 
 class ServiceMode(str, Enum):
@@ -193,9 +197,9 @@ def _get_command(
         "spoon_bot.gateway.server:create_app",
         "--factory",
         "--host",
-        "127.0.0.1",
+        DEFAULT_HTTP_GATEWAY_HOST,
         "--port",
-        "8080",
+        str(DEFAULT_GATEWAY_PORT),
     ]
 
 
@@ -209,8 +213,8 @@ def _get_env_overrides(
     overrides: dict[str, str] = {}
 
     if service_mode is ServiceMode.HTTP_GATEWAY:
-        overrides["GATEWAY_HOST"] = "127.0.0.1"
-        overrides["GATEWAY_PORT"] = "8080"
+        overrides["GATEWAY_HOST"] = DEFAULT_HTTP_GATEWAY_HOST
+        overrides["GATEWAY_PORT"] = str(DEFAULT_GATEWAY_PORT)
         if resolved_config is not None:
             overrides["SPOON_BOT_CONFIG"] = str(resolved_config)
 
@@ -372,7 +376,10 @@ def _get_windows_supervisor(mode: ServiceMode | str = DEFAULT_SERVICE_MODE) -> s
     return SUPERVISOR_NONE
 
 
-def _is_http_gateway_listening(host: str = "127.0.0.1", port: int = 8080) -> bool:
+def _is_http_gateway_listening(
+    host: str = DEFAULT_HTTP_GATEWAY_HOST,
+    port: int = DEFAULT_GATEWAY_PORT,
+) -> bool:
     try:
         with socket.create_connection((host, port), timeout=0.5):
             return True
@@ -452,7 +459,7 @@ def _start_windows_via_schtasks(
     if service_mode is ServiceMode.HTTP_GATEWAY and not _wait_for_http_gateway():
         return False, (
             f"{spec.display_name} was launched via Task Scheduler but did not bind "
-            "http://127.0.0.1:8080 in time."
+            f"{DEFAULT_HTTP_GATEWAY_URL} in time."
         )
 
     return True, (
@@ -499,13 +506,13 @@ def _start_windows_detached(
             if not _wait_for_http_gateway():
                 if proc.poll() is not None:
                     return False, (
-                        f"{spec.display_name} exited before binding http://127.0.0.1:8080 "
+                        f"{spec.display_name} exited before binding {DEFAULT_HTTP_GATEWAY_URL} "
                         f"in {reason}. Check logs: {log_file}"
                     )
                 if not _wait_for_http_gateway(timeout_sec=HTTP_GATEWAY_STARTUP_GRACE_SEC):
                     if proc.poll() is not None:
                         return False, (
-                            f"{spec.display_name} exited before binding http://127.0.0.1:8080 "
+                            f"{spec.display_name} exited before binding {DEFAULT_HTTP_GATEWAY_URL} "
                             f"in {reason}. Check logs: {log_file}"
                         )
                     return True, (
@@ -513,7 +520,7 @@ def _start_windows_detached(
                         f"Logs: {log_file}\n"
                         "Startup is still in progress. Check "
                         "'spoon-bot service status --mode http-gateway' if "
-                        "http://127.0.0.1:8080 is not reachable yet."
+                        f"{DEFAULT_HTTP_GATEWAY_URL} is not reachable yet."
                     )
         else:
             time.sleep(0.5)
@@ -577,7 +584,7 @@ def _get_runtime_pid(mode: ServiceMode | str = DEFAULT_SERVICE_MODE) -> Optional
         return pid
 
     if platform.system() == "Windows" and service_mode is ServiceMode.HTTP_GATEWAY:
-        return _find_windows_listener_pid(8080)
+        return _find_windows_listener_pid(DEFAULT_GATEWAY_PORT)
 
     return None
 
@@ -771,7 +778,7 @@ def get_status(mode: ServiceMode | str = DEFAULT_SERVICE_MODE) -> dict[str, obje
         "supervisor": supervisor,
     }
     if service_mode is ServiceMode.HTTP_GATEWAY:
-        info["url"] = "http://127.0.0.1:8080"
+        info["url"] = DEFAULT_HTTP_GATEWAY_URL
 
     if platform.system() == "Windows":
         if supervisor == WINDOWS_SUPERVISOR_SCHTASKS:
@@ -787,13 +794,13 @@ def get_status(mode: ServiceMode | str = DEFAULT_SERVICE_MODE) -> dict[str, obje
                     info["task_last_result"] = last_result
                 if service_mode is ServiceMode.HTTP_GATEWAY and _is_http_gateway_listening():
                     info["running"] = True
-                    info["pid"] = _find_windows_listener_pid(8080)
+                    info["pid"] = _find_windows_listener_pid(DEFAULT_GATEWAY_PORT)
             info["task_name"] = spec.windows_task_name
         elif supervisor == WINDOWS_SUPERVISOR_STARTUP:
             info["startup_entry"] = str(_get_windows_startup_launcher(service_mode))
             if service_mode is ServiceMode.HTTP_GATEWAY and _is_http_gateway_listening():
                 info["running"] = True
-                info["pid"] = _find_windows_listener_pid(8080)
+                info["pid"] = _find_windows_listener_pid(DEFAULT_GATEWAY_PORT)
 
     if service_mode is ServiceMode.HTTP_GATEWAY and info.get("running"):
         health = _fetch_gateway_health()
@@ -815,7 +822,7 @@ def get_status(mode: ServiceMode | str = DEFAULT_SERVICE_MODE) -> dict[str, obje
 
 def _fetch_gateway_health() -> dict[str, object] | None:
     try:
-        with urlopen("http://127.0.0.1:8080/health", timeout=1.5) as response:
+        with urlopen(f"{DEFAULT_HTTP_GATEWAY_URL}/health", timeout=1.5) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, TimeoutError, ValueError, URLError):
         return None

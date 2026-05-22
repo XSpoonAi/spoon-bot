@@ -605,8 +605,8 @@ class TestAgentLoopStream:
         assert "never remove protective wrappers" in prompt
         assert "never convert a simulated command into a live" in prompt
 
-    def test_build_request_context_prompt_does_not_embed_github_skill_route(self):
-        """Skill install routing should come from tools, not prompt-specific blocks."""
+    def test_build_request_context_prompt_adds_generic_github_skill_context(self):
+        """Explicit GitHub skill install requests should expose the generic tool route."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
@@ -621,10 +621,10 @@ class TestAgentLoopStream:
         prompt = AgentLoop._build_request_context_prompt(loop, message)
 
         assert "[TURN PRIORITY]:" in prompt
-        assert "[GITHUB SKILL INSTALL REQUEST]:" not in prompt
-        assert "skill_marketplace(action='install_skill'" not in prompt
+        assert "[GITHUB SKILL INSTALL CONTEXT]:" in prompt
+        assert "skill_marketplace(action='install_skill'" in prompt
         assert "Do not use web_fetch or git clone only to confirm SKILL.md" not in prompt
-        assert "If no SKILL.md exists" not in prompt
+        assert "read the installed SKILL.md" in prompt
 
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
@@ -1415,6 +1415,7 @@ $CLI stats
             "urls": ["https://github.com/example-org/example-skill"],
             "preferred_tool": "skill_marketplace",
             "action": "install_skill",
+            "install_only": True,
         }
         assert hints["explicit_request_urls"] == ["https://github.com/example-org/example-skill"]
         assert hints["local_executable_skills"] == []
@@ -1444,6 +1445,7 @@ $CLI stats
             "urls": ["https://github.com/Agent-Cypher-Lab/agent-spot-cypher"],
             "preferred_tool": "skill_marketplace",
             "action": "install_skill",
+            "install_only": False,
         }
         assert hints["explicit_request_urls"] == [
             "https://github.com/Agent-Cypher-Lab/agent-spot-cypher"
@@ -1479,6 +1481,24 @@ $CLI stats
             "metadata": {
                 "name": "skill_marketplace",
                 "result": "SUCCESS: Skill 'example-skill' installed (1 files).",
+            },
+        }]
+
+        assert should_run_skill_contract_check(events) is True
+
+    def test_skill_contract_check_survives_compacted_skill_setup_evidence(self):
+        """A remaining skill CLI NEXT still marks the turn as a skill workflow."""
+        from spoon_bot.agent.turn_verifiers import should_run_skill_contract_check
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": (
+                    "Game=152\n"
+                    "Phase=Finished\n"
+                    "NEXT: node skills/example-skill/cli/index.js settlement 152"
+                ),
             },
         }]
 
@@ -1655,6 +1675,7 @@ $CLI stats
         """Verifier should not miss terminal evidence omitted from model summaries."""
         from spoon_bot.agent.turn_verifiers import (
             build_user_facing_tool_event_answer,
+            latest_tool_event_has_user_summary_marker,
             tool_events_have_user_summary_marker,
         )
 
@@ -1672,8 +1693,52 @@ $CLI stats
         }]
 
         assert tool_events_have_user_summary_marker(events) is True
+        assert latest_tool_event_has_user_summary_marker(events) is True
         assert build_user_facing_tool_event_answer(events) == (
             "Completed.\n\nSETTLEMENT game=123 result=WIN rank=1/4"
+        )
+
+    def test_latest_summary_marker_only_accepts_latest_tool_output(self):
+        """Earlier summaries should not hide a later unfinished skill step."""
+        from spoon_bot.agent.turn_verifiers import latest_tool_event_has_user_summary_marker
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "Read it aloud: setup completed.",
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "NEXT: node skills/example-skill/cli/index.js run",
+                },
+            },
+        ]
+
+        assert latest_tool_event_has_user_summary_marker(events) is False
+
+    def test_skill_install_completion_is_detected_from_skill_manager(self):
+        """Install-only requests can finish from skill manager evidence."""
+        from spoon_bot.agent.turn_verifiers import (
+            build_skill_install_completion_answer,
+            tool_events_have_skill_install_completion,
+        )
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "skill_marketplace",
+                "result": "SUCCESS: Skill 'example-skill' installed (3 files).",
+            },
+        }]
+
+        assert tool_events_have_skill_install_completion(events) is True
+        assert build_skill_install_completion_answer(events) == (
+            "Completed.\n\nSkill 'example-skill' installed."
         )
 
     def test_instruction_text_is_not_user_facing_completion_evidence(self):
@@ -1810,6 +1875,43 @@ $CLI stats
         assert "[INTERNAL FOLLOW-UP PLACEHOLDER RECOVERY]" in prompt
         assert "node skills/example/cli/index.js join 145 <A|B|C|D|E>" in prompt
         assert "Do not read the same SKILL.md again" in prompt
+
+    @pytest.mark.asyncio
+    async def test_process_structural_followup_keeps_direct_tool_event(self):
+        """Non-stream structural NEXT execution should remain visible for summary checks."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.turn_verifiers import tool_events_have_user_summary_marker
+
+        agent = AgentLoop.__new__(AgentLoop)
+        agent.tools = MagicMock()
+        agent.tools.execute = AsyncMock(
+            return_value=(
+                "SETTLEMENT game=152 status=finished\n"
+                "Read it aloud: SETTLEMENT game=152 result=WIN rank=1/4."
+            )
+        )
+        agent._workspace_posix_path = MagicMock(return_value="/workspace")
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": (
+                    "Game=152\n"
+                    "Phase=Finished\n"
+                    "NEXT: node skills/example/cli/index.js settlement 152"
+                ),
+            },
+        }]
+
+        emitted = await AgentLoop._execute_structural_followup_commands_for_process(
+            agent,
+            events,
+            reason="test",
+        )
+
+        assert emitted
+        assert tool_events_have_user_summary_marker(events) is True
+        assert "settlement 152" in agent.tools.execute.await_args.args[1]["command"]
 
     @pytest.mark.asyncio
     async def test_stream_yields_typed_dicts(self):
@@ -4081,7 +4183,8 @@ $CLI stats
         error_chunks = [chunk for chunk in chunks if chunk["type"] == "error"]
         emitted = "".join(chunk["delta"] for chunk in chunks if chunk["type"] == "content")
         assert len(error_chunks) == 1
-        assert "Connection lost" in error_chunks[0]["metadata"]["error"]
+        assert error_chunks[0]["metadata"]["error_code"] == "RuntimeError"
+        assert "unexpected error" in error_chunks[0]["metadata"]["error"].lower()
         assert chunks[-1]["type"] == "done"
         assert chunks[-1]["metadata"]["content"] == emitted
 
@@ -4096,10 +4199,10 @@ $CLI stats
         async for chunk in AgentLoop.stream(agent, message="test"):
             chunks.append(chunk)
 
-        # Should get error + done chunks
-        assert chunks[-2]["type"] == "error"
+        # Should get an error event, then a user-facing fallback content chunk and done.
+        assert any(chunk["type"] == "error" for chunk in chunks)
         assert chunks[-1]["type"] == "done"
-        assert chunks[-1]["metadata"]["content"] == ""
+        assert "unexpected error" in chunks[-1]["metadata"]["content"].lower()
 
         user_call = agent._session.add_message.call_args_list[0]
         assert user_call.args[:2] == ("user", "test")

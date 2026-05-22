@@ -8,12 +8,15 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 WINDOWS_DETACHED_PROCESS = 0x00000008
 WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -44,7 +47,9 @@ def _json_result(payload: dict[str, Any]) -> None:
 
 def _load_params() -> dict[str, Any]:
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.read().strip()
+        if not raw and len(sys.argv) > 1:
+            raw = " ".join(sys.argv[1:]).strip()
         payload = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON input: {exc}") from exc
@@ -91,12 +96,24 @@ def _pid_alive(pid: int | None) -> bool:
     try:
         if os.name == "nt":
             import ctypes
+            from ctypes import wintypes
 
-            handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, int(pid))
-            if handle:
+            process_query_limited_information = 0x1000
+            still_active = 259
+            handle = ctypes.windll.kernel32.OpenProcess(
+                process_query_limited_information,
+                False,
+                int(pid),
+            )
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == still_active
+            finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
         os.kill(int(pid), 0)
         return True
     except Exception:
@@ -158,14 +175,23 @@ def _tail(path: str | None, tail_chars: int = 4000) -> str:
         return ""
 
 
-def _spawn_shell(command: str, cwd: Path, log_path: Path) -> int:
+def _spawn_shell(
+    command: str,
+    cwd: Path,
+    log_path: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     flags = 0
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "cwd": str(cwd),
         "shell": True,
-        "env": os.environ.copy(),
+        "env": env,
     }
     if os.name == "nt":
         flags = WINDOWS_DETACHED_PROCESS | WINDOWS_CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_NO_WINDOW
@@ -201,6 +227,73 @@ def _spawn_argv(argv: list[str], cwd: Path, log_path: Path) -> int:
     return int(proc.pid)
 
 
+def _clear_log(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
+def _connect_host(host: str | None) -> str:
+    raw = str(host or "").strip()
+    if raw in {"", "0.0.0.0", "::", "[::]"}:
+        return "127.0.0.1"
+    return raw.strip("[]") if raw.startswith("[") and raw.endswith("]") else raw
+
+
+def _display_host_for_url(host: str) -> str:
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host
+
+
+def _connection_probe_hosts(host: str) -> list[str]:
+    normalized = _connect_host(host)
+    hosts = [normalized]
+    if normalized in {"127.0.0.1", "localhost"}:
+        hosts.extend(["localhost", "::1"])
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in hosts:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _can_connect(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _port_is_free(host: str, port: int) -> bool:
+    for probe_host in _connection_probe_hosts(host):
+        if _can_connect(probe_host, port):
+            return False
+
+    bind_host = str(host or "127.0.0.1").strip()
+    if bind_host in {"::", "[::]"}:
+        bind_host = "::"
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.bind((bind_host, int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def _find_free_port(host: str) -> int:
+    bind_host = str(host or "127.0.0.1").strip()
+    if bind_host in {"::", "[::]"}:
+        bind_host = "::"
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((bind_host, 0))
+        return int(sock.getsockname()[1])
+
+
 def _local_url(params: dict[str, Any], entry: dict[str, Any] | None = None) -> str:
     url = str(params.get("url") or "").strip()
     if url:
@@ -210,15 +303,103 @@ def _local_url(params: dict[str, Any], entry: dict[str, Any] | None = None) -> s
     port = params.get("port") if params.get("port") is not None else (entry or {}).get("port")
     if port is None:
         raise ValueError("port or url is required for tunnel exposure")
-    host = str(params.get("host") or (entry or {}).get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    host = _connect_host(params.get("host") or (entry or {}).get("host") or "127.0.0.1")
     scheme = str(params.get("scheme") or (entry or {}).get("scheme") or "http").strip() or "http"
-    return f"{scheme}://{host}:{int(port)}"
+    return f"{scheme}://{_display_host_for_url(host)}:{int(port)}"
+
+
+def _has_explicit_target(params: dict[str, Any]) -> bool:
+    return bool(str(params.get("url") or "").strip()) or params.get("port") is not None
+
+
+def _apply_explicit_target(entry: dict[str, Any], params: dict[str, Any]) -> None:
+    url = str(params.get("url") or "").strip()
+    if url:
+        entry["local_url"] = url
+        if params.get("host"):
+            entry["host"] = str(params["host"])
+        if params.get("port") is not None:
+            entry["port"] = int(params["port"])
+        if params.get("scheme"):
+            entry["scheme"] = str(params["scheme"])
+        return
+
+    if params.get("port") is None:
+        return
+
+    port = int(params["port"])
+    if port <= 0:
+        raise ValueError("port must be greater than 0 for action=tunnel; use action=start with port=0 for auto-selection")
+    host = _connect_host(params.get("host") or entry.get("host") or "127.0.0.1")
+    scheme = str(params.get("scheme") or entry.get("scheme") or "http").strip() or "http"
+    entry["host"] = host
+    entry["port"] = port
+    entry["scheme"] = scheme
+    entry["local_url"] = f"{scheme}://{_display_host_for_url(host)}:{port}"
+
+
+def _http_body(url: str, timeout: float = 5.0) -> str:
+    req = Request(url, headers={"User-Agent": "spoon-bot-service-expose/1.0"})
+    with urlopen(req, timeout=timeout) as response:  # noqa: S310 - user-requested local/public preview verification
+        data = response.read(512_000)
+    return data.decode("utf-8", errors="replace")
+
+
+def _verify_url(
+    url: str | None,
+    *,
+    expected_text: str | None,
+    wait_seconds: float,
+) -> dict[str, Any] | None:
+    if not url:
+        return None
+    expected = str(expected_text or "").strip()
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    last_error = ""
+    while True:
+        try:
+            body = _http_body(str(url))
+            matched = bool(expected and expected in body)
+            if not expected or matched:
+                return {
+                    "url": url,
+                    "ok": True,
+                    "matched": matched,
+                    "expected_text": expected or None,
+                }
+            last_error = f"Expected text not found: {expected!r}"
+        except (OSError, URLError, TimeoutError) as exc:
+            last_error = str(exc)
+        if time.monotonic() >= deadline:
+            return {
+                "url": url,
+                "ok": False,
+                "matched": False,
+                "expected_text": expected or None,
+                "error": last_error,
+            }
+        time.sleep(0.25)
 
 
 def _parse_public_url(log_path: Path) -> str | None:
     text = _tail(str(log_path), 20000)
     match = TRYCLOUDFLARE_RE.search(text)
     return match.group(0) if match else None
+
+
+def _tunnel_registered(log_path: Path) -> bool:
+    text = _tail(str(log_path), 20000)
+    return "Registered tunnel connection" in text
+
+
+def _normalize_action(action: Any) -> str:
+    normalized = str(action or "").strip().lower()
+    aliases = {
+        "expose": "tunnel",
+        "start_tunnel": "tunnel",
+        "inspect": "status",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _start_tunnel_for_entry(
@@ -235,11 +416,14 @@ def _start_tunnel_for_entry(
 
     local_url = _local_url(params, entry)
     tunnel_log = _logs_dir() / f"{name}.cloudflared.log"
+    _clear_log(tunnel_log)
     pid = _spawn_argv([cloudflared, "tunnel", "--url", local_url], Path.cwd(), tunnel_log)
     public_url = None
+    registered = False
     for _ in range(int(params.get("tunnel_wait_seconds", 25)) * 2):
         public_url = _parse_public_url(tunnel_log)
-        if public_url:
+        registered = _tunnel_registered(tunnel_log)
+        if public_url and registered:
             break
         if not _pid_alive(pid):
             break
@@ -249,12 +433,33 @@ def _start_tunnel_for_entry(
         "pid": pid,
         "local_url": local_url,
         "public_url": public_url,
+        "registered": registered,
         "log_path": str(tunnel_log),
         "started_at": _now(),
         "status": "running" if _pid_alive(pid) else "exited",
     }
+    verify_text = params.get("verify_text")
+    if not verify_text and isinstance(entry.get("verification"), dict):
+        verify_text = entry["verification"].get("expected_text")
+    if public_url and verify_text:
+        tunnel["verification"] = _verify_url(
+            public_url,
+            expected_text=str(verify_text),
+            wait_seconds=float(params.get("verify_wait_seconds") or 10),
+        )
+        if not tunnel["verification"].get("ok"):
+            tunnel["verification_error"] = tunnel["verification"].get("error")
     entry["tunnel"] = tunnel
-    return {"success": public_url is not None, **tunnel}
+    success = public_url is not None and tunnel["status"] == "running"
+    if verify_text and tunnel.get("verification") and not tunnel["verification"].get("ok"):
+        success = False
+    if not success:
+        tunnel["public_url"] = None
+        tunnel["public_url_omitted_reason"] = "unverified"
+        if _pid_alive(pid):
+            _stop_pid(pid)
+            tunnel["status"] = "stopped"
+    return {"success": success, **tunnel}
 
 
 def _refresh_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -262,7 +467,12 @@ def _refresh_entry(entry: dict[str, Any]) -> dict[str, Any]:
     entry["status"] = "running" if _pid_alive(service_pid) else "stopped"
     tunnel = entry.get("tunnel")
     if isinstance(tunnel, dict):
-        tunnel["status"] = "running" if _pid_alive(tunnel.get("pid")) else "stopped"
+        tunnel_running = _pid_alive(tunnel.get("pid"))
+        tunnel["status"] = "running" if tunnel_running else "stopped"
+        if not tunnel_running or tunnel.get("success") is False:
+            tunnel.pop("candidate_public_url", None)
+            tunnel["public_url"] = None
+            tunnel["public_url_omitted_reason"] = "not_running_or_unverified"
     return entry
 
 
@@ -274,6 +484,26 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
     cwd = Path(params.get("cwd") or os.getcwd()).expanduser().resolve()
     if not cwd.is_dir():
         raise ValueError(f"cwd is not a directory: {cwd}")
+
+    host = str(params.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    bind_host = host.strip("[]") if host.startswith("[") and host.endswith("]") else host
+    port = params.get("port")
+    if port is not None:
+        port = int(port)
+        if port <= 0:
+            port = _find_free_port(_connect_host(bind_host))
+            params["port"] = port
+        elif not _port_is_free(_connect_host(bind_host), port):
+            return {
+                "success": False,
+                "error": (
+                    f"Port {port} on {_connect_host(bind_host)} is already in use. "
+                    "Choose a different free port or pass port=0 for auto-selection."
+                ),
+                "port": port,
+                "host": _connect_host(bind_host),
+                "port_available": False,
+            }
 
     registry = _load_registry()
     services = registry.setdefault("services", {})
@@ -290,7 +520,12 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
             _stop_entry(existing, stop_tunnel=True)
 
     log_path = _logs_dir() / f"{name}.service.log"
-    pid = _spawn_shell(command, cwd, log_path)
+    extra_env: dict[str, str] = {}
+    if port is not None:
+        extra_env["PORT"] = str(port)
+    if host:
+        extra_env["HOST"] = host
+    pid = _spawn_shell(command, cwd, log_path, extra_env=extra_env)
     local_url = None
     try:
         local_url = _local_url(params)
@@ -303,16 +538,59 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
         "cwd": str(cwd),
         "pid": pid,
         "status": "running" if _pid_alive(pid) else "exited",
-        "host": str(params.get("host") or "127.0.0.1"),
-        "port": params.get("port"),
+        "host": host,
+        "port": port,
         "scheme": str(params.get("scheme") or "http"),
         "local_url": local_url,
         "log_path": str(log_path),
         "started_at": _now(),
         "tunnel": None,
     }
+
+    startup_wait = float(params.get("startup_wait_seconds") or 1.5)
+    if startup_wait > 0:
+        time.sleep(min(startup_wait, 10.0))
+        entry["status"] = "running" if _pid_alive(pid) else "exited"
+        if entry["status"] != "running":
+            services[name] = entry
+            _save_registry(registry)
+            return {
+                "success": False,
+                "error": "Service process exited during startup",
+                "service": entry,
+                "service_log": _tail(str(log_path), int(params.get("tail_chars") or 4000)),
+            }
+
+    verify_text = params.get("verify_text")
+    if local_url and verify_text:
+        entry["verification"] = _verify_url(
+            local_url,
+            expected_text=str(verify_text),
+            wait_seconds=float(params.get("verify_wait_seconds") or 10),
+        )
+        if not entry["verification"].get("ok"):
+            services[name] = entry
+            _save_registry(registry)
+            return {
+                "success": False,
+                "error": "Local URL verification failed",
+                "service": entry,
+                "verification": entry["verification"],
+                "service_log": _tail(str(log_path), int(params.get("tail_chars") or 4000)),
+            }
+
     if params.get("start_tunnel"):
         entry["tunnel"] = _start_tunnel_for_entry(name, entry, params)
+        if not entry["tunnel"].get("success"):
+            services[name] = entry
+            _save_registry(registry)
+            return {
+                "success": False,
+                "error": "Cloudflare tunnel did not become reachable",
+                "service": _refresh_entry(entry),
+                "tunnel": entry["tunnel"],
+                "service_log": _tail(str(log_path), int(params.get("tail_chars") or 4000)),
+            }
     services[name] = entry
     _save_registry(registry)
     return {"success": True, "service": _refresh_entry(entry)}
@@ -345,6 +623,9 @@ def _action_stop(params: dict[str, Any], *, tunnel_only: bool = False) -> dict[s
         stopped = _stop_pid(tunnel.get("pid"))
         tunnel["status"] = "stopped" if stopped else "stop_failed"
         tunnel["stopped_at"] = _now()
+        if stopped:
+            tunnel["public_url"] = None
+            tunnel["public_url_omitted_reason"] = "stopped"
         result = {"tunnel_stopped": stopped}
     else:
         result = _stop_entry(entry, stop_tunnel=True)
@@ -357,7 +638,13 @@ def _action_tunnel(params: dict[str, Any]) -> dict[str, Any]:
     registry = _load_registry()
     services = registry.setdefault("services", {})
     entry = services.get(name)
+    has_explicit_target = _has_explicit_target(params)
     if not isinstance(entry, dict):
+        if not has_explicit_target:
+            return {
+                "success": False,
+                "error": f"Service '{name}' not found; pass url/port or start it first.",
+            }
         entry = {
             "name": name,
             "command": None,
@@ -372,6 +659,16 @@ def _action_tunnel(params: dict[str, Any]) -> dict[str, Any]:
             "started_at": _now(),
         }
         services[name] = entry
+    elif has_explicit_target:
+        _apply_explicit_target(entry, params)
+    else:
+        _refresh_entry(entry)
+        if entry.get("status") != "running":
+            return {
+                "success": False,
+                "error": f"Service '{name}' is not running; pass url/port or start it first.",
+                "service": entry,
+            }
 
     existing_tunnel = entry.get("tunnel")
     if isinstance(existing_tunnel, dict) and _pid_alive(existing_tunnel.get("pid")):
@@ -381,7 +678,7 @@ def _action_tunnel(params: dict[str, Any]) -> dict[str, Any]:
 
     tunnel = _start_tunnel_for_entry(name, entry, params)
     _save_registry(registry)
-    return {"success": bool(tunnel.get("public_url")), "service": _refresh_entry(entry), "tunnel": tunnel}
+    return {"success": bool(tunnel.get("success")), "service": _refresh_entry(entry), "tunnel": tunnel}
 
 
 def _action_status(params: dict[str, Any]) -> dict[str, Any]:
@@ -419,7 +716,7 @@ def _action_logs(params: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     try:
         params = _load_params()
-        action = str(params.get("action") or "").strip().lower()
+        action = _normalize_action(params.get("action"))
         if action == "start":
             result = _action_start(params)
         elif action == "tunnel":

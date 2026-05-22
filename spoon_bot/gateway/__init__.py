@@ -19,7 +19,7 @@ Usage with spoon-core (recommended):
     )
 
     # Create gateway app
-    config = GatewayConfig(host="0.0.0.0", port=8080)
+    config = GatewayConfig(host="0.0.0.0")
     app = create_app(config)
     set_agent(agent)
 

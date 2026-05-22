@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import shlex
 import signal
 import subprocess
@@ -601,12 +602,26 @@ class ShellTool(Tool):
         }
 
     def tool_invocation_dedup_key(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
-        """Skip exact-call suppression for read-only background job inspection."""
+        """Skip exact-call suppression for polling and workspace skill CLIs.
+
+        Workspace skills frequently define their own retry/idempotency contract
+        around remote state. The shell guard should not turn a documented retry
+        into an internal loop-control error before the skill can recover.
+        """
         if not isinstance(arguments, dict):
             return arguments
         action = str(arguments.get("action") or "execute").strip().lower()
         if action in {"list_jobs", "job_status", "job_output"}:
             return None
+        if action == "execute":
+            command = arguments.get("command")
+            if isinstance(command, str) and command.strip():
+                try:
+                    cwd = self._resolve_working_dir(arguments.get("working_dir"))
+                except Exception:
+                    cwd = str(self.working_dir or os.getcwd())
+                if self._command_invokes_workspace_skill(command, cwd):
+                    return None
         return arguments
 
     def _parse_command_args(self, command: str) -> list[str]:
@@ -803,6 +818,8 @@ class ShellTool(Tool):
                 cwd = cwd.replace("\\", "/")
                 # Convert any Windows-style paths inside the command so that
                 # Git Bash receives valid POSIX paths (C:\foo -> /c/foo).
+                if self._is_git_bash(bash):
+                    command = self._normalize_windows_python_command(command)
                 command = self._convert_win_paths_to_posix(command)
                 result = subprocess.run(
                     [bash, "-c", command],
@@ -814,6 +831,7 @@ class ShellTool(Tool):
                 )
             else:
                 env["HOME"] = home_path.replace("\\", "/")
+                command = self._normalize_windows_python_command(command)
                 result = subprocess.run(
                     command,
                     capture_output=True,
@@ -857,6 +875,14 @@ class ShellTool(Tool):
         max_chars: int | None = None,
         truncate: bool = True,
     ) -> str:
+        already_satisfied = self._format_idempotent_conflict_result(
+            stdout_text,
+            stderr_text,
+            returncode,
+        )
+        if already_satisfied is not None:
+            return already_satisfied
+
         output_parts = []
 
         if stdout_text:
@@ -877,6 +903,68 @@ class ShellTool(Tool):
             result = result[:limit] + f"\n... (truncated, {truncated} more chars)"
 
         return result
+
+    def _format_idempotent_conflict_result(
+        self,
+        stdout_text: str,
+        stderr_text: str,
+        returncode: int | None,
+    ) -> str | None:
+        """Convert remote "already applied" conflicts into a recoverable state.
+
+        Many command-line workflows intentionally use non-zero exit codes for
+        HTTP 409 conflict responses. When the remote message says the requested
+        operation is already satisfied, that is state evidence rather than a
+        task failure.
+        """
+        if returncode in (None, 0):
+            return None
+        combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
+        if not combined.strip():
+            return None
+
+        lowered = combined.casefold()
+        has_conflict_status = bool(
+            re.search(r"\b(?:http\s*)?409\b", lowered)
+            or " conflict" in lowered
+        )
+        has_already_state = bool(
+            re.search(
+                r"\b(?:already|exists|existed|duplicate|claimed|registered|active)\b",
+                lowered,
+            )
+        )
+        if not has_conflict_status or not has_already_state:
+            return None
+
+        detail = self._extract_remote_state_detail(combined)
+        message = "Remote operation already satisfied; continuing from current state."
+        if detail:
+            message += f"\nDetail: {detail}"
+        return self._mask_secrets(message)
+
+    @staticmethod
+    def _extract_remote_state_detail(output: str) -> str:
+        """Extract a concise human-readable remote state detail from command output."""
+        text = str(output or "")
+        for pattern in (
+            r'"(?:error|message|detail)"\s*:\s*"([^"]+)"',
+            r"'(?:error|message|detail)'\s*:\s*'([^']+)'",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return " ".join(match.group(1).split())[:240]
+
+        for raw_line in text.splitlines():
+            line = " ".join(raw_line.strip().split())
+            if not line:
+                continue
+            lowered = line.casefold()
+            if "409" in lowered or "conflict" in lowered:
+                line = re.sub(r"^.*?\b(?:409|conflict)\b[:\s-]*", "", line, flags=re.IGNORECASE)
+            if re.search(r"\b(?:already|exists|existed|duplicate|claimed|registered|active)\b", line, re.IGNORECASE):
+                return line[:240]
+        return ""
 
     async def _consume_process_stream(
         self,
@@ -911,6 +999,8 @@ class ShellTool(Tool):
             process_group_kwargs = self._process_group_kwargs()
             if bash:
                 env["HOME"] = self._windows_home_to_bash(home_path)
+                if self._is_git_bash(bash):
+                    command = self._normalize_windows_python_command(command)
                 command = self._convert_win_paths_to_posix(command)
                 cwd = cwd.replace("\\", "/")
                 return subprocess.Popen(
@@ -923,6 +1013,7 @@ class ShellTool(Tool):
                     **process_group_kwargs,
                 )
             env["HOME"] = home_path.replace("\\", "/")
+            command = self._normalize_windows_python_command(command)
             return subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -959,6 +1050,47 @@ class ShellTool(Tool):
             env=env,
             **self._process_group_kwargs(),
         )
+
+    @staticmethod
+    def _normalize_windows_python_command(command: str) -> str:
+        """Prefer the installed Windows Python launcher spelling when needed.
+
+        Windows often exposes ``python`` while ``python3`` points at the Store
+        alias. Linux/macOS shells keep their native command unchanged.
+        """
+        text = str(command or "")
+        if not text.strip():
+            return text
+        try:
+            tokens = shlex.split(text, posix=False)
+        except ValueError:
+            tokens = text.split()
+        if not tokens:
+            return text
+
+        first = tokens[0].strip().strip('"\'')
+        if first.casefold() not in {"python3", "python3.exe"}:
+            return text
+        python_path = shutil.which("python")
+        python3_path = shutil.which("python3")
+        python3_is_store_alias = bool(
+            python3_path and "\\windowsapps\\" in python3_path.casefold()
+        )
+        if not python_path or (python3_path and not python3_is_store_alias):
+            return text
+        return re.sub(
+            r"^(\s*)(['\"]?)(python3(?:\.exe)?)(\2)(?=\s|$)",
+            r"\1\2python\4",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    @staticmethod
+    def _is_git_bash(path: str | None) -> bool:
+        """Return True for Git-for-Windows bash paths."""
+        normalized = str(path or "").replace("/", "\\").casefold()
+        return "\\git\\bin\\bash.exe" in normalized or "\\git\\usr\\bin\\bash.exe" in normalized
 
     @staticmethod
     def _process_group_kwargs() -> dict[str, Any]:
@@ -1365,6 +1497,9 @@ class ShellTool(Tool):
         # Verify working directory exists and is accessible
         if not os.path.isdir(cwd):
             return f"Error: Working directory not found: {cwd}"
+
+        if self._command_invokes_workspace_skill(command, cwd):
+            effective_timeout = max(effective_timeout, self.timeout)
 
         skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
         if skill_clone_rejection is not None:
@@ -2025,6 +2160,35 @@ class ShellTool(Tool):
             if violation:
                 return violation
         return None
+
+    def _command_invokes_workspace_skill(self, command: str, cwd: str) -> bool:
+        """Return True when a command runs a CLI documented under workspace/skills."""
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            command_tokens = str(command or "").split()
+        if not command_tokens:
+            return False
+
+        current_dir = Path(cwd).resolve()
+        for segment in self._split_shell_segments(command_tokens):
+            if not segment:
+                continue
+            if segment[0].casefold() == "cd":
+                current_dir = self._resolve_cd_segment(current_dir, segment)
+                continue
+            cleaned_segment = self._segment_before_redirection_or_pipe(segment)
+            invocation = self._extract_skill_cli_invocation(cleaned_segment)
+            if invocation is not None:
+                return True
+
+            for token in cleaned_segment:
+                normalized = str(token or "").strip().strip("'\"").replace("\\", "/")
+                if normalized.startswith("./"):
+                    candidate = (current_dir / normalized).resolve(strict=False)
+                    if "/skills/" in str(candidate).replace("\\", "/"):
+                        return True
+        return False
 
     def _maybe_stop_after_exact_command_failure(self, command: str, result: str) -> str:
         """Stop the tool loop after a user-specified exact command fails clearly."""

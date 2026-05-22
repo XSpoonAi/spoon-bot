@@ -37,9 +37,11 @@ class ActivateToolTool(Tool):
         self,
         activate_fn: Callable[[str], bool],
         list_inactive_fn: Callable[[], list[dict[str, str]]],
+        tool_status_fn: Callable[[str], str] | None = None,
     ):
         self._activate = activate_fn
         self._list_inactive = list_inactive_fn
+        self._tool_status = tool_status_fn
 
     @property
     def name(self) -> str:
@@ -101,19 +103,26 @@ class ActivateToolTool(Tool):
                 ok = self._activate(tn)
                 if ok:
                     activated.append(tn)
+                elif self._tool_status is not None:
+                    status = self._tool_status(tn)
+                    if status == "active":
+                        already_active.append(tn)
+                    elif status == "missing":
+                        not_found.append(tn)
+                    else:
+                        not_found.append(tn)
                 else:
-                    # Cannot distinguish "already active" from "not found"
-                    # so just report it generically
                     already_active.append(tn)
 
             parts: list[str] = []
             if activated:
                 parts.append(f"Activated: {', '.join(activated)}.")
             if already_active:
-                parts.append(
-                    f"Already active or not found: {', '.join(already_active)}."
-                )
-            parts.append("You can now use the activated tools.")
+                parts.append(f"Already active: {', '.join(already_active)}.")
+            if not_found:
+                parts.append(f"Not found: {', '.join(not_found)}.")
+            if activated or already_active:
+                parts.append("You can now use these tools.")
             return " ".join(parts)
 
         if action == "list":
@@ -424,6 +433,12 @@ class MemoryManagementTool(Tool):
             },
             "required": ["action"],
         }
+
+    def tool_invocation_dedup_key(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        action = str(kwargs.get("action") or "summary").strip().lower()
+        if action in {"search", "summary"}:
+            return None
+        return kwargs
 
     async def execute(self, **kwargs: Any) -> str:
         if not self._memory_store:

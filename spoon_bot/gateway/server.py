@@ -7,7 +7,7 @@ This module provides a create_app factory that:
 3. Returns a fully configured FastAPI application
 
 Usage with uvicorn:
-    uvicorn spoon_bot.gateway.server:create_app --factory --host 0.0.0.0 --port 8080
+    uvicorn spoon_bot.gateway.server:create_app --factory --host 0.0.0.0 --port 16600
 
 Environment variables:
     See .env.example for all available configuration options.

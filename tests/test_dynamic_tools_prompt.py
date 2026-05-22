@@ -174,6 +174,22 @@ class TestActivateToolTool:
         assert activated == ["tool_a", "tool_b", "tool_c"]
 
     @pytest.mark.asyncio
+    async def test_activate_reports_already_active_separately(self):
+        from spoon_bot.agent.tools.self_config import ActivateToolTool
+
+        tool = ActivateToolTool(
+            activate_fn=lambda _name: False,
+            list_inactive_fn=lambda: [],
+            tool_status_fn=lambda name: "active" if name == "skill_marketplace" else "missing",
+        )
+
+        result = await tool.execute(action="activate", tool_name="skill_marketplace,missing_tool")
+
+        assert "Already active: skill_marketplace" in result
+        assert "Not found: missing_tool" in result
+        assert "Already active or not found" not in result
+
+    @pytest.mark.asyncio
     async def test_activate_missing_name(self):
         """Activate without tool_name returns error."""
         tool = self._make_tool()

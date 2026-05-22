@@ -1,12 +1,12 @@
 ---
 name: service_expose
-description: Run user-created frontend or backend services in the background and optionally expose them through a Cloudflare Quick Tunnel.
+description: Run user-created frontend or backend services in the background and optionally expose them through a Cloudflare Quick Tunnel. Use for preview links, localhost URLs, public/trycloudflare links, WebSocket apps, and service URL verification.
 version: 1.0.0
 author: XSpoon Team
 tags: [service, frontend, backend, cloudflare, tunnel, background]
 triggers:
   - type: keyword
-    keywords: [background service, run service, expose service, cloudflare tunnel, trycloudflare, frontend preview, backend preview]
+    keywords: [background service, run service, expose service, cloudflare tunnel, trycloudflare, frontend preview, backend preview, websocket, public link]
     priority: 90
 scripts:
   enabled: true
@@ -21,7 +21,7 @@ scripts:
         properties:
           action:
             type: string
-            description: "start, tunnel, status, list, logs, stop, or stop_tunnel"
+            description: "start, tunnel, expose, start_tunnel, status, list, inspect, logs, stop, or stop_tunnel"
           name:
             type: string
             description: "Stable service name"
@@ -46,6 +46,15 @@ scripts:
           replace:
             type: boolean
             description: "Stop and replace an existing process with the same name"
+          verify_text:
+            type: string
+            description: "Optional app-specific text that must appear in the local/public HTTP response before a URL is reported"
+          verify_wait_seconds:
+            type: integer
+            description: "Seconds to wait for verify_text checks"
+          startup_wait_seconds:
+            type: number
+            description: "Seconds to wait after starting before checking whether the process exited"
           tail_chars:
             type: integer
             description: "Log tail size"
@@ -61,13 +70,15 @@ Prefer `service_expose` over one-off shell backgrounding for preview services be
 ## Actions
 
 - `start`: run a service command in the background. Include `name`, `command`, and usually `cwd` plus `port` or `url`.
-- `tunnel`: start a Cloudflare Quick Tunnel for an existing service or an explicit local `url`.
-- `status` / `list`: inspect running services and tunnel URLs.
+- `tunnel` / `expose` / `start_tunnel`: start a Cloudflare Quick Tunnel for an existing service or an explicit local `url`.
+- `status` / `list` / `inspect`: inspect running services and tunnel URLs.
 - `logs`: return recent service or tunnel logs.
 - `stop` / `stop_tunnel`: stop the background service or only its Cloudflare tunnel.
 
 ## Rules
 
 Use `replace=true` only when the user wants to restart/replace the existing named service. Quick Tunnels require `cloudflared` in `PATH` or `CLOUDFLARED_PATH`.
+
+When creating a new preview service, pick a free port. Passing `port=0` asks this skill to choose an available port and inject it as `PORT` for the service command. Do not report a link until the local URL returns app-specific content. If a port is occupied, update the app command/config to use a free port and restart; do not treat an unrelated HTTP 200 on that port as success.
 
 Cloudflare Quick Tunnels are for development previews. For production or stable hostnames, use a named Cloudflare Tunnel outside this quick-preview skill.
