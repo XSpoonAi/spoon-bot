@@ -8,6 +8,7 @@ catalog without classifying product-specific routes.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 from pathlib import Path
@@ -445,6 +446,16 @@ def extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
         seen_commands.add(normalized)
         commands.append(normalized)
 
+    def _normalize_skill_command_hint(candidate: str) -> str:
+        stripped = str(candidate or "").strip()
+        if not stripped:
+            return ""
+        if stripped.casefold().startswith("run "):
+            if re.search(r"\bagain\b", stripped, re.IGNORECASE):
+                return ""
+            stripped = stripped[4:].strip()
+        return stripped
+
     if cli_value:
         _push_command(cli_value)
 
@@ -472,17 +483,30 @@ def extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
         if in_commands_section:
             command_section.append(raw_line)
 
-    scan_text = "\n".join(command_section).strip() or content
-    for candidate, explicit in _iter_structural_command_candidates(scan_text):
-        stripped = candidate.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("$CLI "):
-            expanded = stripped.replace("$CLI", cli_value or "$CLI", 1)
-            _push_command(expanded)
-            continue
-        if _looks_like_shell_command(stripped, explicit_shell_context=explicit):
-            _push_command(stripped)
+    scan_texts: list[str] = []
+    if command_section:
+        explicit_run_lines = [
+            raw_line
+            for raw_line in content.splitlines()
+            if _strip_list_marker(raw_line.strip()).casefold().startswith("run ")
+        ]
+        if explicit_run_lines:
+            scan_texts.append("\n".join(explicit_run_lines))
+        scan_texts.append("\n".join(command_section))
+    else:
+        scan_texts.append(content)
+
+    for scan_text in scan_texts:
+        for candidate, explicit in _iter_structural_command_candidates(scan_text):
+            stripped = _normalize_skill_command_hint(candidate)
+            if not stripped:
+                continue
+            if stripped.startswith("$CLI "):
+                expanded = stripped.replace("$CLI", cli_value or "$CLI", 1)
+                _push_command(expanded)
+                continue
+            if _looks_like_shell_command(stripped, explicit_shell_context=explicit):
+                _push_command(stripped)
 
     urls = extract_urls_from_text(content)
     return commands[:16], urls[:12]

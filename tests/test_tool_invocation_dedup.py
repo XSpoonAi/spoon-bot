@@ -56,6 +56,16 @@ class FailingTool(CountingTool):
         return f"provider {kwargs['value']} request failed\nExit code: 1"
 
 
+class RejectedTool(CountingTool):
+    @property
+    def name(self) -> str:
+        return "rejected_tool"
+
+    async def execute(self, **kwargs: Any) -> str:
+        self.calls += 1
+        return f"Rejected: unsupported invocation {kwargs['value']}"
+
+
 class PollingTool(CountingTool):
     @property
     def name(self) -> str:
@@ -179,6 +189,20 @@ async def test_track_tool_invocations_suppresses_consecutive_failures() -> None:
     assert "STOP_TOOL_LOOP" in fourth
     assert "consecutive tool failures suppressed" in fourth
     assert tool.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_rejections_count_as_consecutive_failures() -> None:
+    tool = RejectedTool()
+
+    with track_tool_invocations(max_consecutive_failures=1):
+        first = await tool(value="alpha")
+        second = await tool(value="beta")
+
+    assert "Rejected: unsupported invocation alpha" in first
+    assert "STOP_TOOL_LOOP" in second
+    assert "consecutive tool failures suppressed" in second
+    assert tool.calls == 1
 
 
 @pytest.mark.asyncio

@@ -1373,6 +1373,7 @@ CLI := node skills/spot-agent-cypher/cli/index.js
 
 ```text
 RUN $CLI wallet
+RUN $CLI register
 MATCH output: "No wallet" -> run $CLI wallet again
 RUN $CLI join {gameId} {spot} again
 ```
@@ -1414,9 +1415,12 @@ $CLI stats
         context = format_local_executable_skill_context(hints)
 
         assert any("join [gameId] [spot]" in command for command in commands)
+        assert any(command.endswith(" register") for command in commands)
         assert any("settlement <gameId>" in command for command in commands)
         assert not any("wallet again" in command for command in commands)
+        assert not any("join <gameId> <spot>" in command for command in commands)
         assert "join [gameId] [spot]" in context
+        assert " register" in context
         assert "settlement <gameId>" in context
         assert "extracted command forms" in context
 

@@ -1106,6 +1106,7 @@ class AgentLoop:
             working_dir=str(self.workspace),
             allow_chaining=True,
             allow_substitution=True,
+            yolo_mode=bool(getattr(self, "yolo_mode", False)),
         ))
 
         # Filesystem tools - allow reads from the user home directory so that

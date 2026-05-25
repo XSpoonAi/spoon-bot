@@ -157,6 +157,12 @@ def _tool_failure_signal(payload: Any) -> str | None:
         return None
     if re.search(r"exit code:\s*[1-9]\d*", text):
         return "nonzero_exit"
+    if "stop_tool_loop" in text:
+        return "stop_tool_loop"
+    if text.lstrip().startswith("rejected:"):
+        return "rejected"
+    if text.lstrip().startswith("security error:"):
+        return "security_error"
     if text.lstrip().startswith("error:"):
         return "error_prefix"
     if "traceback" in text or "exception" in text:
@@ -295,6 +301,7 @@ def suppress_redundant_file_read(
     limit: int | None,
     total_lines: int,
     content_fingerprint: str | None = None,
+    request_key: str | None = None,
 ) -> str | None:
     """Return a compact result when a request re-reads covered file content."""
     state = _current_tool_invocation_state()
@@ -319,6 +326,10 @@ def suppress_redundant_file_read(
         end = start
 
     fingerprint = str(content_fingerprint or "")
+    current_request_key = str(
+        request_key or f"{normalized_path}\x1f{start}\x1f{end}\x1f{fingerprint}"
+    )
+    request_counts = state.setdefault("redundant_file_read_counts", defaultdict(int))
     raw_ranges = coverage.setdefault(normalized_path, [])
     ranges: list[tuple[int, int, str]] = []
     for item in raw_ranges:
@@ -331,12 +342,12 @@ def suppress_redundant_file_read(
 
     for existing_start, existing_end, _existing_fingerprint in ranges:
         if int(existing_start) <= start and end <= int(existing_end):
-            redundant_counts = state.setdefault("redundant_file_read_counts", defaultdict(int))
-            redundant_key = f"{normalized_path}\x1f{start}\x1f{end}\x1f{fingerprint}"
-            redundant_counts[redundant_key] += 1
-            if redundant_counts[redundant_key] >= 2:
+            request_counts[current_request_key] += 1
+            if request_counts[current_request_key] >= 3:
                 return _REPEATED_REDUNDANT_FILE_READ_MESSAGE
-            return _REDUNDANT_FILE_READ_MESSAGE
+            if request_counts[current_request_key] >= 2:
+                return _REDUNDANT_FILE_READ_MESSAGE
+            return None
 
     ranges.append((start, end, fingerprint))
     ranges.sort(key=lambda item: (int(item[0]), int(item[1])))
@@ -357,6 +368,7 @@ def suppress_redundant_file_read(
             merged[-1][2],
         )
     coverage[normalized_path] = merged
+    request_counts[current_request_key] += 1
     return None
 
 
@@ -384,6 +396,13 @@ def invalidate_file_read_tracking(*path_keys: Any) -> None:
         for key in list(coverage.keys()):
             if _normalize_file_tracking_path(key) in candidates:
                 coverage.pop(key, None)
+
+    request_counts = state.get("redundant_file_read_counts")
+    if isinstance(request_counts, dict):
+        for key in list(request_counts.keys()):
+            key_path = str(key).split("\x1f", 1)[0]
+            if _normalize_file_tracking_path(key_path) in candidates:
+                request_counts.pop(key, None)
 
     counts = state.get("counts")
     if counts is None:

@@ -471,6 +471,7 @@ class ShellTool(Tool):
         use_shell: bool = True,
         rate_limit_config: RateLimitConfig | None = None,
         background_handoff_timeout: float | None = None,
+        yolo_mode: bool | None = None,
     ):
         """
         Initialize shell tool.
@@ -492,12 +493,21 @@ class ShellTool(Tool):
             rate_limit_config: Configuration for rate limiting shell commands.
             background_handoff_timeout: Extra seconds to watch a command after
                 its foreground budget expires before handing it to background.
+            yolo_mode: If True, do not block shell commands with policy
+                guardrails; execute them and let the command output be the
+                source of truth. If None, read SPOON_BOT_YOLO_MODE.
         """
         self.timeout = timeout
         self.max_timeout = max(timeout, max_timeout)
         self.max_output = max_output
         self.working_dir = working_dir
         self.use_shell = use_shell
+        env_yolo_mode = os.environ.get("SPOON_BOT_YOLO_MODE", "").strip().casefold()
+        self.yolo_mode = (
+            env_yolo_mode in {"1", "true", "yes", "y", "on"}
+            if yolo_mode is None
+            else bool(yolo_mode)
+        )
         self.background_handoff_timeout = self._resolve_background_handoff_timeout(
             background_handoff_timeout
         )
@@ -605,12 +615,7 @@ class ShellTool(Tool):
         }
 
     def tool_invocation_dedup_key(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
-        """Skip exact-call suppression for polling and workspace skill CLIs.
-
-        Workspace skills frequently define their own retry/idempotency contract
-        around remote state. The shell guard should not turn a documented retry
-        into an internal loop-control error before the skill can recover.
-        """
+        """Normalize shell invocations for request-local duplicate suppression."""
         if not isinstance(arguments, dict):
             return arguments
         action = str(arguments.get("action") or "execute").strip().lower()
@@ -623,9 +628,57 @@ class ShellTool(Tool):
                     cwd = self._resolve_working_dir(arguments.get("working_dir"))
                 except Exception:
                     cwd = str(self.working_dir or os.getcwd())
-                if self._command_invokes_workspace_skill(command, cwd):
-                    return None
+                skill_cli_key = self._skill_cli_invocation_dedup_key(command, cwd)
+                if skill_cli_key is not None:
+                    return {
+                        "action": "execute",
+                        "skill_cli": skill_cli_key,
+                    }
+                normalized = dict(arguments)
+                normalized["command"] = self._normalize_exact_command(command)
+                return normalized
         return arguments
+
+    def _skill_cli_invocation_dedup_key(
+        self,
+        command: str,
+        cwd: str,
+    ) -> dict[str, Any] | None:
+        """Return a stable key for logically identical workspace skill CLI calls."""
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            command_tokens = str(command or "").split()
+        if not command_tokens:
+            return None
+
+        workspace_root = Path(self.working_dir or cwd).resolve()
+        current_dir = Path(cwd).resolve()
+        invocations: list[dict[str, Any]] = []
+        for segment in self._split_shell_segments(command_tokens):
+            if not segment:
+                continue
+            if segment[0].casefold() == "cd":
+                current_dir = self._resolve_cd_segment(current_dir, segment)
+                continue
+            cleaned_segment = self._segment_before_redirection_or_pipe(segment)
+            invocation = self._extract_skill_cli_invocation_for_segment(
+                cleaned_segment,
+                current_dir,
+                workspace_root,
+            )
+            if invocation is None:
+                continue
+            skill_name, args, prefix_tokens = invocation
+            invocations.append({
+                "skill": skill_name,
+                "entrypoint": list(self._normalize_skill_cli_prefix_tokens(prefix_tokens)),
+                "args": list(args),
+            })
+
+        if not invocations:
+            return None
+        return {"invocations": invocations}
 
     def _parse_command_args(self, command: str) -> list[str]:
         """
@@ -1545,19 +1598,22 @@ class ShellTool(Tool):
         if not command or not str(command).strip():
             return "Error: 'command' is required for action='execute'"
 
-        manual_tunnel_rejection = self._reject_manual_tunnel_when_tool_available(str(command))
-        if manual_tunnel_rejection is not None:
-            capture_tool_output(manual_tunnel_rejection, manual_tunnel_rejection)
-            return manual_tunnel_rejection
+        enforce_guardrails = not bool(getattr(self, "yolo_mode", False))
 
-        if self._has_unmanaged_background_operator(str(command)):
-            return (
-                "Rejected: unmanaged shell background operator '&' is not supported. "
-                "Run long-lived commands in the foreground with an appropriate timeout "
-                "so the shell tool can keep them as managed background jobs, or "
-                "activate and use a matching dynamic service/tool capability when one "
-                "is listed in the inactive catalog."
-            )
+        if enforce_guardrails:
+            manual_tunnel_rejection = self._reject_manual_tunnel_when_tool_available(str(command))
+            if manual_tunnel_rejection is not None:
+                capture_tool_output(manual_tunnel_rejection, manual_tunnel_rejection)
+                return manual_tunnel_rejection
+
+            if self._has_unmanaged_background_operator(str(command)):
+                return (
+                    "Rejected: unmanaged shell background operator '&' is not supported. "
+                    "Run long-lived commands in the foreground with an appropriate timeout "
+                    "so the shell tool can keep them as managed background jobs, or "
+                    "activate and use a matching dynamic service/tool capability when one "
+                    "is listed in the inactive catalog."
+                )
 
         # Resolve effective timeout: per-command override capped by max_timeout
         effective_timeout = self.timeout
@@ -1580,26 +1636,32 @@ class ShellTool(Tool):
         if invokes_workspace_skill:
             effective_timeout = max(effective_timeout, self.timeout)
 
-        skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
-        if skill_clone_rejection is not None:
-            capture_tool_output(skill_clone_rejection, skill_clone_rejection)
-            return skill_clone_rejection
+        if enforce_guardrails:
+            skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
+            if skill_clone_rejection is not None:
+                capture_tool_output(skill_clone_rejection, skill_clone_rejection)
+                return skill_clone_rejection
 
         command = self._augment_skill_cli_labeled_values(command, cwd)
 
-        skill_command_rejection = self._reject_undocumented_skill_cli_arguments(
-            command,
-            cwd,
-        )
-        if skill_command_rejection is not None:
-            capture_tool_output(skill_command_rejection, skill_command_rejection)
-            return skill_command_rejection
+        if enforce_guardrails:
+            skill_command_rejection = self._reject_undocumented_skill_cli_arguments(
+                command,
+                cwd,
+            )
+            if skill_command_rejection is not None:
+                logger.info(
+                    "Skill CLI invocation differs from extracted SKILL.md command "
+                    f"forms; allowing script execution and using CLI output as source of "
+                    f"truth. Diagnostic: {skill_command_rejection}"
+                )
 
         # Validate command
-        is_valid, error_msg = self.validator.validate(command)
-        if not is_valid:
-            safe_cmd = self.validator.sanitize_for_display(command)
-            return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
+        if enforce_guardrails:
+            is_valid, error_msg = self.validator.validate(command)
+            if not is_valid:
+                safe_cmd = self.validator.sanitize_for_display(command)
+                return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
 
         execution_command = (
             self._prepend_workspace_env_for_skill_command(command, cwd)
@@ -1872,6 +1934,8 @@ class ShellTool(Tool):
 
         lower = stripped.casefold()
         if lower.startswith("run "):
+            if re.search(r"\bagain\b", stripped, re.IGNORECASE):
+                return ""
             stripped = stripped[4:].strip()
             lower = stripped.casefold()
 
@@ -1888,8 +1952,6 @@ class ShellTool(Tool):
             tokens = shlex.split(parseable)
         except ValueError:
             tokens = parseable.split()
-        if tokens and tokens[-1].casefold() == "again":
-            tokens = tokens[:-1]
         return " ".join(tokens)
 
     @classmethod
@@ -1917,7 +1979,24 @@ class ShellTool(Tool):
                     command_section_lines.append(normalized)
 
         if command_section_lines:
-            return command_section_lines
+            combined_lines: list[str] = []
+            seen_lines: set[str] = set()
+            for normalized in command_section_lines:
+                if normalized not in seen_lines:
+                    seen_lines.add(normalized)
+                    combined_lines.append(normalized)
+            for raw_line in lines:
+                stripped = cls._strip_markdown_command_prefix(raw_line)
+                if not stripped.casefold().startswith("run "):
+                    continue
+                normalized = cls._normalize_skill_command_template_line(
+                    raw_line,
+                    cli_value,
+                )
+                if normalized and normalized not in seen_lines:
+                    seen_lines.add(normalized)
+                    combined_lines.append(normalized)
+            return combined_lines
 
         fallback_lines: list[str] = []
         for raw_line in lines:

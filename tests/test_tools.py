@@ -30,6 +30,7 @@ class TestShellTool:
         return ShellTool(
             timeout=5,
             max_output=1000,
+            yolo_mode=False,
             rate_limit_config=RateLimitConfig.unlimited(),
         )
 
@@ -97,21 +98,81 @@ class TestShellTool:
             str(workspace),
         ) is True
 
-    def test_shell_skips_exact_dedup_for_workspace_skill_commands(self, tmp_path):
-        """Skill-owned retry/idempotency should not be blocked by shell dedup."""
+    def test_shell_normalizes_workspace_skill_commands_for_dedup(self, tmp_path):
+        """Equivalent skill CLI spellings should share one loop-guard key."""
         from spoon_bot.agent.tools.shell import ShellTool
 
         workspace = tmp_path / "workspace"
         (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
         shell_tool = ShellTool(working_dir=str(workspace))
 
-        assert shell_tool.tool_invocation_dedup_key(
+        direct = shell_tool.tool_invocation_dedup_key(
             {
                 "action": "execute",
                 "command": "node skills/demo-skill/cli/index.js join A",
                 "working_dir": str(workspace),
             }
-        ) is None
+        )
+        via_cd = shell_tool.tool_invocation_dedup_key(
+            {
+                "action": "execute",
+                "command": "cd skills/demo-skill/cli && node index.js join A 2>&1",
+                "working_dir": str(workspace),
+            }
+        )
+
+        assert direct == via_cd
+        assert direct == {
+            "action": "execute",
+            "skill_cli": {
+                "invocations": [{
+                    "skill": "demo-skill",
+                    "entrypoint": ["node", "skills/demo-skill/cli/index.js"],
+                    "args": ["join", "A"],
+                }],
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_repeated_workspace_skill_cli_is_suppressed(self, tmp_path):
+        """Repeated skill CLI status-style calls should not loop forever."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "demo-skill"
+        cli_dir = skill_dir / "cli"
+        cli_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-skill",
+                "---",
+                "CLI := sh skills/demo-skill/cli/index.sh",
+                "## Commands",
+                "$CLI wallet",
+            ]),
+            encoding="utf-8",
+        )
+        script = cli_dir / "index.sh"
+        script.write_text("#!/bin/sh\necho wallet status\n", encoding="utf-8")
+        script.chmod(0o755)
+        shell_tool = ShellTool(
+            working_dir=str(workspace),
+            timeout=5,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        with track_tool_invocations(max_repeats=1):
+            first = await shell_tool(command="sh skills/demo-skill/cli/index.sh wallet")
+            second = await shell_tool(
+                command="cd skills/demo-skill/cli && sh index.sh wallet 2>&1"
+            )
+
+        assert "wallet status" in first
+        assert "STOP_TOOL_LOOP" in second
+        assert "duplicate tool invocation suppressed" in second
 
     def test_shell_loads_workspace_env_for_skill_commands(self, tmp_path):
         """Installed skill CLIs should receive non-sensitive workspace env values."""
@@ -369,6 +430,7 @@ class TestShellTool:
                 "CLI := node skills/spot-agent-cypher/cli/index.js",
                 "## Setup",
                 "RUN $CLI wallet",
+                "RUN $CLI register",
                 'MATCH output: "No wallet" -> run $CLI wallet again',
                 "RUN $CLI join {gameId} {spot} again",
                 "",
@@ -390,6 +452,7 @@ class TestShellTool:
 
         assert "node skills/spot-agent-cypher/cli/index.js wallet again" not in displays
         assert "node skills/spot-agent-cypher/cli/index.js join <gameId> <spot> again" not in displays
+        assert "node skills/spot-agent-cypher/cli/index.js register" in displays
         assert "node skills/spot-agent-cypher/cli/index.js settlement <gameId>" in displays
 
         shell_tool = ShellTool(working_dir=str(workspace))
@@ -397,6 +460,47 @@ class TestShellTool:
             "node skills/spot-agent-cypher/cli/index.js settlement 142",
             str(workspace),
         ) is None
+        assert shell_tool._reject_undocumented_skill_cli_arguments(
+            "node skills/spot-agent-cypher/cli/index.js register",
+            str(workspace),
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_shell_executes_workspace_skill_cli_when_docs_are_incomplete(self, tmp_path):
+        """SKILL.md command hints should not be a hard execution firewall."""
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "demo-skill"
+        cli_dir = skill_dir / "cli"
+        cli_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-skill",
+                "---",
+                "CLI := sh skills/demo-skill/cli/index.sh",
+                "## Commands",
+                "$CLI wallet",
+            ]),
+            encoding="utf-8",
+        )
+        script = cli_dir / "index.sh"
+        script.write_text("#!/bin/sh\necho ran:$*\n", encoding="utf-8")
+        script.chmod(0o755)
+        shell_tool = ShellTool(
+            working_dir=str(workspace),
+            timeout=5,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        result = await shell_tool.execute(
+            "sh skills/demo-skill/cli/index.sh register --agent-id 8004"
+        )
+
+        assert "ran:register --agent-id 8004" in result
+        assert "Rejected:" not in result
 
     def test_shell_skill_cli_templates_ignore_inline_prose(self, tmp_path):
         """Fallback parsing accepts explicit RUN lines without scanning whole prose."""
@@ -900,6 +1004,25 @@ class TestShellTool:
         # Command chaining should be blocked
         result = await shell_tool.execute("echo hello; rm -rf /")
         assert "Security Error" in result or "blocked" in result.lower() or "injection" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_yolo_mode_executes_commands_without_policy_rejection(self, tmp_path):
+        """Cypher sandbox yolo mode should run commands instead of hard rejecting them."""
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        tool = ShellTool(
+            working_dir=str(tmp_path),
+            custom_blocklist={"printf"},
+            yolo_mode=True,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        result = await tool.execute("printf yolo; printf mode")
+
+        assert "yolomode" in result
+        assert "Rejected:" not in result
+        assert "Security Error:" not in result
 
     @pytest.mark.asyncio
     async def test_nonexistent_directory(self, shell_tool):

@@ -14,6 +14,7 @@ import aiofiles.os
 
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
+    _REDUNDANT_FILE_READ_MESSAGE,
     capture_tool_output,
     invalidate_file_read_tracking,
     suppress_redundant_file_read,
@@ -186,6 +187,11 @@ class ReadFileTool(Tool):
                     limit=visible_line_count,
                     total_lines=total_lines,
                     content_fingerprint=content_fingerprint,
+                    request_key=(
+                        f"{file_path}\x1f{offset if offset is not None else ''}"
+                        f"\x1f{limit if limit is not None else ''}"
+                        f"\x1f{content_fingerprint}"
+                    ),
                 )
 
             def _build_result(body: str) -> str:
@@ -199,6 +205,11 @@ class ReadFileTool(Tool):
             summary_result = _build_result(content)
             full_result = _build_result(full_content)
             if duplicate_read is not None:
+                if duplicate_read == _REDUNDANT_FILE_READ_MESSAGE:
+                    summary_result = f"{duplicate_read}\n\n{summary_result}"
+                    full_result = f"{duplicate_read}\n\n{full_result}"
+                    capture_tool_output(summary_result, full_result)
+                    return summary_result
                 capture_tool_output(duplicate_read, duplicate_read)
                 return duplicate_read
             capture_tool_output(summary_result, full_result)
