@@ -53,6 +53,53 @@ _ERROR_LINE_MARKERS = (
     "insufficient funds",
     "urgent:",
 )
+_LOCAL_SERVICE_URL_RE = re.compile(
+    r"\b(?:https?|wss?|ws)://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?\b",
+    re.IGNORECASE,
+)
+_LOCAL_SERVICE_HOSTPORT_RE = re.compile(
+    r"\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{2,5}\b",
+    re.IGNORECASE,
+)
+_PUBLIC_URL_RE = re.compile(
+    r"\bhttps://(?!localhost\b|127\.0\.0\.1\b|0\.0\.0\.0\b|\[::1\])[-a-z0-9.]+\.[a-z]{2,}(?::\d+)?(?:/[^\s`'\"<>)]*)?",
+    re.IGNORECASE,
+)
+_SERVICE_WORDS = (
+    "api",
+    "app",
+    "backend",
+    "browser",
+    "frontend",
+    "http",
+    "preview",
+    "server",
+    "service",
+    "websocket",
+    "服务",
+    "服务器",
+    "网页",
+    "浏览器",
+    "应用",
+    "聊天室",
+    "实时",
+)
+_LOCAL_ONLY_WORDS = (
+    "local only",
+    "local-only",
+    "localhost only",
+    "no public",
+    "without public",
+    "do not expose",
+    "don't expose",
+    "本地即可",
+    "只要本地",
+    "不需要公网",
+    "不要公网",
+    "不用公网",
+    "不要暴露",
+    "无需暴露",
+)
 
 
 def _contains_workspace_skill_path(text: str) -> bool:
@@ -299,6 +346,109 @@ def tool_events_have_skill_install_completion(
         if "success:" in text and "installed" in text:
             return True
         if "already installed" in text or "is already installed" in text:
+            return True
+    return False
+
+
+def _public_url_from_payload(payload: Any) -> str:
+    if isinstance(payload, dict):
+        value = payload.get("public_url") or payload.get("url")
+        if isinstance(value, str) and _PUBLIC_URL_RE.search(value):
+            return value.strip()
+        for nested_key in ("verification", "public_readiness", "result"):
+            nested = payload.get(nested_key)
+            nested_url = _public_url_from_payload(nested)
+            if nested_url:
+                return nested_url
+    if isinstance(payload, list):
+        for item in payload:
+            nested_url = _public_url_from_payload(item)
+            if nested_url:
+                return nested_url
+    return ""
+
+
+def _parse_json_payload(text: str) -> Any | None:
+    stripped = str(text or "").strip()
+    if not stripped or stripped[0] not in "[{":
+        return None
+    try:
+        return json.loads(stripped)
+    except Exception:
+        return None
+
+
+def tool_events_have_verified_public_url(tool_result_events: list[dict[str, Any]]) -> bool:
+    """Return True when service exposure evidence contains a verified public URL."""
+    for event in tool_result_events:
+        if _stream_tool_event_name(event) != "service_expose":
+            continue
+        text = _stream_tool_event_text(event)
+        payload = _parse_json_payload(text)
+        if isinstance(payload, dict):
+            success = payload.get("success")
+            public_url = payload.get("public_url")
+            if success is True and isinstance(public_url, str) and _PUBLIC_URL_RE.search(public_url):
+                return True
+            nested_url = _public_url_from_payload(payload)
+            if success is True and nested_url:
+                return True
+        if re.search(r'"success"\s*:\s*true', text, re.IGNORECASE) and re.search(
+            r'"public_url"\s*:\s*"https://(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])',
+            text,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
+def _explicitly_local_only(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return any(marker in lowered for marker in _LOCAL_ONLY_WORDS)
+
+
+def _mentions_browser_service(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return any(word in lowered for word in _SERVICE_WORDS)
+
+
+def _mentions_local_service_only(text: str) -> bool:
+    if _LOCAL_SERVICE_URL_RE.search(text) or _LOCAL_SERVICE_HOSTPORT_RE.search(text):
+        return True
+    lowered = str(text or "").casefold()
+    return (
+        ("localhost" in lowered or "0.0.0.0" in lowered or "127.0.0.1" in lowered)
+        and any(marker in lowered for marker in ("listen", "listening", "port", "监听", "端口"))
+    )
+
+
+def final_response_needs_public_service_exposure_recovery(
+    user_request: str,
+    final_content: str,
+    tool_result_events: list[dict[str, Any]],
+) -> bool:
+    """Return True when a browser/service task ended with only local access.
+
+    The check is evidence-based: it does not route by one product prompt.  It
+    only fires when the newest request/final answer is about a browser-facing
+    service, the user did not ask for local-only behavior, and the answer still
+    exposes loopback/local service coordinates without verified public exposure
+    tool evidence.
+    """
+    if tool_events_have_verified_public_url(tool_result_events):
+        return False
+    request_text = str(user_request or "")
+    answer_text = str(final_content or "")
+    combined = f"{request_text}\n{answer_text}"
+    if _explicitly_local_only(combined):
+        return False
+    if not _mentions_browser_service(combined):
+        return False
+    if _mentions_local_service_only(answer_text):
+        return True
+    for event in reversed(tool_result_events[-8:]):
+        text = _stream_tool_event_text(event)
+        if _mentions_local_service_only(text):
             return True
     return False
 

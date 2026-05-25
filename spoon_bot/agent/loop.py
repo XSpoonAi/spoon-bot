@@ -108,6 +108,7 @@ from spoon_bot.agent.turn_verifiers import (
     build_user_facing_tool_event_answer,
     build_user_facing_tool_evidence_answer,
     extract_resolved_tool_next_commands,
+    final_response_needs_public_service_exposure_recovery,
     has_pending_placeholder_next_command,
     latest_tool_event_has_next_command,
     should_run_skill_contract_check,
@@ -894,6 +895,12 @@ class AgentLoop:
             "- Memory, recent replies, and conversation history are stale hints. "
             "For current workspace, skill, account, balance, job, or external-system state, "
             "verify with tools before answering.\n"
+            "- The latest user request is already in the active context. Do not call "
+            "`search_history` to rediscover the current/latest request, to look up "
+            "examples/templates for a new build, or before starting a new coding/execution "
+            "task. Use `search_history` only when the user explicitly asks about earlier "
+            "conversation facts, prior tool results, or a session compact says exact prior "
+            "facts are needed.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
             "- If `write_file` reports an existing file and the task requires a "
             "generated whole-file replacement, retry that same write with "
@@ -907,6 +914,12 @@ class AgentLoop:
             "prefer serving all browser-required pieces from one local service before exposing it. "
             "If multiple services are necessary, expose and verify every browser-required endpoint; "
             "do not finalize with browser code pointing to localhost, loopback, or unexposed ports.\n"
+            "- In sandbox/runtime environments, when you create or start a browser-facing local "
+            "service, WebSocket service, API, frontend, backend, or preview app, use the "
+            "`service_expose` tool to manage the background process and Cloudflare exposure "
+            "unless the user explicitly asks for local-only access. Do not use one-off shell "
+            "backgrounding as the final service manager when `service_expose` can do the same "
+            "job, and do not finalize with only localhost, loopback, or 0.0.0.0 access.\n"
             "- Before starting or exposing a generated service, complete the smallest local preflight "
             "that proves it can launch: install declared runtime dependencies, run the relevant "
             "syntax/build check for the entrypoint when available, and fix failures before calling "
@@ -3222,6 +3235,19 @@ class AgentLoop:
             tool_result_events = self._collect_runtime_tool_result_events_from_memory(
                 _pre_turn_memory_index
             )
+            if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                final_content = await self._run_process_history_search_budget_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_history_search_budget_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
             if (
                 should_run_skill_contract_check(tool_result_events)
                 and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
@@ -3262,6 +3288,24 @@ class AgentLoop:
                 await self._execute_structural_followup_commands_for_process(
                     tool_result_events,
                     reason="process_structural_followup",
+                )
+
+            if final_response_needs_public_service_exposure_recovery(
+                authoritative_message,
+                final_content,
+                tool_result_events,
+            ):
+                final_content = await self._run_process_public_service_exposure_recovery(
+                    authoritative_message=authoritative_message,
+                    final_content=final_content,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_public_service_exposure_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
                 )
 
             if (
@@ -5026,6 +5070,43 @@ class AgentLoop:
         )
 
     @staticmethod
+    def _build_history_search_budget_recovery_prompt(
+        user_request: str,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        request_context: str = "",
+    ) -> str:
+        """Build an internal continuation prompt after unproductive history lookups."""
+        evidence_block = "\n\n".join(
+            AgentLoop._stream_tool_result_event_summary(event, limit=1000)
+            for event in tool_result_events[-6:]
+        ) or "No tool evidence captured."
+        context_block = (
+            "\n\nRelevant request-scoped execution context:\n"
+            f"{request_context.strip()}"
+            if request_context.strip()
+            else ""
+        )
+        return (
+            "[INTERNAL HISTORY-LOOKUP RECOVERY]\n"
+            "The previous tool loop spent this turn's history-search budget "
+            "without finding actionable current evidence. The latest user "
+            "request is already available below, so continue from the next "
+            "concrete action instead of searching conversation history again.\n\n"
+            "Do not call `search_history` again in this recovery turn unless "
+            "the user explicitly asked about earlier conversation facts. Do "
+            "not answer from stale older sessions. Use the available workspace, "
+            "file, shell, or domain-specific tools to complete the newest "
+            "request. If the newest request asks to create and start a service, "
+            "create the needed files, run a small local preflight, and use the "
+            "service-management/exposure tool when a public preview is required "
+            "by the runtime.\n\n"
+            f"Latest user request:\n{user_request}"
+            f"{context_block}\n\n"
+            f"Latest tool evidence:\n{evidence_block}"
+        )
+
+    @staticmethod
     def _build_pending_followup_recovery_prompt(
         user_request: str,
         tool_result_events: list[dict[str, Any]],
@@ -5062,6 +5143,38 @@ class AgentLoop:
             "genuinely absent from the evidence.\n\n"
             f"Latest user request:\n{user_request}{context_block}\n\n"
             f"Pending structural follow-up commands:\n{followup_block}\n\n"
+            f"Latest tool evidence:\n{evidence_block}"
+        )
+
+    @staticmethod
+    def _build_public_service_exposure_recovery_prompt(
+        user_request: str,
+        final_content: str,
+        tool_result_events: list[dict[str, Any]],
+    ) -> str:
+        """Build an internal continuation prompt for local-only service answers."""
+        evidence_block = "\n\n".join(
+            AgentLoop._stream_tool_result_event_summary(event, limit=1200)
+            for event in tool_result_events[-6:]
+        ) or "No tool evidence captured."
+        final_excerpt = AgentLoop._compact_tool_evidence_text(final_content, limit=1000)
+        return (
+            "[INTERNAL PUBLIC SERVICE EXPOSURE RECOVERY]\n"
+            "The previous answer reported a generated browser-facing or WebSocket/API "
+            "service that is reachable only through localhost, loopback, 0.0.0.0, or "
+            "an unexposed local port. In this sandbox, that is not a complete final "
+            "state unless the user explicitly requested local-only access.\n\n"
+            "Continue the latest user request by using the real `service_expose` tool "
+            "through the tool-call API. Prefer one managed service that serves the "
+            "browser page and upgrades WebSocket/API paths on the same public origin. "
+            "If the app currently needs multiple browser-required local endpoints, "
+            "either route them through the same service or expose every required "
+            "endpoint before finalizing. Report a usable preview link only when a "
+            "`service_expose` result has success=true and a non-null public_url. If "
+            "Cloudflare exposure is unavailable or rate-limited, report that concrete "
+            "blocker instead of retrying indefinitely.\n\n"
+            f"Latest user request:\n{user_request}\n\n"
+            f"Previous local-only answer:\n{final_excerpt}\n\n"
             f"Latest tool evidence:\n{evidence_block}"
         )
 
@@ -5603,6 +5716,8 @@ class AgentLoop:
             return None
         if "exact requested shell command failed" in text:
             return None
+        if "history search budget" in text:
+            return "I stopped searching old conversation history and continued from the latest request."
         if "consecutive tool failures suppressed" in text:
             return "I stopped retrying after repeated failures."
         if "repeated side-effecting tool series suppressed" in text:
@@ -5828,6 +5943,37 @@ class AgentLoop:
                 return True
         return False
 
+    @staticmethod
+    def _tool_events_have_history_search_budget(
+        events: list[dict[str, Any]],
+    ) -> bool:
+        """Return True when history lookup budget is exhausted for this turn."""
+        for event in events:
+            metadata = dict(event.get("metadata") or {})
+            if str(metadata.get("name") or "").strip() != "search_history":
+                continue
+            payload = (
+                metadata.get("model_result")
+                or metadata.get("model_output")
+                or metadata.get("model_content")
+                or metadata.get("output")
+                or metadata.get("result")
+                or metadata.get("content")
+                or event.get("delta")
+            )
+            text = AgentLoop._stringify_stream_payload(payload).strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("budget_exhausted") is True:
+                return True
+            if "history search budget reached for this request" in text.casefold():
+                return True
+        return False
+
     async def _run_process_repeated_read_recovery(
         self,
         *,
@@ -5866,6 +6012,49 @@ class AgentLoop:
 
         return AgentLoop._extract_run_result_text(result)
 
+    async def _run_process_history_search_budget_recovery(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        label: str,
+    ) -> str:
+        """Retry once after unproductive history lookup consumes the turn."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        repair_prompt = AgentLoop._build_history_search_budget_recovery_prompt(
+            authoritative_message,
+            tool_result_events,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        recovery_hints = dict(request_execution_hints)
+        recovery_hints["history_search_budget_exhausted"] = True
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(recovery_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label=label,
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
+        return AgentLoop._extract_run_result_text(result)
+
     async def _run_process_pending_followup_recovery(
         self,
         *,
@@ -5881,6 +6070,49 @@ class AgentLoop:
         self._reset_agent_state_for_retry()
         repair_prompt = AgentLoop._build_pending_followup_recovery_prompt(
             authoritative_message,
+            tool_result_events,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label=label,
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
+        return AgentLoop._extract_run_result_text(result)
+
+    async def _run_process_public_service_exposure_recovery(
+        self,
+        *,
+        authoritative_message: str,
+        final_content: str,
+        request_execution_hints: dict[str, Any],
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        label: str,
+    ) -> str:
+        """Retry once for non-stream flows when a service answer is local-only."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        repair_prompt = AgentLoop._build_public_service_exposure_recovery_prompt(
+            authoritative_message,
+            final_content,
             tool_result_events,
         )
         await self._agent.add_message("user", repair_prompt)
@@ -6106,6 +6338,7 @@ class AgentLoop:
         saw_tool_call = False
         saw_content_after_tool_call = False
         pseudo_tool_repair_attempted = False
+        public_service_exposure_repair_attempted = False
         stream_completed = False
         stream_cancelled = False
         bg_task: asyncio.Task[None] | None = None
@@ -6188,6 +6421,8 @@ class AgentLoop:
             non_read_tool_call_count = 0
             repeated_read_recovery_attempted = False
             repeated_read_guardrail_seen = False
+            history_search_budget_recovery_attempted = False
+            history_search_budget_seen = False
             # 2. Start run() in background
             run_result_text = ""
             provider_silence_retry_count = 0
@@ -6406,6 +6641,7 @@ class AgentLoop:
                 *,
                 repair_prompt_override: str | None = None,
                 repair_reason: str = "pseudo_tool_call_text",
+                request_hint_overrides: dict[str, Any] | None = None,
             ) -> tuple[str, list[dict[str, Any]]]:
                 """Retry once when the model wrote fake tool calls as text."""
                 nonlocal stream_error_reason, stream_tool_result_index
@@ -6435,6 +6671,11 @@ class AgentLoop:
                     repair_kwargs["reasoning_effort"] = repair_reasoning_effort
 
                 request_execution_hints = self._build_request_execution_hints(authoritative_message)
+                if request_hint_overrides:
+                    request_execution_hints = {
+                        **request_execution_hints,
+                        **request_hint_overrides,
+                    }
                 result: Any | None = None
                 try:
                     with (
@@ -6865,6 +7106,14 @@ class AgentLoop:
                 except Exception:
                     pass
 
+            def _stop_current_run_for_history_search_budget_recovery() -> None:
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    td.set()
+                except Exception:
+                    pass
+
             while not (td.is_set() and oq.empty()):
                 if _stop_if_total_timeout():
                     break
@@ -6884,8 +7133,20 @@ class AgentLoop:
                 _record_tool_result_events(tool_result_events)
                 if _events_have_repeated_read_guardrail(tool_result_events):
                     repeated_read_guardrail_seen = True
+                if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                    history_search_budget_seen = True
                 for event in tool_result_events:
                     yield _decorate_stream_event(event)
+                if (
+                    history_search_budget_seen
+                    and not history_search_budget_recovery_attempted
+                ):
+                    logger.warning(
+                        "History search budget was exhausted without task progress; "
+                        "switching to internal continuation recovery."
+                    )
+                    _stop_current_run_for_history_search_budget_recovery()
+                    break
                 if any(AgentLoop._is_tool_loop_suppression_event(event) for event in tool_result_events):
                     logger.warning("Stopping tool loop after repeated-tool guardrail result.")
                     _stop_tool_loop("tool_suppression")
@@ -7160,6 +7421,18 @@ class AgentLoop:
                         "metadata": metadata,
                     }
                     yield _decorate_stream_event(tool_result_event)
+                    if AgentLoop._tool_events_have_history_search_budget([tool_result_event]):
+                        history_search_budget_seen = True
+                    if (
+                        history_search_budget_seen
+                        and not history_search_budget_recovery_attempted
+                    ):
+                        logger.warning(
+                            "History search budget was exhausted without task progress; "
+                            "switching to internal continuation recovery."
+                        )
+                        _stop_current_run_for_history_search_budget_recovery()
+                        break
                     if AgentLoop._is_tool_loop_suppression_event(tool_result_event):
                         logger.warning("Stopping tool loop after repeated-tool guardrail result.")
                         _stop_tool_loop("tool_suppression")
@@ -7248,10 +7521,48 @@ class AgentLoop:
                 )
             )
             _record_tool_result_events(tool_result_events)
+            if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                history_search_budget_seen = True
             for event in tool_result_events:
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
+
+            if (
+                history_search_budget_seen
+                and not history_search_budget_recovery_attempted
+            ):
+                logger.warning(
+                    "History search budget consumed the tool loop; running "
+                    "internal continuation recovery."
+                )
+                history_search_budget_recovery_attempted = True
+                repair_prompt = AgentLoop._build_history_search_budget_recovery_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    "History search budget reached before task completion.",
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="history_search_budget_recovery",
+                    request_hint_overrides={"history_search_budget_exhausted": True},
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        metadata = dict(event.get("metadata") or {})
+                        event = {
+                            **event,
+                            "delta": AgentLoop._stream_tool_result_visible_delta(
+                                event.get("delta", ""),
+                                metadata,
+                            ),
+                            "metadata": metadata,
+                        }
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                run_result_text = repair_text
+                post_tool_content_buffer = repair_text
+                post_tool_content_events = []
 
             if should_run_skill_contract_check(
                 all_tool_result_events,
@@ -7402,6 +7713,41 @@ class AgentLoop:
                 pending_fallback_content_emit = True
                 pending_fallback_reason = "pseudo_tool_call_repair"
                 pending_fallback_delta = repair_text
+
+            if (
+                stream_error_reason is None
+                and full_content.strip()
+                and not public_service_exposure_repair_attempted
+                and final_response_needs_public_service_exposure_recovery(
+                    authoritative_message,
+                    full_content,
+                    all_tool_result_events,
+                )
+            ):
+                logger.warning(
+                    "Final stream content exposed only local service access; "
+                    "retrying once with public service exposure recovery."
+                )
+                public_service_exposure_repair_attempted = True
+                repair_prompt = AgentLoop._build_public_service_exposure_recovery_prompt(
+                    authoritative_message,
+                    full_content,
+                    all_tool_result_events,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    full_content,
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="public_service_exposure_recovery",
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                if repair_text.strip():
+                    full_content = repair_text
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "public_service_exposure_recovery"
+                    pending_fallback_delta = repair_text
 
             if (
                 stream_error_reason is None
@@ -7799,6 +8145,20 @@ class AgentLoop:
             tool_result_events = self._collect_runtime_tool_result_events_from_memory(
                 _pre_turn_memory_index
             )
+            if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                final_content = await self._run_process_history_search_budget_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_with_thinking_history_search_budget_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                thinking_content = None
+
             if (
                 should_run_skill_contract_check(tool_result_events)
                 and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
@@ -7842,6 +8202,25 @@ class AgentLoop:
                     tool_result_events,
                     reason="process_with_thinking_structural_followup",
                 )
+
+            if final_response_needs_public_service_exposure_recovery(
+                authoritative_message,
+                final_content,
+                tool_result_events,
+            ):
+                final_content = await self._run_process_public_service_exposure_recovery(
+                    authoritative_message=authoritative_message,
+                    final_content=final_content,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_with_thinking_public_service_exposure_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                thinking_content = None
 
             if (
                 should_run_skill_contract_check(tool_result_events)
@@ -8437,8 +8816,25 @@ class AgentLoop:
                 "when_to_use": fm.get("when_to_use") or "",
             })
         hints = build_request_execution_hints(message, skill_candidates)
+        AgentLoop._configure_request_scoped_history_tool(self, hints)
         AgentLoop._bind_request_execution_hints_to_tools(self, hints)
         return hints
+
+    def _configure_request_scoped_history_tool(self, hints: dict[str, Any]) -> None:
+        """Expose history search only for turns that need earlier transcript facts."""
+        if not hasattr(self, "tools"):
+            return
+        needs_history = bool(
+            isinstance(hints, dict)
+            and hints.get("current_session_fact_check_required")
+        )
+        try:
+            if needs_history:
+                self.add_tool("search_history")
+            else:
+                self.remove_tool("search_history")
+        except Exception as exc:
+            logger.debug(f"Failed to adjust request-scoped history tool: {exc}")
 
     def _bind_request_execution_hints_to_tools(self, hints: dict[str, Any]) -> None:
         """Make request hints available to tool calls that lose contextvars."""

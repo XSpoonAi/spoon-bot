@@ -652,8 +652,122 @@ class TestAgentLoopStream:
         assert "Do not stop after setup" in source
         assert "safe next action that the newest request already asked" in source
         assert "public browser app with frontend plus API/WebSocket/backend" in source
+        assert "service_expose` tool to manage the background process" in source
+        assert "do not finalize with only localhost" in source
         assert "smallest local preflight" in source
         assert "[GITHUB SKILL INSTALL CONTEXT]" not in source
+
+    def test_local_service_final_answer_requires_public_exposure_recovery(self):
+        """Browser-facing service answers should not end with loopback-only access."""
+        from spoon_bot.agent.turn_verifiers import (
+            final_response_needs_public_service_exposure_recovery,
+        )
+
+        assert final_response_needs_public_service_exposure_recovery(
+            "Create a WebSocket app and start the server.",
+            "Done. Server is running at ws://localhost:8765.",
+            [],
+        ) is True
+
+    def test_public_exposure_recovery_respects_local_only_requests(self):
+        """Explicit local-only requests should not be forced through Cloudflare."""
+        from spoon_bot.agent.turn_verifiers import (
+            final_response_needs_public_service_exposure_recovery,
+        )
+
+        assert final_response_needs_public_service_exposure_recovery(
+            "Create a WebSocket app for local-only testing.",
+            "Done. Server is running at ws://localhost:8765.",
+            [],
+        ) is False
+
+    def test_verified_service_expose_public_url_satisfies_service_recovery(self):
+        """A successful service_expose public_url is sufficient completion evidence."""
+        from spoon_bot.agent.turn_verifiers import (
+            final_response_needs_public_service_exposure_recovery,
+            tool_events_have_verified_public_url,
+        )
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "service_expose",
+                "result": (
+                    '{"success": true, '
+                    '"public_url": "https://preview-demo.trycloudflare.com"}'
+                ),
+            },
+        }]
+
+        assert tool_events_have_verified_public_url(events) is True
+        assert final_response_needs_public_service_exposure_recovery(
+            "Create a WebSocket app and start the server.",
+            "Done. Server is running at ws://localhost:8765.",
+            events,
+        ) is False
+
+    def test_public_service_exposure_recovery_prompt_is_generic(self):
+        """The internal exposure recovery prompt should rely on service evidence."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_public_service_exposure_recovery_prompt(
+            "Create a WebSocket app and start the server.",
+            "Server is running at ws://localhost:8765.",
+            [{
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "python server.py is LISTENing on 0.0.0.0:8765",
+                },
+            }],
+        )
+
+        assert "[INTERNAL PUBLIC SERVICE EXPOSURE RECOVERY]" in prompt
+        assert "service_expose" in prompt
+        assert "success=true and a non-null public_url" in prompt
+        assert "chatroom" not in prompt.lower()
+
+    def test_history_search_budget_recovery_prompt_is_generic(self):
+        """History lookup recovery should continue the task without stale session routing."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "search_history",
+                "result": json.dumps(
+                    {
+                        "hits": [],
+                        "budget_exhausted": True,
+                        "note": "History search budget reached for this request.",
+                    }
+                ),
+            },
+        }]
+
+        prompt = AgentLoop._build_history_search_budget_recovery_prompt(
+            "Create a WebSocket app and start the server.",
+            events,
+        )
+
+        assert "[INTERNAL HISTORY-LOOKUP RECOVERY]" in prompt
+        assert "Do not call `search_history` again" in prompt
+        assert "latest user request" in prompt.lower()
+        assert "chatroom" not in prompt.lower()
+
+    def test_history_search_budget_event_is_detected_structurally(self):
+        """The loop should detect the structured budget marker from tool evidence."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "search_history",
+                "result": json.dumps({"budget_exhausted": True, "hits": []}),
+            },
+        }]
+
+        assert AgentLoop._tool_events_have_history_search_budget(events) is True
 
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""
@@ -2015,6 +2129,96 @@ $CLI stats
         assert attempts == 2
         assert "".join(chunk["delta"] for chunk in content_chunks) == "Recovered answer."
         assert done_chunks[-1]["metadata"]["content"] == "Recovered answer."
+
+    @pytest.mark.asyncio
+    async def test_stream_recovers_local_only_service_final_answer(self):
+        """A service task that ends at localhost should get one exposure recovery turn."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        attempts = 0
+        agent = self._make_stream_agent([])
+        agent._reset_agent_state_for_retry = MagicMock()
+
+        async def run(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                content = "Done. Server is running at ws://localhost:8765."
+                await agent._agent.output_queue.put({"content": content})
+                return MagicMock(content=content)
+            content = "Public preview: https://preview-demo.trycloudflare.com"
+            await agent._agent.output_queue.put({"content": content})
+            return MagicMock(content=content)
+
+        async def run_with_retry(label="agent", pre_retry_cleanup=None, **run_kwargs):
+            return await agent._agent.run(**run_kwargs)
+
+        agent._agent.run = AsyncMock(side_effect=run)
+        agent._run_agent_with_retry = AsyncMock(side_effect=run_with_retry)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(
+            agent,
+            message="Create a WebSocket app and start the server.",
+        ):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        done = [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"]
+
+        assert attempts == 2
+        assert "https://preview-demo.trycloudflare.com" in content
+        assert "https://preview-demo.trycloudflare.com" in done
+        assert "localhost:8765" not in done
+
+    @pytest.mark.asyncio
+    async def test_stream_recovers_after_history_search_budget(self):
+        """Repeated unproductive history lookup should trigger one continuation turn."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        attempts = 0
+        agent = self._make_stream_agent([])
+        agent._reset_agent_state_for_retry = MagicMock()
+
+        async def run(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                await agent._agent.output_queue.put(
+                    {
+                        "type": "tool_result",
+                        "metadata": {"id": "hist_1", "name": "search_history"},
+                        "result": json.dumps(
+                            {
+                                "hits": [],
+                                "budget_exhausted": True,
+                                "note": "History search budget reached for this request.",
+                            }
+                        ),
+                    }
+                )
+                return MagicMock(content="")
+            content = "Created the service files and started the server."
+            await agent._agent.output_queue.put({"content": content})
+            return MagicMock(content=content)
+
+        agent._agent.run = AsyncMock(side_effect=run)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(
+            agent,
+            message="Create a WebSocket app and start the server.",
+        ):
+            chunks.append(chunk)
+
+        content = "".join(c["delta"] for c in chunks if c["type"] == "content")
+        done = [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"]
+        recovery_prompt = agent._agent.add_message.await_args_list[-1].args[1]
+
+        assert attempts == 2
+        assert "Created the service files" in content
+        assert done == "Created the service files and started the server."
+        assert "[INTERNAL HISTORY-LOOKUP RECOVERY]" in recovery_prompt
 
     @pytest.mark.asyncio
     async def test_stream_handles_string_chunks(self):

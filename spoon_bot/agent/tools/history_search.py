@@ -25,6 +25,10 @@ import re
 from typing import Any, Callable, Iterable, Optional, TYPE_CHECKING
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import (
+    get_request_execution_hints,
+    get_tracked_tool_invocation_counts,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import for typing only
     from spoon_bot.session.manager import SessionManager
@@ -186,7 +190,10 @@ class SearchHistoryTool(Tool):
             "matching. Use this to recover information after the runtime "
             "context has been compacted, for example to look up an earlier "
             "tool result, attachment id, user question, or assistant tool-"
-            "call trace. By default the current session is searched and "
+            "call trace. Do not use this tool to rediscover the current/latest "
+            "user request, to search for examples/templates, or before starting "
+            "a new build/coding/execution task; the active request is already "
+            "in context. By default the current session is searched and "
             "plain assistant replies are omitted to avoid reviving stale "
             "plans; pass roles=['assistant'] when you explicitly need the "
             "literal earlier assistant wording. Pass scope='all' only when "
@@ -278,6 +285,52 @@ class SearchHistoryTool(Tool):
             "required": ["query"],
         }
 
+    @staticmethod
+    def _history_search_budget_response(
+        *,
+        query: str,
+        target_session_key: str | None,
+        requested_scope: str,
+        limit: int,
+        offset: int,
+        stop_loop: bool = False,
+    ) -> str:
+        import json
+
+        stop_message = (
+            "STOP_TOOL_LOOP: Error: history search budget exhausted. The latest "
+            "user request is already in context; continue the current task "
+            "without calling search_history again."
+            if stop_loop
+            else None
+        )
+        payload: dict[str, Any] = {
+            "query": query,
+            "scope": "session" if target_session_key is not None else requested_scope,
+            "session_key": target_session_key,
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+            "hits": [],
+            "budget_exhausted": True,
+            "next_action": "continue_latest_request_without_history_search",
+            "note": (
+                "History search budget reached for this request. The newest "
+                "user request is already in the active context; do not call "
+                "search_history again unless the user explicitly asks about "
+                "earlier conversation facts. Continue the current task from "
+                "the latest request and available tool evidence."
+            ),
+        }
+        if stop_message is not None:
+            payload["guardrail_stop"] = True
+            payload["error"] = stop_message
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+        )
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -336,6 +389,24 @@ class SearchHistoryTool(Tool):
             # Always ask the resolver first so we pick up WS-driven
             # session switches that bypass AgentLoop's internal hooks.
             target_session_key = active_session_key
+
+        invocation_counts = get_tracked_tool_invocation_counts()
+        request_hints = get_request_execution_hints()
+        if (
+            (
+                bool(request_hints.get("history_search_budget_exhausted"))
+                or int(invocation_counts.get(self.name, 0) or 0) >= 3
+            )
+            and not bool(request_hints.get("current_session_fact_check_required"))
+        ):
+            return self._history_search_budget_response(
+                query=query,
+                target_session_key=target_session_key,
+                requested_scope=requested_scope,
+                limit=limit_int,
+                offset=offset_int,
+                stop_loop=bool(request_hints.get("history_search_budget_exhausted")),
+            )
 
         roles_list: list[str] | None
         if roles is None:

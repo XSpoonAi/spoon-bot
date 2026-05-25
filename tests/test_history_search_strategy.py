@@ -4,6 +4,12 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
+from spoon_bot.agent.tools.execution_context import (
+    bind_request_execution_hints,
+    track_tool_invocations,
+)
 from spoon_bot.agent.tools.history_search import SearchHistoryTool
 from spoon_bot.session.manager import SessionManager
 from spoon_bot.session.store import FileSessionStore
@@ -166,3 +172,58 @@ def test_specific_cross_session_query_still_searches_all_sessions(tmp_path: Path
         "archived-session",
     }
     assert "requested_scope" not in payload
+
+
+@pytest.mark.asyncio
+async def test_history_search_budget_guides_non_fact_check_tasks_after_variants(
+    tmp_path: Path,
+) -> None:
+    mgr = _build_manager(tmp_path)
+    tool = SearchHistoryTool(mgr, default_session_key="fresh-session")
+
+    with track_tool_invocations():
+        await tool(query="websocket chat")
+        await tool(query="chat room")
+        await tool(query="latest user request")
+        payload = json.loads(await tool(query="server status"))
+
+    assert payload["total"] == 0
+    assert payload["budget_exhausted"] is True
+    assert payload["next_action"] == "continue_latest_request_without_history_search"
+    assert "History search budget reached" in payload["note"]
+    assert "Continue the current task" in payload["note"]
+
+
+@pytest.mark.asyncio
+async def test_history_search_budget_allows_explicit_fact_check_searches(
+    tmp_path: Path,
+) -> None:
+    mgr = _build_manager(tmp_path)
+    tool = SearchHistoryTool(mgr, default_session_key="fresh-session")
+
+    with bind_request_execution_hints({"current_session_fact_check_required": True}):
+        with track_tool_invocations():
+            await tool(query="previous command")
+            await tool(query="tool result")
+            await tool(query="earlier output")
+            payload = json.loads(await tool(query="prior status"))
+
+    assert payload["total"] == 0
+    assert "History search budget reached" not in payload.get("note", "")
+
+
+@pytest.mark.asyncio
+async def test_history_search_budget_hint_blocks_recovery_turn_searches(
+    tmp_path: Path,
+) -> None:
+    mgr = _build_manager(tmp_path)
+    tool = SearchHistoryTool(mgr, default_session_key="fresh-session")
+
+    with bind_request_execution_hints({"history_search_budget_exhausted": True}):
+        payload = json.loads(await tool.execute(query="websocket chat"))
+
+    assert payload["total"] == 0
+    assert payload["budget_exhausted"] is True
+    assert payload["guardrail_stop"] is True
+    assert "STOP_TOOL_LOOP" in payload["error"]
+    assert "do not call search_history again" in payload["note"]
