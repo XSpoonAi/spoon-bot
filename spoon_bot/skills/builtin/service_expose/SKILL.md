@@ -56,6 +56,15 @@ scripts:
           startup_wait_seconds:
             type: number
             description: "Seconds to wait after starting before checking whether the process exited"
+          tunnel_protocol:
+            type: string
+            description: "cloudflared protocol; defaults to http2 for Docker/Linux networks where QUIC/UDP may be blocked"
+          tunnel_attempts:
+            type: integer
+            description: "Transient public verification retry attempts; defaults to 3 and is capped at 5"
+          tunnel_public_settle_seconds:
+            type: number
+            description: "Seconds to wait after cloudflared registration before public URL verification; defaults to 8 to avoid negative DNS caching"
           tail_chars:
             type: integer
             description: "Log tail size"
@@ -82,4 +91,16 @@ Use `replace=true` only when the user wants to restart/replace the existing name
 
 When creating a new preview service, pick a free port. Passing `port=0` asks this skill to choose an available port and inject it as `PORT` for the service command. Do not report a link until the local URL returns app-specific content. If a port is occupied, update the app command/config to use a free port and restart; do not treat an unrelated HTTP 200 on that port as success.
 
+Before calling `service_expose` for generated code, complete the smallest local preflight that proves the service can launch: install declared runtime dependencies, run a syntax/build check for the entrypoint when the stack provides one, and fix failures before starting or exposing the service.
+
 Cloudflare Quick Tunnels are for development previews. For production or stable hostnames, use a named Cloudflare Tunnel outside this quick-preview skill.
+
+For WebSocket-only services, an HTTP `426 Upgrade Required` response or a successful TCP port probe is acceptable service reachability evidence when no `verify_text` was requested. Do not rewrite a working WebSocket server solely to satisfy an HTTP GET check unless the user also asked for a browser page.
+
+The tunnel protocol defaults to `http2` because Docker and restricted Linux hosts often block or degrade QUIC/UDP. Override with `tunnel_protocol` or `SPOON_BOT_CLOUDFLARED_PROTOCOL` only when the environment requires another Cloudflare transport. If tunnel creation fails, inspect `service_expose` status/logs and retry through `service_expose`; do not bypass it with manual `cloudflared` shell commands.
+
+Report a public URL only when the `service_expose` result has `success=true` and a non-null `public_url`. A trycloudflare URL that appears only in logs, `verification.url`, or a failed attempt is an unverified candidate and must not be presented as a usable link.
+
+For browser apps, the public URL is not complete until every browser-required API, asset, and WebSocket endpoint is reachable from that public page. Prefer serving the frontend and API/WebSocket from one local service before exposing it; for example, serve `index.html` and upgrade WebSocket connections on the same port. If you use multiple local services, expose each browser-required service or rewrite/proxy the frontend so it does not point at localhost, loopback, or an unexposed local port. If a result contains `public_readiness.blocking=true`, resolve the listed missing public dependencies before finalizing.
+
+If the tool reports Cloudflare Quick Tunnel rate limiting with `retry_after_seconds`, do not retry in the same turn. Wait for the cooldown or use a named/authenticated Cloudflare tunnel outside the quick-preview flow.

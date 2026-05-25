@@ -621,8 +621,8 @@ class TestAgentLoopStream:
         assert "never remove protective wrappers" in prompt
         assert "never convert a simulated command into a live" in prompt
 
-    def test_build_request_context_prompt_adds_generic_github_skill_context(self):
-        """Explicit GitHub skill install requests should expose the generic tool route."""
+    def test_build_request_context_prompt_does_not_add_github_skill_route(self):
+        """GitHub skill install intent stays in tool contracts, not prompt routes."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
@@ -630,17 +630,30 @@ class TestAgentLoopStream:
         loop._extract_env_for_prompt = MagicMock(return_value="")
 
         message = (
-            "https://github.com/Agent-Cypher-Lab/agent-spot-cypher\n"
+            "https://github.com/example-org/example-skill\n"
             "Help me install the skill in the repo."
         )
 
         prompt = AgentLoop._build_request_context_prompt(loop, message)
 
         assert "[TURN PRIORITY]:" in prompt
-        assert "[GITHUB SKILL INSTALL CONTEXT]:" in prompt
-        assert "skill_marketplace(action='install_skill'" in prompt
+        assert "[GITHUB SKILL INSTALL CONTEXT]:" not in prompt
+        assert "skill_marketplace(action='install_skill'" not in prompt
         assert "Do not use web_fetch or git clone only to confirm SKILL.md" not in prompt
-        assert "read the installed SKILL.md" in prompt
+        assert message in prompt
+
+    def test_system_prompt_has_generic_stop_condition_not_case_route(self):
+        """The loop should prevent premature setup-only stops with a generic contract."""
+        # Check the initialized system-prompt fragment without constructing
+        # the full spoon-core agent stack in this focused unit test.
+        source = Path("spoon_bot/agent/loop.py").read_text(encoding="utf-8")
+
+        assert "### Stop condition" in source
+        assert "Do not stop after setup" in source
+        assert "safe next action that the newest request already asked" in source
+        assert "public browser app with frontend plus API/WebSocket/backend" in source
+        assert "smallest local preflight" in source
+        assert "[GITHUB SKILL INSTALL CONTEXT]" not in source
 
     def test_build_request_context_prompt_explains_interrupted_previous_request_resolution(self):
         """Interrupted prior requests should be presented as amend-vs-replace context, not a second task."""

@@ -7,6 +7,12 @@
 # --------------- Stage 1: Build ---------------
 FROM python:3.12-slim AS builder
 
+# Git is required because spoon-ai-sdk is pinned from the spoon-core Git repo.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install uv for fast dependency resolution
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -37,12 +43,20 @@ LABEL version="0.1.0"
 
 # Install runtime system dependencies
 # - git: for workspace git operations
-# - curl: for healthchecks
+# - curl/ca-certificates: healthchecks and release downloads
+# - nodejs/pnpm: generated apps and installed skills commonly ship JS CLIs
 # - tini: proper PID 1 init for signal handling
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
+    ca-certificates \
     curl \
+    git \
     tini \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm \
+    && node --version \
+    && npm --version \
+    && pnpm --version \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for security
@@ -51,15 +65,16 @@ RUN groupadd -r spoonbot && useradd -r -g spoonbot -m -d /home/spoonbot spoonbot
 WORKDIR /app
 
 # Copy the virtual environment from builder
-COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder --chown=spoonbot:spoonbot /app/.venv /app/.venv
 
 # Copy application source
-COPY --from=builder /app/spoon_bot /app/spoon_bot
-COPY --from=builder /app/pyproject.toml /app/
+COPY --from=builder --chown=spoonbot:spoonbot /app/spoon_bot /app/spoon_bot
+COPY --from=builder --chown=spoonbot:spoonbot /app/pyproject.toml /app/
 
 # Copy entrypoint script
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+COPY --chown=spoonbot:spoonbot docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh
 
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
@@ -76,7 +91,7 @@ ENV SPOON_BOT_MODE=gateway
 
 # --- Gateway Settings ---
 ENV GATEWAY_HOST=0.0.0.0
-ENV GATEWAY_PORT=8080
+ENV GATEWAY_PORT=16600
 ENV GATEWAY_DEBUG=false
 ENV GATEWAY_WORKERS=1
 
@@ -131,13 +146,13 @@ ENV TINI_SUBREAPER=1
 
 # Create workspace directory with correct ownership
 RUN mkdir -p /data/workspace/memory /data/workspace/skills \
-    && chown -R spoonbot:spoonbot /data /app
+    && chown -R spoonbot:spoonbot /data
 
 # Volume for persistent workspace data
 VOLUME ["/data"]
 
 # Expose gateway port
-EXPOSE 8080
+EXPOSE 16600
 
 # Switch to non-root user
 USER spoonbot

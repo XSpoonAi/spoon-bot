@@ -13,6 +13,7 @@ from spoon_bot.agent.tools.execution_context import (
     capture_tool_output,
     current_session_fact_check_blocker,
 )
+from spoon_bot.agent.tools.filesystem import ReadFileTool
 
 
 # ---------------------------------------------------------------------------
@@ -37,10 +38,12 @@ class ActivateToolTool(Tool):
         self,
         activate_fn: Callable[[str], bool],
         list_inactive_fn: Callable[[], list[dict[str, str]]],
+        list_active_fn: Callable[[], list[dict[str, str]]] | None = None,
         tool_status_fn: Callable[[str], str] | None = None,
     ):
         self._activate = activate_fn
         self._list_inactive = list_inactive_fn
+        self._list_active = list_active_fn
         self._tool_status = tool_status_fn
 
     @property
@@ -129,11 +132,30 @@ class ActivateToolTool(Tool):
 
         if action == "list":
             inactive = self._list_inactive()
+            active = self._list_active() if self._list_active is not None else []
+            active = active or []
             if not inactive:
-                return "All tools are already active."
+                if not active:
+                    return "All tools are already active."
+                lines = [
+                    "No inactive tools are available to activate.",
+                    "",
+                    "Already active callable tools:",
+                ]
+                for t in active[:40]:
+                    lines.append(f"- **{t['name']}**: {t['description']}")
+                return "\n".join(lines)
             lines = ["Available tools that can be activated:\n"]
             for t in inactive:
                 lines.append(f"- **{t['name']}**: {t['description']}")
+            if active:
+                lines.append("\nAlready active callable tools:")
+                for t in active[:40]:
+                    lines.append(f"- **{t['name']}**: {t['description']}")
+                lines.append(
+                    "\nIf the tool you need is listed as already active, call it directly; "
+                    "do not treat its absence from the activation list as missing."
+                )
             return "\n".join(lines)
 
         return f"Unknown action: {action}"
@@ -588,8 +610,9 @@ class SelfUpgradeTool(Tool):
         if removed:
             parts.append(f"  Removed: {', '.join(removed)}")
 
-        # Include SKILL.md content for newly added skills so the agent
-        # knows how to use them right away.
+        # Include a compact execution contract for newly added skills.  Raw
+        # SKILL.md files can be long enough that the model-visible tool result
+        # drops the procedure/command sections in the middle.
         if added:
             ws = str(self._workspace).replace("\\", "/")
             for skill_name in added:
@@ -598,9 +621,19 @@ class SelfUpgradeTool(Tool):
                 skill_md = self._read_skill_md(skill_name)
                 if skill_md:
                     parts.append("")
-                    parts.append(f"--- {skill_name} SKILL.md ---")
-                    parts.append(skill_md)
-                    parts.append(f"--- end {skill_name} ---")
+                    parts.append(f"--- {skill_name} SKILL.md execution contract ---")
+                    parts.append(
+                        ReadFileTool._extract_skill_cli_content(
+                            skill_md,
+                            budget=7000,
+                        )
+                    )
+                    parts.append(f"--- end {skill_name} execution contract ---")
+                    parts.append(
+                        f"Full instructions remain available at "
+                        f"skills/{skill_name}/SKILL.md via read_file if a "
+                        "specific referenced section is needed."
+                    )
             parts.append("")
             parts.append(
                 f"NOTE: Skill scripts are at {ws}/skills/<skill_name>/scripts/. "
@@ -608,6 +641,8 @@ class SelfUpgradeTool(Tool):
                 f"bash {ws}/skills/{added[0]}/scripts/<script>.sh. "
                 "Use the `shell` tool to run any commands or scripts. "
                 "You do NOT need a special Python tool. "
+                "For each newly added skill, run the listed Setup commands "
+                "before invoking the CLI entrypoint or primary commands. "
                 "If the user's latest request contains additional work beyond "
                 "installation, continue from the SKILL.md execution contract now. "
                 "Ask for confirmation only when SKILL.md or a real missing input "

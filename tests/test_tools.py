@@ -676,6 +676,30 @@ class TestShellTool:
         assert "unmanaged shell background operator" in result
         assert "managed background jobs" in result
 
+    @pytest.mark.asyncio
+    async def test_shell_routes_manual_cloudflared_to_service_expose(self, shell_tool):
+        """Public-link tunnels should use the structured service exposure tool."""
+        result = await shell_tool(
+            command=(
+                "cloudflared tunnel --url http://localhost:3000 "
+                "--no-autoupdate > /tmp/cloudflared.log 2>&1 &"
+            ),
+        )
+
+        assert result.startswith("Rejected:")
+        assert "service_expose" in result
+        assert "cloudflared" in result
+        assert "unmanaged shell background operator" not in result
+
+    @pytest.mark.asyncio
+    async def test_shell_routes_cloudflared_inspection_to_service_expose(self, shell_tool):
+        """Tunnel inspection should stay on service_expose logs/status too."""
+        result = await shell_tool(command="/home/spoonbot/bin/cloudflared tunnel --help")
+
+        assert result.startswith("Rejected:")
+        assert "service_expose" in result
+        assert "tunnel logs" in result
+
     def test_shell_stops_after_exact_requested_command_failure(self, shell_tool):
         """Exact user-requested shell commands should fail fast without extra tool detours."""
         from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
@@ -1442,6 +1466,63 @@ class TestFilesystemTools:
         assert "Hello, World!" in result
 
     @pytest.mark.asyncio
+    async def test_self_upgrade_reload_returns_skill_execution_contract(self, temp_dir):
+        """Reload should expose a compact skill contract instead of raw long SKILL.md."""
+        from spoon_bot.agent.tools.self_config import SelfUpgradeTool
+
+        skill_dir = temp_dir / "skills" / "demo-runner"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-runner",
+                "description: Run a demo workflow through the local CLI.",
+                "---",
+                "# Demo Runner",
+                "CLI := node skills/demo-runner/cli/index.js",
+                "## Setup",
+                "cd skills/demo-runner/cli && pnpm install && cd ../../..",
+                *("setup filler line" for _ in range(400)),
+                "## Primary Flow",
+                "PROCEDURE run_demo():",
+                "  RUN $CLI prepare",
+                "  RUN $CLI start",
+                "  RUN $CLI wait",
+                "  RUN $CLI finish",
+                "## Commands",
+                "```bash",
+                "$CLI prepare",
+                "$CLI start",
+                "$CLI wait",
+                "$CLI finish",
+                "```",
+            ]),
+            encoding="utf-8",
+        )
+
+        class FakeAgentLoop:
+            async def reload_skills(self):
+                return {
+                    "after": ["demo-runner"],
+                    "added": ["demo-runner"],
+                    "removed": [],
+                }
+
+        tool = SelfUpgradeTool(workspace=temp_dir)
+        tool.set_agent_loop(FakeAgentLoop())
+
+        result = await tool.execute(action="reload_skills")
+
+        assert "--- demo-runner SKILL.md execution contract ---" in result
+        assert "[SKILL.md execution summary]" in result
+        assert "Setup commands to run before primary commands:" in result
+        assert "cd skills/demo-runner/cli && pnpm install && cd ../../.." in result
+        assert "PROCEDURE run_demo():" in result
+        assert "$CLI finish" in result
+        assert "Full instructions remain available at skills/demo-runner/SKILL.md" in result
+        assert result.count("setup filler line") <= 1
+
+    @pytest.mark.asyncio
     async def test_read_skill_md_returns_execution_summary(self, temp_dir):
         """Large SKILL.md reads should surface command contracts to the model."""
         from spoon_bot.agent.tools.filesystem import ReadFileTool
@@ -1458,6 +1539,9 @@ class TestFilesystemTools:
                 "# Spot Agent",
                 "CLI := node skills/spot-agent-cypher/cli/index.js",
                 "## Setup",
+                "cd skills/spot-agent-cypher/cli && pnpm install && cd ../../..",
+                "otherwise -> continue",
+                "see references/faucet.md",
                 *("setup details" for _ in range(300)),
                 "RUN $CLI join {spot} again so backend can assign a fresh room.",
                 "## Commands",
@@ -1476,6 +1560,13 @@ class TestFilesystemTools:
         assert "skill-ref" in result
         assert "[SKILL.md execution summary]" in result
         assert "node skills/spot-agent-cypher/cli/index.js" in result
+        assert "Setup commands to run before primary commands:" in result
+        assert "cd skills/spot-agent-cypher/cli && pnpm install && cd ../../.." in result
+        setup_block = result.split(
+            "Setup commands to run before primary commands:", 1
+        )[1].split("Operational contract:", 1)[0]
+        assert "otherwise -> continue" not in setup_block
+        assert "see references/faucet.md" not in setup_block
         assert "Operational contract:" in result
         assert "RUN $CLI join {spot} again so backend can assign a fresh room" in result
         assert "$CLI join [gameId] [spot]" in result

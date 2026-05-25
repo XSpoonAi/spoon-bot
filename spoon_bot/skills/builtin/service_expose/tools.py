@@ -26,7 +26,15 @@ class ServiceExposeTool(BaseTool):
         "links, trycloudflare/cloudflare tunnels, and follow-up requests asking "
         "for the current preview link. Prefer this tool over manual background "
         "shell commands for preview services. Supports free-port selection with "
-        "port=0 and app-specific URL verification via verify_text."
+        "port=0 and app-specific URL verification via verify_text. Only report "
+        "a public link when the tool result has success=true and public_url is "
+        "non-null; trycloudflare URLs in logs are candidates, not verified links. "
+        "For WebSocket-only services, HTTP 426 or TCP reachability can be valid "
+        "when no verify_text was requested. If the result contains "
+        "public_readiness.blocking=true, expose the missing browser dependencies "
+        "or route them through the same public origin before finalizing. For "
+        "browser apps with WebSocket/API dependencies, prefer one service that "
+        "serves the page and upgrades WebSocket/API paths on the same public origin."
     )
     parameters: dict = {
         "type": "object",
@@ -102,6 +110,28 @@ class ServiceExposeTool(BaseTool):
                 "type": "integer",
                 "description": "Seconds to wait for a trycloudflare URL.",
             },
+            "tunnel_protocol": {
+                "type": "string",
+                "description": (
+                    "cloudflared transport protocol. Defaults to http2 for "
+                    "Docker/Linux networks where QUIC/UDP may be unavailable."
+                ),
+            },
+            "tunnel_attempts": {
+                "type": "integer",
+                "description": (
+                    "Number of transient tunnel verification attempts. Defaults "
+                    "to 3 and is capped at 5."
+                ),
+            },
+            "tunnel_public_settle_seconds": {
+                "type": "number",
+                "description": (
+                    "Seconds to wait after cloudflared registration before the "
+                    "first public URL verification. Defaults to 8 to avoid "
+                    "negative DNS caching on new trycloudflare names."
+                ),
+            },
             "tail_chars": {
                 "type": "integer",
                 "description": "Log tail size for logs or failures.",
@@ -120,9 +150,14 @@ class ServiceExposeTool(BaseTool):
         action = str(kwargs.get("action") or "").strip().lower()
         if action in {"start", "tunnel", "expose", "start_tunnel"} or kwargs.get("start_tunnel"):
             tunnel_wait = int(kwargs.get("tunnel_wait_seconds") or 60)
-            verify_wait = int(kwargs.get("verify_wait_seconds") or 10)
+            verify_wait = int(kwargs.get("verify_wait_seconds") or 20)
+            try:
+                attempts = int(kwargs.get("tunnel_attempts") or 3)
+            except (TypeError, ValueError):
+                attempts = 3
+            attempts = max(1, min(attempts, 5))
             startup_wait = int(float(kwargs.get("startup_wait_seconds") or 2))
-            timeout = max(timeout, tunnel_wait + verify_wait + startup_wait + 30)
+            timeout = max(timeout, attempts * (tunnel_wait + verify_wait + 5) + startup_wait + 30)
         payload = {k: v for k, v in kwargs.items() if v is not None}
 
         def _run() -> subprocess.CompletedProcess[str]:

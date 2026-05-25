@@ -541,7 +541,8 @@ class ShellTool(Tool):
             "Commands exceeding the budget keep running in the background — "
             "use job_status to monitor and terminate_job to stop if there is "
             "evidence it is stuck. Silent running jobs are not stuck evidence; "
-            "keep polling unless the caller explicitly abandons the job. "
+            "after one status check, use job_output/log evidence rather than "
+            "repeating job_status with no new signal. "
             "Do not append unmanaged shell background operators such as '&'; "
             "run long-lived commands in the foreground so this tool can manage them. "
             "Do not install skills by cloning directly into workspace/skills; "
@@ -1391,8 +1392,9 @@ class ShellTool(Tool):
             f"  3. Stop if stuck:   action='terminate_job', job_id='{job.job_id}'\n"
             "The command is still active. Do not rerun the same command while "
             "this job exists. Quiet output can be normal for network, build, "
-            "or waiting operations; keep polling until it reaches a terminal "
-            "status or until the caller explicitly no longer needs it."
+            "or waiting operations. If a first status check is still running, "
+            "inspect job_output or the command's log/output artifact next; do "
+            "not repeatedly call job_status without new evidence."
         )
 
     async def _handle_background_action(
@@ -1439,10 +1441,11 @@ class ShellTool(Tool):
                 f"returncode: {job.returncode if job.returncode is not None else 'running'}\n"
                 "Recent output tail:\n"
                 f"{self._build_output_result(job.stdout_text, job.stderr_text, job.returncode, max_chars=tail_chars)}\n"
-                "Guidance: if status is running, keep polling this job or read "
-                "job_output; do not rerun the same command. Terminate only when "
-                "the caller explicitly wants to abandon it or you have evidence "
-                "that it is unrecoverably stuck."
+                "Guidance: if status is running, inspect job_output or the "
+                "command's log/output artifact next; do not repeat job_status "
+                "without new evidence. Do not rerun the same command. Terminate "
+                "only when the caller explicitly wants to abandon it or you have "
+                "evidence that it is unrecoverably stuck."
             )
 
         if action == "job_output":
@@ -1541,6 +1544,11 @@ class ShellTool(Tool):
 
         if not command or not str(command).strip():
             return "Error: 'command' is required for action='execute'"
+
+        manual_tunnel_rejection = self._reject_manual_tunnel_when_tool_available(str(command))
+        if manual_tunnel_rejection is not None:
+            capture_tool_output(manual_tunnel_rejection, manual_tunnel_rejection)
+            return manual_tunnel_rejection
 
         if self._has_unmanaged_background_operator(str(command)):
             return (
@@ -1777,6 +1785,36 @@ class ShellTool(Tool):
             )
 
         return None
+
+    @staticmethod
+    def _uses_cloudflared_command(command: str) -> bool:
+        try:
+            tokens = shlex.split(str(command or ""))
+        except ValueError:
+            tokens = str(command or "").split()
+        for segment in ShellTool._split_shell_segments(tokens):
+            if not segment:
+                continue
+            command_name = segment[0].casefold().replace("\\", "/")
+            if command_name == "cloudflared" or command_name.endswith("/cloudflared"):
+                return True
+            if command_name == "timeout" and len(segment) >= 3:
+                wrapped = segment[2].casefold().replace("\\", "/")
+                if wrapped == "cloudflared" or wrapped.endswith("/cloudflared"):
+                    return True
+        return False
+
+    def _reject_manual_tunnel_when_tool_available(self, command: str) -> str | None:
+        """Keep public-link workflows on the structured service_expose tool."""
+        if not self._uses_cloudflared_command(command):
+            return None
+        return (
+            "Rejected: cloudflared is owned by the service exposure toolchain. "
+            "Use service_expose to start, expose, inspect, or read tunnel logs; "
+            "if it is not in the callable tool list, activate the matching "
+            "service exposure tool first. This avoids unmanaged tunnel jobs and "
+            "keeps local/public URL verification in one structured path."
+        )
 
     @staticmethod
     def _strip_template_token(token: str) -> str:

@@ -263,9 +263,77 @@ class ReadFileTool(Tool):
             if stripped.startswith("$CLI") or re.match(r"^[A-Za-z0-9_.\\/-]+\s+", stripped):
                 command_section.append(stripped)
 
+        setup_headings = (
+            "setup",
+            "prerequisite",
+            "install",
+            "dependency",
+            "dependencies",
+        )
+        setup_section_lines: list[str] = []
+        in_setup_section = False
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if stripped.startswith("#"):
+                title = stripped.lstrip("#").strip().casefold()
+                in_setup_section = any(
+                    heading in title for heading in setup_headings
+                )
+                continue
+            if in_setup_section:
+                setup_section_lines.append(raw_line)
+
+        setup_commands: list[str] = []
+        if setup_section_lines:
+            from spoon_bot.agent.request_hints import extract_shell_command_candidates
+
+            command_starters = (
+                "cd ",
+                "npm ",
+                "pnpm ",
+                "npx ",
+                "yarn ",
+                "bun ",
+                "deno ",
+                "node ",
+                "uv ",
+                "pip ",
+                "poetry ",
+                "python ",
+                "bash ",
+                "sh ",
+                "./",
+                "../",
+                "/",
+            )
+            candidate_commands = extract_shell_command_candidates(
+                "\n".join(setup_section_lines),
+                limit=24,
+            )
+            setup_commands = _dedupe(
+                [
+                    command
+                    for command in candidate_commands
+                    if command.casefold().startswith(command_starters)
+                ],
+                limit=12,
+            )
+            setup_commands = _dedupe(
+                setup_commands
+                + [
+                    line.strip()
+                    for line in setup_section_lines
+                    if line.strip().casefold().startswith(command_starters)
+                ],
+                limit=12,
+            )
+
         contract_headings = (
             "setup",
             "prerequisite",
+            "install",
+            "dependency",
+            "dependencies",
             "primary flow",
             "workflow",
             "procedure",
@@ -340,6 +408,11 @@ class ReadFileTool(Tool):
             sections.append("Metadata:\n" + "\n".join(frontmatter[:12]))
         if cli_lines:
             sections.append("CLI entrypoint:\n" + "\n".join(cli_lines))
+        if setup_commands:
+            sections.append(
+                "Setup commands to run before primary commands:\n"
+                + "\n".join(setup_commands)
+            )
         if contract_lines:
             sections.append("Operational contract:\n" + "\n".join(contract_lines))
         if command_section:

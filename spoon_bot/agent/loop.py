@@ -879,6 +879,16 @@ class AgentLoop:
             "matching specialized tool. Do NOT write script files unless requested.\n"
             "4. When done, return the user-facing result in the format the latest user requested. "
             "Only summarize if the user explicitly asked for a summary.\n\n"
+            "### Stop condition\n"
+            "- Do not stop after setup when the latest user request also asked for follow-on execution. "
+            "Setup, installation, dependency checks, status checks, and readiness reports are intermediate "
+            "states unless they fully satisfy the newest request.\n"
+            "- If a tool result contains a blocking readiness/validation warning, treat it as an "
+            "intermediate state and resolve it before giving a final answer.\n"
+            "- Do not ask the user whether to run a safe next action that the newest request already asked "
+            "you to run. Continue with the tool or skill contract. Ask only when a required value is "
+            "absent, a documented skill rule requires user input, or the next action is destructive, "
+            "irreversible, or materially ambiguous.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
             "- Memory, recent replies, and conversation history are stale hints. "
@@ -893,6 +903,14 @@ class AgentLoop:
             "its documented terminal state. If a command is moved to the background, "
             "monitor that job to completion before issuing related commands.\n"
             "- Follow user instructions exactly - respect specific IDs, names, actions.\n"
+            "- When creating a public browser app with frontend plus API/WebSocket/backend, "
+            "prefer serving all browser-required pieces from one local service before exposing it. "
+            "If multiple services are necessary, expose and verify every browser-required endpoint; "
+            "do not finalize with browser code pointing to localhost, loopback, or unexposed ports.\n"
+            "- Before starting or exposing a generated service, complete the smallest local preflight "
+            "that proves it can launch: install declared runtime dependencies, run the relevant "
+            "syntax/build check for the entrypoint when available, and fix failures before calling "
+            "service exposure tools.\n"
             "- Use web search when the task needs live external facts or installed skills/tools are insufficient.\n"
         )
 
@@ -1131,6 +1149,10 @@ class AgentLoop:
             list_inactive_fn=lambda: [
                 {"name": t.name, "description": t.description}
                 for t in self.tools.get_inactive_tools().values()
+            ],
+            list_active_fn=lambda: [
+                {"name": t.name, "description": t.description}
+                for t in self.tools.get_active_tools().values()
             ],
             tool_status_fn=self._tool_activation_status,
         ))

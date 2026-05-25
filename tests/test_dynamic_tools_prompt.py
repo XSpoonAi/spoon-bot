@@ -154,6 +154,28 @@ class TestActivateToolTool:
         assert "tool_b" in result
 
     @pytest.mark.asyncio
+    async def test_list_action_shows_active_tools_when_available(self):
+        """List output should not make active tools look missing."""
+        from spoon_bot.agent.tools.self_config import ActivateToolTool
+
+        tool = ActivateToolTool(
+            activate_fn=lambda _name: False,
+            list_inactive_fn=lambda: [{"name": "spawn", "description": "Delegate work"}],
+            list_active_fn=lambda: [{
+                "name": "skill_marketplace",
+                "description": "Install skills from GitHub",
+            }],
+            tool_status_fn=lambda name: "active" if name == "skill_marketplace" else "inactive",
+        )
+
+        result = await tool.execute(action="list")
+
+        assert "Available tools that can be activated" in result
+        assert "Already active callable tools" in result
+        assert "skill_marketplace" in result
+        assert "call it directly" in result
+
+    @pytest.mark.asyncio
     async def test_activate_single(self):
         """Activate a single tool."""
         activated = []

@@ -16,7 +16,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 WINDOWS_DETACHED_PROCESS = 0x00000008
@@ -449,6 +449,17 @@ def _verify_url(
                     "expected_text": expected or None,
                 }
             last_error = f"Expected text not found: {expected!r}"
+        except HTTPError as exc:
+            if not expected and exc.code == 426:
+                return {
+                    "url": url,
+                    "ok": True,
+                    "matched": False,
+                    "expected_text": None,
+                    "http_status": 426,
+                    "method": "websocket-upgrade-probe",
+                }
+            last_error = f"HTTP Error {exc.code}: {exc.reason}"
         except (OSError, URLError, TimeoutError) as exc:
             last_error = str(exc)
         if time.monotonic() >= deadline:
@@ -500,6 +511,70 @@ def _normalize_action(action: Any) -> str:
     return aliases.get(normalized, normalized)
 
 
+def _tunnel_protocol(params: dict[str, Any]) -> str:
+    protocol = str(
+        params.get("tunnel_protocol")
+        or os.environ.get("SPOON_BOT_CLOUDFLARED_PROTOCOL")
+        or "http2"
+    ).strip().lower()
+    return protocol or "http2"
+
+
+def _tunnel_attempts(params: dict[str, Any]) -> int:
+    raw = params.get("tunnel_attempts") or os.environ.get("SPOON_BOT_CLOUDFLARED_TUNNEL_ATTEMPTS") or 3
+    try:
+        attempts = int(raw)
+    except (TypeError, ValueError):
+        attempts = 3
+    return max(1, min(attempts, 5))
+
+
+def _tunnel_public_settle_seconds(params: dict[str, Any]) -> float:
+    raw = (
+        params.get("tunnel_public_settle_seconds")
+        or os.environ.get("SPOON_BOT_CLOUDFLARE_PUBLIC_SETTLE_SECONDS")
+        or 8
+    )
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        seconds = 8.0
+    return max(0.0, min(seconds, 30.0))
+
+
+def _public_verification_error_is_transient(verification: dict[str, Any] | None) -> bool:
+    if not isinstance(verification, dict):
+        return False
+    error = str(verification.get("error") or "").casefold()
+    return any(
+        marker in error
+        for marker in (
+            "name or service not known",
+            "temporary failure in name resolution",
+            "errno -2",
+            "http error 530",
+            "timed out",
+        )
+    )
+
+
+def _cloudflare_quick_tunnel_rate_limited(log_path: Path) -> bool:
+    text = _tail(str(log_path), 20000).casefold()
+    return "429 too many requests" in text or "error code: 1015" in text
+
+
+def _tunnel_retry_after(entry: dict[str, Any]) -> int | None:
+    tunnel = entry.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return None
+    try:
+        retry_after_epoch = float(tunnel.get("retry_after_epoch") or 0)
+    except (TypeError, ValueError):
+        return None
+    remaining = int(retry_after_epoch - time.time())
+    return remaining if remaining > 0 else None
+
+
 def _start_tunnel_for_entry(
     name: str,
     entry: dict[str, Any],
@@ -515,64 +590,123 @@ def _start_tunnel_for_entry(
 
     local_url = _local_url(params, entry)
     tunnel_log = _logs_dir() / f"{name}.cloudflared.log"
-    _clear_log(tunnel_log)
-    pid = _spawn_argv([cloudflared, "tunnel", "--url", local_url], Path.cwd(), tunnel_log)
-    public_url = None
-    registered = False
-    for _ in range(int(params.get("tunnel_wait_seconds", 60)) * 2):
-        public_url = _parse_public_url(tunnel_log)
-        registered = _tunnel_registered(tunnel_log)
-        if public_url and registered:
-            break
-        if not _pid_alive(pid):
-            break
-        time.sleep(0.5)
-
-    tunnel = {
-        "pid": pid,
-        "local_url": local_url,
-        "public_url": public_url,
-        "registered": registered,
-        "log_path": str(tunnel_log),
-        "started_at": _now(),
-        "status": "running" if _pid_alive(pid) else "exited",
-    }
-    if not local_url and params.get("start_tunnel"):
-        inferred_port = _infer_port_from_log(log_path)
-        if inferred_port:
-            port = inferred_port
-            params["port"] = inferred_port
-            entry["port"] = inferred_port
-            entry["local_url"] = _local_url(params)
-            local_url = entry["local_url"]
-
+    protocol = _tunnel_protocol(params)
     verify_text = params.get("verify_text")
     if not verify_text and isinstance(entry.get("verification"), dict):
         verify_text = entry["verification"].get("expected_text")
-    if public_url:
-        tunnel["verification"] = _verify_url(
-            public_url,
-            expected_text=str(verify_text) if verify_text else None,
-            wait_seconds=float(params.get("verify_wait_seconds") or 10),
+    public_settle_seconds = _tunnel_public_settle_seconds(params)
+
+    attempts: list[dict[str, Any]] = []
+    last_tunnel: dict[str, Any] | None = None
+    max_attempts = _tunnel_attempts(params)
+    for attempt in range(1, max_attempts + 1):
+        _clear_log(tunnel_log)
+        pid = _spawn_argv(
+            [cloudflared, "tunnel", "--protocol", protocol, "--url", local_url],
+            Path.cwd(),
+            tunnel_log,
         )
-        if not tunnel["verification"].get("ok"):
-            tunnel["verification_error"] = tunnel["verification"].get("error")
-    entry["tunnel"] = tunnel
-    success = (
-        public_url is not None
-        and registered
-        and tunnel["status"] == "running"
-        and bool(tunnel.get("verification", {}).get("ok"))
-    )
-    if tunnel.get("verification") and not tunnel["verification"].get("ok"):
-        success = False
-    if not success:
-        tunnel["public_url"] = None
-        tunnel["public_url_omitted_reason"] = "unverified"
+        public_url = None
+        registered = False
+        for _ in range(int(params.get("tunnel_wait_seconds", 60)) * 2):
+            public_url = _parse_public_url(tunnel_log)
+            registered = _tunnel_registered(tunnel_log)
+            if public_url and registered:
+                break
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.5)
+
+        rate_limited = _cloudflare_quick_tunnel_rate_limited(tunnel_log)
+        tunnel = {
+            "pid": pid,
+            "local_url": local_url,
+            "public_url": public_url,
+            "registered": registered,
+            "rate_limited": rate_limited,
+            "protocol": protocol,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "log_path": str(tunnel_log),
+            "started_at": _now(),
+            "status": "running" if _pid_alive(pid) else "exited",
+        }
+        if not local_url and params.get("start_tunnel"):
+            inferred_port = _infer_port_from_log(tunnel_log)
+            if inferred_port:
+                params["port"] = inferred_port
+                entry["port"] = inferred_port
+                entry["local_url"] = _local_url(params)
+                local_url = entry["local_url"]
+
+        if public_url:
+            if registered and public_settle_seconds > 0:
+                time.sleep(public_settle_seconds)
+            tunnel["verification"] = _verify_url(
+                public_url,
+                expected_text=str(verify_text) if verify_text else None,
+                wait_seconds=float(params.get("verify_wait_seconds") or 20),
+            )
+            if not tunnel["verification"].get("ok"):
+                tunnel["verification_error"] = tunnel["verification"].get("error")
+        success = (
+            public_url is not None
+            and registered
+            and tunnel["status"] == "running"
+            and bool(tunnel.get("verification", {}).get("ok"))
+        )
+        if tunnel.get("verification") and not tunnel["verification"].get("ok"):
+            success = False
+        if success:
+            if attempts:
+                tunnel["attempts"] = attempts + [
+                    {"attempt": attempt, "success": True, "registered": registered}
+                ]
+            entry["tunnel"] = tunnel
+            return {"success": True, **tunnel}
+
         if _pid_alive(pid):
             _stop_pid(pid)
             tunnel["status"] = "stopped"
-    return {"success": success, **tunnel}
+        tunnel["public_url"] = None
+        tunnel["public_url_omitted_reason"] = "unverified"
+        attempts.append(
+            {
+                "attempt": attempt,
+                "success": False,
+                "registered": registered,
+                "rate_limited": rate_limited,
+                "verification_error": tunnel.get("verification_error"),
+            }
+        )
+        last_tunnel = tunnel
+        if rate_limited:
+            tunnel["retry_after_seconds"] = int(params.get("rate_limit_retry_after_seconds") or 600)
+            tunnel["retry_after_epoch"] = time.time() + tunnel["retry_after_seconds"]
+            break
+        if not (
+            attempt < max_attempts
+            and registered
+            and _public_verification_error_is_transient(tunnel.get("verification"))
+        ):
+            break
+        time.sleep(min(5.0, 1.5 * attempt))
+
+    tunnel = last_tunnel or {
+        "pid": None,
+        "local_url": local_url,
+        "public_url": None,
+        "registered": False,
+        "protocol": protocol,
+        "log_path": str(tunnel_log),
+        "started_at": _now(),
+        "status": "exited",
+        "public_url_omitted_reason": "unverified",
+    }
+    if attempts:
+        tunnel["attempts"] = attempts
+    entry["tunnel"] = tunnel
+    return {"success": False, **tunnel}
 
 
 def _refresh_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -587,6 +721,81 @@ def _refresh_entry(entry: dict[str, Any]) -> dict[str, Any]:
             tunnel["public_url"] = None
             tunnel["public_url_omitted_reason"] = "not_running_or_unverified"
     return entry
+
+
+def _same_workspace_unexposed_services(
+    name: str,
+    entry: dict[str, Any],
+    services: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return running sibling services that a public browser cannot reach."""
+
+    tunnel = entry.get("tunnel") if isinstance(entry.get("tunnel"), dict) else {}
+    if not isinstance(tunnel, dict) or not tunnel.get("public_url"):
+        return []
+    try:
+        entry_cwd = Path(str(entry.get("cwd") or "")).resolve()
+    except Exception:
+        return []
+
+    blocked: list[dict[str, Any]] = []
+    for other_name, other in services.items():
+        if other_name == name or not isinstance(other, dict):
+            continue
+        if not _pid_alive(other.get("pid")):
+            continue
+        try:
+            other_cwd = Path(str(other.get("cwd") or "")).resolve()
+        except Exception:
+            continue
+        if other_cwd != entry_cwd:
+            continue
+        other_tunnel = other.get("tunnel") if isinstance(other.get("tunnel"), dict) else {}
+        if isinstance(other_tunnel, dict) and other_tunnel.get("public_url"):
+            continue
+        blocked.append(
+            {
+                "name": str(other.get("name") or other_name),
+                "port": other.get("port"),
+                "local_url": other.get("local_url"),
+                "command": other.get("command"),
+            }
+        )
+    return blocked
+
+
+def _apply_public_readiness(
+    name: str,
+    entry: dict[str, Any],
+    services: dict[str, Any],
+) -> None:
+    """Warn when a public app URL still depends on local-only sibling services."""
+
+    blocked = _same_workspace_unexposed_services(name, entry, services)
+    if not blocked:
+        return
+    readiness = {
+        "ok": False,
+        "blocking": True,
+        "reason": "same-workspace-services-not-public",
+        "message": (
+            "A public browser URL was created, but other running services in "
+            "the same app workspace are still local-only. If the public page "
+            "uses any of these API/WebSocket/backend ports, do not report the "
+            "app as complete until those dependencies are exposed too or routed "
+            "through the same public origin."
+        ),
+        "unexposed_services": blocked,
+        "required_next_steps": [
+            "Expose each browser-required local service with service_expose, or",
+            "serve/proxy the frontend and API/WebSocket from one public origin, then",
+            "verify the public URL with a real browser/client request before finalizing.",
+        ],
+    }
+    entry["public_readiness"] = readiness
+    tunnel = entry.get("tunnel")
+    if isinstance(tunnel, dict):
+        tunnel["public_readiness"] = readiness
 
 
 def _action_start(params: dict[str, Any]) -> dict[str, Any]:
@@ -681,6 +890,20 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
             expected_text=str(verify_text) if verify_text else None,
             wait_seconds=float(params.get("verify_wait_seconds") or 10),
         )
+        if (
+            not entry["verification"].get("ok")
+            and not verify_text
+            and port is not None
+            and _can_connect(_connect_host(host), int(port))
+        ):
+            entry["verification"] = {
+                "url": local_url,
+                "ok": True,
+                "matched": False,
+                "expected_text": None,
+                "method": "tcp-port-probe",
+                "http_error": entry["verification"].get("error"),
+            }
         if not entry["verification"].get("ok"):
             inferred_port = _infer_port_from_log(log_path)
             if inferred_port and inferred_port != port:
@@ -694,6 +917,19 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
                     expected_text=str(verify_text) if verify_text else None,
                     wait_seconds=float(params.get("verify_wait_seconds") or 10),
                 )
+                if (
+                    not entry["verification"].get("ok")
+                    and not verify_text
+                    and _can_connect(_connect_host(host), int(port))
+                ):
+                    entry["verification"] = {
+                        "url": local_url,
+                        "ok": True,
+                        "matched": False,
+                        "expected_text": None,
+                        "method": "tcp-port-probe",
+                        "http_error": entry["verification"].get("error"),
+                    }
         if not entry["verification"].get("ok"):
             services[name] = entry
             _save_registry(registry)
@@ -718,6 +954,7 @@ def _action_start(params: dict[str, Any]) -> dict[str, Any]:
                 "service_log": _tail(str(log_path), int(params.get("tail_chars") or 4000)),
             }
     services[name] = entry
+    _apply_public_readiness(name, entry, services)
     _save_registry(registry)
     return {"success": True, "service": _refresh_entry(entry)}
 
@@ -801,8 +1038,21 @@ def _action_tunnel(params: dict[str, Any]) -> dict[str, Any]:
         if not params.get("replace"):
             return {"success": False, "error": f"Tunnel for '{name}' is already running", "service": entry}
         _stop_pid(existing_tunnel.get("pid"))
+    retry_after = _tunnel_retry_after(entry)
+    if retry_after and not params.get("force"):
+        return {
+            "success": False,
+            "error": (
+                "Cloudflare Quick Tunnel is currently rate-limited for this "
+                "service. Do not retry in this turn; wait for retry_after_seconds "
+                "or use an authenticated/named tunnel."
+            ),
+            "retry_after_seconds": retry_after,
+            "service": _refresh_entry(entry),
+        }
 
     tunnel = _start_tunnel_for_entry(name, entry, params)
+    _apply_public_readiness(name, entry, services)
     _save_registry(registry)
     return {"success": bool(tunnel.get("success")), "service": _refresh_entry(entry), "tunnel": tunnel}
 
@@ -835,7 +1085,15 @@ def _action_logs(params: dict[str, Any]) -> dict[str, Any]:
         result["service_log"] = _tail(entry.get("log_path"), tail_chars)
     if target in {"tunnel", "all"}:
         tunnel = entry.get("tunnel") if isinstance(entry.get("tunnel"), dict) else {}
-        result["tunnel_log"] = _tail(tunnel.get("log_path"), tail_chars)
+        tunnel_log = _tail(tunnel.get("log_path"), tail_chars)
+        if isinstance(tunnel, dict) and not tunnel.get("public_url"):
+            tunnel_log = TRYCLOUDFLARE_RE.sub("<unverified-trycloudflare-url-redacted>", tunnel_log)
+            result["tunnel_log_redacted"] = True
+            result["tunnel_log_note"] = (
+                "Unverified trycloudflare candidate URLs are redacted. "
+                "Report only service_expose public_url values from successful tunnel results."
+            )
+        result["tunnel_log"] = tunnel_log
     return result
 
 
