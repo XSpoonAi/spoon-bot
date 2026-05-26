@@ -1,7 +1,7 @@
 """Built-in EVM wallet bootstrap for spoon-bot.
 
 The runtime layout intentionally matches the legacy ``clawcast-wallet`` files
-so existing skills such as ``joker-game-agent`` can keep working unchanged.
+so existing wallet-aware skills can keep working unchanged.
 """
 
 from __future__ import annotations

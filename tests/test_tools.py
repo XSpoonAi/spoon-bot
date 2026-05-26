@@ -135,7 +135,7 @@ class TestShellTool:
 
     @pytest.mark.asyncio
     async def test_repeated_workspace_skill_cli_is_suppressed(self, tmp_path):
-        """Repeated skill CLI status-style calls should not loop forever."""
+        """Repeated skill CLI status-style calls should stay recoverable."""
         from spoon_bot.agent.tools.execution_context import track_tool_invocations
         from spoon_bot.agent.tools.shell import ShellTool
         from spoon_bot.utils.rate_limit import RateLimitConfig
@@ -171,6 +171,47 @@ class TestShellTool:
             )
 
         assert "wallet status" in first
+        assert "Repeated shell inspection skipped" in second
+        assert "STOP_TOOL_LOOP" not in second
+
+    @pytest.mark.asyncio
+    async def test_repeated_workspace_skill_cli_side_effect_still_stops(self, tmp_path):
+        """Repeated skill CLI side-effect calls should still end the tool loop."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "demo-skill"
+        cli_dir = skill_dir / "cli"
+        cli_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-skill",
+                "---",
+                "CLI := sh skills/demo-skill/cli/index.sh",
+                "## Commands",
+                "$CLI join [game_id]",
+            ]),
+            encoding="utf-8",
+        )
+        script = cli_dir / "index.sh"
+        script.write_text("#!/bin/sh\necho joined $2\n", encoding="utf-8")
+        script.chmod(0o755)
+        shell_tool = ShellTool(
+            working_dir=str(workspace),
+            timeout=5,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        with track_tool_invocations(max_repeats=1):
+            first = await shell_tool(command="sh skills/demo-skill/cli/index.sh join A")
+            second = await shell_tool(
+                command="cd skills/demo-skill/cli && sh index.sh join A 2>&1"
+            )
+
+        assert "joined A" in first
         assert "STOP_TOOL_LOOP" in second
         assert "duplicate tool invocation suppressed" in second
 
@@ -209,6 +250,20 @@ class TestShellTool:
         assert "Address already claimed in this round" in result
         assert "STDERR" not in result
         assert "Exit code" not in result
+
+    def test_shell_adds_pnpm_corepack_node_recovery(self, shell_tool):
+        """Corepack pnpm/Node mismatch should produce a concrete compatible retry."""
+        result = shell_tool._append_pnpm_corepack_recovery(
+            "cd skills/demo-skill/cli && pnpm install 2>&1",
+            "\n".join([
+                "! Corepack is about to download https://registry.npmjs.org/pnpm/-/pnpm-11.3.0.tgz",
+                "warn: This version of pnpm requires at least Node.js v22.13",
+                "Error [ERR_UNKNOWN_BUILTIN_MODULE]: No such built-in module: node:sqlite",
+            ]),
+        )
+
+        assert "RECOVERY:" in result
+        assert "cd skills/demo-skill/cli && npx --yes pnpm@10 install 2>&1" in result
 
     def test_shell_normalizes_windows_python3_store_alias(self, shell_tool):
         """Windows Store python3 alias should fall back to installed python."""
@@ -1023,6 +1078,25 @@ class TestShellTool:
         assert "yolomode" in result
         assert "Rejected:" not in result
         assert "Security Error:" not in result
+
+    @pytest.mark.asyncio
+    async def test_yolo_mode_still_rejects_manual_workspace_skill_clone(self, tmp_path):
+        """Yolo shell policy must not bypass the managed skill install contract."""
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        tool = ShellTool(
+            working_dir=str(tmp_path),
+            yolo_mode=True,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        result = await tool.execute(
+            "git clone https://github.com/example-org/example-skill skills/example-skill"
+        )
+
+        assert result.startswith("Rejected: workspace skills must be installed")
+        assert "skill_marketplace(action='install_skill'" in result
 
     @pytest.mark.asyncio
     async def test_nonexistent_directory(self, shell_tool):

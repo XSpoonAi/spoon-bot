@@ -159,6 +159,17 @@ class Tool(ABC):
                         dedup_arguments,
                     )
                     if duplicate_result is not None:
+                        formatter = getattr(
+                            self,
+                            "format_duplicate_invocation_result",
+                            None,
+                        )
+                        if callable(formatter):
+                            duplicate_result = formatter(
+                                duplicate_result,
+                                kwargs,
+                                dedup_arguments,
+                            )
                         result = duplicate_result
                         return result
                 series_key_func = getattr(self, "tool_invocation_series_key", None)

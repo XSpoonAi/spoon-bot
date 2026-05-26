@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 from spoon_bot.agent.loop import AgentLoop
 from spoon_bot.skills.builtin import builtin_skills_root, ensure_builtin_skills
 
@@ -82,6 +85,18 @@ def test_builtin_skills_root_contains_builtin_skill_set():
     assert (root / "service_expose" / "scripts" / "service_expose.py").exists()
     assert not (root / "wallet" / "scripts").exists()
     assert not (root / "wallet" / "assets").exists()
+
+
+def test_builtin_skill_data_is_packaged():
+    """Built-in skills must be present after wheel installs, not only in git checkouts."""
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+    assert "skills/builtin/**/*" in package_data["spoon_bot"]
 
 
 def test_skill_frontmatter_uses_top_level_description(tmp_path):

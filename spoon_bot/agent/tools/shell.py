@@ -31,19 +31,16 @@ from spoon_bot.config import (
     DEFAULT_SHELL_MAX_TIMEOUT,
     DEFAULT_SHELL_TIMEOUT,
 )
+from spoon_bot.utils.privacy import SCRUBBED_ENV_VARS, is_sensitive_env_var
 from spoon_bot.utils.rate_limit import (
     RateLimitConfig,
     get_rate_limiter,
 )
-from spoon_bot.utils.errors import RateLimitExceeded, ToolExecutionError
 
 
 class ShellSecurityError(Exception):
     """Raised when a command fails security validation."""
     pass
-
-
-from spoon_bot.utils.privacy import SCRUBBED_ENV_VARS, is_sensitive_env_var
 
 
 def _scrub_env(env: dict[str, str]) -> dict[str, str]:
@@ -455,6 +452,77 @@ class ShellTool(Tool):
     - Safe argument parsing with shlex
     """
 
+    _READ_ONLY_COMMANDS = frozenset({
+        "basename",
+        "cat",
+        "date",
+        "diff",
+        "dir",
+        "du",
+        "echo",
+        "file",
+        "find",
+        "free",
+        "grep",
+        "head",
+        "jq",
+        "less",
+        "ls",
+        "more",
+        "pwd",
+        "realpath",
+        "rg",
+        "sed",
+        "stat",
+        "tail",
+        "uname",
+        "wc",
+        "where",
+        "which",
+        "whoami",
+    })
+    _READ_ONLY_GIT_SUBCOMMANDS = frozenset({
+        "branch",
+        "diff",
+        "log",
+        "remote",
+        "rev-parse",
+        "show",
+        "status",
+    })
+    _READ_ONLY_VERSION_FLAGS = frozenset({"-v", "--version", "version"})
+    _READ_ONLY_SKILL_ACTIONS = frozenset({
+        "-h",
+        "--help",
+        "balance",
+        "balances",
+        "context",
+        "get",
+        "help",
+        "history",
+        "list",
+        "logs",
+        "show",
+        "snapshot",
+        "state",
+        "status",
+        "summary",
+        "version",
+        "wallet",
+    })
+    _READ_ONLY_SKILL_GROUP_ACTIONS = frozenset({
+        "context",
+        "get",
+        "history",
+        "list",
+        "logs",
+        "show",
+        "snapshot",
+        "state",
+        "status",
+        "summary",
+    })
+
     def __init__(
         self,
         timeout: int = DEFAULT_SHELL_TIMEOUT,
@@ -638,6 +706,117 @@ class ShellTool(Tool):
                 normalized["command"] = self._normalize_exact_command(command)
                 return normalized
         return arguments
+
+    def format_duplicate_invocation_result(
+        self,
+        duplicate_result: str,
+        arguments: dict[str, Any],
+        dedup_arguments: Any,
+    ) -> str:
+        """Keep repeated read-only inspections recoverable instead of ending the turn."""
+        if (
+            not isinstance(arguments, dict)
+            or str(arguments.get("action") or "execute").strip().lower() != "execute"
+        ):
+            return duplicate_result
+
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return duplicate_result
+
+        try:
+            cwd = self._resolve_working_dir(arguments.get("working_dir"))
+        except Exception:
+            cwd = str(self.working_dir or os.getcwd())
+
+        if not self._command_is_read_only_inspection(command, cwd, dedup_arguments):
+            return duplicate_result
+
+        return (
+            "Repeated shell inspection skipped: this command already ran in this "
+            "request. Use the previous output as the observation and continue with "
+            "the next distinct action needed to finish the user's task; do not "
+            "treat this skipped duplicate as a blocker."
+        )
+
+    @classmethod
+    def _skill_args_are_read_only(cls, args: list[str]) -> bool:
+        if not args:
+            return False
+        action = str(args[0] or "").strip().casefold()
+        if action in cls._READ_ONLY_SKILL_ACTIONS:
+            return True
+        if (
+            len(args) >= 2
+            and str(args[1] or "").strip().casefold()
+            in cls._READ_ONLY_SKILL_GROUP_ACTIONS
+        ):
+            return True
+        return False
+
+    @classmethod
+    def _segment_is_read_only_inspection(cls, segment: list[str]) -> bool:
+        cleaned = cls._segment_before_redirection_or_pipe(segment)
+        if not cleaned:
+            return False
+        command_name = os.path.basename(
+            str(cleaned[0] or "").strip().strip("'\"").replace("\\", "/")
+        ).casefold()
+        if command_name in cls._READ_ONLY_COMMANDS:
+            return True
+        if command_name == "git" and len(cleaned) >= 2:
+            return str(cleaned[1] or "").strip().casefold() in cls._READ_ONLY_GIT_SUBCOMMANDS
+        if (
+            command_name in {"node", "npm", "npx", "pnpm", "python", "python3"}
+            and len(cleaned) >= 2
+        ):
+            return str(cleaned[1] or "").strip().casefold() in cls._READ_ONLY_VERSION_FLAGS
+        return False
+
+    def _command_is_read_only_inspection(
+        self,
+        command: str,
+        cwd: str,
+        dedup_arguments: Any = None,
+    ) -> bool:
+        skill_cli_key = (
+            dedup_arguments.get("skill_cli")
+            if isinstance(dedup_arguments, dict)
+            else None
+        )
+        if skill_cli_key is None:
+            skill_cli_key = self._skill_cli_invocation_dedup_key(command, cwd)
+        if isinstance(skill_cli_key, dict):
+            invocations = skill_cli_key.get("invocations")
+            if isinstance(invocations, list) and invocations:
+                return all(
+                    isinstance(invocation, dict)
+                    and self._skill_args_are_read_only(
+                        [
+                            str(arg)
+                            for arg in invocation.get("args", [])
+                            if str(arg).strip()
+                        ]
+                    )
+                    for invocation in invocations
+                )
+
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            command_tokens = str(command or "").split()
+        if not command_tokens:
+            return False
+
+        segments = [
+            segment
+            for segment in self._split_shell_segments(command_tokens)
+            if segment and segment[0].casefold() != "cd"
+        ]
+        return bool(segments) and all(
+            self._segment_is_read_only_inspection(segment)
+            for segment in segments
+        )
 
     def _skill_cli_invocation_dedup_key(
         self,
@@ -1004,6 +1183,66 @@ class ShellTool(Tool):
             result = result[:limit] + f"\n... (truncated, {truncated} more chars)"
 
         return result
+
+    @staticmethod
+    def _looks_like_pnpm_corepack_node_mismatch(output: str) -> bool:
+        """Detect Corepack selecting a pnpm release unsupported by current Node."""
+        lower = str(output or "").casefold()
+        if "pnpm" not in lower:
+            return False
+        return (
+            "corepack is about to download" in lower
+            and "requires at least node.js" in lower
+        ) or "no such built-in module: node:sqlite" in lower
+
+    @staticmethod
+    def _pnpm_compat_retry_command(command: str) -> str | None:
+        """Return the same command with pnpm routed through a Node-compatible major."""
+        original = str(command or "").strip()
+        if not original:
+            return None
+
+        # Keep the user's cwd, redirection, and install flags intact.  The
+        # replacement is generic for unpinned pnpm installs; if a project has a
+        # packageManager field, package-manager resolution remains the source of
+        # truth and this fallback is only offered after Corepack has failed.
+        retry = re.sub(
+            r"(?<![\w./-])pnpm(\.cmd)?\s+install\b",
+            "npx --yes pnpm@10 install",
+            original,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if retry == original:
+            retry = re.sub(
+                r"(?<![\w./-])pnpm(\.cmd)?\b",
+                "npx --yes pnpm@10",
+                original,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return retry if retry != original else None
+
+    def _append_pnpm_corepack_recovery(self, command: str, result: str) -> str:
+        """Add a concrete next command for pnpm/Corepack Node-version failures."""
+        if not self._looks_like_pnpm_corepack_node_mismatch(result):
+            return result
+        retry = self._pnpm_compat_retry_command(command)
+        if not retry:
+            return (
+                f"{result}\n\n"
+                "RECOVERY: Corepack selected a pnpm release that is incompatible "
+                "with the current Node.js runtime. Retry the same install with a "
+                "Node-compatible pnpm major, for example `npx --yes pnpm@10 install`, "
+                "unless the package declares a different packageManager contract."
+            )
+        return (
+            f"{result}\n\n"
+            "RECOVERY: Corepack selected a pnpm release that is incompatible "
+            "with the current Node.js runtime. This is package-manager bootstrap "
+            "failure, not a skill failure. Retry without changing the skill flow:\n"
+            f"{retry}"
+        )
 
     def _format_idempotent_conflict_result(
         self,
@@ -1632,15 +1871,14 @@ class ShellTool(Tool):
         if not os.path.isdir(cwd):
             return f"Error: Working directory not found: {cwd}"
 
+        skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
+        if skill_clone_rejection is not None:
+            capture_tool_output(skill_clone_rejection, skill_clone_rejection)
+            return skill_clone_rejection
+
         invokes_workspace_skill = self._command_invokes_workspace_skill(command, cwd)
         if invokes_workspace_skill:
             effective_timeout = max(effective_timeout, self.timeout)
-
-        if enforce_guardrails:
-            skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
-            if skill_clone_rejection is not None:
-                capture_tool_output(skill_clone_rejection, skill_clone_rejection)
-                return skill_clone_rejection
 
         command = self._augment_skill_cli_labeled_values(command, cwd)
 
@@ -1680,6 +1918,8 @@ class ShellTool(Tool):
                 await asyncio.wait_for(self._wait_for_process(job.process), timeout=effective_timeout)
                 await self._refresh_background_job(job)
                 result, full_result = self._build_completed_job_result(job)
+                result = self._append_pnpm_corepack_recovery(command, result)
+                full_result = self._append_pnpm_corepack_recovery(command, full_result)
                 result = self._maybe_stop_after_exact_command_failure(command, result)
                 full_result = self._maybe_stop_after_exact_command_failure(command, full_result)
                 capture_tool_output(result, full_result)
@@ -1689,6 +1929,8 @@ class ShellTool(Tool):
             except asyncio.TimeoutError:
                 if await self._wait_for_background_handoff(job):
                     result, full_result = self._build_completed_job_result(job)
+                    result = self._append_pnpm_corepack_recovery(command, result)
+                    full_result = self._append_pnpm_corepack_recovery(command, full_result)
                     result = self._maybe_stop_after_exact_command_failure(command, result)
                     full_result = self._maybe_stop_after_exact_command_failure(command, full_result)
                     capture_tool_output(result, full_result)
