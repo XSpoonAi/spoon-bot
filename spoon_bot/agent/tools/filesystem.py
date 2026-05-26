@@ -417,6 +417,13 @@ class ReadFileTool(Tool):
         sections: list[str] = ["[SKILL.md execution summary]"]
         if frontmatter:
             sections.append("Metadata:\n" + "\n".join(frontmatter[:12]))
+        sections.append(
+            "Command contract guardrails:\n"
+            "- Prompt topic, product, repo, and site words are context, not CLI "
+            "arguments, unless SKILL.md documents them.\n"
+            "- Replace only placeholders such as <value> or {value}; on argument "
+            "or usage errors, check CLI help and retry the documented form."
+        )
         if cli_lines:
             sections.append("CLI entrypoint:\n" + "\n".join(cli_lines))
         if setup_commands:

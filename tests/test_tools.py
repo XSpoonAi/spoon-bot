@@ -1712,6 +1712,7 @@ class TestFilesystemTools:
 
         assert "--- demo-runner SKILL.md execution contract ---" in result
         assert "[SKILL.md execution summary]" in result
+        assert "Treat product, repo, site, and task names in the user prompt as context" in result
         assert "Setup commands to run before primary commands:" in result
         assert "cd skills/demo-runner/cli && pnpm install && cd ../../.." in result
         assert "PROCEDURE run_demo():" in result
@@ -1756,6 +1757,8 @@ class TestFilesystemTools:
 
         assert "skill-ref" in result
         assert "[SKILL.md execution summary]" in result
+        assert "Command contract guardrails:" in result
+        assert "not CLI arguments, unless SKILL.md documents them" in result
         assert "node skills/spot-agent-cypher/cli/index.js" in result
         assert "Setup commands to run before primary commands:" in result
         assert "cd skills/spot-agent-cypher/cli && pnpm install && cd ../../.." in result
