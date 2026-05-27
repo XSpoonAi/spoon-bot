@@ -49,8 +49,6 @@ image = modal.Image.from_dockerfile(
     ],
 ).env({
     "GATEWAY_AUTH_REQUIRED": "false",
-    "GATEWAY_TIMEOUT_REQUEST_MS": "900000",
-    "GATEWAY_TIMEOUT_STREAM_MS": "900000",
     "SPOON_BOT_CONFIG": "/app/modal_config.yaml",
     "SPOON_BOT_DEFAULT_PROVIDER": "openrouter",
     "SPOON_BOT_DEFAULT_MODEL": "deepseek/deepseek-v4-pro",
@@ -59,7 +57,6 @@ image = modal.Image.from_dockerfile(
     "SANDBOX_PROVIDER": "modal",
     "SPOON_BOT_YOLO_MODE": "true",
     "SPOON_BOT_MAX_ITERATIONS": "20",
-    "SPOON_BOT_SHELL_TIMEOUT": "900",
     "SPOON_BOT_MAX_OUTPUT": "12000",
     "SPOON_BOT_LOG_LEVEL": "INFO",
     "PYTHONUNBUFFERED": "1",
@@ -75,8 +72,6 @@ if runtime_secret_values:
 @app.function(
     secrets=function_secrets,
     volumes={"/modal-data": data_volume},
-    timeout=900,
-    scaledown_window=900,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=20)
