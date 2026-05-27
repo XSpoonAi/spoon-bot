@@ -87,6 +87,7 @@ _LOOP_GUARD_MARKERS = (
     "duplicate tool invocation suppressed",
     "repeated side-effecting tool series suppressed",
     _BACKGROUND_POLL_GUARD_MARKER,
+    "duplicate shell inspection suppressed",
     "duplicate action was skipped",
     "repeated external action was skipped",
 )

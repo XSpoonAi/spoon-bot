@@ -344,7 +344,7 @@ class TestShellTool:
             "STOP_TOOL_LOOP: duplicate tool invocation suppressed",
             {"action": "execute", "command": command, "working_dir": str(workspace)},
             key,
-        ).startswith("Repeated shell inspection skipped")
+        ).startswith("STOP_TOOL_LOOP: Error: duplicate shell inspection suppressed")
 
     @pytest.mark.asyncio
     async def test_repeated_workspace_skill_cli_inspection_is_soft_deduped(self, tmp_path):
@@ -382,8 +382,8 @@ class TestShellTool:
             second = await shell_tool(command="sh skills/demo-skill/cli/index.sh wallet")
 
         assert "wallet status" in first
-        assert "Repeated shell inspection skipped" in second
-        assert "STOP_TOOL_LOOP" not in second
+        assert "duplicate shell inspection suppressed" in second
+        assert "STOP_TOOL_LOOP" in second
 
     @pytest.mark.asyncio
     async def test_repeated_workspace_skill_cli_side_effect_still_stops(self, tmp_path):

@@ -845,10 +845,10 @@ class ShellTool(Tool):
             return duplicate_result
 
         return (
-            "Repeated shell inspection skipped: this command already ran in this "
-            "request. Use the previous output as the observation and continue with "
-            "the next distinct action needed to finish the user's task; do not "
-            "treat this skipped duplicate as a blocker."
+            "STOP_TOOL_LOOP: Error: duplicate shell inspection suppressed. "
+            "The same read-only shell command already ran in this request; use "
+            "the previous observation and produce the best bounded answer now "
+            "instead of running more tools for this same inspection."
         )
 
     @classmethod

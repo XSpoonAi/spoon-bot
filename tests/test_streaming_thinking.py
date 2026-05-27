@@ -3520,6 +3520,46 @@ $CLI join [gameId]
         assert "tool guardrail" not in emitted_content[0]["delta"]
 
     @pytest.mark.asyncio
+    async def test_stream_stops_after_duplicate_shell_inspection_guardrail(self):
+        """Repeated read-only shell inspections should end the turn generically."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        tool_call = MagicMock()
+        tool_call.id = "call_1"
+        tool_call.function = MagicMock()
+        tool_call.function.name = "shell"
+        tool_call.function.arguments = '{"command":"node skills/example/cli/index.js status"}'
+
+        suppressed_result = (
+            "STOP_TOOL_LOOP: Error: duplicate shell inspection suppressed. "
+            "The same read-only shell command already ran in this request."
+        )
+        agent = self._make_stream_agent(
+            [
+                {"tool_calls": [tool_call]},
+                {
+                    "type": "tool_result",
+                    "name": "shell",
+                    "tool_call_id": "call_1",
+                    "result": suppressed_result,
+                },
+                {"tool_calls": [tool_call]},
+            ]
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(agent, message="placeholder", thinking=True):
+            chunks.append(chunk)
+
+        emitted_tool_calls = [c for c in chunks if c["type"] == "tool_call"]
+        emitted_content = [c for c in chunks if c["type"] == "content"]
+
+        assert len(emitted_tool_calls) == 1
+        assert emitted_content
+        assert "repeated status/inspection command" in emitted_content[0]["delta"]
+        assert "STOP_TOOL_LOOP" not in emitted_content[0]["delta"]
+
+    @pytest.mark.asyncio
     async def test_stream_stops_after_tool_failure_suppression_guardrail(self):
         """Tool-layer failure suppression should end the stream loop."""
         from spoon_bot.agent.loop import AgentLoop
