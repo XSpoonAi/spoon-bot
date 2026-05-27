@@ -85,6 +85,7 @@ _BACKGROUND_JOB_ID_RE = re.compile(r"\bjob_id[:=]\s*([A-Za-z0-9_.:-]+)")
 _BACKGROUND_POLL_GUARD_MARKER = "repeated background job polling suppressed"
 _LOOP_GUARD_MARKERS = (
     "duplicate tool invocation suppressed",
+    "repeated tool failure pattern suppressed",
     "repeated side-effecting tool series suppressed",
     _BACKGROUND_POLL_GUARD_MARKER,
     "duplicate shell inspection suppressed",

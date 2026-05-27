@@ -192,6 +192,28 @@ async def test_track_tool_invocations_suppresses_consecutive_failures() -> None:
 
 
 @pytest.mark.asyncio
+async def test_track_tool_invocations_suppresses_repeated_failure_pattern() -> None:
+    tool = FailingTool()
+
+    with track_tool_invocations(max_consecutive_failures=3):
+        first = await tool(value="1")
+        progress = await CountingTool()(value="status")
+        second = await tool(value="2")
+        another_progress = await CountingTool()(value="status2")
+        third = await tool(value="3")
+        fourth = await tool(value="4")
+
+    assert "provider 1 request failed" in first
+    assert progress == "executed:status:1"
+    assert "provider 2 request failed" in second
+    assert another_progress == "executed:status2:1"
+    assert "provider 3 request failed" in third
+    assert "STOP_TOOL_LOOP" in fourth
+    assert "repeated tool failure pattern suppressed" in fourth
+    assert tool.calls == 3
+
+
+@pytest.mark.asyncio
 async def test_rejections_count_as_consecutive_failures() -> None:
     tool = RejectedTool()
 

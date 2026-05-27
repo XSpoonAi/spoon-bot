@@ -5917,6 +5917,8 @@ class AgentLoop:
             return "I stopped searching old conversation history and continued from the latest request."
         if "consecutive tool failures suppressed" in text:
             return "I stopped retrying after repeated failures."
+        if "repeated tool failure pattern suppressed" in text:
+            return "I stopped retrying after the same failure pattern repeated."
         if "repeated side-effecting tool series suppressed" in text:
             return "I stopped before repeating the same external action."
         if "duplicate shell inspection suppressed" in text:

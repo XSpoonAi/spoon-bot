@@ -86,6 +86,11 @@ _CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
     "has failed repeatedly in this request without producing progress; report "
     "the blocker now instead of trying more alternate commands."
 )
+_REPEATED_TOOL_FAILURE_PATTERN_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: repeated tool failure pattern suppressed. The same "
+    "tool produced the same class of failure repeatedly in this request; report "
+    "the blocker now instead of trying more alternate commands."
+)
 
 
 def normalize_tool_owner_user(user_id: str | None) -> str:
@@ -176,6 +181,17 @@ def _tool_failure_signal(payload: Any) -> str | None:
     return None
 
 
+def _tool_failure_fingerprint(payload: Any) -> str:
+    """Return a compact generic fingerprint for repeated no-progress failures."""
+    text = stringify_tool_output(payload).casefold()
+    text = re.sub(r"\b0x[0-9a-f]{16,}\b", "0x#", text)
+    text = re.sub(r"\b\d+\b", "#", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    return text[:240]
+
+
 def normalize_tool_arguments(arguments: Any) -> str:
     """Normalize tool arguments so captured output can be matched later."""
     if arguments is None:
@@ -215,6 +231,7 @@ def track_tool_invocations(
         "last_exact_repeats": 0,
         "series_counts": defaultdict(int),
         "consecutive_failures": [],
+        "failure_pattern_counts": defaultdict(int),
         "file_read_coverage": defaultdict(list),
         "max_repeats": max(1, int(max_repeats or 1)),
         "max_series_repeats": max(1, int(max_series_repeats or 1)),
@@ -476,14 +493,22 @@ def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:
     failures = state.get("consecutive_failures")
     if not isinstance(failures, list):
         return None
-    max_failures = int(state.get("max_consecutive_failures") or 3)
-    if len(failures) < max_failures:
-        return None
-
-    recent = failures[-max_failures:]
     current_name = str(tool_name or "")
-    if all(item.get("tool") == current_name for item in recent if isinstance(item, dict)):
-        return _CONSECUTIVE_TOOL_FAILURE_MESSAGE
+    max_failures = int(state.get("max_consecutive_failures") or 3)
+    if len(failures) >= max_failures:
+        recent = failures[-max_failures:]
+        if all(item.get("tool") == current_name for item in recent if isinstance(item, dict)):
+            return _CONSECUTIVE_TOOL_FAILURE_MESSAGE
+
+    pattern_counts = state.get("failure_pattern_counts")
+    if isinstance(pattern_counts, dict):
+        prefix = f"{current_name}\x1f"
+        if any(
+            int(value or 0) >= max_failures
+            for key, value in pattern_counts.items()
+            if isinstance(key, str) and key.startswith(prefix)
+        ):
+            return _REPEATED_TOOL_FAILURE_PATTERN_MESSAGE
     return None
 
 
@@ -503,6 +528,11 @@ def record_tool_invocation_result(tool_name: str, result: Any) -> None:
         return
 
     failures.append({"tool": str(tool_name or ""), "signal": signal})
+    pattern_counts = state.get("failure_pattern_counts")
+    if isinstance(pattern_counts, dict):
+        fingerprint = _tool_failure_fingerprint(result)
+        if fingerprint:
+            pattern_counts[f"{str(tool_name or '')}\x1f{signal}\x1f{fingerprint}"] += 1
     max_failures = int(state.get("max_consecutive_failures") or 3)
     del failures[: -max(1, max_failures)]
 
