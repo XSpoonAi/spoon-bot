@@ -1159,6 +1159,57 @@ class ShellTool(Tool):
             return command
         return f"{exports}; {command}"
 
+    def _align_wallet_home_for_skill_command(
+        self,
+        env: dict[str, str],
+        command: str,
+        cwd: str,
+    ) -> None:
+        """Expose the active built-in wallet through ~/.agent-wallet for skill CLIs.
+
+        Some installed CLIs intentionally avoid private-key environment variables
+        and load a wallet from ``~/.agent-wallet``.  When spoon-bot is running with
+        an isolated wallet root, give those CLIs an isolated HOME containing only
+        a compatibility ``.agent-wallet`` link instead of changing the real user
+        home or leaking a private key into the subprocess environment.
+        """
+        try:
+            if not self._command_invokes_workspace_skill(command, cwd):
+                return
+        except Exception:
+            return
+
+        raw_wallet_root = (
+            env.get("AGENT_WALLET_DIR")
+            or os.environ.get("AGENT_WALLET_DIR")
+            or env.get("SPOON_BOT_WALLET_PATH")
+            or os.environ.get("SPOON_BOT_WALLET_PATH")
+        )
+        if not raw_wallet_root:
+            return
+
+        try:
+            wallet_root = Path(raw_wallet_root).expanduser().resolve()
+            if not wallet_root.is_dir():
+                return
+            compat_home = wallet_root.parent / f".home-{wallet_root.name}"
+            compat_home.mkdir(parents=True, exist_ok=True)
+            compat_wallet = compat_home / ".agent-wallet"
+            if compat_wallet.exists() or compat_wallet.is_symlink():
+                try:
+                    if compat_wallet.resolve() != wallet_root:
+                        if compat_wallet.is_symlink():
+                            compat_wallet.unlink()
+                        else:
+                            return
+                except OSError:
+                    return
+            if not compat_wallet.exists():
+                compat_wallet.symlink_to(wallet_root, target_is_directory=True)
+            env["HOME"] = str(compat_home)
+        except OSError:
+            return
+
     @staticmethod
     def _workspace_env_exports(env_file: Path) -> str:
         """Return shell exports for non-sensitive workspace env values."""
@@ -1195,6 +1246,7 @@ class ShellTool(Tool):
     ) -> tuple[bytes, bytes, int]:
         """Synchronous subprocess execution (called via run_in_executor)."""
         env = _scrub_env(os.environ.copy())
+        self._align_wallet_home_for_skill_command(env, command, cwd)
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
             env["HOME"] = userprofile.replace("\\", "/")
@@ -1439,6 +1491,7 @@ class ShellTool(Tool):
         cwd: str,
     ) -> subprocess.Popen[bytes]:
         env = _scrub_env(os.environ.copy())
+        self._align_wallet_home_for_skill_command(env, command, cwd)
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
             env["HOME"] = userprofile.replace("\\", "/")

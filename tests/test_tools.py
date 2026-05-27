@@ -449,6 +449,33 @@ class TestShellTool:
         assert "0x" + "11" * 32 not in result
         assert result.endswith(command)
 
+    def test_shell_aligns_skill_cli_home_to_active_wallet_root(self, tmp_path, monkeypatch):
+        """Skill CLIs that read ~/.agent-wallet should see the active wallet root."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        (workspace / "skills" / "demo-skill" / "SKILL.md").write_text(
+            "---\nname: demo-skill\n---\n",
+            encoding="utf-8",
+        )
+        wallet_root = tmp_path / "wallet-root"
+        wallet_root.mkdir()
+        monkeypatch.setenv("AGENT_WALLET_DIR", str(wallet_root))
+        monkeypatch.delenv("PRIVATE_KEY", raising=False)
+
+        env = dict(os.environ)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._align_wallet_home_for_skill_command(
+            env,
+            "node skills/demo-skill/cli/index.js wallet",
+            str(workspace),
+        )
+
+        compat_wallet = Path(env["HOME"]) / ".agent-wallet"
+        assert compat_wallet.resolve() == wallet_root.resolve()
+        assert env.get("PRIVATE_KEY") is None
+
     def test_shell_formats_idempotent_conflict_as_state(self, shell_tool):
         """HTTP 409 already-state output should not look like a failed command."""
         result = shell_tool._build_output_result(
