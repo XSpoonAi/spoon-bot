@@ -1053,8 +1053,8 @@ class TestAgentLoopStream:
         assert "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in cleaned
         assert "***masked_private_key***" in cleaned
 
-    def test_finalize_response_content_omits_file_body_when_user_requested_it(self):
-        """If the user says not to show file content, final text must honor it too."""
+    def test_finalize_response_content_does_not_prompt_regex_rewrite_file_body(self):
+        """Finalization should not route by user wording; file body control lives in tool output shaping."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
@@ -1075,9 +1075,9 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "title=demo" not in cleaned
-        assert "status=ready" not in cleaned
-        assert "文件正文已按要求省略" in cleaned
+        assert "title=demo" in cleaned
+        assert "status=ready" in cleaned
+        assert "文件正文已按要求省略" not in cleaned
         assert "修改已完成" in cleaned
 
     def test_finalize_response_content_replaces_raw_tool_trace_leak(self):
@@ -1114,7 +1114,7 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "Completed from the latest tool evidence" in cleaned
+        assert "FINAL_STATE task=347 action=joined" in cleaned
         assert "raw tool transcript" not in cleaned
         assert "FINAL_STATE task=347 action=joined" in cleaned
         assert "Tool `shell` output" not in cleaned
@@ -1154,7 +1154,7 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "could not derive a concise user-facing result" in cleaned
+        assert "NO_CONCISE_TOOL_EVIDENCE" in cleaned
         assert "raw tool transcript" not in cleaned
         assert "Tool `list_dir` output:" not in cleaned
         assert "write_file(path=" not in cleaned
@@ -1196,7 +1196,7 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "could not derive a concise user-facing result" in cleaned
+        assert "NO_CONCISE_TOOL_EVIDENCE" in cleaned
         assert "[file: app.py | 100 chars | lines 1-10/10]" not in cleaned
         assert "content body omitted from user-visible fallback" not in cleaned
         assert "SECRET_BODY_SHOULD_NOT_BE_VISIBLE" not in cleaned
@@ -1941,8 +1941,8 @@ $CLI join [gameId]
 
         assert answer == "已安装技能并完成注册。"
 
-    def test_tool_evidence_fallback_bridges_english_summary_for_chinese_user(self):
-        """Direct tool summaries should still match a Chinese continuation cue."""
+    def test_tool_evidence_fallback_does_not_localize_with_hardcoded_boilerplate(self):
+        """Direct evidence fallback is evidence-only; model synthesis handles localization."""
         from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
 
         answer = build_user_facing_tool_evidence_answer(
@@ -1950,10 +1950,11 @@ $CLI join [gameId]
             user_message="继续玩",
         )
 
-        assert answer == "已完成：SETTLEMENT game=196 result=DRAW."
+        assert answer == "SETTLEMENT game=196 result=DRAW."
+        assert "已完成" not in answer
 
-    def test_tool_evidence_status_fallback_matches_chinese_user_language(self):
-        """Deterministic status fallback must not expose English boilerplate to Chinese users."""
+    def test_tool_evidence_status_fallback_is_evidence_only(self):
+        """Deterministic fallback must not add localized completion conclusions."""
         from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
 
         answer = build_user_facing_tool_evidence_answer(
@@ -1967,13 +1968,13 @@ $CLI join [gameId]
             user_message="玩一局spot游戏",
         )
 
-        assert answer.startswith("已完成。")
+        assert "已完成" not in answer
         assert "Completed" not in answer
         assert "Latest tool evidence" not in answer
         assert "SETTLEMENT game=206 result=LOSE" in answer
 
-    def test_tool_evidence_pending_fallback_matches_chinese_user_language(self):
-        """Pending NEXT fallback should use Chinese status labels for Chinese users."""
+    def test_tool_evidence_pending_fallback_is_evidence_only(self):
+        """Pending fallback should expose sanitized evidence, not localized boilerplate."""
         from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
 
         answer = build_user_facing_tool_evidence_answer(
@@ -1987,9 +1988,9 @@ $CLI join [gameId]
             user_message="继续玩",
         )
 
-        assert answer.startswith("我先停在当前状态。")
+        assert "我先停在当前状态" not in answer
         assert "Pending next step" not in answer
-        assert "待执行的下一步" in answer
+        assert "NEXT: node skills/example/cli/index.js wait 206" in answer
 
     def test_tool_evidence_fallback_strips_tool_observation_prefix(self):
         """Fallback blockers should not expose raw tool transcript wrappers."""
@@ -2011,7 +2012,7 @@ $CLI join [gameId]
             "STOP_TOOL_LOOP: Error: repeated side-effecting tool series suppressed.",
         ])
 
-        assert "Paused at the current safe state" in answer
+        assert "tool_loop_guard status=stopped" in answer
         assert "STOP_TOOL_LOOP" not in answer
         assert "Latest blocker" not in answer
 
@@ -2027,13 +2028,13 @@ $CLI join [gameId]
             ),
         ])
 
-        assert "background command is still running" in answer
+        assert "background_job status=running" in answer
         assert "sh_abc123" in answer
         assert "STOP_TOOL_LOOP" not in answer
         assert "Latest blocker" not in answer
 
-    def test_tool_evidence_fallback_localizes_background_poll_guard(self):
-        """Background poll guard fallback should match a Chinese continuation cue."""
+    def test_tool_evidence_fallback_keeps_background_poll_guard_structured(self):
+        """Background poll guard fallback should stay evidence-only across languages."""
         from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
 
         answer = build_user_facing_tool_evidence_answer(
@@ -2046,7 +2047,7 @@ $CLI join [gameId]
             user_message="继续玩",
         )
 
-        assert "后台命令仍在运行" in answer
+        assert "background_job status=running" in answer
         assert "sh_abc123" in answer
         assert "STOP_TOOL_LOOP" not in answer
 
@@ -2116,7 +2117,7 @@ $CLI join [gameId]
         assert "Registered AGENT_ID=341" in brief
         assert "JOINED room=202 agentId=341" in brief
         assert "SETTLEMENT room=202 status=finished result=WIN" in brief
-        assert "Pending next step evidence:" not in brief
+        assert "Pending action evidence:" not in brief
 
     def test_tool_event_synthesis_milestones_supersede_stale_errors(self):
         """Final synthesis should preserve install evidence and not revive resolved errors."""
@@ -2167,7 +2168,7 @@ $CLI join [gameId]
 
         assert "skill_marketplace installed skill spot-agent-cypher." in brief
         assert "Wallet=0xabc GAS=0.3 GLD=400.0 AgentID=none" in brief
-        assert "Latest blockers:" not in brief
+        assert "Blocker evidence:" not in brief
         assert final_answer_denies_available_tool_evidence(
             "No explicit installation step was recorded.",
             events,
@@ -2256,14 +2257,19 @@ $CLI join [gameId]
         assert "STOP_TOOL_LOOP" not in messages[-1].content
 
     @pytest.mark.asyncio
-    async def test_final_answer_synthesis_falls_back_on_script_mismatch(self):
-        """A Chinese continuation should not surface an English synthesis result."""
+    async def test_final_answer_synthesis_repairs_script_mismatch_with_model(self):
+        """A Chinese continuation should be repaired by synthesis, not a hardcoded fallback."""
         from spoon_bot.agent.loop import AgentLoop
 
         loop = AgentLoop.__new__(AgentLoop)
         loop.provider = "openrouter"
         manager = MagicMock()
-        manager.chat = AsyncMock(return_value=MagicMock(content="Current status checked."))
+        manager.chat = AsyncMock(
+            side_effect=[
+                MagicMock(content="Current status checked."),
+                MagicMock(content="已检查当前状态：STATUS games=10 win_rate=40%。"),
+            ]
+        )
         loop._chatbot = MagicMock(llm_manager=manager)
 
         answer = await AgentLoop._synthesize_final_answer_from_tool_events(
@@ -2276,10 +2282,40 @@ $CLI join [gameId]
                 },
             }],
             user_message="继续玩",
-            fallback_text="已完成：STATUS games=10 win_rate=40%",
+            fallback_text="STATUS games=10 win_rate=40%",
         )
 
-        assert answer == "已完成：STATUS games=10 win_rate=40%"
+        assert answer == "已检查当前状态：STATUS games=10 win_rate=40%。"
+        assert manager.chat.await_count == 2
+        repair_messages = manager.chat.await_args_list[-1].kwargs["messages"]
+        assert "SYNTHESIS LANGUAGE CHECK" in repair_messages[-1].content
+
+    @pytest.mark.asyncio
+    async def test_final_answer_synthesis_uses_chatbot_ask_when_manager_chat_missing(self):
+        """spoon-core ChatBot exposes ask(), so synthesis must not fall back to templates."""
+        from types import SimpleNamespace
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.provider = "openrouter"
+        ask = AsyncMock(return_value="这局已经结算：result=WIN。")
+        loop._chatbot = SimpleNamespace(ask=ask)
+
+        answer = await AgentLoop._synthesize_final_answer_from_tool_events(
+            loop,
+            [{
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "SETTLEMENT game=210 result=WIN rank=1/4",
+                },
+            }],
+            user_message="玩spot game",
+            fallback_text="SETTLEMENT game=210 result=WIN rank=1/4",
+        )
+
+        assert answer == "这局已经结算：result=WIN。"
+        ask.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_final_answer_synthesis_repairs_denied_available_evidence(self):
@@ -2464,7 +2500,7 @@ $CLI join [gameId]
 
         assert tool_events_have_skill_install_completion(events) is True
         assert build_skill_install_completion_answer(events) == (
-            "Completed.\n\nSkill 'example-skill' installed."
+            "skill_name=example-skill install_status=installed"
         )
 
     def test_instruction_text_is_not_user_facing_completion_evidence(self):
@@ -2481,7 +2517,7 @@ $CLI join [gameId]
         ])
 
         assert "Completed from the latest tool evidence" not in answer
-        assert "could not derive a concise user-facing result" in answer
+        assert answer == "NO_CONCISE_TOOL_EVIDENCE"
 
     def test_latest_tool_event_has_next_command_detects_pending_continuation(self):
         """A latest follow-up command keeps a skill workflow open until evidence completes."""
@@ -4220,8 +4256,8 @@ $CLI join [gameId]
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "I paused before a final answer" in content
-        assert "Latest blocker" in content
+        assert "I paused before a final answer" not in content
+        assert "Latest blocker" not in content
         assert "remote endpoint did not respond" in content
         assert "stopped the tool loop" not in content
         done_chunks = [c for c in chunks if c["type"] == "done"]
@@ -4262,9 +4298,9 @@ $CLI join [gameId]
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
         errors = [c for c in chunks if c["type"] == "error"]
 
-        assert "I paused before a final answer" in content
+        assert "I paused before a final answer" not in content
         assert "CHALLENGE PASSED task=42" in content
-        assert "Pending next step" in content
+        assert "NEXT: node skills/example/cli/index.js finish 42" in content
         assert "node skills/example/cli/index.js finish 42" in content
         assert "secret key URL" not in "".join(str(c.get("delta", "")) for c in chunks)
         assert errors and errors[0]["delta"] == "An unexpected error occurred. Please try again."
@@ -4290,8 +4326,8 @@ $CLI join [gameId]
             reason="total_timeout",
         )
 
-        assert "I paused before a final answer" in cleaned
-        assert "Latest blocker" in cleaned
+        assert "I paused before a final answer" not in cleaned
+        assert "Latest blocker" not in cleaned
         assert "EADDRINUSE" in cleaned
         assert "Server.setupListenHandle" not in cleaned
         assert "Recent tool evidence" not in cleaned
@@ -4343,7 +4379,7 @@ $CLI join [gameId]
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "could not derive a concise user-facing result" in content
+        assert "NO_CONCISE_TOOL_EVIDENCE" in content
         assert "stopped the tool loop" not in content
 
     @pytest.mark.asyncio
@@ -4381,9 +4417,9 @@ $CLI join [gameId]
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "could not derive a concise user-facing result" in content
+        assert "tokenAddress" in content
         assert "response time budget" not in content
-        assert "tokenAddress" not in content
+        assert "0xabc123" not in content
         assert [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"] == content
 
     @pytest.mark.asyncio

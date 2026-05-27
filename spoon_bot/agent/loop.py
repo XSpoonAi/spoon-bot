@@ -5345,7 +5345,7 @@ class AgentLoop:
             "by the runtime.\n\n"
             f"Latest user request:\n{user_request}"
             f"{context_block}\n\n"
-            f"Latest tool evidence:\n{evidence_block}"
+            f"Tool evidence:\n{evidence_block}"
         )
 
     @staticmethod
@@ -5381,8 +5381,9 @@ class AgentLoop:
             "placeholder in prose only; the next visible action must be the "
             "pending command with the placeholder replaced. If calculation is "
             "needed, compute the concrete value first and immediately run the "
-            "command. Do not claim funding, registration, join, or settlement "
-            "until a tool result confirms it. Do not read the same SKILL.md again. "
+            "command. Do not claim any external side effect, registration, entry, "
+            "transaction, or terminal outcome until a tool result confirms it. "
+            "Do not read the same SKILL.md again. "
             "Do not treat a numeric id or label from the user's natural-language "
             "request as an extra CLI argument unless the documented command form "
             "explicitly supports that parameter. "
@@ -5390,7 +5391,7 @@ class AgentLoop:
             "genuinely absent from the evidence.\n\n"
             f"Latest user request:\n{user_request}{context_block}\n\n"
             f"Pending structural follow-up commands:\n{followup_block}\n\n"
-            f"Latest tool evidence:\n{evidence_block}"
+            f"Tool evidence:\n{evidence_block}"
         )
 
     @staticmethod
@@ -5644,49 +5645,6 @@ class AgentLoop:
             text = stripped
         return text
 
-    @staticmethod
-    def _request_suppresses_file_body(message: str) -> bool:
-        """Return true when the user explicitly asked not to show file contents."""
-        text = str(message or "").lower()
-        patterns = [
-            r"(?:不要|别|无需|不需要).{0,12}(?:展示|显示|输出|打印).{0,12}(?:文件正文|文件内容|正文|内容)",
-            r"(?:文件正文|文件内容|正文|内容).{0,12}(?:不要|别|无需|不需要).{0,12}(?:展示|显示|输出|打印)",
-            r"do\s+not\s+(?:show|display|print|include).{0,40}(?:file\s+body|file\s+content|contents?)",
-            r"without\s+(?:showing|displaying|printing|including).{0,40}(?:file\s+body|file\s+content|contents?)",
-        ]
-        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
-
-    @staticmethod
-    def _omit_file_body_for_user_constraint(message: str, content: str) -> str:
-        """Remove file-body snippets from final text when the user requested omission."""
-        if not AgentLoop._request_suppresses_file_body(message):
-            return content
-
-        text = str(content or "")
-        placeholder = "[文件正文已按要求省略]"
-        text = re.sub(
-            r"(?is)(?:文件|正文|内容)[^\n]{0,80}(?:显示|如下|内容)[^\n]*\n\s*```.*?```",
-            placeholder,
-            text,
-        )
-        text = re.sub(
-            r"(?is)(?:file|content|body|lines?)[^\n]{0,80}(?:shows?|below|content)[^\n]*\n\s*```.*?```",
-            "File content omitted as requested.",
-            text,
-        )
-        text = re.sub(
-            r"(?is)```(?:text|txt|html|js|javascript|json|css|[a-z0-9_-]*)?\n.*?```",
-            f"```text\n{placeholder}\n```",
-            text,
-        )
-        text = re.sub(
-            r"(?im)^\s*(?:<!doctype\b.*|<html\b.*|function\s+\w+\s*\(.*|const\s+\w+\s*=.*|[a-z0-9_.-]+\s*=\s*[^`\n]{1,200})\s*$",
-            placeholder,
-            text,
-        )
-        text = re.sub(rf"(?:{re.escape(placeholder)}\s*){{2,}}", placeholder + "\n", text)
-        return text
-
     def _finalize_response_content(
         self,
         message: str,
@@ -5702,10 +5660,9 @@ class AgentLoop:
                     turn_memory_start_index,
                     user_message=message,
                 )
-            )
+        )
         filtered = AgentLoop._filter_execution_steps(self, content)
         cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
-        cleaned = AgentLoop._omit_file_body_for_user_constraint(message, cleaned)
         return AgentLoop._mask_user_visible_text(cleaned)
     @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
@@ -6144,7 +6101,8 @@ class AgentLoop:
         chatbot = getattr(self, "_chatbot", None)
         manager = getattr(chatbot, "llm_manager", None)
         chat = getattr(manager, "chat", None)
-        if manager is None or not callable(chat):
+        ask = getattr(chatbot, "ask", None)
+        if not callable(chat) and not callable(ask):
             return deterministic_fallback
 
         retry_config = getattr(self, "_retry_config", None)
@@ -6158,8 +6116,23 @@ class AgentLoop:
             ]
 
             async def _do_synthesis() -> Any:
+                async def _invoke() -> Any:
+                    if callable(chat):
+                        result = chat(
+                            messages=messages,
+                            provider=getattr(self, "provider", None),
+                        )
+                    else:
+                        result = ask(
+                            messages=[Message(role="user", content=brief)],
+                            system_msg=_FINAL_ANSWER_SYNTHESIS_SYSTEM_PROMPT,
+                        )
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+
                 return await asyncio.wait_for(
-                    chat(messages=messages, provider=getattr(self, "provider", None)),
+                    _invoke(),
                     timeout=_FINAL_ANSWER_SYNTHESIS_TIMEOUT,
                 )
 
@@ -6191,16 +6164,51 @@ class AgentLoop:
         if AgentLoop._final_answer_script_mismatch(user_message, synthesized):
             logger.warning(
                 "Final-answer synthesis returned a script mismatch; "
-                "falling back to deterministic evidence summary."
+                "requesting a language repair from the synthesis model."
             )
-            if deterministic_fallback and not AgentLoop._final_answer_script_mismatch(
+        synthesized = AgentLoop._mask_user_visible_text(
+            AgentLoop._strip_leaked_scratchpad_prefix(synthesized)
+        )
+        if AgentLoop._final_answer_script_mismatch(user_message, synthesized):
+            language_repair_brief = (
+                evidence_brief
+                + "\n\n[SYNTHESIS LANGUAGE CHECK]\n"
+                + "The previous draft did not match the newest user's language. "
+                + "Rewrite the final answer from the same verified evidence, "
+                + "using the newest user's language and no raw tool transcript."
+            )
+            try:
+                language_repair_response = await _chat_with_brief(
+                    language_repair_brief,
+                    label="Final-answer synthesis language repair",
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Final-answer synthesis language repair failed; using fallback: {exc}"
+                )
+                return deterministic_fallback
+            repaired_language = AgentLoop._extract_run_result_text(
+                language_repair_response
+            ).strip()
+            if not repaired_language:
+                content = getattr(language_repair_response, "content", "")
+                repaired_language = str(content or "").strip()
+            repaired_language = AgentLoop._mask_user_visible_text(
+                AgentLoop._strip_leaked_scratchpad_prefix(repaired_language)
+            )
+            if (
+                repaired_language
+                and not AgentLoop._final_answer_script_mismatch(
+                    user_message,
+                    repaired_language,
+                )
+            ):
+                synthesized = repaired_language
+            elif deterministic_fallback and not AgentLoop._final_answer_script_mismatch(
                 user_message,
                 deterministic_fallback,
             ):
                 return deterministic_fallback
-        synthesized = AgentLoop._mask_user_visible_text(
-            AgentLoop._strip_leaked_scratchpad_prefix(synthesized)
-        )
         if final_answer_denies_available_tool_evidence(synthesized, synthesis_events):
             repair_brief = (
                 evidence_brief
@@ -7197,8 +7205,7 @@ class AgentLoop:
                     )
                 else:
                     run_result_text = (
-                        "I paused before a final answer, and no "
-                        "tool result was captured before the stop condition."
+                        "NO_TOOL_RESULT_CAPTURED_BEFORE_STOP_CONDITION"
                     )
                 tool_loop_fallback_active = True
                 if bg_task is not None and not bg_task.done():

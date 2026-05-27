@@ -25,22 +25,6 @@ _USER_SUMMARY_PREFIXES = (
     "final answer:",
     "user summary:",
 )
-_STATUS_LINE_MARKERS = (
-    "complete",
-    "completed",
-    "success",
-    "passed",
-    "installed",
-    "registered",
-    "joined",
-    "final_state",
-    "result=",
-    "status=",
-    "phase=",
-    "rank=",
-    "score=",
-    "reward=",
-)
 _ACTIONABLE_FOLLOWUP_EXECUTABLES = frozenset({
     "bash",
     "bun",
@@ -117,30 +101,12 @@ _EVIDENCE_DENIAL_RE = re.compile(
     r"nothing .* evidence"
     r")\b|没有[^。.\n]{0,24}证据|无法确认|不能确认"
 )
-_INSTALL_COMPLETION_DENIAL_RE = re.compile(
-    r"(?i)\b(?:"
-    r"no evidence[^.\n]{0,80}(?:install|installed|dependencies)|"
-    r"no explicit install(?:ation)?|"
-    r"install(?:ation)? (?:step )?(?:was )?(?:not|never) (?:recorded|observed|shown|completed)|"
-    r"skill (?:was )?(?:not|never) installed"
-    r")\b|没有[^。.\n]{0,16}安装证据|未看到[^。.\n]{0,16}安装"
-)
-_BALANCE_ZERO_DENIAL_RE = re.compile(
-    r"(?i)\b(?:"
-    r"balance (?:is )?(?:zero|empty|missing)|"
-    r"gas and gld balance is zero|"
-    r"wallet (?:is )?(?:zero|empty|unfunded)"
-    r")\b|余额[^。.\n]{0,16}(?:为零|为空|不足)"
-)
-_BALANCE_PAIR_RE = re.compile(
-    r"\bGAS=(?P<gas>\d+(?:\.\d+)?)\s+GLD=(?P<gld>\d+(?:\.\d+)?)\b",
-    re.IGNORECASE,
-)
 _EVIDENCE_FACT_RE = re.compile(
     r"\b[A-Za-z][A-Za-z0-9_:-]{0,32}=[^\s,.;)]+|"
     r"\b[A-Z]{2,}(?:_[A-Z0-9]+)*\b|"
     r"\b\d{2,}(?:/\d+)?\b"
 )
+_KEY_VALUE_FIELD_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{0,48}=[^\s,;]+")
 
 
 def _contains_workspace_skill_path(text: str) -> bool:
@@ -290,7 +256,10 @@ def latest_tool_event_has_next_command(tool_result_events: list[dict[str, Any]])
         normalized = text.casefold()
         if (
             _iter_user_summary_lines([text])
-            or any(marker in normalized for marker in _STATUS_LINE_MARKERS)
+            or any(
+                _is_structured_status_evidence_line(line)
+                for line in normalized.splitlines()
+            )
         ):
             return False
         continue
@@ -380,7 +349,10 @@ def has_pending_placeholder_next_command(tool_result_events: list[dict[str, Any]
         if later_commands:
             continue
         normalized = text.casefold()
-        if any(marker in normalized for marker in _STATUS_LINE_MARKERS):
+        if any(
+            _is_structured_status_evidence_line(line)
+            for line in normalized.splitlines()
+        ):
             return False
 
     resolved_commands = extract_resolved_tool_next_commands(tool_result_events)
@@ -411,6 +383,36 @@ def _looks_like_structured_evidence_line(line: str) -> bool:
     if "=" in stripped and not stripped.casefold().startswith(("q:", "question:")):
         return True
     return False
+
+
+def _is_structured_status_evidence_line(line: str) -> bool:
+    """Return True for machine-readable progress evidence from any tool domain."""
+    stripped = str(line or "").strip()
+    if not stripped or len(stripped) > 260:
+        return False
+    lower = stripped.casefold()
+    if lower.startswith(
+        (
+            "next:",
+            "q:",
+            "question:",
+            "rule ",
+            "rule_",
+            "run $",
+            "use ",
+            "do not ",
+            "traceback",
+            "stderr:",
+            "error:",
+            "exit code:",
+            "{",
+            "}",
+        )
+    ):
+        return False
+    if "stop_tool_loop" in lower or "observed output of cmd" in lower:
+        return False
+    return bool(_KEY_VALUE_FIELD_RE.search(stripped) or _looks_like_structured_evidence_line(stripped))
 
 
 def _response_language_instruction(user_message: str | None) -> str:
@@ -446,83 +448,6 @@ def _response_language_instruction(user_message: str | None) -> str:
     )
 
 
-def _match_user_language_for_direct_evidence(line: str, user_message: str | None) -> str:
-    if not isinstance(user_message, str) or not _CJK_RE.search(user_message):
-        return line
-    if _CJK_RE.search(line):
-        return line
-    return f"已完成：{line}"
-
-
-def _user_message_contains_cjk(user_message: str | None) -> bool:
-    return isinstance(user_message, str) and bool(_CJK_RE.search(user_message))
-
-
-def _format_latest_evidence_answer(
-    bullets: str,
-    *,
-    incomplete: bool,
-    user_message: str | None,
-) -> str:
-    if _user_message_contains_cjk(user_message):
-        if incomplete:
-            return "我先停在当前状态。\n\n最新工具证据：\n" + bullets
-        return "已完成。\n\n最新工具证据：\n" + bullets
-    if incomplete:
-        return "I paused before a final answer.\n\nLatest tool evidence:\n" + bullets
-    return "Completed from the latest tool evidence.\n\n" + bullets
-
-
-def _format_pending_next_answer(
-    status_lines: list[str],
-    next_lines: list[str],
-    *,
-    user_message: str | None,
-) -> str:
-    if _user_message_contains_cjk(user_message):
-        parts = ["我先停在当前状态。"]
-        if status_lines:
-            parts.append(
-                "最新工具证据：\n"
-                + "\n".join(f"- {line}" for line in status_lines)
-            )
-        parts.append(
-            "待执行的下一步：\n"
-            + "\n".join(f"- {line}" for line in next_lines)
-        )
-        return "\n\n".join(parts)
-
-    parts = ["I paused before a final answer."]
-    if status_lines:
-        parts.append(
-            "Latest tool evidence:\n"
-            + "\n".join(f"- {line}" for line in status_lines)
-        )
-    parts.append(
-        "Pending next step:\n"
-        + "\n".join(f"- {line}" for line in next_lines)
-    )
-    return "\n\n".join(parts)
-
-
-def _format_latest_blocker_answer(
-    bullets: str,
-    *,
-    user_message: str | None,
-) -> str:
-    if _user_message_contains_cjk(user_message):
-        return "我先停在当前状态。\n\n最新阻塞：\n" + bullets
-    return "I paused before a final answer.\n\nLatest blocker:\n" + bullets
-
-
-def _format_no_concise_result_answer(user_message: str | None) -> str:
-    if _user_message_contains_cjk(user_message):
-        return "我还无法从当前工具证据里整理出可靠的简短结果。"
-    return (
-        "I could not derive a concise user-facing result from the available tool evidence."
-    )
-
-
 def _tool_outputs_have_loop_guard(tool_outputs: list[str]) -> bool:
     for output in reversed(tool_outputs):
         lowered = str(output or "").casefold()
@@ -532,12 +457,7 @@ def _tool_outputs_have_loop_guard(tool_outputs: list[str]) -> bool:
 
 
 def _loop_guard_user_message(user_message: str | None) -> str:
-    if isinstance(user_message, str) and _CJK_RE.search(user_message):
-        return "已暂停：为避免重复执行同一类外部操作，我停在了当前安全状态。请继续时我会从最新状态接着处理。"
-    return (
-        "Paused at the current safe state to avoid repeating the same external "
-        "action. Send a continuation request to proceed from the latest state."
-    )
+    return "tool_loop_guard status=stopped reason=repeated_external_action"
 
 
 def _background_poll_guard_user_message(
@@ -547,16 +467,7 @@ def _background_poll_guard_user_message(
     job_id = _background_poll_guard_job_id(tool_outputs)
     if not job_id:
         return ""
-
-    if isinstance(user_message, str) and _CJK_RE.search(user_message):
-        return (
-            "后台命令仍在运行，连续检查没有新的状态或输出。我已停止继续轮询，"
-            f"避免一直调用。当前 job：{job_id}。"
-        )
-    return (
-        "The background command is still running and repeated checks produced "
-        f"no new status or output. I stopped polling to avoid a loop. Current job: {job_id}."
-    )
+    return f"background_job status=running poll_guard=stopped_no_progress job_id={job_id}"
 
 
 def _background_poll_guard_job_id(tool_outputs: list[str]) -> str:
@@ -706,22 +617,6 @@ def tool_events_have_verified_public_url(tool_result_events: list[dict[str, Any]
     return False
 
 
-def _latest_balance_pair_is_nonzero(tool_outputs: list[str]) -> bool:
-    """Return True when the latest observed GAS/GLD pair is funded."""
-    for output in reversed(tool_outputs):
-        matches = list(_BALANCE_PAIR_RE.finditer(str(output or "")))
-        if not matches:
-            continue
-        latest = matches[-1]
-        try:
-            gas = float(latest.group("gas"))
-            gld = float(latest.group("gld"))
-        except Exception:
-            return False
-        return gas > 0 or gld > 0
-    return False
-
-
 def _tool_output_contains_recovery_status(output: str) -> bool:
     """Detect a later non-error status that supersedes older transient errors."""
     for raw_line in str(output or "").splitlines():
@@ -734,24 +629,15 @@ def _tool_output_contains_recovery_status(output: str) -> bool:
         lower = stripped.casefold()
         if lower.startswith(("error:", "stderr:", "exit code:")):
             continue
-        if any(marker in lower for marker in ("success", "installed", "registered", "joined")):
+        if _is_structured_status_evidence_line(stripped):
             return True
-        if "status=funded" in lower or "bound invitation code:" in lower:
-            return True
-        balance_match = _BALANCE_PAIR_RE.search(stripped)
-        if balance_match:
-            try:
-                if float(balance_match.group("gas")) > 0 or float(balance_match.group("gld")) > 0:
-                    return True
-            except Exception:
-                continue
     return False
 
 
 def build_skill_install_completion_answer(
     tool_result_events: list[dict[str, Any]],
 ) -> str:
-    """Build a concise answer from skill installation evidence."""
+    """Return sanitized skill-install evidence without adding a final conclusion."""
     for event in reversed(tool_result_events):
         if _stream_tool_event_name(event) != "skill_marketplace":
             continue
@@ -772,9 +658,9 @@ def build_skill_install_completion_answer(
             skill_name = match.group(1).strip()
         status = "already installed" if "already installed" in lowered else "installed"
         if skill_name:
-            return f"Completed.\n\nSkill '{skill_name}' {status}."
-        return f"Completed.\n\nSkill {status}."
-    return "Completed.\n\nSkill installation completed."
+            return f"skill_name={skill_name} install_status={status}"
+        return f"install_status={status}"
+    return "install_status=completed"
 
 
 def _iter_status_evidence_lines(tool_outputs: list[str], *, limit: int = 5) -> list[str]:
@@ -793,7 +679,7 @@ def _iter_status_evidence_lines(tool_outputs: list[str], *, limit: int = 5) -> l
                 continue
             if lower.startswith(("rule ", "rule_", "run $", "use ", "do not ")):
                 continue
-            if not any(marker in lower for marker in _STATUS_LINE_MARKERS):
+            if not _is_structured_status_evidence_line(stripped):
                 continue
             cleaned = _clean_user_visible_evidence_line(stripped)
             if not cleaned or cleaned in seen:
@@ -853,7 +739,7 @@ def _iter_next_evidence_lines(tool_outputs: list[str], *, limit: int = 2) -> lis
                     pending.append(cleaned)
                 continue
             if pending and (
-                any(marker in lower for marker in _STATUS_LINE_MARKERS)
+                _is_structured_status_evidence_line(stripped)
                 or any(lower.startswith(prefix) for prefix in _USER_SUMMARY_PREFIXES)
             ):
                 pending.clear()
@@ -894,10 +780,7 @@ def _iter_chronological_evidence_lines(
                 continue
             if lower.startswith(("rule ", "rule_", "run $", "use ", "do not ")):
                 continue
-            if (
-                any(marker in lower for marker in _STATUS_LINE_MARKERS)
-                or _looks_like_structured_evidence_line(stripped)
-            ):
+            if _is_structured_status_evidence_line(stripped):
                 cleaned = _clean_user_visible_evidence_line(stripped)
                 if cleaned and cleaned not in seen:
                     seen.add(cleaned)
@@ -915,17 +798,7 @@ def final_answer_denies_available_tool_evidence(
     """Return True when a draft denies evidence that tool events actually contain."""
     if not isinstance(final_content, str) or not final_content.strip():
         return False
-    if (
-        _INSTALL_COMPLETION_DENIAL_RE.search(final_content)
-        and tool_events_have_skill_install_completion(tool_result_events)
-    ):
-        return True
     tool_outputs = [_stream_tool_event_text(event) for event in tool_result_events]
-    if (
-        _BALANCE_ZERO_DENIAL_RE.search(final_content)
-        and _latest_balance_pair_is_nonzero(tool_outputs)
-    ):
-        return True
     if not _EVIDENCE_DENIAL_RE.search(final_content):
         return False
 
@@ -957,13 +830,10 @@ def build_user_facing_tool_evidence_answer(
     incomplete: bool = False,
     user_message: str | None = None,
 ) -> str:
-    """Build a concise final answer from tool evidence without raw transcripts."""
+    """Build sanitized fallback evidence without adding a hardcoded conclusion."""
     summary_lines = _latest_user_summary_lines(tool_outputs)
     if summary_lines:
-        return _match_user_language_for_direct_evidence(
-            summary_lines[-1],
-            user_message,
-        )
+        return summary_lines[-1]
 
     background_poll_message = _background_poll_guard_user_message(
         tool_outputs,
@@ -975,30 +845,21 @@ def build_user_facing_tool_evidence_answer(
     next_lines = _iter_next_evidence_lines(tool_outputs)
     if incomplete and next_lines:
         status_lines = _iter_status_evidence_lines(tool_outputs, limit=3)
-        return _format_pending_next_answer(
-            status_lines,
-            next_lines,
-            user_message=user_message,
-        )
+        lines = status_lines + [f"NEXT: {line}" for line in next_lines]
+        return "\n".join(f"- {line}" for line in lines if line)
 
     if _tool_outputs_have_loop_guard(tool_outputs):
         return _loop_guard_user_message(user_message)
 
     error_lines = _iter_error_evidence_lines(tool_outputs)
     if error_lines:
-        bullets = "\n".join(f"- {line}" for line in error_lines)
-        return _format_latest_blocker_answer(bullets, user_message=user_message)
+        return "\n".join(f"- {line}" for line in error_lines)
 
     status_lines = _iter_status_evidence_lines(tool_outputs)
     if status_lines:
-        bullets = "\n".join(f"- {line}" for line in status_lines)
-        return _format_latest_evidence_answer(
-            bullets,
-            incomplete=incomplete,
-            user_message=user_message,
-        )
+        return "\n".join(f"- {line}" for line in status_lines)
 
-    return _format_no_concise_result_answer(user_message)
+    return "NO_CONCISE_TOOL_EVIDENCE"
 
 
 def build_tool_evidence_synthesis_brief(
@@ -1013,14 +874,13 @@ def build_tool_evidence_synthesis_brief(
         "Write the final answer as natural language for the newest user.",
         "Use only the verified evidence below; do not invent missing progress.",
         "Treat the newest user request as intent only, not as evidence of completed work.",
-        "Do not claim clone/install/faucet/register/join steps completed unless they appear in evidence.",
-        "If skill_marketplace reports the requested skill installed, do not deny skill installation just because no manual git clone appears.",
-        "If a register command is documented as ERC-8004 registration and evidence says Registered AGENT_ID=<assigned id>, treat the assigned id as successful registration unless a tool explicitly accepts a user-supplied id argument.",
-        "If the active skill contract exposes an auto-selection command such as join <spot>, do not say a game id is required solely because the user asked for the latest game; use verified join evidence if present or report that join is still pending.",
+        "Treat each tool's structured output and skill contract as the source of truth for what completed, what is pending, and what is blocked.",
+        "Do not require a manual setup path when a tool reports the same capability completed through its own contract.",
+        "When a command uses placeholders or auto-selected values, explain the verified outcome instead of inventing a missing-input blocker.",
         "When newer evidence contradicts an older transient error or older state for the same workflow, trust the newer evidence and do not report the older state as a current blocker.",
         "Do not provide generic troubleshooting guides, manual install instructions, option menus, or invented example commands.",
         "Do not ask the user to provide optional next inputs or choose among options; if the verified workflow is done or blocked, state that status and stop.",
-        "If settlement, final result, or equivalent terminal evidence exists, treat that as the outcome for this turn instead of inviting another run.",
+        "If terminal evidence exists, treat that as the outcome for this turn instead of inviting another run.",
         "If a next step is needed, use only exact NEXT commands or blockers found in the evidence.",
         "Match the newest user's language unless they requested a specific output format.",
         _response_language_instruction(user_message),
@@ -1057,7 +917,7 @@ def build_tool_evidence_synthesis_brief(
 
     error_lines = _iter_error_evidence_lines(tool_outputs)
     if error_lines:
-        lines.extend(["", "Latest blockers:"])
+        lines.extend(["", "Blocker evidence:"])
         lines.extend(f"- {line}" for line in error_lines[:3])
 
     status_lines = _iter_status_evidence_lines(tool_outputs)
@@ -1067,7 +927,7 @@ def build_tool_evidence_synthesis_brief(
 
     next_lines = _iter_next_evidence_lines(tool_outputs)
     if next_lines:
-        lines.extend(["", "Pending next step evidence:"])
+        lines.extend(["", "Pending action evidence:"])
         lines.extend(f"- {line}" for line in next_lines[-2:])
 
     if len(lines) <= 8:
@@ -1122,16 +982,7 @@ def _iter_tool_event_milestone_lines(
             lower = stripped.casefold()
             if lower.startswith(("next:", "q:", "question:", "read it aloud:")):
                 continue
-            keep = False
-            if "skills reloaded" in lower or "installed at:" in lower:
-                keep = True
-            elif "status=funded" in lower or "bound invitation code:" in lower:
-                keep = True
-            elif _BALANCE_PAIR_RE.search(stripped):
-                keep = True
-            elif any(marker in lower for marker in ("registered agent_id=", "joined", "settlement", "final_state")):
-                keep = True
-            if not keep:
+            if not _is_structured_status_evidence_line(stripped):
                 continue
             cleaned = _clean_user_visible_evidence_line(stripped)
             if cleaned and cleaned not in seen:
