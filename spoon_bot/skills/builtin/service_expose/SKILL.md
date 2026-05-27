@@ -1,6 +1,6 @@
 ---
 name: service_expose
-description: Run user-created frontend or backend services in the background and optionally expose them through a Cloudflare Quick Tunnel. Use for preview links, localhost URLs, public/trycloudflare links, WebSocket apps, and service URL verification.
+description: Run user-created frontend/backend/WebSocket services and expose them through Cloudflare by default when the user asks to start, deploy, preview, share, or make the service accessible. Local-only is allowed only when explicitly requested.
 version: 1.0.0
 author: XSpoon Team
 tags: [service, frontend, backend, cloudflare, tunnel, background]
@@ -73,13 +73,15 @@ scripts:
 
 # Service Expose
 
-Use this skill when a user-created frontend or backend needs to keep running after the turn and be reachable through Cloudflare.
+Use this skill when a user-created frontend, backend, API, WebSocket server, or preview app needs to keep running after the turn.
+
+Default stance: when the user asks to create and start, deploy, preview, share, open, or make a service accessible, Cloudflare exposure is part of completion unless the user explicitly says local-only. A local URL, localhost port, PID, or background process alone is an intermediate state, not a final answer.
 
 Prefer `service_expose` over one-off shell backgrounding for preview services because it persists service metadata, log paths, PIDs, local URLs, and tunnel URLs under `~/.spoon-bot/service-expose`.
 
 ## Actions
 
-- `start`: run a service command in the background. Include `name`, `command`, and usually `cwd` plus `port` or `url`.
+- `start`: run a service command in the background. Include `name`, `command`, and usually `cwd` plus `port` or `url`. For deploy/preview/share/access requests, pass `start_tunnel=true` in the same call unless the user explicitly asked for local-only.
 - `tunnel` / `expose` / `start_tunnel`: start a Cloudflare Quick Tunnel for an existing service or an explicit local `url`.
 - `status` / `list` / `inspect`: inspect running services and tunnel URLs.
 - `logs`: return recent service or tunnel logs.
@@ -88,6 +90,8 @@ Prefer `service_expose` over one-off shell backgrounding for preview services be
 ## Rules
 
 Use `replace=true` only when the user wants to restart/replace the existing named service. Quick Tunnels use `cloudflared` from `CLOUDFLARED_PATH` or `PATH`; when it is missing on Linux/Windows, this skill can download the official latest Cloudflare binary into `~/.spoon-bot/service-expose/bin` unless `SPOON_BOT_AUTO_INSTALL_CLOUDFLARED=0`.
+
+For generated services in sandbox/runtime environments, prefer one `service_expose` call with `action=start` and `start_tunnel=true`. Use `action=start` without a tunnel only for explicit local-only requests, internal preflight phases, or background helper services that the browser will not access. If a service was already started locally and the user still needs deployment/preview/share access, immediately call `service_expose` again with `action=tunnel` for that service before finalizing.
 
 When creating a new preview service, pick a free port. Passing `port=0` asks this skill to choose an available port and inject it as `PORT` for the service command. Do not report a link until the local URL returns app-specific content. If a port is occupied, update the app command/config to use a free port and restart; do not treat an unrelated HTTP 200 on that port as success.
 
@@ -99,7 +103,7 @@ For WebSocket-only services, an HTTP `426 Upgrade Required` response or a succes
 
 The tunnel protocol defaults to `http2` because Docker and restricted Linux hosts often block or degrade QUIC/UDP. Override with `tunnel_protocol` or `SPOON_BOT_CLOUDFLARED_PROTOCOL` only when the environment requires another Cloudflare transport. If tunnel creation fails, inspect `service_expose` status/logs and retry through `service_expose`; do not bypass it with manual `cloudflared` shell commands.
 
-Report a public URL only when the `service_expose` result has `success=true` and a non-null `public_url`. A trycloudflare URL that appears only in logs, `verification.url`, or a failed attempt is an unverified candidate and must not be presented as a usable link.
+Report a public URL only when the `service_expose` result has `success=true` and a non-null `public_url`, including nested tunnel results from `action=start` with `start_tunnel=true`. A trycloudflare URL that appears only in logs, `verification.url`, or a failed attempt is an unverified candidate and must not be presented as a usable link.
 
 For browser apps, the public URL is not complete until every browser-required API, asset, and WebSocket endpoint is reachable from that public page. Prefer serving the frontend and API/WebSocket from one local service before exposing it; for example, serve `index.html` and upgrade WebSocket connections on the same port. If you use multiple local services, expose each browser-required service or rewrite/proxy the frontend so it does not point at localhost, loopback, or an unexposed local port. If a result contains `public_readiness.blocking=true`, resolve the listed missing public dependencies before finalizing.
 

@@ -24,6 +24,7 @@ from spoon_bot.agent.tools.execution_context import (
     current_session_fact_check_blocker,
     get_request_execution_hints,
     get_tool_owner,
+    suppress_repeated_background_job_poll,
 )
 from spoon_bot.config import (
     DEFAULT_MAX_OUTPUT,
@@ -522,6 +523,23 @@ class ShellTool(Tool):
         "status",
         "summary",
     })
+    _SKILL_ENTRYPOINT_WRAPPERS = frozenset({
+        "bash",
+        "bun",
+        "deno",
+        "node",
+        "npx",
+        "npm",
+        "pnpm",
+        "poetry",
+        "python",
+        "python3",
+        "sh",
+        "tsx",
+        "uv",
+        "uvx",
+        "yarn",
+    })
 
     def __init__(
         self,
@@ -698,6 +716,8 @@ class ShellTool(Tool):
                     cwd = str(self.working_dir or os.getcwd())
                 skill_cli_key = self._skill_cli_invocation_dedup_key(command, cwd)
                 if skill_cli_key is not None:
+                    if skill_cli_key.get("transient_challenge_request") is True:
+                        return None
                     return {
                         "action": "execute",
                         "skill_cli": skill_cli_key,
@@ -706,6 +726,98 @@ class ShellTool(Tool):
                 normalized["command"] = self._normalize_exact_command(command)
                 return normalized
         return arguments
+
+    def tool_invocation_series_key(self, arguments: dict[str, Any]) -> str | None:
+        """Group repeated side-effecting skill CLI actions within one request."""
+        if not isinstance(arguments, dict):
+            return None
+        action = str(arguments.get("action") or "execute").strip().lower()
+        if action != "execute":
+            return None
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return None
+        try:
+            cwd = self._resolve_working_dir(arguments.get("working_dir"))
+        except Exception:
+            cwd = str(self.working_dir or os.getcwd())
+        skill_cli_key = self._skill_cli_invocation_dedup_key(command, cwd)
+        invocations = (
+            skill_cli_key.get("invocations")
+            if isinstance(skill_cli_key, dict)
+            else None
+        )
+        if not isinstance(invocations, list) or not invocations:
+            return None
+
+        series_parts: list[str] = []
+        for invocation in invocations:
+            if not isinstance(invocation, dict):
+                continue
+            args = [
+                str(arg).strip()
+                for arg in invocation.get("args", [])
+                if str(arg).strip()
+            ]
+            if not args or self._skill_args_are_read_only(args):
+                continue
+            skill = str(invocation.get("skill") or "").strip().casefold()
+            action_name = args[0].casefold()
+            if not skill or not action_name:
+                continue
+            skill_md = Path(cwd).resolve() / "skills" / skill / "SKILL.md"
+            if not skill_md.exists():
+                workspace_root = Path(self.working_dir or cwd).resolve()
+                fallback_skill_md = workspace_root / "skills" / skill / "SKILL.md"
+                if fallback_skill_md.exists():
+                    skill_md = fallback_skill_md
+            templates = self._parse_skill_command_templates(skill_md)
+            if self._skill_args_contain_literal_placeholder(args, templates):
+                continue
+            series_action = self._skill_cli_side_effect_series_action(args)
+            if not series_action:
+                continue
+            series_parts.append(f"skill_cli:{skill}:{series_action}")
+        if not series_parts:
+            return None
+        return "|".join(series_parts)
+
+    @staticmethod
+    def _skill_cli_side_effect_series_action(args: list[str]) -> str:
+        """Return a durable side-effect series label from documented CLI args."""
+        if not args:
+            return ""
+        action = str(args[0] or "").strip().casefold()
+        if action in {"challenge-start", "faucet"}:
+            return ""
+        if action == "join" and len(args) >= 2:
+            first_value = str(args[1] or "").strip()
+            if first_value and re.fullmatch(r"\d+", first_value):
+                return "join:explicit"
+            return "join:auto"
+        return action
+
+    @classmethod
+    def _skill_cli_invocations_are_transient_challenge_requests(
+        cls,
+        invocations: list[dict[str, Any]],
+    ) -> bool:
+        """Return True for challenge issuance commands that are safe to retry."""
+        if not invocations:
+            return False
+        for invocation in invocations:
+            if not isinstance(invocation, dict):
+                return False
+            args = [
+                str(arg).strip()
+                for arg in invocation.get("args", [])
+                if str(arg).strip()
+            ]
+            if not args:
+                return False
+            if args[0].casefold() not in {"challenge-start", "faucet"}:
+                return False
+        return True
 
     def format_duplicate_invocation_result(
         self,
@@ -857,6 +969,8 @@ class ShellTool(Tool):
 
         if not invocations:
             return None
+        if self._skill_cli_invocations_are_transient_challenge_requests(invocations):
+            return {"transient_challenge_request": True}
         return {"invocations": invocations}
 
     def _parse_command_args(self, command: str) -> list[str]:
@@ -1725,6 +1839,12 @@ class ShellTool(Tool):
         await self._refresh_background_job(job)
 
         if action == "job_status":
+            repeated_poll = suppress_repeated_background_job_poll(
+                job.job_id,
+                self._background_job_progress_key(job),
+            )
+            if repeated_poll is not None:
+                return repeated_poll
             return (
                 f"job_id: {job.job_id}\n"
                 f"status: {job.status}\n"
@@ -1741,6 +1861,12 @@ class ShellTool(Tool):
             )
 
         if action == "job_output":
+            repeated_poll = suppress_repeated_background_job_poll(
+                job.job_id,
+                self._background_job_progress_key(job),
+            )
+            if repeated_poll is not None:
+                return repeated_poll
             full_result = self._build_output_result(
                 job.stdout_text,
                 job.stderr_text,
@@ -1799,6 +1925,16 @@ class ShellTool(Tool):
             return result
 
         return f"Error: Unknown action '{action}'"
+
+    @staticmethod
+    def _background_job_progress_key(job: _BackgroundShellJob) -> str:
+        """Build a compact progress signature for request-local poll guards."""
+        stdout_len = len(job.stdout_text or "")
+        stderr_len = len(job.stderr_text or "")
+        return (
+            f"status={job.status}|returncode={job.returncode}|"
+            f"stdout={stdout_len}|stderr={stderr_len}"
+        )
 
     async def execute(
         self,
@@ -2051,6 +2187,13 @@ class ShellTool(Tool):
         workspace_root = Path(self.working_dir or cwd).resolve()
         skills_root = (workspace_root / "skills").resolve()
         current_dir = Path(cwd).resolve()
+        try:
+            hints = get_request_execution_hints()
+        except Exception:
+            hints = {}
+        if not isinstance(hints, dict):
+            hints = getattr(self, "_request_execution_hints", {}) or {}
+        skill_install_intent = bool(hints.get("skill_install_intent"))
 
         for segment in self._split_shell_segments(command_tokens):
             if not segment:
@@ -2068,6 +2211,15 @@ class ShellTool(Tool):
             else:
                 source_tail = source.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
                 destination = source_tail.removesuffix(".git") or "repo"
+
+            if skill_install_intent and "github.com" in source.casefold():
+                return (
+                    "Rejected: the current request asks to install an Agent Skill. "
+                    "Do not clone a GitHub skill repo manually; call "
+                    f"skill_marketplace(action='install_skill', url='{source}') so "
+                    "the installer validates SKILL.md and installs the correct "
+                    "workspace/skills directory."
+                )
 
             destination_path = Path(destination)
             if not destination_path.is_absolute():
@@ -2259,6 +2411,18 @@ class ShellTool(Tool):
             content = skill_md.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return []
+        references_dir = skill_md.parent / "references"
+        if references_dir.is_dir():
+            reference_chunks: list[str] = []
+            for reference_md in sorted(references_dir.glob("*.md"))[:12]:
+                try:
+                    reference_chunks.append(
+                        reference_md.read_text(encoding="utf-8", errors="replace")
+                    )
+                except Exception:
+                    continue
+            if reference_chunks:
+                content = content + "\n\n" + "\n\n".join(reference_chunks)
 
         templates: list[_SkillCommandTemplate] = []
         seen_templates: set[tuple[Any, ...]] = set()
@@ -2365,11 +2529,23 @@ class ShellTool(Tool):
             cleaned.append(token)
         return cleaned
 
-    @staticmethod
+    @classmethod
+    def _token_can_be_skill_entrypoint(cls, tokens: list[str], index: int) -> bool:
+        if index <= 0:
+            return True
+        command_name = os.path.basename(
+            str(tokens[0] or "").strip().strip("'\"").replace("\\", "/")
+        ).casefold()
+        return command_name in cls._SKILL_ENTRYPOINT_WRAPPERS
+
+    @classmethod
     def _extract_skill_cli_invocation(
+        cls,
         tokens: list[str],
     ) -> tuple[str, list[str], list[str]] | None:
         for index, token in enumerate(tokens):
+            if not cls._token_can_be_skill_entrypoint(tokens, index):
+                continue
             normalized = str(token or "").replace("\\", "/").strip("'\"")
             if normalized.startswith("skills/"):
                 parts = normalized.split("/")
@@ -2412,6 +2588,8 @@ class ShellTool(Tool):
             return invocation
 
         for index, token in enumerate(tokens):
+            if not cls._token_can_be_skill_entrypoint(tokens, index):
+                continue
             normalized = str(token or "").replace("\\", "/").strip("'\"")
             if (
                 not normalized
@@ -2484,6 +2662,30 @@ class ShellTool(Tool):
         return bool(template_labels and request_labels and template_labels & request_labels)
 
     @classmethod
+    def _skill_args_contain_literal_placeholder(
+        cls,
+        args: list[str],
+        templates: list[_SkillCommandTemplate],
+    ) -> bool:
+        if not args or not templates:
+            return False
+        normalized_args = [str(arg or "").strip().casefold() for arg in args]
+        for template in templates:
+            if tuple(args[: len(template.fixed_tokens)]) != template.fixed_tokens:
+                continue
+            label_tokens: set[str] = set()
+            for label in template.positional_labels:
+                label_tokens.update(cls._label_tokens(label))
+            if not label_tokens:
+                continue
+            for token in normalized_args[len(template.fixed_tokens) :]:
+                if not token or token.startswith("-"):
+                    continue
+                if token in label_tokens:
+                    return True
+        return False
+
+    @classmethod
     def _flag_alias_value_label(
         cls,
         flag: str,
@@ -2520,6 +2722,137 @@ class ShellTool(Tool):
             if label_set:
                 result[value] = label_set
         return result
+
+    @staticmethod
+    def _template_preferred_flag(flags: list[str]) -> str:
+        """Choose the most explicit documented flag from equivalent candidates."""
+        if not flags:
+            return ""
+        return sorted(
+            flags,
+            key=lambda item: (
+                0 if str(item).startswith("--") else 1,
+                -len(str(item)),
+                str(item),
+            ),
+        )[0]
+
+    @classmethod
+    def _positional_values_for_template(cls, args: list[str], template: _SkillCommandTemplate) -> list[str]:
+        remaining = args[len(template.fixed_tokens):]
+        positionals: list[str] = []
+        index = 0
+        flag_value_labels = dict(template.flag_value_labels)
+        while index < len(remaining):
+            token = remaining[index]
+            if not token:
+                index += 1
+                continue
+            if token.startswith("-"):
+                flag = cls._flag_name(token)
+                if (flag in template.flags_with_values or flag in flag_value_labels) and "=" not in token:
+                    index += 2
+                else:
+                    index += 1
+                continue
+            positionals.append(token)
+            index += 1
+        return positionals
+
+    def _repair_skill_cli_alias_flags_from_request_values(
+        self,
+        command_tokens: list[str],
+        prefix_tokens: list[str],
+        args: list[str],
+        templates: list[_SkillCommandTemplate],
+        explicit_request_values: dict[str, set[str]],
+    ) -> list[str] | None:
+        """Rewrite unsupported value flags to documented flags or positionals.
+
+        The repair is intentionally data-driven: it only fires when the value is
+        a structured user-provided fact and SKILL.md documents exactly where a
+        value with that label belongs.
+        """
+        if not explicit_request_values:
+            return None
+
+        prefix_len = len(prefix_tokens)
+        for template in sorted(
+            templates,
+            key=lambda item: (len(item.fixed_tokens), item.max_positionals),
+            reverse=True,
+        ):
+            if tuple(args[: len(template.fixed_tokens)]) != template.fixed_tokens:
+                continue
+            remaining = args[len(template.fixed_tokens):]
+            offset = len(template.fixed_tokens)
+            index = 0
+            while index < len(remaining):
+                token = remaining[index]
+                if not token or not token.startswith("-"):
+                    index += 1
+                    continue
+                observed_flag = self._flag_name(token)
+                if observed_flag in template.allowed_flags:
+                    if observed_flag in template.flags_with_values and "=" not in token:
+                        index += 2
+                    else:
+                        index += 1
+                    continue
+
+                value = ""
+                value_is_inline = False
+                if "=" in token:
+                    value = token.split("=", 1)[1]
+                    value_is_inline = True
+                elif index + 1 < len(remaining):
+                    value = remaining[index + 1]
+                request_labels = explicit_request_values.get(value)
+                if not value or not request_labels:
+                    index += 1
+                    continue
+
+                command_index = prefix_len + offset + index
+                flag_value_labels = dict(template.flag_value_labels)
+                documented_flags = [
+                    flag
+                    for flag, label in flag_value_labels.items()
+                    if flag in template.flags_with_values
+                    and self._label_accepts_request_value(label, request_labels)
+                ]
+                replacement_flag = self._template_preferred_flag(documented_flags)
+                if replacement_flag:
+                    updated = list(command_tokens)
+                    updated[command_index] = (
+                        f"{replacement_flag}={value}"
+                        if value_is_inline
+                        else replacement_flag
+                    )
+                    logger.info(
+                        "Repaired unsupported skill CLI value flag "
+                        f"{observed_flag!r} to documented flag "
+                        f"{replacement_flag!r} from SKILL.md."
+                    )
+                    return updated
+
+                positionals = self._positional_values_for_template(args, template)
+                if len(positionals) < len(template.positional_labels):
+                    label = template.positional_labels[len(positionals)]
+                    if self._label_accepts_request_value(label, request_labels):
+                        updated = list(command_tokens)
+                        if value_is_inline:
+                            updated[command_index] = value
+                        else:
+                            del updated[command_index]
+                        logger.info(
+                            "Repaired unsupported skill CLI value flag "
+                            f"{observed_flag!r} to documented positional "
+                            f"parameter {label!r} from SKILL.md."
+                        )
+                        return updated
+
+                index += 1
+        return None
 
     @classmethod
     def _validate_skill_cli_args_against_template(
@@ -2599,6 +2932,16 @@ class ShellTool(Tool):
                 if positionals < len(template.positional_labels)
                 else ""
             )
+            positional_label_tokens: set[str] = set()
+            for template_label in template.positional_labels:
+                positional_label_tokens.update(cls._label_tokens(template_label))
+            if token.casefold() in positional_label_tokens:
+                return (
+                    "Rejected: this skill CLI argument is a placeholder label "
+                    f"passed literally: {token!r}. Follow skills/{skill_name}/SKILL.md "
+                    "with a concrete value for that placeholder instead of the "
+                    "placeholder name itself."
+                )
             request_labels = explicit_request_values.get(token)
             if (
                 request_labels
@@ -2679,8 +3022,31 @@ class ShellTool(Tool):
             return command
         if not command_tokens:
             return command
-        if any(token in {"&&", "||", ";", "|"} for token in command_tokens):
+        if any(token in {"||", ";", "|"} for token in command_tokens):
             return command
+        if "&&" in command_tokens:
+            segments = self._split_shell_segments(command_tokens)
+            if not segments:
+                return command
+            current_dir = Path(cwd).resolve()
+            rendered_segments: list[str] = []
+            changed = False
+            for segment in segments:
+                if not segment:
+                    continue
+                if segment[0].casefold() == "cd":
+                    current_dir = self._resolve_cd_segment(current_dir, segment)
+                    rendered_segments.append(shlex.join(segment))
+                    continue
+                segment_command = shlex.join(segment)
+                augmented_segment = self._augment_skill_cli_labeled_values(
+                    segment_command,
+                    str(current_dir),
+                )
+                if augmented_segment != segment_command:
+                    changed = True
+                rendered_segments.append(augmented_segment)
+            return " && ".join(rendered_segments) if changed else command
         if any(str(token).startswith((">", "1>", "2>")) for token in command_tokens):
             return command
 
@@ -2709,6 +3075,16 @@ class ShellTool(Tool):
         ]
         if not matching_templates:
             return command
+
+        repaired_tokens = self._repair_skill_cli_alias_flags_from_request_values(
+            command_tokens,
+            list(prefix_tokens),
+            args,
+            matching_templates,
+            explicit_request_values,
+        )
+        if repaired_tokens is not None:
+            return shlex.join(repaired_tokens)
 
         existing_flags = {
             self._flag_name(token)
@@ -2739,6 +3115,44 @@ class ShellTool(Tool):
                         f"value for skills/{skill_name}/SKILL.md parameter {flag}."
                     )
                     return augmented
+            remaining = args[len(template.fixed_tokens) :]
+            positional_values: list[str] = []
+            index = 0
+            flag_value_labels = dict(template.flag_value_labels)
+            while index < len(remaining):
+                token = remaining[index]
+                if not token:
+                    index += 1
+                    continue
+                if token.startswith("-"):
+                    flag = self._flag_name(token)
+                    if (
+                        flag in template.flags_with_values
+                        or flag in flag_value_labels
+                    ) and "=" not in token:
+                        index += 2
+                    else:
+                        index += 1
+                    continue
+                positional_values.append(token)
+                index += 1
+
+            if len(positional_values) >= len(template.positional_labels):
+                continue
+            label = template.positional_labels[len(positional_values)]
+            for value, request_labels in explicit_request_values.items():
+                if value in existing_values:
+                    continue
+                if not self._label_accepts_request_value(label, request_labels):
+                    continue
+                updated = [*command_tokens, value]
+                augmented = shlex.join(updated)
+                logger.info(
+                    "Augmented skill CLI command with structured request "
+                    f"value for skills/{skill_name}/SKILL.md positional "
+                    f"parameter {label!r}."
+                )
+                return augmented
         return command
 
     def _reject_undocumented_skill_cli_arguments(

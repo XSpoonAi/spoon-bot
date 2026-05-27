@@ -23,6 +23,7 @@ import asyncio
 import json
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
@@ -318,16 +319,41 @@ class TestCheckBudget:
 
 class TestBudgetConfig:
     def test_defaults(self):
-        from spoon_bot.gateway.config import BudgetConfig
+        from spoon_bot.gateway.config import (
+            BudgetConfig,
+            DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS,
+            DEFAULT_GATEWAY_STREAM_TIMEOUT_MS,
+        )
         b = BudgetConfig()
-        assert b.request_timeout_ms == 0
+        assert b.request_timeout_ms == DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
         assert b.tool_timeout_ms > 0
-        assert b.stream_timeout_ms == 0
+        assert b.stream_timeout_ms == DEFAULT_GATEWAY_STREAM_TIMEOUT_MS
 
     def test_custom_values(self):
         from spoon_bot.gateway.config import BudgetConfig
         b = BudgetConfig(request_timeout_ms=5000, tool_timeout_ms=2000)
         assert b.request_timeout_ms == 5000
+
+    @pytest.mark.asyncio
+    async def test_wait_for_budget_interrupts_hanging_coroutine(self):
+        from spoon_bot.gateway.observability.budget import (
+            BudgetExhaustedError,
+            wait_for_budget,
+        )
+
+        async def hangs():
+            await asyncio.sleep(10)
+
+        started_at = asyncio.get_running_loop().time()
+        with pytest.raises(BudgetExhaustedError) as exc:
+            await wait_for_budget(
+                hangs(),
+                budget_type="request",
+                limit_ms=20,
+                elapsed_ms=lambda: int((asyncio.get_running_loop().time() - started_at) * 1000),
+            )
+
+        assert exc.value.budget_type == "request"
 
 
 # ============================================================================
@@ -816,6 +842,26 @@ class TestWsCancellationPropagation:
 class TestWsTimeoutErrorCodes:
     """WS agent.error events use standardized timeout codes."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_session_runtime_registry(self):
+        async def get_or_create(session_key="default"):
+            from spoon_bot.gateway.websocket import handler as ws_handler_module
+
+            return SimpleNamespace(
+                agent=ws_handler_module.get_agent(),
+                lock=asyncio.Lock(),
+                active_task_id=None,
+            )
+
+        fake_registry = SimpleNamespace(
+            get_or_create=AsyncMock(side_effect=get_or_create),
+        )
+        with patch(
+            "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+            return_value=fake_registry,
+        ):
+            yield
+
     @pytest.mark.asyncio
     async def test_timeout_emits_error_event_with_upstream_code(self):
         from spoon_bot.gateway.websocket.handler import WebSocketHandler
@@ -888,6 +934,91 @@ class TestWsTimeoutErrorCodes:
         assert ed["error"]["budget_type"] == "request"
         assert ed["error"]["elapsed_ms"] == 1500
         assert ed["error"]["limit_ms"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_request_budget_interrupts_hanging_non_stream_chat(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+        from spoon_bot.gateway.observability.budget import BudgetExhaustedError
+
+        handler = WebSocketHandler("conn_test")
+        mock_agent = AsyncMock()
+
+        async def hangs(**kwargs):
+            await asyncio.sleep(10)
+
+        mock_agent.process = AsyncMock(side_effect=hangs)
+        fake_runtime = SimpleNamespace(
+            agent=mock_agent,
+            lock=asyncio.Lock(),
+            active_task_id=None,
+        )
+        fake_registry = SimpleNamespace(
+            get_or_create=AsyncMock(return_value=fake_runtime),
+        )
+        fm = _FakeManager()
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=mock_agent):
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch(
+                    "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+                    return_value=fake_registry,
+                ):
+                    with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                        from spoon_bot.gateway.config import GatewayConfig, BudgetConfig
+
+                        cfg = GatewayConfig()
+                        cfg.budget = BudgetConfig(request_timeout_ms=20, stream_timeout_ms=0)
+                        mc.return_value = cfg
+                        with pytest.raises(BudgetExhaustedError):
+                            await handler._handle_chat({"message": "keep going", "stream": False})
+
+        errors = [m for m in fm.sent_messages
+                  if isinstance(m, dict) and m.get("event") == "agent.error"]
+        assert errors
+        assert errors[0]["data"]["error"]["code"] == "TIMEOUT_TOTAL"
+        assert errors[0]["data"]["error"]["budget_type"] == "request"
+
+    @pytest.mark.asyncio
+    async def test_stream_budget_interrupts_hanging_stream_before_first_chunk(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+        from spoon_bot.gateway.observability.budget import BudgetExhaustedError
+
+        handler = WebSocketHandler("conn_test")
+        mock_agent = _make_mock_agent()
+
+        async def hanging_stream(**kwargs):
+            await asyncio.sleep(10)
+            yield {"type": "content", "delta": "late", "metadata": {}}
+
+        mock_agent.stream = hanging_stream
+        fake_runtime = SimpleNamespace(
+            agent=mock_agent,
+            lock=asyncio.Lock(),
+            active_task_id=None,
+        )
+        fake_registry = SimpleNamespace(
+            get_or_create=AsyncMock(return_value=fake_runtime),
+        )
+        fm = _FakeManager()
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=mock_agent):
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch(
+                    "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+                    return_value=fake_registry,
+                ):
+                    with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                        from spoon_bot.gateway.config import GatewayConfig, BudgetConfig
+
+                        cfg = GatewayConfig()
+                        cfg.budget = BudgetConfig(request_timeout_ms=1000, stream_timeout_ms=20)
+                        mc.return_value = cfg
+                        with pytest.raises(BudgetExhaustedError):
+                            await handler._handle_chat({"message": "keep going", "stream": True})
+
+        errors = [m for m in fm.sent_messages
+                  if isinstance(m, dict) and m.get("event") == "agent.error"]
+        assert errors
+        assert errors[0]["data"]["error"]["code"] == "TIMEOUT_TOTAL"
+        assert errors[0]["data"]["error"]["budget_type"] == "stream"
 
     @pytest.mark.asyncio
     async def test_stream_budget_exhausted_emits_error(self):

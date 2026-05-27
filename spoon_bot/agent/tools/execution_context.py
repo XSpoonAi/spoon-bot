@@ -65,6 +65,12 @@ _REPEATED_TOOL_SERIES_MESSAGE = (
     "result or ask for an explicit count before continuing. Do not call more "
     "tools for this same action."
 )
+_REPEATED_BACKGROUND_JOB_POLL_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: repeated background job polling suppressed. "
+    "job_id={job_id}. The background job produced no new status or output "
+    "signal across repeated polls; report the current state instead of "
+    "polling again in this request."
+)
 _REDUNDANT_FILE_READ_MESSAGE = (
     "File content already available in this request. Treat this read as "
     "complete and continue the user's remaining instructions without calling "
@@ -292,6 +298,44 @@ def suppress_repeated_tool_series(tool_name: str, series_key: str | None) -> str
     if counts[key] <= max_repeats:
         return None
     return _REPEATED_TOOL_SERIES_MESSAGE
+
+
+def suppress_repeated_background_job_poll(
+    job_id: str,
+    progress_key: str,
+    *,
+    max_no_progress_polls: int = 2,
+) -> str | None:
+    """Return a compact result when one request keeps polling an unchanged job."""
+    state = _current_tool_invocation_state()
+    if not isinstance(state, dict):
+        return None
+
+    normalized_job_id = str(job_id or "").strip()
+    normalized_progress_key = str(progress_key or "").strip()
+    if not normalized_job_id or not normalized_progress_key:
+        return None
+
+    poll_state = state.setdefault("background_job_poll_state", {})
+    if not isinstance(poll_state, dict):
+        return None
+
+    current = poll_state.get(normalized_job_id)
+    if (
+        isinstance(current, dict)
+        and current.get("progress_key") == normalized_progress_key
+    ):
+        count = int(current.get("count") or 0) + 1
+    else:
+        count = 1
+
+    poll_state[normalized_job_id] = {
+        "progress_key": normalized_progress_key,
+        "count": count,
+    }
+    if count <= max(1, int(max_no_progress_polls or 1)):
+        return None
+    return _REPEATED_BACKGROUND_JOB_POLL_MESSAGE.format(job_id=normalized_job_id)
 
 
 def suppress_redundant_file_read(

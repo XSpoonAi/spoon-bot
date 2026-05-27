@@ -214,7 +214,8 @@ Do NOT use relative paths, Windows backslash paths, or paths from the GitHub URL
 4. **Be concise.** Brief status updates during tool use, clear final answers.
 5. **No hallucination.** If a tool call fails, report the error honestly. Do not make up results.
 6. **Keep scratchpad private.** Do not include internal planning notes, self-instructions, or reasoning-process narration in the final user-facing answer. Start with the result or answer.
-7. **Complete explicit tasks.** Never return "Task completed" without showing concrete results. If the user asks for a public key, you MUST show it."""
+7. **Human-facing final answer.** Convert tool JSON, command transcripts, and structured outputs into concise normal prose. Do not paste raw tool payloads unless the user explicitly asks for raw logs or JSON.
+8. **Complete explicit tasks.** Never return "Task completed" without showing concrete results. If the user asks for a public key, you MUST show it."""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

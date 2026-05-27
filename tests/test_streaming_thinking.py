@@ -621,6 +621,38 @@ class TestAgentLoopStream:
         assert "never remove protective wrappers" in prompt
         assert "never convert a simulated command into a live" in prompt
 
+    def test_build_request_context_prompt_bounds_bare_continuation(self):
+        """A continuation-only turn should not become an unbounded workflow loop."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.request_hints import request_is_bare_continuation
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "keep going")
+
+        assert request_is_bare_continuation("keep going") is True
+        assert request_is_bare_continuation("keep going and deploy it") is False
+        assert "[BOUNDED CONTINUATION REQUEST]:" in prompt
+        assert "at most one verifier-visible continuation unit" in prompt
+        assert "unbounded polling" in prompt
+        assert "stay within that skill family" in prompt
+
+    def test_request_context_prompt_requires_language_matched_human_summary(self):
+        """Final-output contract should keep raw tool JSON out of normal replies."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = Path("/workspace")
+        loop._extract_env_for_prompt = MagicMock(return_value="")
+
+        prompt = AgentLoop._build_request_context_prompt(loop, "请总结结果")
+
+        assert "[USER-FACING OUTPUT BOUNDARY]:" in prompt
+        assert "Match the newest user's natural language" in prompt
+        assert "Do not paste raw JSON/tool transcripts" in prompt
+
     def test_build_request_context_prompt_does_not_add_github_skill_route(self):
         """GitHub skill install intent stays in tool contracts, not prompt routes."""
         from spoon_bot.agent.loop import AgentLoop
@@ -637,6 +669,8 @@ class TestAgentLoopStream:
         prompt = AgentLoop._build_request_context_prompt(loop, message)
 
         assert "[TURN PRIORITY]:" in prompt
+        assert "[EXPLICIT USER URLS]:" in prompt
+        assert "pass the URL to the appropriate active tool whose contract covers that action" in prompt
         assert "[GITHUB SKILL INSTALL CONTEXT]:" not in prompt
         assert "skill_marketplace(action='install_skill'" not in prompt
         assert "Do not use web_fetch or git clone only to confirm SKILL.md" not in prompt
@@ -654,39 +688,23 @@ class TestAgentLoopStream:
         assert "public browser app with frontend plus API/WebSocket/backend" in source
         assert "service_expose` tool to manage the background process" in source
         assert "do not finalize with only localhost" in source
+        assert "Runtime verifiers only " in source
+        assert "trust structured tool evidence" in source
         assert "smallest local preflight" in source
         assert "[GITHUB SKILL INSTALL CONTEXT]" not in source
 
-    def test_local_service_final_answer_requires_public_exposure_recovery(self):
-        """Browser-facing service answers should not end with loopback-only access."""
-        from spoon_bot.agent.turn_verifiers import (
-            final_response_needs_public_service_exposure_recovery,
+    def test_turn_verifier_does_not_semantically_classify_service_prompts(self):
+        """Service exposure intent belongs to the agent/skill contract, not regex."""
+        import spoon_bot.agent.turn_verifiers as turn_verifiers
+
+        assert not hasattr(
+            turn_verifiers,
+            "final_response_needs_public_service_exposure_recovery",
         )
 
-        assert final_response_needs_public_service_exposure_recovery(
-            "Create a WebSocket app and start the server.",
-            "Done. Server is running at ws://localhost:8765.",
-            [],
-        ) is True
-
-    def test_public_exposure_recovery_respects_local_only_requests(self):
-        """Explicit local-only requests should not be forced through Cloudflare."""
-        from spoon_bot.agent.turn_verifiers import (
-            final_response_needs_public_service_exposure_recovery,
-        )
-
-        assert final_response_needs_public_service_exposure_recovery(
-            "Create a WebSocket app for local-only testing.",
-            "Done. Server is running at ws://localhost:8765.",
-            [],
-        ) is False
-
-    def test_verified_service_expose_public_url_satisfies_service_recovery(self):
-        """A successful service_expose public_url is sufficient completion evidence."""
-        from spoon_bot.agent.turn_verifiers import (
-            final_response_needs_public_service_exposure_recovery,
-            tool_events_have_verified_public_url,
-        )
+    def test_verified_service_expose_public_url_is_structured_evidence(self):
+        """A successful service_expose public_url is hard verifier evidence."""
+        from spoon_bot.agent.turn_verifiers import tool_events_have_verified_public_url
 
         events = [{
             "type": "tool_result",
@@ -700,32 +718,38 @@ class TestAgentLoopStream:
         }]
 
         assert tool_events_have_verified_public_url(events) is True
-        assert final_response_needs_public_service_exposure_recovery(
-            "Create a WebSocket app and start the server.",
-            "Done. Server is running at ws://localhost:8765.",
-            events,
-        ) is False
 
-    def test_public_service_exposure_recovery_prompt_is_generic(self):
-        """The internal exposure recovery prompt should rely on service evidence."""
-        from spoon_bot.agent.loop import AgentLoop
+        nested_events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "service_expose",
+                "result": json.dumps({
+                    "success": True,
+                    "service": {
+                        "tunnel": {
+                            "success": True,
+                            "public_url": "https://preview-demo.trycloudflare.com",
+                        },
+                    },
+                }),
+            },
+        }]
 
-        prompt = AgentLoop._build_public_service_exposure_recovery_prompt(
-            "Create a WebSocket app and start the server.",
-            "Server is running at ws://localhost:8765.",
-            [{
-                "type": "tool_result",
-                "metadata": {
-                    "name": "shell",
-                    "result": "python server.py is LISTENing on 0.0.0.0:8765",
-                },
-            }],
-        )
+        assert tool_events_have_verified_public_url(nested_events) is True
 
-        assert "[INTERNAL PUBLIC SERVICE EXPOSURE RECOVERY]" in prompt
-        assert "service_expose" in prompt
-        assert "success=true and a non-null public_url" in prompt
-        assert "chatroom" not in prompt.lower()
+    def test_public_url_verifier_rejects_unstructured_text_candidate(self):
+        """Verifier should not scrape URLs out of arbitrary text."""
+        from spoon_bot.agent.turn_verifiers import tool_events_have_verified_public_url
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "service_expose",
+                "result": "Visit https://candidate.trycloudflare.com in the tunnel log",
+            },
+        }]
+
+        assert tool_events_have_verified_public_url(events) is False
 
     def test_history_search_budget_recovery_prompt_is_generic(self):
         """History lookup recovery should continue the task without stale session routing."""
@@ -973,6 +997,42 @@ class TestAgentLoopStream:
 
         assert cleaned == "Completed: created the requested report."
 
+    def test_finalize_response_content_replaces_json_tool_transcript_in_chinese(self):
+        """Raw tool transcript artifacts should be converted to a Chinese human summary."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = SimpleNamespace(
+            memory=SimpleNamespace(
+                get_messages=lambda: [
+                    {
+                        "role": "tool",
+                        "content": "Read it aloud: 技能安装已完成，已加入最新游戏。",
+                    },
+                ]
+            )
+        )
+        content = (
+            '{\n  "action": "list",\n  "arguments": "Available tools"\n}\n'
+            "Output\n"
+            '{\n  "result": "Available tools that can be activated"\n}\n\n'
+            "Thought process\n\n"
+            "Tool · activate_tool\n"
+            "Input\n"
+            '{\n  "action": "activate"\n}'
+        )
+
+        cleaned = AgentLoop._finalize_response_content(
+            loop,
+            "继续，用中文总结",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert cleaned == "技能安装已完成，已加入最新游戏。"
+        assert '"action"' not in cleaned
+        assert "Output" not in cleaned
+
     def test_finalize_response_content_masks_private_key(self):
         """User-visible final content must not expose raw EVM private keys."""
         from spoon_bot.agent.loop import AgentLoop
@@ -1094,7 +1154,7 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "Internal tool details were suppressed" in cleaned
+        assert "could not derive a concise user-facing result" in cleaned
         assert "raw tool transcript" not in cleaned
         assert "Tool `list_dir` output:" not in cleaned
         assert "write_file(path=" not in cleaned
@@ -1136,7 +1196,7 @@ class TestAgentLoopStream:
             turn_memory_start_index=0,
         )
 
-        assert "Internal tool details were suppressed" in cleaned
+        assert "could not derive a concise user-facing result" in cleaned
         assert "[file: app.py | 100 chars | lines 1-10/10]" not in cleaned
         assert "content body omitted from user-visible fallback" not in cleaned
         assert "SECRET_BODY_SHOULD_NOT_BE_VISIBLE" not in cleaned
@@ -1587,11 +1647,18 @@ $CLI stats
         assert hints["explicit_request_urls"] == [
             "https://github.com/Agent-Cypher-Lab/agent-spot-cypher"
         ]
-        assert hints["explicit_request_values"] == [{
-            "value": "3KK57S",
-            "labels": ["code", "invited"],
-            "label": "Invited Code",
-        }]
+        assert hints["explicit_request_values"] == [
+            {
+                "value": "3KK57S",
+                "labels": ["code", "invited"],
+                "label": "Invited Code",
+            },
+            {
+                "value": "8004",
+                "labels": ["agent", "id"],
+                "label": "agent id",
+            },
+        ]
         assert "github_skill_install_request" not in hints
         assert "execution_workflows" not in hints
         assert "tool_call_mode" not in hints
@@ -1600,6 +1667,141 @@ $CLI stats
         context = format_explicit_request_values_context(message)
         assert "[STRUCTURED USER REQUEST FACTS]:" in context
         assert "Invited Code: 3KK57S" in context
+        assert "agent id: 8004" in context
+
+    def test_unpunctuated_invite_code_is_structured_without_route(self, tmp_path):
+        """Natural-language labeled values should flow into generic tool hints."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.request_hints import format_explicit_request_values_context
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+
+        message = (
+            "https://github.com/Agent-Cypher-Lab/agent-spot-cypher\n"
+            "Help me install the skill, use the faucet, register 8004 agent id, "
+            "and join the game. use this invite code 3KK57S"
+        )
+
+        hints = AgentLoop._build_request_execution_hints(loop, message)
+
+        assert hints["explicit_request_values"] == [
+            {
+                "value": "3KK57S",
+                "labels": ["code", "invite"],
+                "label": "invite code",
+            },
+            {
+                "value": "8004",
+                "labels": ["agent", "id"],
+                "label": "agent id",
+            },
+        ]
+        context = format_explicit_request_values_context(message)
+        assert "invite code: 3KK57S" in context
+        assert "agent id: 8004" in context
+        assert "github_skill_install_request" not in hints
+
+    def test_bare_continuation_inherits_anchor_values_and_skill_context(self, tmp_path):
+        """Continuation turns should keep prior request facts without route hardcoding."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        class Session:
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "https://github.com/example-org/example-skill\n"
+                        "Install the skill, use the faucet, register 8004 agent id, "
+                        "and join the game. use this invite code 3KK57S"
+                    ),
+                    "turn_state": "completed",
+                },
+                {"role": "assistant", "content": "Skill installed."},
+                {"role": "user", "content": "继续玩"},
+            ]
+
+            def get_messages(self):
+                return list(self.messages)
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "example-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            """---
+description: Play an example game through the local CLI.
+when_to_use: Use when the user wants to play or continue the example game.
+---
+CLI := node skills/example-skill/cli/index.js
+
+## Commands
+
+```bash
+$CLI wallet
+$CLI faucet [-c <code>]
+$CLI register <agent id>
+$CLI join [gameId]
+```
+""",
+            encoding="utf-8",
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = workspace
+        loop._skill_paths = [workspace / "skills"]
+        loop._touched_paths = set()
+        loop._session = Session()
+
+        hints = AgentLoop._build_request_execution_hints(loop, "继续玩")
+        prompt = AgentLoop._build_step_prompt(loop, "继续玩")
+
+        assert hints["explicit_request_values"] == [
+            {
+                "value": "3KK57S",
+                "labels": ["code", "invite"],
+                "label": "invite code",
+            },
+            {
+                "value": "8004",
+                "labels": ["agent", "id"],
+                "label": "agent id",
+            },
+        ]
+        assert hints["local_executable_skills"][0]["name"] == "example-skill"
+        assert "[LOCAL SKILL EXECUTION CONTEXT]:" in prompt
+        assert "node skills/example-skill/cli/index.js faucet [-c <code>]" in prompt
+        assert "invite code: 3KK57S" in prompt
+        assert "[USER REQUEST]: 继续玩" in prompt
+
+    def test_known_request_value_recovery_detects_repeat_question(self):
+        """A final answer should not ask for a value already in structured facts."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        hints = {
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invite"],
+                "label": "invite code",
+            }]
+        }
+
+        assert AgentLoop._final_answer_asks_for_known_request_value(
+            "Before I hit the faucet, do you have an invitation code?",
+            hints,
+        )
+        prompt = AgentLoop._build_known_request_value_recovery_prompt(
+            "use this invite code 3KK57S",
+            hints,
+        )
+
+        assert "do not ask the user" in prompt.casefold()
+        assert "to repeat" in prompt.casefold()
+        assert "invite code: 3KK57S" in prompt
 
     def test_request_execution_hints_do_not_treat_plain_repo_clone_as_skill_install(self, tmp_path):
         """A normal GitHub repo request should not be routed into workspace/skills."""
@@ -1724,9 +1926,427 @@ $CLI stats
             ),
         ])
 
-        assert answer == "Completed.\n\nSETTLEMENT game=116 result=WIN rank=1/4 spot=A score=10."
+        assert answer == "SETTLEMENT game=116 result=WIN rank=1/4 spot=A score=10."
         assert tx_hash not in answer
         assert "Tool `" not in answer
+
+    def test_tool_evidence_fallback_keeps_summary_language_without_boilerplate(self):
+        """Evidence fallback should not add hardcoded localized boilerplate."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer(
+            ["Read it aloud: 已安装技能并完成注册。"],
+            user_message="继续，用中文总结",
+        )
+
+        assert answer == "已安装技能并完成注册。"
+
+    def test_tool_evidence_fallback_bridges_english_summary_for_chinese_user(self):
+        """Direct tool summaries should still match a Chinese continuation cue."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer(
+            ["Read it aloud: SETTLEMENT game=196 result=DRAW."],
+            user_message="继续玩",
+        )
+
+        assert answer == "已完成：SETTLEMENT game=196 result=DRAW."
+
+    def test_tool_evidence_status_fallback_matches_chinese_user_language(self):
+        """Deterministic status fallback must not expose English boilerplate to Chinese users."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer(
+            [
+                (
+                    "APPROVED game=206 amount=20.0\n"
+                    "JOINED game=206 spot=C agentId=337\n"
+                    "SETTLEMENT game=206 result=LOSE rank=2/4 spot=C score=6 reward=0."
+                )
+            ],
+            user_message="玩一局spot游戏",
+        )
+
+        assert answer.startswith("已完成。")
+        assert "Completed" not in answer
+        assert "Latest tool evidence" not in answer
+        assert "SETTLEMENT game=206 result=LOSE" in answer
+
+    def test_tool_evidence_pending_fallback_matches_chinese_user_language(self):
+        """Pending NEXT fallback should use Chinese status labels for Chinese users."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer(
+            [
+                (
+                    "Wallet=0xabc GAS=1 GLD=2 AgentID=3\n"
+                    "NEXT: node skills/example/cli/index.js wait 206"
+                )
+            ],
+            incomplete=True,
+            user_message="继续玩",
+        )
+
+        assert answer.startswith("我先停在当前状态。")
+        assert "Pending next step" not in answer
+        assert "待执行的下一步" in answer
+
+    def test_tool_evidence_fallback_strips_tool_observation_prefix(self):
+        """Fallback blockers should not expose raw tool transcript wrappers."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer([
+            "[tool]: Observed output of cmd shell execution: Error: duplicate action failed",
+        ])
+
+        assert "[tool]" not in answer
+        assert "Observed output of cmd" not in answer
+        assert "Error: duplicate action failed" in answer
+
+    def test_tool_evidence_fallback_turns_loop_guard_into_status(self):
+        """Loop guards should not be reported as raw internal blockers."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer([
+            "STOP_TOOL_LOOP: Error: repeated side-effecting tool series suppressed.",
+        ])
+
+        assert "Paused at the current safe state" in answer
+        assert "STOP_TOOL_LOOP" not in answer
+        assert "Latest blocker" not in answer
+
+    def test_tool_evidence_fallback_turns_background_poll_guard_into_status(self):
+        """No-progress background polling should become a human status update."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer([
+            "status: running\nRecent output tail:\n(no output)",
+            (
+                "STOP_TOOL_LOOP: Error: repeated background job polling suppressed. "
+                "job_id=sh_abc123. The background job produced no new status or output signal."
+            ),
+        ])
+
+        assert "background command is still running" in answer
+        assert "sh_abc123" in answer
+        assert "STOP_TOOL_LOOP" not in answer
+        assert "Latest blocker" not in answer
+
+    def test_tool_evidence_fallback_localizes_background_poll_guard(self):
+        """Background poll guard fallback should match a Chinese continuation cue."""
+        from spoon_bot.agent.turn_verifiers import build_user_facing_tool_evidence_answer
+
+        answer = build_user_facing_tool_evidence_answer(
+            [
+                (
+                    "STOP_TOOL_LOOP: Error: repeated background job polling suppressed. "
+                    "job_id=sh_abc123."
+                ),
+            ],
+            user_message="继续玩",
+        )
+
+        assert "后台命令仍在运行" in answer
+        assert "sh_abc123" in answer
+        assert "STOP_TOOL_LOOP" not in answer
+
+    def test_tool_evidence_synthesis_brief_is_not_a_hardcoded_final_answer(self):
+        """Verifier should provide evidence for the model, not a fixed conclusion."""
+        from spoon_bot.agent.turn_verifiers import build_tool_evidence_synthesis_brief
+
+        brief = build_tool_evidence_synthesis_brief(
+            [
+                (
+                    "STOP_TOOL_LOOP: Error: repeated background job polling suppressed. "
+                    "job_id=sh_abc123."
+                ),
+            ],
+            user_message="continúa jugando",
+            incomplete=True,
+        )
+
+        assert "Newest user request:\ncontinúa jugando" in brief
+        assert "Current background job id: sh_abc123" in brief
+        assert "request as intent only" in brief
+        assert "Do not provide generic troubleshooting guides" in brief
+        assert "exact NEXT commands" in brief
+        assert "STOP_TOOL_LOOP" not in brief
+        assert "后台命令仍在运行" not in brief
+
+    def test_tool_evidence_synthesis_brief_keeps_short_continuation_language(self):
+        """Short continuation messages should still control final-answer language."""
+        from spoon_bot.agent.turn_verifiers import build_tool_evidence_synthesis_brief
+
+        brief = build_tool_evidence_synthesis_brief(
+            ["Read it aloud: Wallet status checked. Continue from latest game state."],
+            user_message="继续玩",
+            incomplete=True,
+        )
+
+        assert "Newest user request:\n继续玩" in brief
+        assert "Required response language" in brief
+        assert "contains CJK characters" in brief
+        assert "Do not answer in English" in brief
+
+    def test_tool_evidence_synthesis_brief_keeps_chronological_milestones(self):
+        """Final synthesis should see completed facts, not only the last raw line."""
+        from spoon_bot.agent.turn_verifiers import build_tool_evidence_synthesis_brief
+
+        brief = build_tool_evidence_synthesis_brief(
+            [
+                "SUCCESS: package installed",
+                "Wallet=0xabc GAS=0.0 TOKEN=0.0 AgentID=none",
+                "CLAIM status=FUNDED\nInvitation code: ABC123\nBound invitation code: USER77",
+                "Registered AGENT_ID=341 tx=0x1234",
+                (
+                    "JOINED room=202 agentId=341\n"
+                    "NEXT: node tool wait 202\n"
+                    "READY room=202 phase=Started\n"
+                    "SETTLEMENT room=202 status=finished result=WIN\n"
+                    "Read it aloud: SETTLEMENT room=202 result=WIN rank=1/4"
+                ),
+            ],
+            user_message="continue",
+        )
+
+        assert "Verified chronological evidence:" in brief
+        assert "SUCCESS: package installed" in brief
+        assert "CLAIM status=FUNDED" in brief
+        assert "Bound invitation code: USER77" in brief
+        assert "Registered AGENT_ID=341" in brief
+        assert "JOINED room=202 agentId=341" in brief
+        assert "SETTLEMENT room=202 status=finished result=WIN" in brief
+        assert "Pending next step evidence:" not in brief
+
+    def test_tool_event_synthesis_milestones_supersede_stale_errors(self):
+        """Final synthesis should preserve install evidence and not revive resolved errors."""
+        from spoon_bot.agent.turn_verifiers import (
+            build_tool_event_synthesis_brief,
+            final_answer_denies_available_tool_evidence,
+        )
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "skill_marketplace",
+                    "result": "SUCCESS: Skill 'spot-agent-cypher' installed (42 files).",
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "Wallet=0xabc GAS=0.0 GLD=0.0 AgentID=none\n"
+                        "URGENT: GAS and GLD balance is zero or missing for 0xabc"
+                    ),
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "FAUCET CLAIM: abc status=FUNDED\n"
+                        "Bound invitation code: 3KK57S\n"
+                        "Wallet=0xabc GAS=0.3 GLD=400.0 AgentID=none"
+                    ),
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "Registered AGENT_ID=346 tx=0x1234",
+                },
+            },
+        ]
+
+        brief = build_tool_event_synthesis_brief(events, user_message="continue")
+
+        assert "skill_marketplace installed skill spot-agent-cypher." in brief
+        assert "Wallet=0xabc GAS=0.3 GLD=400.0 AgentID=none" in brief
+        assert "Latest blockers:" not in brief
+        assert final_answer_denies_available_tool_evidence(
+            "No explicit installation step was recorded.",
+            events,
+        ) is True
+        assert final_answer_denies_available_tool_evidence(
+            "Installation: No evidence that dependencies were installed.",
+            events,
+        ) is True
+        assert final_answer_denies_available_tool_evidence(
+            "The wallet balance is zero, so stop here.",
+            events,
+        ) is True
+
+    def test_final_answer_missing_skill_command_syntax_is_recoverable(self):
+        """A model should not turn an active SKILL.md contract into missing syntax."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        assert AgentLoop._final_answer_claims_missing_skill_command_syntax(
+            "The exact CLI command to register and join is not present in the verified evidence."
+        ) is True
+        assert AgentLoop._final_answer_claims_missing_skill_command_syntax(
+            "No tool evidence for the registration step; those actions haven't been executed yet."
+        ) is True
+        assert AgentLoop._final_answer_claims_missing_skill_command_syntax(
+            "The latest spot game cannot be automatically run because no game ID is available."
+        ) is True
+        assert AgentLoop._final_answer_claims_missing_skill_command_syntax(
+            "The faucet is funded and the next step is registration."
+        ) is False
+
+    def test_skill_command_recovery_prompt_keeps_autonomous_placeholders(self):
+        """Autonomous skill placeholders such as <spot> should stay visible."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        events = [{
+            "type": "tool_result",
+            "metadata": {
+                "name": "shell",
+                "result": (
+                    "CLI := node skills/example/cli/index.js\n"
+                    "RUN $CLI register\n"
+                    "RUN $CLI join <spot>\n"
+                ),
+            },
+        }]
+
+        prompt = AgentLoop._build_skill_command_recovery_prompt(
+            "register and join the latest game",
+            events,
+        )
+
+        assert "node skills/example/cli/index.js join <spot>" in prompt
+
+    @pytest.mark.asyncio
+    async def test_final_answer_synthesis_uses_model_output(self):
+        """AgentLoop should ask the configured model to write final summaries."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.provider = "openrouter"
+        manager = MagicMock()
+        manager.chat = AsyncMock(return_value=MagicMock(content="Listo, sigo desde el estado actual."))
+        loop._chatbot = MagicMock(llm_manager=manager)
+
+        answer = await AgentLoop._synthesize_final_answer_from_tool_events(
+            loop,
+            [{
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "STOP_TOOL_LOOP: Error: repeated background job polling suppressed. "
+                        "job_id=sh_abc123."
+                    ),
+                },
+            }],
+            user_message="continúa jugando",
+            incomplete=True,
+            fallback_text="fallback should not be used",
+        )
+
+        assert answer == "Listo, sigo desde el estado actual."
+        manager.chat.assert_awaited_once()
+        messages = manager.chat.await_args.kwargs["messages"]
+        assert "continúa jugando" in messages[-1].content
+        assert "STOP_TOOL_LOOP" not in messages[-1].content
+
+    @pytest.mark.asyncio
+    async def test_final_answer_synthesis_falls_back_on_script_mismatch(self):
+        """A Chinese continuation should not surface an English synthesis result."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.provider = "openrouter"
+        manager = MagicMock()
+        manager.chat = AsyncMock(return_value=MagicMock(content="Current status checked."))
+        loop._chatbot = MagicMock(llm_manager=manager)
+
+        answer = await AgentLoop._synthesize_final_answer_from_tool_events(
+            loop,
+            [{
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "Read it aloud: STATUS games=10 win_rate=40%",
+                },
+            }],
+            user_message="继续玩",
+            fallback_text="已完成：STATUS games=10 win_rate=40%",
+        )
+
+        assert answer == "已完成：STATUS games=10 win_rate=40%"
+
+    @pytest.mark.asyncio
+    async def test_final_answer_synthesis_repairs_denied_available_evidence(self):
+        """A draft that denies visible tool evidence should be repaired once."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.provider = "openrouter"
+        manager = MagicMock()
+        manager.chat = AsyncMock(
+            side_effect=[
+                MagicMock(content="No steps are shown, so I can't confirm progress."),
+                MagicMock(content="Package installed, claim funded, AGENT_ID=341 joined room=202 and result=WIN."),
+            ]
+        )
+        loop._chatbot = MagicMock(llm_manager=manager)
+
+        events = [
+            {"type": "tool_result", "metadata": {"name": "shell", "result": "SUCCESS: package installed"}},
+            {"type": "tool_result", "metadata": {"name": "shell", "result": "CLAIM status=FUNDED"}},
+            {"type": "tool_result", "metadata": {"name": "shell", "result": "Registered AGENT_ID=341"}},
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "JOINED room=202 agentId=341\nSETTLEMENT room=202 status=finished result=WIN",
+                },
+            },
+        ]
+
+        answer = await AgentLoop._synthesize_final_answer_from_tool_events(
+            loop,
+            events,
+            user_message="continue",
+            fallback_text="fallback should not be used",
+        )
+
+        assert answer == "Package installed, claim funded, AGENT_ID=341 joined room=202 and result=WIN."
+        assert manager.chat.await_count == 2
+        repair_messages = manager.chat.await_args_list[-1].kwargs["messages"]
+        assert "SYNTHESIS QUALITY CHECK" in repair_messages[-1].content
+
+    @pytest.mark.asyncio
+    async def test_tool_loop_stop_guard_sets_agent_shutdown_event(self):
+        """Non-streaming runs should stop after a tool hard guardrail result."""
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_ai.schema import AgentState
+        from types import SimpleNamespace
+
+        loop = AgentLoop.__new__(AgentLoop)
+        agent = SimpleNamespace(
+            _shutdown_event=asyncio.Event(),
+            state=AgentState.RUNNING,
+            execute_tool=AsyncMock(
+                return_value=(
+                    "STOP_TOOL_LOOP: Error: repeated side-effecting tool series suppressed."
+                )
+            ),
+        )
+        loop._agent = agent
+
+        AgentLoop._install_tool_loop_stop_guard(loop)
+        result = await agent.execute_tool(MagicMock())
+
+        assert "STOP_TOOL_LOOP" in result
+        assert agent._shutdown_event.is_set()
+        assert agent.state == AgentState.FINISHED
 
     def test_tool_event_summary_marker_distinguishes_completion_from_status(self):
         """Verifier acceptance should depend on explicit user-facing tool evidence."""
@@ -1774,7 +2394,7 @@ $CLI stats
         assert tool_events_have_user_summary_marker(events) is True
         assert latest_tool_event_has_user_summary_marker(events) is True
         assert build_user_facing_tool_event_answer(events) == (
-            "Completed.\n\nSETTLEMENT game=123 result=WIN rank=1/4"
+            "SETTLEMENT game=123 result=WIN rank=1/4"
         )
 
     def test_latest_summary_marker_only_accepts_latest_tool_output(self):
@@ -1799,6 +2419,33 @@ $CLI stats
         ]
 
         assert latest_tool_event_has_user_summary_marker(events) is False
+
+    def test_latest_tool_event_has_next_command_scans_back_through_diagnostics(self):
+        """Usage-error recovery should survive later diagnostic reads with no completion."""
+        from spoon_bot.agent.turn_verifiers import latest_tool_event_has_next_command
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "STDERR:\n"
+                        "error: unknown option '--agent-id'\n\n"
+                        "Usage: node skills/example/cli/index.js register [options]"
+                    ),
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "read_file",
+                    "result": "Error: File not found: skills/example/cli/commands/register.js",
+                },
+            },
+        ]
+
+        assert latest_tool_event_has_next_command(events) is True
 
     def test_skill_install_completion_is_detected_from_skill_manager(self):
         """Install-only requests can finish from skill manager evidence."""
@@ -1834,7 +2481,7 @@ $CLI stats
         ])
 
         assert "Completed from the latest tool evidence" not in answer
-        assert "Internal tool details were suppressed" in answer
+        assert "could not derive a concise user-facing result" in answer
 
     def test_latest_tool_event_has_next_command_detects_pending_continuation(self):
         """A latest follow-up command keeps a skill workflow open until evidence completes."""
@@ -1929,6 +2576,78 @@ $CLI stats
 
         assert commands[-1] == "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
         assert has_pending_placeholder_next_command(events) is True
+
+    def test_skill_contract_filters_prose_followup_commands(self):
+        """Instruction prose should not masquerade as executable skill follow-up."""
+        from spoon_bot.agent.turn_verifiers import (
+            extract_resolved_tool_next_commands,
+            latest_tool_event_has_next_command,
+        )
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "wait\n"
+                        "Replace only placeholders with real values.\n"
+                        "NEXT: node skills/example/cli/index.js register 8004"
+                    ),
+                },
+            }
+        ]
+
+        commands = extract_resolved_tool_next_commands(events, limit=5)
+
+        assert commands == ["node skills/example/cli/index.js register 8004"]
+        assert latest_tool_event_has_next_command(events) is True
+
+    def test_skill_contract_ignores_malformed_url_log_noise(self):
+        """Verifier command extraction should not crash on malformed URL-shaped logs."""
+        from spoon_bot.agent.turn_verifiers import has_pending_placeholder_next_command
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "server at http://[::1:3000 failed\n"
+                        "Error: listen EADDRINUSE: address already in use :::3000"
+                    ),
+                },
+            }
+        ]
+
+        assert has_pending_placeholder_next_command(events) is False
+
+    def test_skill_contract_clears_placeholder_after_later_status(self):
+        """A later successful tool status should supersede stale placeholder NEXT text."""
+        from spoon_bot.agent.turn_verifiers import has_pending_placeholder_next_command
+
+        events = [
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": (
+                        "QUESTION: 3 - 5 + 7 =\n"
+                        "NEXT: node skills/example/cli/index.js faucet-answer "
+                        "abc <answer> --invitation-code 3KK57S"
+                    ),
+                },
+            },
+            {
+                "type": "tool_result",
+                "metadata": {
+                    "name": "shell",
+                    "result": "FAUCET CLAIM: fclm_123 status=FUNDED",
+                },
+            },
+        ]
+
+        assert has_pending_placeholder_next_command(events) is False
 
     def test_pending_followup_recovery_prompt_is_generic(self):
         """Placeholder recovery prompt should rely on evidence, not route literals."""
@@ -2131,8 +2850,8 @@ $CLI stats
         assert done_chunks[-1]["metadata"]["content"] == "Recovered answer."
 
     @pytest.mark.asyncio
-    async def test_stream_recovers_local_only_service_final_answer(self):
-        """A service task that ends at localhost should get one exposure recovery turn."""
+    async def test_stream_does_not_regex_recover_local_only_service_answer(self):
+        """Service exposure must come from the agent/skill path, not post-hoc regex."""
         from spoon_bot.agent.loop import AgentLoop
 
         attempts = 0
@@ -2142,11 +2861,7 @@ $CLI stats
         async def run(**kwargs):
             nonlocal attempts
             attempts += 1
-            if attempts == 1:
-                content = "Done. Server is running at ws://localhost:8765."
-                await agent._agent.output_queue.put({"content": content})
-                return MagicMock(content=content)
-            content = "Public preview: https://preview-demo.trycloudflare.com"
+            content = "Done. Server is running at ws://localhost:8765."
             await agent._agent.output_queue.put({"content": content})
             return MagicMock(content=content)
 
@@ -2166,10 +2881,9 @@ $CLI stats
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
         done = [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"]
 
-        assert attempts == 2
-        assert "https://preview-demo.trycloudflare.com" in content
-        assert "https://preview-demo.trycloudflare.com" in done
-        assert "localhost:8765" not in done
+        assert attempts == 1
+        assert "localhost:8765" in content
+        assert "localhost:8765" in done
 
     @pytest.mark.asyncio
     async def test_stream_recovers_after_history_search_budget(self):
@@ -2644,6 +3358,9 @@ $CLI stats
             + ("raw output " * 200)
         )
         agent = self._make_stream_agent([], run_result_text=raw_result)
+        manager = MagicMock()
+        manager.chat = AsyncMock(return_value=MagicMock(content="Workflow finished from verified evidence."))
+        agent._chatbot = MagicMock(llm_manager=manager)
         agent._agent.memory = SimpleNamespace(
             messages=[
                 SimpleNamespace(role="user", content="run external workflow"),
@@ -2663,12 +3380,13 @@ $CLI stats
         emitted_content = [c for c in chunks if c["type"] == "content"]
         assert emitted_content
         assert all("Step 1: Observed output" not in c["delta"] for c in emitted_content)
-        assert "Completed from the latest tool evidence" in emitted_content[0]["delta"]
+        assert "Workflow finished from verified evidence." in emitted_content[0]["delta"]
         assert "raw tool transcript" not in emitted_content[0]["delta"]
         done_chunks = [c for c in chunks if c["type"] == "done"]
-        assert "Completed from the latest tool evidence" in done_chunks[0]["metadata"]["content"]
+        assert "Workflow finished from verified evidence." in done_chunks[0]["metadata"]["content"]
         assert "raw tool transcript" not in done_chunks[0]["metadata"]["content"]
         assert "Step 1: Observed output" not in done_chunks[0]["metadata"]["content"]
+        manager.chat.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_stream_fallback_after_tool_preamble_emits_only_missing_suffix(self):
@@ -3502,7 +4220,7 @@ $CLI stats
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "The tool workflow stopped before a final answer" in content
+        assert "I paused before a final answer" in content
         assert "Latest blocker" in content
         assert "remote endpoint did not respond" in content
         assert "stopped the tool loop" not in content
@@ -3544,7 +4262,7 @@ $CLI stats
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
         errors = [c for c in chunks if c["type"] == "error"]
 
-        assert "The tool workflow stopped before a final answer" in content
+        assert "I paused before a final answer" in content
         assert "CHALLENGE PASSED task=42" in content
         assert "Pending next step" in content
         assert "node skills/example/cli/index.js finish 42" in content
@@ -3572,7 +4290,7 @@ $CLI stats
             reason="total_timeout",
         )
 
-        assert "The tool workflow stopped before a final answer" in cleaned
+        assert "I paused before a final answer" in cleaned
         assert "Latest blocker" in cleaned
         assert "EADDRINUSE" in cleaned
         assert "Server.setupListenHandle" not in cleaned
@@ -3625,8 +4343,7 @@ $CLI stats
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "The tool workflow stopped before a final answer" in content
-        assert "Internal tool details were suppressed" in content
+        assert "could not derive a concise user-facing result" in content
         assert "stopped the tool loop" not in content
 
     @pytest.mark.asyncio
@@ -3664,8 +4381,7 @@ $CLI stats
             chunks.append(chunk)
 
         content = "".join(c["delta"] for c in chunks if c["type"] == "content")
-        assert "The tool workflow stopped before a final answer" in content
-        assert "Internal tool details were suppressed" in content
+        assert "could not derive a concise user-facing result" in content
         assert "response time budget" not in content
         assert "tokenAddress" not in content
         assert [c for c in chunks if c["type"] == "done"][-1]["metadata"]["content"] == content

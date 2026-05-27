@@ -22,6 +22,31 @@ _EXECUTABLE_SUFFIXES = tuple(
     .split(os.pathsep)
     if suffix
 )
+_COMMAND_INTRO_TRAILING_WORDS = frozenset({
+    "call",
+    "cmd",
+    "command",
+    "exec",
+    "execute",
+    "invoke",
+    "next",
+    "run",
+    "try",
+})
+
+
+def _safe_url_scheme(value: str) -> str:
+    try:
+        return urlparse(value).scheme
+    except ValueError:
+        return ""
+
+
+def _looks_urlish(value: str) -> bool:
+    token = str(value or "").strip()
+    if "://" in token:
+        return True
+    return _safe_url_scheme(token) in {"http", "https"}
 
 
 def tokenize_request_matching_text(text: str) -> set[str]:
@@ -46,7 +71,10 @@ def extract_urls_from_text(text: str) -> list[str]:
     seen: set[str] = set()
     for raw in str(text or "").replace("\n", " ").split():
         candidate = raw.strip("`'\"<>()[]{}").rstrip(".,;:，。；")
-        parsed = urlparse(candidate)
+        try:
+            parsed = urlparse(candidate)
+        except ValueError:
+            continue
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             continue
         if candidate in seen:
@@ -74,6 +102,78 @@ def _last_label_fragment(label: str) -> str:
     return fragment
 
 
+_VALUE_LABEL_WORD_PATTERN = (
+    r"(?:[A-Za-z][A-Za-z0-9_-]*\s+){0,4}"
+    r"(?:address|code|id|key|name|profile|token|uri|url)"
+)
+_FORWARD_LABELED_VALUE_RE = re.compile(
+    rf"\b(?:use|using|with|provide|provided|pass|set)?\s*"
+    rf"(?:this|the|a|an)?\s*"
+    rf"(?P<label>{_VALUE_LABEL_WORD_PATTERN})\s+"
+    rf"(?:(?:is|as)\s+)?"
+    rf"(?P<value>[A-Za-z0-9][A-Za-z0-9_-]{{2,79}})\b",
+    re.IGNORECASE,
+)
+_REVERSE_LABELED_VALUE_RE = re.compile(
+    rf"\b(?P<value>[A-Za-z0-9][A-Za-z0-9_-]{{2,79}})\s+"
+    rf"(?P<label>{_VALUE_LABEL_WORD_PATTERN})\b",
+    re.IGNORECASE,
+)
+_LABELED_VALUE_STOPWORDS = frozenset({
+    "a",
+    "an",
+    "and",
+    "code",
+    "id",
+    "invite",
+    "invited",
+    "join",
+    "key",
+    "latest",
+    "name",
+    "pass",
+    "profile",
+    "provide",
+    "provided",
+    "register",
+    "set",
+    "the",
+    "this",
+    "token",
+    "use",
+    "using",
+    "with",
+})
+
+
+def _append_explicit_request_value(
+    values: list[dict[str, Any]],
+    seen: set[str],
+    *,
+    label: str,
+    value: str,
+) -> None:
+    label = _last_label_fragment(label)
+    label = re.sub(r"^(?:this|the|a|an)\s+", "", label, flags=re.IGNORECASE)
+    labels = sorted(tokenize_request_matching_text(label))
+    value = _clean_extracted_value(value)
+    if (
+        not labels
+        or value.casefold() in _LABELED_VALUE_STOPWORDS
+        or not _looks_like_user_supplied_value(value)
+    ):
+        return
+    key = value.casefold()
+    if key in seen:
+        return
+    seen.add(key)
+    values.append({
+        "value": value,
+        "labels": labels,
+        "label": label,
+    })
+
+
 def extract_explicit_request_values_from_text(text: str) -> list[dict[str, Any]]:
     """Extract user-labeled values from simple ``label: value`` request facts."""
     values: list[dict[str, Any]] = []
@@ -94,19 +194,27 @@ def extract_explicit_request_values_from_text(text: str) -> list[dict[str, Any]]
             tail_words = tail.strip().split()
             if not tail_words:
                 break
-            value = _clean_extracted_value(tail_words[0])
-            if not _looks_like_user_supplied_value(value):
-                break
-            key = value.casefold()
-            if key in seen:
-                break
-            seen.add(key)
-            values.append({
-                "value": value,
-                "labels": labels,
-                "label": label,
-            })
+            _append_explicit_request_value(
+                values,
+                seen,
+                label=label,
+                value=tail_words[0],
+            )
             break
+    for match in _FORWARD_LABELED_VALUE_RE.finditer(source):
+        _append_explicit_request_value(
+            values,
+            seen,
+            label=match.group("label"),
+            value=match.group("value"),
+        )
+    for match in _REVERSE_LABELED_VALUE_RE.finditer(source):
+        _append_explicit_request_value(
+            values,
+            seen,
+            label=match.group("label"),
+            value=match.group("value"),
+        )
     return values[:12]
 
 
@@ -150,7 +258,7 @@ def _looks_like_executable_token(token: str) -> bool:
     token = str(token or "").strip().strip("'\"")
     if not token:
         return False
-    if urlparse(token).scheme in {"http", "https"} or "://" in token:
+    if _looks_urlish(token):
         return False
     if token.startswith(("./", "../", ".\\", "..\\", "/", "\\")):
         return True
@@ -163,6 +271,7 @@ def _looks_like_executable_token(token: str) -> bool:
         return True
     return bool(
         len(token) >= 2
+        and any(char.isalpha() for char in token)
         and token == token.casefold()
         and all(char.isalnum() or char in {"_", "-", ".", "+"} for char in token)
     )
@@ -229,23 +338,81 @@ def _iter_embedded_command_candidates(line: str):
     if not stripped:
         return
     yield stripped
-    search = stripped
-    while ":" in search:
-        _, _, tail = search.partition(":")
-        candidate = tail.strip()
-        if candidate:
+    for match in re.finditer(":", stripped):
+        label = stripped[: match.start()].strip()
+        candidate = stripped[match.end() :].strip()
+        if candidate and _looks_like_command_intro_label(label):
             yield candidate
-        search = candidate
+
+
+def _iter_usage_retry_command_candidates(text: str):
+    """Yield documented retry commands after CLI option parsing failures."""
+    normalized = str(text or "")
+    lowered = normalized.casefold()
+    if not any(
+        marker in lowered
+        for marker in (
+            "unknown option",
+            "unrecognized option",
+            "invalid option",
+        )
+    ):
+        return
+
+    for raw_line in normalized.splitlines():
+        stripped = raw_line.strip()
+        if not stripped.casefold().startswith("usage:"):
+            continue
+        candidate = stripped.partition(":")[2].strip()
+        candidate = re.sub(r"\s+\[[^\]]+\]", "", candidate).strip()
+        candidate = " ".join(candidate.split())
+        if not candidate or any(marker in candidate for marker in ("<", ">", "{", "}")):
+            continue
+        yield candidate
+
+
+def _extract_shell_command_aliases(text: str) -> dict[str, str]:
+    """Extract simple command aliases from instruction text."""
+    aliases: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        stripped = raw_line.strip()
+        match = re.match(r"^(?:\$?CLI)\s*(?::=|=)\s*(.+)$", stripped)
+        if not match:
+            continue
+        command = " ".join(match.group(1).strip().split())
+        if _looks_like_shell_command(command, explicit_shell_context=True):
+            aliases["$CLI"] = command
+    return aliases
+
+
+def _looks_like_command_intro_label(label: str) -> bool:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", str(label or "").casefold())
+    if not words:
+        return False
+    return words[-1] in _COMMAND_INTRO_TRAILING_WORDS
 
 
 def extract_shell_command_candidates(text: str, *, limit: int = 8) -> list[str]:
     """Extract shell-like command candidates from free-form text generically."""
     commands: list[str] = []
     seen: set[str] = set()
+    aliases = _extract_shell_command_aliases(text)
 
     def _add(raw: str, *, explicit: bool) -> None:
         candidate = " ".join(str(raw or "").strip().split())
         candidate = candidate.strip("`").rstrip("。；;")
+        if candidate.casefold().startswith("run "):
+            candidate = candidate[4:].strip()
+            explicit = True
+        for alias, replacement in aliases.items():
+            if candidate == alias:
+                candidate = replacement
+                explicit = True
+                break
+            if candidate.startswith(alias + " "):
+                candidate = replacement + candidate[len(alias):]
+                explicit = True
+                break
         if not candidate:
             return
         if not _looks_like_shell_command(candidate, explicit_shell_context=explicit):
@@ -265,6 +432,12 @@ def extract_shell_command_candidates(text: str, *, limit: int = 8) -> list[str]:
                 _add(embedded, explicit=True)
         if len(commands) >= limit:
             break
+    if len(commands) < limit:
+        for candidate in _iter_usage_retry_command_candidates(text):
+            if 3 <= len(candidate) <= 400:
+                _add(candidate, explicit=True)
+            if len(commands) >= limit:
+                break
     return commands[:limit]
 
 
@@ -321,6 +494,102 @@ def request_needs_current_session_fact_check(message: str) -> bool:
     return has_actor_cue and any(cue in text for cue in temporal_or_dispute_cues)
 
 
+def request_is_bare_continuation(message: str) -> bool:
+    """Return True for a request that only asks to resume the active task."""
+    text = str(message or "").strip().casefold()
+    if not text:
+        return False
+    compact = re.sub(r"[\s.。!！?？,，;；:：~～…]+", " ", text).strip()
+    compact = compact.strip("`'\"()[]{}<>")
+    if not compact:
+        return False
+    return compact in {
+        "continue",
+        "continue please",
+        "go on",
+        "keep going",
+        "resume",
+        "proceed",
+        "next",
+        "继续",
+        "继续吧",
+        "继续玩",
+        "接着",
+        "接着做",
+        "接着玩",
+        "继续执行",
+        "继续游戏",
+        "继续修复",
+        "继续处理",
+    }
+
+
+def format_bare_continuation_context(message: str) -> str:
+    """Format bounded-continuation guidance for continuation-only turns."""
+    if not request_is_bare_continuation(message):
+        return ""
+    return (
+        "[BOUNDED CONTINUATION REQUEST]: The newest user message is only a "
+        "continuation cue. Resume the current task from real state, but perform "
+        "at most one verifier-visible continuation unit before returning a "
+        "concise status. A continuation cue does not authorize unbounded polling, "
+        "repeated retries, repeated external side effects, or restarting the "
+        "whole workflow. If the latest selected turn's tool evidence contains a "
+        "pending concrete NEXT command, execute that next command instead of "
+        "answering the embedded challenge or status in prose. If the current "
+        "session compact names selected skills for the latest prior turn, stay "
+        "within that skill family and do not switch to another earlier skill "
+        "unless the newest user message explicitly asks for it. Runtime timeouts "
+        "remain authoritative.\n"
+    )
+
+
+def format_explicit_request_urls_context(message: str) -> str:
+    """Format explicit user-supplied URLs as source facts, not routes."""
+    urls = extract_urls_from_text(message)
+    if not urls:
+        return ""
+    lines = ["[EXPLICIT USER URLS]:"]
+    for url in urls[:8]:
+        lines.append(f"- {url}")
+    lines.append(
+        "Treat these as literal user-provided source facts. Do not infer local "
+        "paths from URLs. If the newest request asks for a URL-backed action, "
+        "pass the URL to the appropriate active tool whose contract covers that "
+        "action; otherwise inspect it with normal tools."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_skill_install_intent_context(hints: dict[str, Any]) -> str:
+    """Format generic guidance for URL-backed skill installation requests."""
+    if not isinstance(hints, dict) or not hints.get("skill_install_intent"):
+        return ""
+
+    urls = hints.get("urls")
+    if not isinstance(urls, list):
+        urls = hints.get("explicit_request_urls")
+    github_urls = [
+        str(url).strip()
+        for url in urls
+        if isinstance(url, str)
+        and "github.com/" in url.casefold()
+        and str(url).strip()
+    ] if isinstance(urls, list) else []
+    if not github_urls:
+        return ""
+
+    lines = [
+        "[SKILL INSTALL REQUEST CONTEXT]: The newest request asks to install a skill from a GitHub URL.",
+        "Use the skill management tool directly with the user-provided URL. Do not web-fetch the repository first unless the install tool fails and the repository contents are needed to diagnose that failure.",
+    ]
+    for url in github_urls[:4]:
+        lines.append(f"- install URL: {url}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def format_current_session_fact_check_context(message: str) -> str:
     """Format the fact-check boundary for prior-action follow-up requests."""
     if not request_needs_current_session_fact_check(message):
@@ -345,6 +614,10 @@ def format_explicit_request_values_context(message: str) -> str:
     if not values:
         return ""
     lines = ["[STRUCTURED USER REQUEST FACTS]:"]
+    lines.append(
+        "Use these user-provided facts when a matching tool or skill "
+        "parameter is needed; do not ask the user to repeat them."
+    )
     for entry in values[:8]:
         if not isinstance(entry, dict):
             continue
@@ -576,6 +849,7 @@ def build_request_execution_hints(
     return {
         "explicit_request_urls": explicit_urls,
         "explicit_request_values": explicit_request_values,
+        "skill_install_intent": request_asks_to_install_skill(message_text),
         "exact_shell_commands": exact_commands,
         "restrict_to_exact_shell_commands": request_restricts_to_exact_shell_commands(
             message_text,
@@ -586,3 +860,13 @@ def build_request_execution_hints(
         ),
         "local_executable_skills": local_executable_skills[:3],
     }
+
+
+def request_asks_to_install_skill(message: str) -> bool:
+    """Return True for generic skill-install intent without binding a URL route."""
+    lowered = str(message or "").casefold()
+    install_words = ("install", "add", "安装", "装上", "安装一下")
+    skill_words = ("skill", "技能")
+    return any(word in lowered for word in install_words) and any(
+        word in lowered for word in skill_words
+    )

@@ -75,7 +75,189 @@ class TestShellTool:
 
     def test_shell_tool_does_not_infer_side_effect_series_from_command_text(self, shell_tool):
         """Shell should not guess business side effects from command words."""
-        assert not callable(getattr(shell_tool, "tool_invocation_series_key", None))
+        assert shell_tool.tool_invocation_series_key({
+            "action": "execute",
+            "command": "echo join the latest game",
+        }) is None
+
+    def test_shell_groups_repeated_skill_cli_side_effect_series(self, tmp_path):
+        """Repeated skill CLI side effects are grouped without prompt-specific routes."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "demo-skill"
+        (skill_dir / "cli").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-skill",
+                "---",
+                "CLI := node skills/demo-skill/cli/index.js",
+                "$CLI join [gameId] [spot]",
+                "$CLI wallet",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        assert shell_tool.tool_invocation_series_key({
+            "action": "execute",
+            "command": "node skills/demo-skill/cli/index.js join A",
+            "working_dir": str(workspace),
+        }) == "skill_cli:demo-skill:join:auto"
+        assert shell_tool.tool_invocation_series_key({
+            "action": "execute",
+            "command": "node skills/demo-skill/cli/index.js join 194 A",
+            "working_dir": str(workspace),
+        }) == "skill_cli:demo-skill:join:explicit"
+        assert shell_tool.tool_invocation_series_key({
+            "action": "execute",
+            "command": "node skills/demo-skill/cli/index.js wallet",
+            "working_dir": str(workspace),
+        }) is None
+        assert shell_tool.tool_invocation_series_key({
+            "action": "execute",
+            "command": "node skills/demo-skill/cli/index.js join spot",
+            "working_dir": str(workspace),
+        }) is None
+
+    def test_shell_read_only_skill_cli_uses_soft_exact_dedup(self, tmp_path):
+        """Repeated skill inspections should skip execution without a hard stop."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "demo-skill"
+        (skill_dir / "cli").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-skill",
+                "---",
+                "CLI := node skills/demo-skill/cli/index.js",
+                "$CLI wallet",
+                "$CLI join [gameId] [spot]",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        assert shell_tool.tool_invocation_dedup_key({
+            "action": "execute",
+            "command": "node skills/demo-skill/cli/index.js wallet",
+            "working_dir": str(workspace),
+        }) is not None
+        assert shell_tool.tool_invocation_dedup_key({
+            "action": "execute",
+            "command": "node skills/demo-skill/cli/index.js join 1 C",
+            "working_dir": str(workspace),
+        }) is not None
+
+    def test_shell_rejects_literal_skill_placeholder_argument(self, tmp_path):
+        """Skill placeholder labels should not be passed as literal CLI values."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "demo-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: demo-skill",
+                "---",
+                "CLI := node skills/demo-skill/cli/index.js",
+                "$CLI join [gameId] [spot]",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        result = shell_tool._reject_undocumented_skill_cli_arguments(
+            "node skills/demo-skill/cli/index.js join spot",
+            str(workspace),
+        )
+
+        assert result is not None
+        assert "placeholder label passed literally" in result
+
+    @pytest.mark.asyncio
+    async def test_shell_suppresses_repeated_skill_cli_side_effect_series(self, tmp_path):
+        """A request should not run the same skill side-effect series indefinitely."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool.execute = AsyncMock(return_value="ok")  # type: ignore[method-assign]
+
+        with track_tool_invocations(max_series_repeats=2):
+            first = await shell_tool(
+                command="node skills/demo-skill/cli/index.js join 193 A",
+                working_dir=str(workspace),
+            )
+            second = await shell_tool(
+                command="node skills/demo-skill/cli/index.js join 194 A",
+                working_dir=str(workspace),
+            )
+            third = await shell_tool(
+                command="node skills/demo-skill/cli/index.js join 195 B",
+                working_dir=str(workspace),
+            )
+
+        assert first == "ok"
+        assert second == "ok"
+        assert "repeated side-effecting tool series suppressed" in third
+        assert shell_tool.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_shell_allows_auto_join_then_explicit_join_after_challenge(self, tmp_path):
+        """A challenge-producing auto join and explicit join are distinct CLI phases."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool.execute = AsyncMock(return_value="ok")  # type: ignore[method-assign]
+
+        with track_tool_invocations(max_series_repeats=2):
+            auto_join = await shell_tool(
+                command="node skills/demo-skill/cli/index.js join A",
+                working_dir=str(workspace),
+            )
+            explicit_join = await shell_tool(
+                command="node skills/demo-skill/cli/index.js join 201 A",
+                working_dir=str(workspace),
+            )
+
+        assert auto_join == "ok"
+        assert explicit_join == "ok"
+        assert shell_tool.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_shell_allows_repeated_transient_challenge_requests(self, tmp_path):
+        """Challenge issuance can be retried while answer/submit actions stay guarded."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool.execute = AsyncMock(return_value="challenge")  # type: ignore[method-assign]
+
+        with track_tool_invocations(max_repeats=1, max_series_repeats=1):
+            first = await shell_tool(
+                command="node skills/demo-skill/cli/index.js faucet --invitation-code ABC",
+                working_dir=str(workspace),
+            )
+            second = await shell_tool(
+                command="node skills/demo-skill/cli/index.js faucet --invitation-code ABC",
+                working_dir=str(workspace),
+            )
+
+        assert first == "challenge"
+        assert second == "challenge"
+        assert shell_tool.execute.await_count == 2
 
     def test_shell_detects_workspace_skill_commands_for_timeout_floor(self, tmp_path):
         """Workspace skill CLI commands should keep the default foreground budget."""
@@ -133,8 +315,39 @@ class TestShellTool:
             },
         }
 
+    def test_shell_does_not_treat_skill_directory_listing_as_skill_cli(self, tmp_path):
+        """Listing a skill path is inspection, not execution of that skill."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        command = (
+            f"ls '{(workspace / 'skills').as_posix()}/' 2>/dev/null "
+            f"&& echo '---' "
+            f"&& ls '{skill_dir.as_posix()}/' 2>/dev/null "
+            "|| echo 'Skill not found'"
+        )
+
+        key = shell_tool.tool_invocation_dedup_key({
+            "action": "execute",
+            "command": command,
+            "working_dir": str(workspace),
+        })
+
+        assert isinstance(key, dict)
+        assert "skill_cli" not in key
+        assert shell_tool._command_invokes_workspace_skill(command, str(workspace)) is False
+        assert shell_tool._command_is_read_only_inspection(command, str(workspace), key) is True
+        assert shell_tool.format_duplicate_invocation_result(
+            "STOP_TOOL_LOOP: duplicate tool invocation suppressed",
+            {"action": "execute", "command": command, "working_dir": str(workspace)},
+            key,
+        ).startswith("Repeated shell inspection skipped")
+
     @pytest.mark.asyncio
-    async def test_repeated_workspace_skill_cli_is_suppressed(self, tmp_path):
+    async def test_repeated_workspace_skill_cli_inspection_is_soft_deduped(self, tmp_path):
         """Repeated skill CLI status-style calls should stay recoverable."""
         from spoon_bot.agent.tools.execution_context import track_tool_invocations
         from spoon_bot.agent.tools.shell import ShellTool
@@ -166,9 +379,7 @@ class TestShellTool:
 
         with track_tool_invocations(max_repeats=1):
             first = await shell_tool(command="sh skills/demo-skill/cli/index.sh wallet")
-            second = await shell_tool(
-                command="cd skills/demo-skill/cli && sh index.sh wallet 2>&1"
-            )
+            second = await shell_tool(command="sh skills/demo-skill/cli/index.sh wallet")
 
         assert "wallet status" in first
         assert "Repeated shell inspection skipped" in second
@@ -309,6 +520,24 @@ class TestShellTool:
         )
 
         assert result is None
+
+    def test_shell_rejects_github_clone_for_skill_install_request(self, tmp_path):
+        """Skill install intent should use skill_marketplace even outside skills/."""
+        from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        shell_tool = ShellTool(working_dir=str(workspace))
+
+        with bind_request_execution_hints({"skill_install_intent": True}):
+            result = shell_tool._reject_workspace_skill_clone(
+                "git clone https://github.com/example-org/example-skill.git",
+                str(workspace),
+            )
+
+        assert result is not None
+        assert "skill_marketplace(action='install_skill'" in result
 
     def test_shell_rejects_undocumented_skill_cli_flag(self, tmp_path):
         """Skill CLI commands must not invent flags from user wording."""
@@ -692,6 +921,186 @@ class TestShellTool:
 
         assert augmented.endswith("faucet -c 3KK57S")
 
+    def test_shell_augments_skill_cli_from_reference_command_template(self, tmp_path):
+        """Reference docs linked by SKILL.md should contribute command templates."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        (skill_dir / "references").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "see references/faucet.md",
+                "RUN $CLI faucet",
+            ]),
+            encoding="utf-8",
+        )
+        (skill_dir / "references" / "faucet.md").write_text(
+            "$CLI faucet --invitation-code <code>\n",
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._request_execution_hints = {
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invite"],
+                "label": "invite code",
+            }]
+        }
+
+        augmented = shell_tool._augment_skill_cli_labeled_values(
+            "node skills/spot-agent-cypher/cli/index.js faucet",
+            str(workspace),
+        )
+
+        assert augmented.endswith("faucet --invitation-code 3KK57S")
+
+    def test_shell_repairs_unsupported_skill_cli_flag_from_reference_template(self, tmp_path):
+        """Unsupported value flags are rewritten only when SKILL.md documents the target."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        (skill_dir / "references").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "see references/faucet.md",
+                "RUN $CLI faucet",
+            ]),
+            encoding="utf-8",
+        )
+        (skill_dir / "references" / "faucet.md").write_text(
+            "$CLI faucet --invitation-code <code>\n",
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._request_execution_hints = {
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invite"],
+                "label": "invite code",
+            }]
+        }
+
+        augmented = shell_tool._augment_skill_cli_labeled_values(
+            "node skills/spot-agent-cypher/cli/index.js faucet --invite 3KK57S",
+            str(workspace),
+        )
+
+        assert augmented.endswith("faucet --invitation-code 3KK57S")
+
+    def test_shell_repairs_skill_cli_flag_after_cd_chain(self, tmp_path):
+        """The same command repair works for the common cd && node cli form."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        (skill_dir / "references").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "see references/faucet.md",
+                "RUN $CLI faucet",
+            ]),
+            encoding="utf-8",
+        )
+        (skill_dir / "references" / "faucet.md").write_text(
+            "$CLI faucet --invitation-code <code>\n",
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._request_execution_hints = {
+            "explicit_request_values": [{
+                "value": "3KK57S",
+                "labels": ["code", "invite"],
+                "label": "invite code",
+            }]
+        }
+
+        augmented = shell_tool._augment_skill_cli_labeled_values(
+            "cd skills/spot-agent-cypher && node cli/index.js faucet --invite 3KK57S",
+            str(workspace),
+        )
+
+        assert augmented.endswith("node cli/index.js faucet --invitation-code 3KK57S")
+
+    def test_shell_augments_missing_skill_cli_positional_from_labeled_request_value(self, tmp_path):
+        """Documented positional values can be filled from structured request facts."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "$CLI register <agent id>",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._request_execution_hints = {
+            "explicit_request_values": [{
+                "value": "8004",
+                "labels": ["agent", "id"],
+                "label": "agent id",
+            }]
+        }
+
+        augmented = shell_tool._augment_skill_cli_labeled_values(
+            "node skills/spot-agent-cypher/cli/index.js register",
+            str(workspace),
+        )
+
+        assert augmented.endswith("register 8004")
+
+    def test_shell_repairs_unsupported_skill_cli_flag_to_documented_positional(self, tmp_path):
+        """A request-labeled value flag can be folded into a documented positional."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        skill_dir = workspace / "skills" / "spot-agent-cypher"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "\n".join([
+                "---",
+                "name: spot-agent-cypher",
+                "---",
+                "CLI := node skills/spot-agent-cypher/cli/index.js",
+                "$CLI register <agent id>",
+            ]),
+            encoding="utf-8",
+        )
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._request_execution_hints = {
+            "explicit_request_values": [{
+                "value": "8004",
+                "labels": ["agent", "id"],
+                "label": "agent id",
+            }]
+        }
+
+        augmented = shell_tool._augment_skill_cli_labeled_values(
+            "node skills/spot-agent-cypher/cli/index.js register --agent-id 8004",
+            str(workspace),
+        )
+
+        assert augmented.endswith("register 8004")
+
     def test_shell_allows_long_flag_alias_matching_documented_value_label(self, tmp_path):
         """Skill-emitted long flag aliases are accepted when their label matches."""
         from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
@@ -763,7 +1172,7 @@ class TestShellTool:
 
     @pytest.mark.asyncio
     async def test_background_job_status_can_be_polled_repeatedly_in_request_scope(self, shell_tool):
-        """The generic duplicate guard should not block repeated status reads."""
+        """Repeated background polling is allowed briefly, then bounded if unchanged."""
         from spoon_bot.agent.tools.execution_context import track_tool_invocations
         from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
 
@@ -797,10 +1206,51 @@ class TestShellTool:
         with track_tool_invocations(max_repeats=1):
             first = await shell_tool(action="job_status", job_id=job.job_id)
             second = await shell_tool(action="job_status", job_id=job.job_id)
+            third = await shell_tool(action="job_output", job_id=job.job_id)
 
         assert "job_id: sh_polljob" in first
         assert "job_id: sh_polljob" in second
         assert "STOP_TOOL_LOOP" not in second
+        assert "repeated background job polling suppressed" in third
+        assert "job_id=sh_polljob" in third
+
+    @pytest.mark.asyncio
+    async def test_background_job_poll_guard_resets_when_output_changes(self, shell_tool):
+        """Background poll guard should be based on progress, not action count alone."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import _BackgroundShellJob, _SHELL_BACKGROUND_JOBS
+
+        class _FakeProcess:
+            returncode = None
+
+            async def wait(self):
+                return None
+
+        _SHELL_BACKGROUND_JOBS.clear()
+        stdout_task = asyncio.create_task(asyncio.sleep(0))
+        stderr_task = asyncio.create_task(asyncio.sleep(0))
+        job = _BackgroundShellJob(
+            job_id="sh_progressjob",
+            command="echo hello",
+            cwd=os.getcwd(),
+            process=_FakeProcess(),
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            buffer_limit=1000,
+            stdout_text="line one",
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+
+        with track_tool_invocations(max_repeats=1):
+            first = await shell_tool(action="job_output", job_id=job.job_id)
+            second = await shell_tool(action="job_output", job_id=job.job_id)
+            job.stdout_text += "\nline two"
+            third = await shell_tool(action="job_output", job_id=job.job_id)
+
+        assert "line one" in first
+        assert "STOP_TOOL_LOOP" not in second
+        assert "line two" in third
+        assert "STOP_TOOL_LOOP" not in third
 
     @pytest.mark.asyncio
     async def test_refresh_completed_job_does_not_hang_on_open_child_pipes(self, shell_tool):
@@ -1118,8 +1568,9 @@ class TestShellTool:
             rate_limit_config=RateLimitConfig.unlimited(),
         )
 
+        python_exe = str(Path(sys.executable))
         result = await tool.execute(
-            "python -c \"print(open('marker.txt').read())\"",
+            f"\"{python_exe}\" -c \"print(open('marker.txt').read())\"",
             working_dir=".",
         )
 

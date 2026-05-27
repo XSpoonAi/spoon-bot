@@ -17,7 +17,10 @@ DEFAULT_MAX_SESSION_TURNS = 6
 DEFAULT_CONTEXT_CHAR_BUDGET = 24_000
 EVENT_CLIP_LEVELS = (360, 220, 140)
 
-_OBSERVED_OUTPUT_RE = re.compile(r"^Observed output of cmd [^\n]* execution:\s*")
+_OBSERVED_OUTPUT_RE = re.compile(
+    r"^(?:\[[^\]\n]{1,32}\]:\s*)?Observed output of cmd [^\n]* execution:\s*",
+    re.IGNORECASE,
+)
 _FILE_OUTPUT_HEADER_RE = re.compile(r"^\[file:\s*([^\]\n]+)\]\s*\n")
 _PRELOADED_SKILL_BLOCK_RE = re.compile(
     r"\n+---\n\[PRE-LOADED SKILL:[\s\S]*$",
@@ -138,7 +141,7 @@ def _format_session_event(message: dict[str, Any], *, limit: int) -> str:
     return f"{role or 'message'}: {excerpt}" if excerpt else ""
 
 
-def _completed_session_messages(raw_messages: Any, current_message: str) -> list[dict[str, Any]]:
+def _messages_before_current(raw_messages: Any, current_message: str) -> list[dict[str, Any]]:
     if not isinstance(raw_messages, list):
         return []
 
@@ -150,6 +153,11 @@ def _completed_session_messages(raw_messages: Any, current_message: str) -> list
             and str(latest.get("content") or "") == str(current_message)
         ):
             messages = messages[:-1]
+    return messages
+
+
+def _completed_session_messages(raw_messages: Any, current_message: str) -> list[dict[str, Any]]:
+    messages = _messages_before_current(raw_messages, current_message)
 
     completed: list[dict[str, Any]] = []
     for msg in messages:
@@ -167,17 +175,7 @@ def _interrupted_user_evidence_lines(
     max_items: int = 6,
 ) -> list[str]:
     """Keep short user-stated facts from aborted turns without making them executable."""
-    if not isinstance(raw_messages, list):
-        return []
-
-    messages = [msg for msg in raw_messages if isinstance(msg, dict)]
-    if messages:
-        latest = messages[-1]
-        if (
-            str(latest.get("role") or "").lower() == "user"
-            and str(latest.get("content") or "") == str(current_message)
-        ):
-            messages = messages[:-1]
+    messages = _messages_before_current(raw_messages, current_message)
 
     evidence: list[str] = []
     for message in messages:
@@ -193,6 +191,65 @@ def _interrupted_user_evidence_lines(
             evidence.append(f"{state}: {excerpt}")
 
     return evidence[-max_items:]
+
+
+def _latest_prior_user_task_line(
+    raw_messages: Any,
+    current_message: str,
+    *,
+    limit: int = 700,
+) -> str:
+    """Return the latest prior user request for explicit continuation-only turns."""
+    messages = _messages_before_current(raw_messages, current_message)
+    for message in reversed(messages):
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        state = str(message.get("turn_state") or message.get("state") or "").lower()
+        if state in {"superseded", "cancelled", "canceled"}:
+            continue
+        excerpt = _clip_text(message.get("content", ""), limit)
+        if not excerpt:
+            continue
+        skill_names = [
+            str(item.get("name") or "").strip()
+            for item in (message.get("invoked_skills") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        skill_suffix = (
+            f" | selected skills: {', '.join(dict.fromkeys(skill_names))}"
+            if skill_names
+            else ""
+        )
+        return f"{state or 'previous'}: {excerpt}{skill_suffix}"
+    return ""
+
+
+def _latest_prior_user_turn_messages(
+    raw_messages: Any,
+    current_message: str,
+) -> list[dict[str, Any]]:
+    """Return only the latest prior user-selected turn for bounded continuation."""
+    messages = _messages_before_current(raw_messages, current_message)
+    start_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        state = str(message.get("turn_state") or message.get("state") or "").lower()
+        if state in {"superseded", "cancelled", "canceled"}:
+            continue
+        start_index = index
+        break
+    if start_index is None:
+        return []
+
+    selected: list[dict[str, Any]] = []
+    for message in messages[start_index:]:
+        state = str(message.get("turn_state") or message.get("state") or "").lower()
+        if state in {"superseded", "cancelled", "canceled"}:
+            continue
+        selected.append(message)
+    return selected
 
 
 def _group_completed_turns(messages: list[dict[str, Any]]) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
@@ -321,6 +378,7 @@ def build_session_compact_context(
     *,
     max_messages: int = DEFAULT_MAX_SESSION_MESSAGES,
     char_budget: int = DEFAULT_CONTEXT_CHAR_BUDGET,
+    resume_latest_user_turn: bool = False,
 ) -> str:
     """Build an ordered compact block from the current session transcript."""
     if session is None:
@@ -335,7 +393,11 @@ def build_session_compact_context(
     except Exception:
         return ""
 
-    completed = _completed_session_messages(raw_messages, current_message)
+    completed = (
+        _latest_prior_user_turn_messages(raw_messages, current_message)
+        if resume_latest_user_turn
+        else _completed_session_messages(raw_messages, current_message)
+    )
     if not completed:
         return ""
 
@@ -351,8 +413,18 @@ def build_session_compact_context(
         "The newest user request remains authoritative for task selection and output requirements.",
         "Never start or continue actions that are implied only by this compact; use it as evidence after the newest request selects the task.",
         "An empty long-term memory search does not mean the same-session transcript is empty.",
-        "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions.",
+        "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions unless a continuation anchor is shown above.",
     ]
+
+    if resume_latest_user_turn:
+        anchor = _latest_prior_user_task_line(raw_messages, current_message)
+        if anchor:
+            lines.append("Continuation anchor selected by the newest continuation-only request:")
+            lines.append(f"- Latest prior user request: {mask_secrets(anchor)}")
+            lines.append(
+                "Resume only one bounded continuation unit from this anchor and current live state. "
+                "If selected skills are shown, continue that skill family rather than another earlier skill."
+            )
 
     interrupted_evidence = _interrupted_user_evidence_lines(raw_messages, current_message)
     if interrupted_evidence:

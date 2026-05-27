@@ -12,7 +12,6 @@ from typing import Any
 
 from spoon_ai.tools.base import BaseTool
 
-
 _SCRIPT = Path(__file__).resolve().parent / "scripts" / "service_expose.py"
 
 
@@ -24,7 +23,11 @@ class ServiceExposeTool(BaseTool):
         "Start, stop, inspect, and Cloudflare-expose local frontend/backend "
         "preview services. Use for local URLs, WebSocket apps, public "
         "links, trycloudflare/cloudflare tunnels, and follow-up requests asking "
-        "for the current preview link. Prefer this tool over manual background "
+        "for the current preview link. When a user asks to create and start, "
+        "deploy, preview, share, open, or make a service accessible, use this "
+        "tool with action=start and start_tunnel=true unless the user explicitly "
+        "asked for local-only access; a localhost URL alone is only an "
+        "intermediate state. Prefer this tool over manual background "
         "shell commands for preview services. Supports free-port selection with "
         "port=0 and app-specific URL verification via verify_text. Only report "
         "a public link when the tool result has success=true and public_url is "
@@ -85,7 +88,11 @@ class ServiceExposeTool(BaseTool):
             },
             "start_tunnel": {
                 "type": "boolean",
-                "description": "Start Cloudflare tunnel after service start.",
+                "description": (
+                    "Start Cloudflare tunnel after service start. Defaults to "
+                    "true for action=start unless explicitly set false for a "
+                    "local-only request."
+                ),
             },
             "replace": {
                 "type": "boolean",
@@ -148,6 +155,8 @@ class ServiceExposeTool(BaseTool):
     async def execute(self, **kwargs: Any) -> str:
         timeout = 90
         action = str(kwargs.get("action") or "").strip().lower()
+        if action == "start" and "start_tunnel" not in kwargs:
+            kwargs["start_tunnel"] = True
         if action in {"start", "tunnel", "expose", "start_tunnel"} or kwargs.get("start_tunnel"):
             tunnel_wait = int(kwargs.get("tunnel_wait_seconds") or 60)
             verify_wait = int(kwargs.get("verify_wait_seconds") or 20)

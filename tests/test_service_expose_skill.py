@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import io
+import json
 import os
 import socket
 import subprocess
@@ -236,10 +237,13 @@ def test_service_expose_tool_exposes_structured_schema() -> None:
     tool = module.ServiceExposeTool()
     assert tool.name == "service_expose"
     assert "manual background shell commands" in tool.description
+    assert "start_tunnel=true" in tool.description
+    assert "localhost URL alone is only an intermediate state" in tool.description
     assert "public_readiness.blocking=true" in tool.description
     assert "same public origin" in tool.description
     assert "port" in tool.parameters["properties"]
     assert "verify_text" in tool.parameters["properties"]
+    assert "Defaults to true" in tool.parameters["properties"]["start_tunnel"]["description"]
     assert tool.parameters["properties"]["action"]["enum"] == [
         "start",
         "tunnel",
@@ -252,6 +256,86 @@ def test_service_expose_tool_exposes_structured_schema() -> None:
         "stop",
         "stop_tunnel",
     ]
+
+
+def test_service_expose_skill_contract_requires_tunnel_for_accessible_services() -> None:
+    skill_md = (
+        PROJECT_ROOT
+        / "spoon_bot"
+        / "skills"
+        / "builtin"
+        / "service_expose"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Cloudflare exposure is part of completion" in skill_md
+    assert "start_tunnel=true" in skill_md
+    assert "local URL, localhost port, PID, or background process alone is an intermediate state" in skill_md
+
+
+def test_service_expose_tool_defaults_start_to_cloudflare_tunnel(monkeypatch) -> None:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    tools_path = PROJECT_ROOT / "spoon_bot" / "skills" / "builtin" / "service_expose" / "tools.py"
+    spec = spec_from_file_location("service_expose_tools_default", tools_path)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    captured: list[dict] = []
+
+    def fake_run(argv, input, **kwargs):
+        captured.append(json.loads(input))
+        return subprocess.CompletedProcess(argv, 0, stdout='{"success": true}', stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = asyncio.run(
+        module.ServiceExposeTool().execute(
+            action="start",
+            name="demo",
+            command="python server.py",
+            cwd=str(PROJECT_ROOT),
+            port=0,
+            tunnel_wait_seconds=1,
+            verify_wait_seconds=0,
+            startup_wait_seconds=0,
+        )
+    )
+
+    assert json.loads(result)["success"] is True
+    assert captured[0]["start_tunnel"] is True
+
+
+def test_service_expose_tool_respects_explicit_local_only_start(monkeypatch) -> None:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    tools_path = PROJECT_ROOT / "spoon_bot" / "skills" / "builtin" / "service_expose" / "tools.py"
+    spec = spec_from_file_location("service_expose_tools_local_only", tools_path)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    captured: list[dict] = []
+
+    def fake_run(argv, input, **kwargs):
+        captured.append(json.loads(input))
+        return subprocess.CompletedProcess(argv, 0, stdout='{"success": true}', stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    asyncio.run(
+        module.ServiceExposeTool().execute(
+            action="start",
+            name="demo",
+            command="python server.py",
+            cwd=str(PROJECT_ROOT),
+            port=0,
+            start_tunnel=False,
+        )
+    )
+
+    assert captured[0]["start_tunnel"] is False
 
 
 def test_service_expose_public_readiness_warns_for_local_only_sibling(monkeypatch, tmp_path: Path) -> None:

@@ -51,6 +51,59 @@ def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence(
     assert "Do not search for alternatives" not in compact
 
 
+def test_session_compact_adds_anchor_for_bare_continuation_only() -> None:
+    session = DummySession(
+        [
+            {
+                "role": "user",
+                "content": "Help me answer a binary challenge.",
+                "turn_state": "completed",
+            },
+            {
+                "role": "tool",
+                "name": "shell",
+                "content": (
+                    "Observed output of cmd shell execution: "
+                    "QUESTION: Determine how many 1-bits appear in 480950896. "
+                    "NEXT: node skills/old-skill/cli/index.js challenge-answer 15"
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "The answer is 15.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "https://github.com/example-org/example-skill\n"
+                    "Help me install the skill and join the latest game."
+                ),
+                "turn_state": "completed",
+                "invoked_skills": [{"name": "example-skill"}],
+            },
+            {
+                "role": "assistant",
+                "content": "The tool workflow stopped before a final answer.",
+            },
+        ]
+    )
+
+    regular = build_session_compact_context(session, "What happened?")
+    continuation = build_session_compact_context(
+        session,
+        "继续玩",
+        resume_latest_user_turn=True,
+    )
+
+    assert "Continuation anchor selected" not in regular
+    assert "Continuation anchor selected" in continuation
+    assert "https://github.com/example-org/example-skill" in continuation
+    assert "selected skills: example-skill" in continuation
+    assert "continue that skill family" in continuation
+    assert "480950896" not in continuation
+    assert "Resume only one bounded continuation unit" in continuation
+
+
 def test_session_compact_omits_file_body_from_tool_evidence() -> None:
     session = DummySession(
         [

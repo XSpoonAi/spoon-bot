@@ -282,19 +282,98 @@ class TestToolProfileSkillManagement:
         assert "Agent-Cypher-Lab" not in context
 
     def test_github_skill_install_is_not_request_routed(self):
-        from spoon_bot.agent.request_hints import build_request_execution_hints
+        from spoon_bot.agent.request_hints import (
+            build_request_execution_hints,
+            format_skill_install_intent_context,
+        )
 
         hints = build_request_execution_hints(
             "https://github.com/example-org/example-skill install the skill in this repo",
             [],
         )
+        context = format_skill_install_intent_context(hints)
 
         assert hints["explicit_request_urls"] == [
             "https://github.com/example-org/example-skill"
         ]
+        assert hints["skill_install_intent"] is True
+        assert "[SKILL INSTALL REQUEST CONTEXT]:" in context
+        assert "skill management tool directly" in context
+        assert "https://github.com/example-org/example-skill" in context
         assert "github_skill_install_request" not in hints
         assert "execution_workflows" not in hints
         assert "tool_call_mode" not in hints
+
+    def test_malformed_url_text_does_not_become_shell_followup(self):
+        from spoon_bot.agent.request_hints import (
+            extract_shell_command_candidates,
+            extract_urls_from_text,
+        )
+
+        text = (
+            "server at http://[::1:3000 failed\n"
+            "Error: listen EADDRINUSE: address already in use :::3000\n"
+            "Open https://github.com/example-org/example-skill then continue"
+        )
+
+        assert extract_shell_command_candidates(text) == []
+        assert extract_urls_from_text(text) == [
+            "https://github.com/example-org/example-skill"
+        ]
+
+    def test_command_intro_extracts_followup_without_error_log_noise(self):
+        from spoon_bot.agent.request_hints import extract_shell_command_candidates
+
+        text = (
+            "Error: listen EADDRINUSE: address already in use :::3000\n"
+            "ACTION REQUIRED: decide a spot and run: "
+            "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
+        )
+
+        assert extract_shell_command_candidates(text) == [
+            "node skills/example/cli/index.js join 145 <A|B|C|D|E>"
+        ]
+
+    def test_shell_command_candidates_expand_skill_cli_run_alias(self):
+        from spoon_bot.agent.request_hints import extract_shell_command_candidates
+
+        text = (
+            "CLI := node skills/spot-agent-cypher/cli/index.js\n"
+            "IF AgentID=none:\n"
+            "  RUN $CLI register\n"
+            "RUN $CLI join <spot>\n"
+        )
+
+        commands = extract_shell_command_candidates(text, limit=10)
+
+        assert "node skills/spot-agent-cypher/cli/index.js register" in commands
+        assert "node skills/spot-agent-cypher/cli/index.js join <spot>" in commands
+
+    def test_unknown_option_usage_extracts_documented_retry_command(self):
+        from spoon_bot.agent.request_hints import extract_shell_command_candidates
+
+        text = (
+            "STDERR:\n"
+            "error: unknown option '--agent-id'\n\n"
+            "Usage: node skills/example/cli/index.js register [options]\n\n"
+            "Options:\n"
+            "  -h, --help  display help for command"
+        )
+
+        assert extract_shell_command_candidates(text) == [
+            "node skills/example/cli/index.js register"
+        ]
+
+    def test_usage_without_option_error_is_not_a_followup_command(self):
+        from spoon_bot.agent.request_hints import extract_shell_command_candidates
+
+        text = (
+            "Usage: node skills/example/cli/index.js register [options]\n\n"
+            "Options:\n"
+            "  -h, --help  display help for command"
+        )
+
+        assert extract_shell_command_candidates(text) == []
 
     def test_agent_loop_has_no_request_scoped_activation_hook(self):
         from spoon_bot.agent.loop import AgentLoop
