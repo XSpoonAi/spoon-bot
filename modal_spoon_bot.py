@@ -25,6 +25,7 @@ import modal
 APP_NAME = os.environ.get("MODAL_SPOON_BOT_APP", "spoon-bot-deepseek-v4")
 VOLUME_NAME = os.environ.get("MODAL_SPOON_BOT_VOLUME", f"{APP_NAME}-data")
 SECRET_NAME = os.environ.get("MODAL_SPOON_BOT_SECRET", "spoon-bot-openrouter")
+FUNCTION_TIMEOUT = int(os.environ.get("MODAL_SPOON_BOT_FUNCTION_TIMEOUT", "3600"))
 RUNTIME_SECRET_KEYS = (
     "TAVILY_API_KEY",
     "SANDBOX_PROVIDER",
@@ -72,6 +73,7 @@ if runtime_secret_values:
 @app.function(
     secrets=function_secrets,
     volumes={"/modal-data": data_volume},
+    timeout=FUNCTION_TIMEOUT,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=20)
