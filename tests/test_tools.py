@@ -474,7 +474,64 @@ class TestShellTool:
 
         compat_wallet = Path(env["HOME"]) / ".agent-wallet"
         assert compat_wallet.resolve() == wallet_root.resolve()
+        assert env["AGENT_WALLET_DIR"] == str(wallet_root.resolve())
         assert env.get("PRIVATE_KEY") is None
+
+    def test_shell_aligns_cd_skill_cli_home_to_active_wallet_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Skill CLIs invoked after cd should still see the active wallet root."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        (workspace / "skills" / "demo-skill" / "cli").mkdir(parents=True)
+        (workspace / "skills" / "demo-skill" / "cli" / "index.js").write_text(
+            "",
+            encoding="utf-8",
+        )
+        (workspace / "skills" / "demo-skill" / "SKILL.md").write_text(
+            "---\nname: demo-skill\n---\n",
+            encoding="utf-8",
+        )
+        wallet_root = tmp_path / "wallet-root"
+        wallet_root.mkdir()
+        monkeypatch.setenv("SPOON_BOT_WALLET_PATH", str(wallet_root))
+        monkeypatch.delenv("PRIVATE_KEY", raising=False)
+
+        env = dict(os.environ)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._align_wallet_home_for_command(
+            env,
+            "cd skills/demo-skill/cli && node index.js wallet 2>&1",
+            str(workspace),
+        )
+
+        assert (Path(env["HOME"]) / ".agent-wallet").resolve() == wallet_root.resolve()
+        assert env["AGENT_WALLET_DIR"] == str(wallet_root.resolve())
+        assert env.get("PRIVATE_KEY") is None
+
+    def test_shell_aligns_agent_wallet_inspections_to_active_wallet_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Shell wallet inspections should not read the host user's real wallet."""
+        from spoon_bot.agent.tools.shell import ShellTool
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        wallet_root = tmp_path / "wallet-root"
+        wallet_root.mkdir()
+        monkeypatch.setenv("SPOON_BOT_WALLET_PATH", str(wallet_root))
+
+        env = dict(os.environ)
+        shell_tool = ShellTool(working_dir=str(workspace))
+        shell_tool._align_wallet_home_for_command(
+            env,
+            "ls -la ~/.agent-wallet && cat ~/.agent-wallet/state.env",
+            str(workspace),
+        )
+
+        assert (Path(env["HOME"]) / ".agent-wallet").resolve() == wallet_root.resolve()
+        assert env["AGENT_WALLET_DIR"] == str(wallet_root.resolve())
 
     def test_shell_formats_idempotent_conflict_as_state(self, shell_tool):
         """HTTP 409 already-state output should not look like a failed command."""

@@ -1159,13 +1159,18 @@ class ShellTool(Tool):
             return command
         return f"{exports}; {command}"
 
-    def _align_wallet_home_for_skill_command(
+    @staticmethod
+    def _command_references_agent_wallet_path(command: str) -> bool:
+        normalized = str(command or "").replace("\\", "/")
+        return "~/.agent-wallet" in normalized or "/.agent-wallet" in normalized
+
+    def _align_wallet_home_for_command(
         self,
         env: dict[str, str],
         command: str,
         cwd: str,
     ) -> None:
-        """Expose the active built-in wallet through ~/.agent-wallet for skill CLIs.
+        """Expose the active built-in wallet through ~/.agent-wallet when needed.
 
         Some installed CLIs intentionally avoid private-key environment variables
         and load a wallet from ``~/.agent-wallet``.  When spoon-bot is running with
@@ -1174,7 +1179,10 @@ class ShellTool(Tool):
         home or leaking a private key into the subprocess environment.
         """
         try:
-            if not self._command_invokes_workspace_skill(command, cwd):
+            if not (
+                self._command_invokes_workspace_skill(command, cwd)
+                or self._command_references_agent_wallet_path(command)
+            ):
                 return
         except Exception:
             return
@@ -1207,8 +1215,18 @@ class ShellTool(Tool):
             if not compat_wallet.exists():
                 compat_wallet.symlink_to(wallet_root, target_is_directory=True)
             env["HOME"] = str(compat_home)
+            env["AGENT_WALLET_DIR"] = str(wallet_root)
         except OSError:
             return
+
+    def _align_wallet_home_for_skill_command(
+        self,
+        env: dict[str, str],
+        command: str,
+        cwd: str,
+    ) -> None:
+        """Backward-compatible wrapper for tests and older callers."""
+        self._align_wallet_home_for_command(env, command, cwd)
 
     @staticmethod
     def _workspace_env_exports(env_file: Path) -> str:
@@ -1246,7 +1264,7 @@ class ShellTool(Tool):
     ) -> tuple[bytes, bytes, int]:
         """Synchronous subprocess execution (called via run_in_executor)."""
         env = _scrub_env(os.environ.copy())
-        self._align_wallet_home_for_skill_command(env, command, cwd)
+        self._align_wallet_home_for_command(env, command, cwd)
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
             env["HOME"] = userprofile.replace("\\", "/")
@@ -1491,7 +1509,7 @@ class ShellTool(Tool):
         cwd: str,
     ) -> subprocess.Popen[bytes]:
         env = _scrub_env(os.environ.copy())
-        self._align_wallet_home_for_skill_command(env, command, cwd)
+        self._align_wallet_home_for_command(env, command, cwd)
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
             env["HOME"] = userprofile.replace("\\", "/")
