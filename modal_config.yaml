@@ -6,6 +6,8 @@ agent:
   provider: "openrouter"
   workspace: "/modal-data/workspace"
   max_iterations: 20
+  shell_timeout: 3600
+  shell_max_timeout: 7200
   tool_profile: "core"
   yolo_mode: true
 

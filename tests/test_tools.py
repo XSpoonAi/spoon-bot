@@ -426,6 +426,58 @@ class TestShellTool:
         assert "STOP_TOOL_LOOP" in second
         assert "duplicate tool invocation suppressed" in second
 
+    @pytest.mark.asyncio
+    async def test_repeated_shell_file_read_is_suppressed_by_range(self, tmp_path):
+        """Shell cat/sed reads of already-seen file content should not loop."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        target = workspace / "server.py"
+        target.write_text("line1\nline2\nline3\n", encoding="utf-8")
+        shell_tool = ShellTool(
+            working_dir=str(workspace),
+            timeout=5,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        with track_tool_invocations(max_repeats=99):
+            first = await shell_tool(command="cat server.py")
+            second = await shell_tool(command="sed -n '1,2p' server.py")
+
+        assert "line1" in first
+        assert "line2" in first
+        assert "STOP_TOOL_LOOP" in second
+        assert "repeated shell file read suppressed" in second
+
+    @pytest.mark.asyncio
+    async def test_shell_file_read_guard_allows_changed_content(self, tmp_path):
+        """A changed file fingerprint should permit a fresh shell read."""
+        from spoon_bot.agent.tools.execution_context import track_tool_invocations
+        from spoon_bot.agent.tools.shell import ShellTool
+        from spoon_bot.utils.rate_limit import RateLimitConfig
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        target = workspace / "server.py"
+        target.write_text("before\n", encoding="utf-8")
+        shell_tool = ShellTool(
+            working_dir=str(workspace),
+            timeout=5,
+            rate_limit_config=RateLimitConfig.unlimited(),
+        )
+
+        with track_tool_invocations(max_repeats=99):
+            first = await shell_tool(command="cat server.py")
+            target.write_text("after\n", encoding="utf-8")
+            second = await shell_tool(command="sed -n '1,1p' server.py")
+
+        assert "before" in first
+        assert "after" in second
+        assert "STOP_TOOL_LOOP" not in second
+
     def test_shell_loads_workspace_env_for_skill_commands(self, tmp_path):
         """Installed skill CLIs should receive non-sensitive workspace env values."""
         from spoon_bot.agent.tools.shell import ShellTool

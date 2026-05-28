@@ -25,7 +25,7 @@ import modal
 APP_NAME = os.environ.get("MODAL_SPOON_BOT_APP", "spoon-bot-deepseek-v4")
 VOLUME_NAME = os.environ.get("MODAL_SPOON_BOT_VOLUME", f"{APP_NAME}-data")
 SECRET_NAME = os.environ.get("MODAL_SPOON_BOT_SECRET", "spoon-bot-openrouter")
-FUNCTION_TIMEOUT = int(os.environ.get("MODAL_SPOON_BOT_FUNCTION_TIMEOUT", "3600"))
+FUNCTION_TIMEOUT = int(os.environ.get("MODAL_SPOON_BOT_FUNCTION_TIMEOUT", "86400"))
 RUNTIME_SECRET_KEYS = (
     "TAVILY_API_KEY",
     "SANDBOX_PROVIDER",
@@ -58,7 +58,11 @@ image = modal.Image.from_dockerfile(
     "SANDBOX_PROVIDER": "modal",
     "SPOON_BOT_YOLO_MODE": "true",
     "SPOON_BOT_MAX_ITERATIONS": "20",
+    "SPOON_BOT_SHELL_TIMEOUT": "3600",
+    "SPOON_BOT_SHELL_MAX_TIMEOUT": "7200",
     "SPOON_BOT_MAX_OUTPUT": "12000",
+    "GATEWAY_TIMEOUT_REQUEST_MS": "0",
+    "GATEWAY_TIMEOUT_STREAM_MS": "0",
     "SPOON_BOT_LOG_LEVEL": "INFO",
     "PYTHONUNBUFFERED": "1",
 })

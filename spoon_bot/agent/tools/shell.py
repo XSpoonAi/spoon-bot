@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ from spoon_bot.agent.tools.execution_context import (
     get_request_execution_hints,
     get_tool_owner,
     suppress_repeated_background_job_poll,
+    suppress_redundant_shell_file_read,
 )
 from spoon_bot.config import (
     DEFAULT_MAX_OUTPUT,
@@ -438,6 +440,16 @@ _SHELL_BACKGROUND_JOBS: dict[str, _BackgroundShellJob] = {}
 _SILENT_BACKGROUND_TERMINATE_GRACE_SECONDS = 300.0
 
 
+@dataclass(frozen=True)
+class _ShellFileReadInspection:
+    """A simple shell command that prints a file or a line range from a file."""
+
+    path: Path
+    start_line: int | None = 1
+    end_line: int | None = None
+    tail_lines: int | None = None
+
+
 class ShellTool(Tool):
     """
     Tool to execute shell commands with comprehensive safety guards.
@@ -540,6 +552,7 @@ class ShellTool(Tool):
         "uvx",
         "yarn",
     })
+    _SHELL_FILE_READ_TRACKING_MAX_BYTES = 20 * 1024 * 1024
 
     def __init__(
         self,
@@ -928,6 +941,279 @@ class ShellTool(Tool):
         return bool(segments) and all(
             self._segment_is_read_only_inspection(segment)
             for segment in segments
+        )
+
+    def _shell_file_read_inspection(
+        self,
+        command: str,
+        cwd: str,
+    ) -> _ShellFileReadInspection | None:
+        """Return the inspected file/range for a pure shell file read."""
+        try:
+            command_tokens = shlex.split(str(command or ""))
+        except ValueError:
+            return None
+        if not command_tokens or "|" in command_tokens:
+            return None
+
+        current_dir = Path(cwd).resolve()
+        inspections: list[_ShellFileReadInspection] = []
+        for segment in self._split_shell_segments(command_tokens):
+            if not segment:
+                continue
+            if segment[0].casefold() == "cd":
+                current_dir = self._resolve_cd_segment(current_dir, segment)
+                continue
+            cleaned = self._segment_before_redirection_or_pipe(segment)
+            if not cleaned:
+                continue
+            inspection = self._extract_shell_file_read_segment(cleaned, current_dir)
+            if inspection is None:
+                return None
+            inspections.append(inspection)
+
+        if len(inspections) != 1:
+            return None
+        return inspections[0]
+
+    @classmethod
+    def _extract_shell_file_read_segment(
+        cls,
+        segment: list[str],
+        current_dir: Path,
+    ) -> _ShellFileReadInspection | None:
+        if not segment:
+            return None
+        command_name = os.path.basename(
+            str(segment[0] or "").strip().strip("'\"").replace("\\", "/")
+        ).casefold()
+        if command_name == "cat":
+            path = cls._single_shell_read_path(segment[1:], current_dir)
+            if path is None:
+                return None
+            return _ShellFileReadInspection(path=path)
+        if command_name == "head":
+            return cls._head_tail_file_read_inspection(segment[1:], current_dir, tail=False)
+        if command_name == "tail":
+            return cls._head_tail_file_read_inspection(segment[1:], current_dir, tail=True)
+        if command_name == "sed":
+            return cls._sed_file_read_inspection(segment[1:], current_dir)
+        return None
+
+    @staticmethod
+    def _resolve_shell_read_path(raw_path: str, current_dir: Path) -> Path | None:
+        value = str(raw_path or "").strip()
+        if not value or value == "-" or value.startswith("-"):
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = current_dir / path
+        try:
+            path = path.resolve()
+        except OSError:
+            path = path.absolute()
+        try:
+            if not path.is_file():
+                return None
+        except OSError:
+            return None
+        return path
+
+    @classmethod
+    def _single_shell_read_path(
+        cls,
+        args: list[str],
+        current_dir: Path,
+    ) -> Path | None:
+        paths: list[Path] = []
+        for arg in args:
+            token = str(arg or "").strip()
+            if not token:
+                continue
+            if token.startswith("-"):
+                continue
+            path = cls._resolve_shell_read_path(token, current_dir)
+            if path is None:
+                return None
+            paths.append(path)
+        if len(paths) != 1:
+            return None
+        return paths[0]
+
+    @classmethod
+    def _head_tail_file_read_inspection(
+        cls,
+        args: list[str],
+        current_dir: Path,
+        *,
+        tail: bool,
+    ) -> _ShellFileReadInspection | None:
+        line_count = 10
+        tail_from_line: int | None = None
+        paths: list[Path] = []
+        index = 0
+        while index < len(args):
+            token = str(args[index] or "").strip()
+            lowered = token.casefold()
+            if not token:
+                index += 1
+                continue
+            if lowered in {"-f", "--follow"} or lowered.startswith("--follow="):
+                return None
+            if lowered in {"-c", "--bytes"} or lowered.startswith(("-c", "--bytes=")):
+                return None
+            if lowered in {"-n", "--lines"}:
+                if index + 1 >= len(args):
+                    return None
+                raw_count = str(args[index + 1] or "").strip()
+                if tail and raw_count.startswith("+") and raw_count[1:].isdigit():
+                    tail_from_line = max(1, int(raw_count[1:]))
+                elif raw_count.isdigit():
+                    line_count = max(1, int(raw_count))
+                else:
+                    return None
+                index += 2
+                continue
+            if lowered.startswith("--lines="):
+                raw_count = token.split("=", 1)[1].strip()
+                if tail and raw_count.startswith("+") and raw_count[1:].isdigit():
+                    tail_from_line = max(1, int(raw_count[1:]))
+                elif raw_count.isdigit():
+                    line_count = max(1, int(raw_count))
+                else:
+                    return None
+                index += 1
+                continue
+            if lowered.startswith("-n") and len(token) > 2:
+                raw_count = token[2:].strip()
+                if raw_count.isdigit():
+                    line_count = max(1, int(raw_count))
+                    index += 1
+                    continue
+                return None
+            if re.fullmatch(r"-\d+", token):
+                line_count = max(1, int(token[1:]))
+                index += 1
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            path = cls._resolve_shell_read_path(token, current_dir)
+            if path is None:
+                return None
+            paths.append(path)
+            index += 1
+
+        if len(paths) != 1:
+            return None
+        if tail:
+            if tail_from_line is not None:
+                return _ShellFileReadInspection(path=paths[0], start_line=tail_from_line)
+            return _ShellFileReadInspection(path=paths[0], tail_lines=line_count)
+        return _ShellFileReadInspection(path=paths[0], start_line=1, end_line=line_count)
+
+    @classmethod
+    def _sed_file_read_inspection(
+        cls,
+        args: list[str],
+        current_dir: Path,
+    ) -> _ShellFileReadInspection | None:
+        quiet = False
+        script: str | None = None
+        paths: list[Path] = []
+        index = 0
+        while index < len(args):
+            token = str(args[index] or "").strip()
+            lowered = token.casefold()
+            if not token:
+                index += 1
+                continue
+            if lowered in {"-n", "--quiet", "--silent"}:
+                quiet = True
+                index += 1
+                continue
+            if lowered in {"-e", "--expression"}:
+                if index + 1 >= len(args):
+                    return None
+                script = str(args[index + 1] or "").strip()
+                index += 2
+                continue
+            if lowered.startswith("-e") and len(token) > 2:
+                script = token[2:].strip()
+                index += 1
+                continue
+            if lowered.startswith("-i") or lowered in {"-f", "--file"}:
+                return None
+            if token.startswith("-"):
+                return None
+            if script is None:
+                script = token
+            else:
+                path = cls._resolve_shell_read_path(token, current_dir)
+                if path is None:
+                    return None
+                paths.append(path)
+            index += 1
+
+        if not quiet or not script or len(paths) != 1:
+            return None
+        match = re.fullmatch(r"\s*(\d+)\s*(?:,\s*(\d+|\$)\s*)?p\s*", script)
+        if not match:
+            return None
+        start = max(1, int(match.group(1)))
+        raw_end = match.group(2)
+        end = None if raw_end in {None, "$"} else max(start, int(raw_end))
+        return _ShellFileReadInspection(path=paths[0], start_line=start, end_line=end)
+
+    def _shell_file_read_content_info(self, path: Path) -> tuple[int, str] | None:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        if stat_result.st_size > self._SHELL_FILE_READ_TRACKING_MAX_BYTES:
+            return None
+
+        digest = hashlib.sha256()
+        newline_count = 0
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    newline_count += chunk.count(b"\n")
+        except OSError:
+            return None
+        return max(1, newline_count + 1), digest.hexdigest()
+
+    def _suppress_redundant_shell_file_read(
+        self,
+        command: str,
+        cwd: str,
+    ) -> str | None:
+        inspection = self._shell_file_read_inspection(command, cwd)
+        if inspection is None:
+            return None
+        content_info = self._shell_file_read_content_info(inspection.path)
+        if content_info is None:
+            return None
+
+        total_lines, fingerprint = content_info
+        if inspection.tail_lines is not None:
+            start_line = max(1, total_lines - inspection.tail_lines + 1)
+            end_line = total_lines
+        else:
+            start_line = max(1, int(inspection.start_line or 1))
+            end_line = (
+                total_lines
+                if inspection.end_line is None
+                else min(total_lines, max(start_line, int(inspection.end_line)))
+            )
+        limit = max(1, end_line - start_line + 1)
+        return suppress_redundant_shell_file_read(
+            str(inspection.path),
+            offset=start_line,
+            limit=limit,
+            total_lines=total_lines,
+            content_fingerprint=fingerprint,
         )
 
     def _skill_cli_invocation_dedup_key(
@@ -2107,6 +2393,11 @@ class ShellTool(Tool):
             if not is_valid:
                 safe_cmd = self.validator.sanitize_for_display(command)
                 return f"Security Error: {error_msg}\nCommand: {safe_cmd}"
+
+        redundant_shell_read = self._suppress_redundant_shell_file_read(command, cwd)
+        if redundant_shell_read is not None:
+            capture_tool_output(redundant_shell_read, redundant_shell_read)
+            return redundant_shell_read
 
         execution_command = (
             self._prepend_workspace_env_for_skill_command(command, cwd)

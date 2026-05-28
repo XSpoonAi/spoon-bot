@@ -5921,6 +5921,8 @@ class AgentLoop:
             return "I stopped retrying after the same failure pattern repeated."
         if "repeated side-effecting tool series suppressed" in text:
             return "I stopped before repeating the same external action."
+        if "repeated shell file read suppressed" in text:
+            return "I stopped after a repeated shell file inspection produced no new action."
         if "duplicate shell inspection suppressed" in text:
             return "I stopped after a repeated status/inspection command produced no new action."
         if "redundant file read suppressed" in text:

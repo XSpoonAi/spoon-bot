@@ -72,14 +72,21 @@ _REPEATED_BACKGROUND_JOB_POLL_MESSAGE = (
     "polling again in this request."
 )
 _REDUNDANT_FILE_READ_MESSAGE = (
-    "File content already available in this request. Treat this read as "
-    "complete and continue the user's remaining instructions without calling "
-    "read_file again for the same path and range."
+    "READ_FILE_CACHE_HIT: requested file range already available in this "
+    "request. File content already available in this request. Treat this read "
+    "as complete and continue the user's remaining instructions without "
+    "calling read_file again for the same path and range."
 )
 _REPEATED_REDUNDANT_FILE_READ_MESSAGE = (
     "Repeated read skipped: the requested file range was already provided "
     "earlier in this request; use the previous file content and continue with "
     "the next non-read action."
+)
+_REPEATED_SHELL_FILE_READ_MESSAGE = (
+    "STOP_TOOL_LOOP: Error: repeated shell file read suppressed. The requested "
+    "file range was already inspected in this request; use the previous file "
+    "content and continue with the next write, edit, test, or final-answer "
+    "action instead of running another shell file read."
 )
 _CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
     "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "
@@ -430,6 +437,78 @@ def suppress_redundant_file_read(
         )
     coverage[normalized_path] = merged
     request_counts[current_request_key] += 1
+    return None
+
+
+def suppress_redundant_shell_file_read(
+    path_key: str,
+    *,
+    offset: int | None,
+    limit: int | None,
+    total_lines: int,
+    content_fingerprint: str | None = None,
+) -> str | None:
+    """Return a hard stop when shell re-reads file content already seen.
+
+    Shell reads such as ``cat file`` and ``sed -n 1,80p file`` bypass the
+    read_file tool's exact argument cache. This shares the same range coverage
+    map with read_file so a request cannot loop by switching read mechanisms.
+    """
+    state = _current_tool_invocation_state()
+    if not isinstance(state, dict):
+        return None
+
+    coverage = state.get("file_read_coverage")
+    if not isinstance(coverage, dict):
+        return None
+
+    normalized_path = str(path_key or "").strip()
+    if not normalized_path:
+        return None
+
+    total = max(1, int(total_lines or 1))
+    start = max(1, int(offset or 1))
+    if limit is None:
+        end = total
+    else:
+        end = min(total, start + max(1, int(limit or 1)) - 1)
+    if end < start:
+        end = start
+
+    fingerprint = str(content_fingerprint or "")
+    raw_ranges = coverage.setdefault(normalized_path, [])
+    ranges: list[tuple[int, int, str]] = []
+    for item in raw_ranges:
+        if not isinstance(item, tuple) or len(item) < 2:
+            continue
+        existing_fingerprint = str(item[2]) if len(item) >= 3 else ""
+        if fingerprint and existing_fingerprint and existing_fingerprint != fingerprint:
+            continue
+        ranges.append((int(item[0]), int(item[1]), existing_fingerprint))
+
+    for existing_start, existing_end, _existing_fingerprint in ranges:
+        if int(existing_start) <= start and end <= int(existing_end):
+            return _REPEATED_SHELL_FILE_READ_MESSAGE
+
+    ranges.append((start, end, fingerprint))
+    ranges.sort(key=lambda item: (int(item[0]), int(item[1])))
+    merged: list[tuple[int, int, str]] = []
+    for range_start, range_end, range_fingerprint in ranges:
+        range_start = int(range_start)
+        range_end = int(range_end)
+        if (
+            not merged
+            or range_fingerprint != merged[-1][2]
+            or range_start > merged[-1][1] + 1
+        ):
+            merged.append((range_start, range_end, range_fingerprint))
+            continue
+        merged[-1] = (
+            merged[-1][0],
+            max(merged[-1][1], range_end),
+            merged[-1][2],
+        )
+    coverage[normalized_path] = merged
     return None
 
 
