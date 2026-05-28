@@ -5194,10 +5194,10 @@ $CLI join [gameId]
         assert agent.sessions.save.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_stream_close_cancels_background_run_and_skips_session_save(self):
-        """Closing the stream should stop the background run and avoid persisting stale output."""
+    async def test_stream_close_cancels_background_run_and_saves_partial_reply(self, tmp_path):
+        """Closing the stream should stop the run and persist user-visible partial output."""
         from spoon_bot.agent.loop import AgentLoop
-        from spoon_bot.session.manager import Session
+        from spoon_bot.session.manager import SessionManager
 
         run_cancelled = asyncio.Event()
         emitted_text = "hello " * 70
@@ -5218,9 +5218,8 @@ $CLI join [gameId]
         agent._agent.run = mock_run
         agent._agent.add_message = AsyncMock()
         agent._agent.state = "idle"
-        agent._session = Session(session_key="cancelled_stream")
-        agent.sessions = MagicMock()
-        agent.sessions.save = MagicMock()
+        agent.sessions = SessionManager(tmp_path)
+        agent._session = agent.sessions.get_or_create("cancelled_stream")
         agent.memory = MagicMock()
         agent.memory.get_memory_context = MagicMock(return_value=None)
         agent.context = MagicMock()
@@ -5242,12 +5241,25 @@ $CLI join [gameId]
         await stream.aclose()
         await asyncio.wait_for(run_cancelled.wait(), timeout=1.0)
 
-        assert len(agent._session.messages) == 1
+        assert len(agent._session.messages) == 2
         assert agent._session.messages[0]["role"] == "user"
         assert agent._session.messages[0]["content"] == "test message"
         assert agent._session.messages[0]["turn_state"] == "interrupted"
         assert agent._session.messages[0]["turn_state_reason"] == "task_cancelled"
-        assert agent.sessions.save.call_count >= 2
+        assert agent._session.messages[1]["role"] == "assistant"
+        assert agent._session.messages[1]["content"] == emitted_text
+        assert agent._session.messages[1]["incomplete"] is True
+        assert agent._session.messages[1]["incomplete_reason"] == "task_cancelled"
+        assert agent._session.messages[1]["message_kind"] == "assistant_reply"
+
+        jsonl_path = tmp_path / "sessions" / "cancelled_stream.jsonl"
+        persisted = [
+            json.loads(line)
+            for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert [message["role"] for message in persisted] == ["user", "assistant"]
+        assert persisted[1]["content"] == emitted_text
+        assert persisted[1]["incomplete"] is True
 
     @pytest.mark.asyncio
     async def test_install_anti_loop_tracker_does_not_stack_previous_request_prompt(self):

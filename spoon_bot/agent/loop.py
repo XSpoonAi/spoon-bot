@@ -2975,6 +2975,47 @@ class AgentLoop:
         except Exception as exc:
             logger.debug(f"Cancelled-turn persistence skipped: {exc}")
 
+    @staticmethod
+    def _persist_interrupted_assistant_reply(
+        self,
+        content: str,
+        *,
+        reason: str = "task_cancelled",
+    ) -> bool:
+        """Persist user-visible assistant text from an interrupted stream."""
+        if not getattr(self, "_session", None):
+            return False
+
+        content = str(content or "")
+        if not content.strip():
+            return False
+
+        try:
+            messages = getattr(self._session, "messages", None)
+            if isinstance(messages, list) and messages:
+                last = messages[-1]
+                if (
+                    isinstance(last, dict)
+                    and last.get("role") == "assistant"
+                    and last.get("incomplete") is True
+                    and str(last.get("content") or "") == content
+                ):
+                    return False
+
+            self._session.add_message(
+                "assistant",
+                content,
+                incomplete=True,
+                incomplete_reason=reason,
+                incomplete_source="stream",
+                **AgentLoop._assistant_session_save_kwargs(content),
+            )
+            AgentLoop._persist_session_if_possible(self)
+            return True
+        except Exception as exc:
+            logger.debug(f"Interrupted assistant reply persistence skipped: {exc}")
+            return False
+
     def _current_tool_owner_key(self, session_key: str | None = None) -> str:
         """Resolve a user-scoped ownership key for background tool jobs."""
         return build_tool_owner_key(
@@ -6957,6 +6998,19 @@ class AgentLoop:
         tool_loop_fallback_active = False
         initial_content_passthrough_started = False
         stream_error_reason: BaseException | str | None = None
+        interrupted_assistant_reply_persisted = False
+
+        def _persist_interrupted_stream_reply(reason: str = "task_cancelled") -> None:
+            nonlocal interrupted_assistant_reply_persisted
+            if interrupted_assistant_reply_persisted:
+                return
+            interrupted_assistant_reply_persisted = (
+                AgentLoop._persist_interrupted_assistant_reply(
+                    self,
+                    full_content,
+                    reason=reason,
+                )
+            )
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context(message)
@@ -8568,6 +8622,7 @@ class AgentLoop:
             logger.warning("Streaming cancelled")
             AgentLoop._drain_agent_output_queue(self)
             AgentLoop._truncate_runtime_memory(self, _pre_turn_memory_index)
+            _persist_interrupted_stream_reply("task_cancelled")
             AgentLoop._mark_latest_user_turn_state(
                 self,
                 _TURN_STATE_INTERRUPTED,
@@ -8612,6 +8667,7 @@ class AgentLoop:
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
             if not stream_completed and not stream_cancelled:
+                _persist_interrupted_stream_reply("task_cancelled")
                 AgentLoop._mark_latest_user_turn_state(
                     self,
                     _TURN_STATE_INTERRUPTED,
