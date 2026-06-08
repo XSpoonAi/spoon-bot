@@ -8118,12 +8118,13 @@ class AgentLoop:
         original_base_system_prompt: object = _MISSING
         tool_output_capture_scope: str | None = None
         capture_manager = None
-        withheld_initial_content = False
         pending_fallback_content_emit = False
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
         tool_loop_fallback_active = False
         initial_content_passthrough_started = False
+        post_tool_content_passthrough_started = False
+        emitted_content_text = ""
         stream_error_reason: BaseException | str | None = None
         interrupted_assistant_reply_persisted = False
         execution_ledger: ExecutionLedger | None = None
@@ -9603,12 +9604,34 @@ class AgentLoop:
                                     continue
                                 full_content += delta
                             else:
-                                post_tool_content_buffer += delta
-                                post_tool_content_events.append(event)
-                                continue
+                                if not post_tool_content_passthrough_started:
+                                    post_tool_content_buffer += delta
+                                    post_tool_content_events.append(event)
+                                    pending_content = AgentLoop._strip_leaked_scratchpad_prefix(
+                                        post_tool_content_buffer
+                                    )
+                                    compact_pending = " ".join(pending_content.strip().split())
+                                    if (
+                                        not compact_pending
+                                        or len(compact_pending) < 12
+                                        or AgentLoop._looks_like_internal_scratchpad_text(
+                                            pending_content
+                                        )
+                                    ):
+                                        continue
+                                    delta = pending_content
+                                    post_tool_content_events = []
+                                    post_tool_content_buffer = ""
+                                    post_tool_content_passthrough_started = True
+                                delta = AgentLoop._mask_user_visible_text(delta)
+                                if not delta:
+                                    continue
+                                saw_content_after_tool_call = True
+                                full_content += delta
                             if buffer_stream_content:
                                 continue
                             event["delta"] = delta
+                            emitted_content_text += delta
                         yield _decorate_stream_event(event)
                         if _stop_if_total_timeout():
                             break
@@ -9781,8 +9804,18 @@ class AgentLoop:
                 post_tool_content_events = []
 
             if pre_tool_scratchpad_buffer and not saw_tool_call:
-                full_content += AgentLoop._mask_user_visible_text(pre_tool_scratchpad_buffer)
-                withheld_initial_content = True
+                for buffered_event in pre_tool_scratchpad_events:
+                    buffered_delta = AgentLoop._mask_user_visible_text(
+                        str(buffered_event.get("delta") or "")
+                    )
+                    if not buffered_delta:
+                        continue
+                    full_content += buffered_delta
+                    emitted_content_text += buffered_delta
+                    yield _decorate_stream_event({
+                        **buffered_event,
+                        "delta": buffered_delta,
+                    })
                 pre_tool_scratchpad_events = []
                 pre_tool_scratchpad_buffer = ""
 
@@ -10366,10 +10399,19 @@ class AgentLoop:
                 full_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
+            final_content_changed = (
+                self._normalize_comparable_text(final_content)
+                != self._normalize_comparable_text(pre_finalize_full_content)
+            )
             if (
                 (
-                    buffer_stream_content
-                    or withheld_initial_content
+                    (
+                        buffer_stream_content
+                        and (
+                            not emitted_content_text.strip()
+                            or final_content_changed
+                        )
+                    )
                     or pending_fallback_content_emit
                 )
                 and final_content
@@ -10383,7 +10425,6 @@ class AgentLoop:
                     emit_delta = pending_fallback_delta or final_content
                 emit_metadata = {
                     "buffered": bool(buffer_stream_content),
-                    "withheld_initial_content": bool(withheld_initial_content),
                     "validated": True,
                 }
                 if pending_fallback_reason:

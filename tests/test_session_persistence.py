@@ -811,6 +811,40 @@ class _ChunkedRuntimeAgent:
         return type("RunResult", (), {"content": "".join(self._chunks)})()
 
 
+class _ToolThenChunkedRuntimeAgent:
+    """Runtime agent that emits a tool event sequence before final content chunks."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._chunks = chunks
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": '{"query":"spoon bot"}',
+                    },
+                }
+            ],
+        })
+        for chunk in self._chunks:
+            await self.output_queue.put({"type": "content", "delta": chunk})
+            await asyncio.sleep(0)
+        return type("RunResult", (), {"content": "".join(self._chunks)})()
+
+
 class _RetryRuntimeAgent:
     """Runtime agent that fails once, then succeeds on retry."""
 
@@ -1206,6 +1240,44 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Hello"
         assert loop._session.messages[-1]["content"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_stream_preserves_post_tool_content_chunks(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        answer_chunks = ["Final answer ", "visible over websocket."]
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _ToolThenChunkedRuntimeAgent(answer_chunks)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_post_tool_content")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="search then answer"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        tool_call_index = next(i for i, c in enumerate(chunks) if c["type"] == "tool_call")
+        first_content_index = next(i for i, c in enumerate(chunks) if c["type"] == "content")
+        done_index = next(i for i, c in enumerate(chunks) if c["type"] == "done")
+
+        assert [c["delta"] for c in content_chunks] == answer_chunks
+        assert tool_call_index < first_content_index < done_index
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "".join(answer_chunks)
+        assert loop._session.messages[-1]["content"] == "".join(answer_chunks)
 
     @pytest.mark.asyncio
     async def test_stream_persists_original_user_text_instead_of_attachment_prose(self, tmp_dir: Path):
