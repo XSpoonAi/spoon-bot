@@ -277,8 +277,8 @@ def phase_builtin_tool(mgr: SessionManager) -> None:
         f"scope=current (s-alpha) should not find README; got {payload['total']} hits",
     )
 
-    # scope=all finds README hit
-    out = asyncio.run(tool.execute(query="README", scope="all"))
+    # scope=all requires a stable anchor before crossing session boundaries.
+    out = asyncio.run(tool.execute(query="README.md", scope="all"))
     payload = json.loads(out)
     _assert(
         "tool.scope.all",

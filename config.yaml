@@ -3,7 +3,7 @@
 
 # Agent Configuration
 agent:
-  model: "anthropic/claude-sonnet-4"
+  model: "deepseek/deepseek-v4-pro"
   provider: "openrouter"
   workspace: "~/.spoon-bot/workspace"
   max_iterations: 20

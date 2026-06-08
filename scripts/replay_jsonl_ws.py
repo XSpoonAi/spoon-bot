@@ -61,6 +61,18 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for the streamed run to finish.",
     )
     parser.add_argument(
+        "--ws-ping-interval",
+        type=float,
+        default=0,
+        help="Protocol ping interval in seconds; 0 disables client pings for long agent turns.",
+    )
+    parser.add_argument(
+        "--ws-ping-timeout",
+        type=float,
+        default=0,
+        help="Protocol ping timeout in seconds; 0 disables client ping timeouts.",
+    )
+    parser.add_argument(
         "--print-events",
         action="store_true",
         help="Print every incoming WebSocket payload.",
@@ -102,8 +114,12 @@ def load_base_config(config_path: Path | None) -> dict[str, Any]:
     return data
 
 
-def build_temp_config(repo_root: Path, workspace: Path) -> Path:
-    base_config = load_base_config(find_config_path(repo_root))
+def build_temp_config(
+    repo_root: Path,
+    workspace: Path,
+    config_source_path: Path | None,
+) -> Path:
+    base_config = load_base_config(config_source_path or find_config_path(repo_root))
     agent = dict(base_config.get("agent") or {})
     agent["workspace"] = str(workspace)
     agent["tool_profile"] = "full"
@@ -234,13 +250,21 @@ async def stream_chat(
     session_key: str,
     timeout_seconds: int,
     print_events: bool,
+    ws_ping_interval: float,
+    ws_ping_timeout: float,
 ) -> dict[str, Any]:
     request_id = f"replay_{int(time.time())}"
     events: list[dict[str, Any]] = []
     content_parts: list[str] = []
     tool_results: list[str] = []
 
-    async with websockets.connect(ws_url, ping_interval=30, ping_timeout=30) as ws:
+    ping_interval = ws_ping_interval if ws_ping_interval > 0 else None
+    ping_timeout = ws_ping_timeout if ws_ping_timeout > 0 else None
+    async with websockets.connect(
+        ws_url,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+    ) as ws:
         established = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
         events.append(established)
 
@@ -287,13 +311,20 @@ def start_gateway(
     repo_root: Path,
     config_path: Path,
     port: int,
-) -> subprocess.Popen[str]:
+) -> tuple[subprocess.Popen[str], Path, Any]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["GATEWAY_AUTH_REQUIRED"] = "false"
     env["SPOON_BOT_CONFIG"] = str(config_path)
     env["GATEWAY_PORT"] = str(port)
-    return subprocess.Popen(
+    env.setdefault("SPOON_BOT_WS_STALE_SECONDS", "3600")
+    server_ws_ping_interval = os.environ.get("SPOON_REPLAY_UVICORN_WS_PING_INTERVAL", "60")
+    server_ws_ping_timeout = os.environ.get("SPOON_REPLAY_UVICORN_WS_PING_TIMEOUT", "600")
+    fd, log_name = tempfile.mkstemp(prefix="spoon-replay-gateway-", suffix=".log")
+    os.close(fd)
+    log_path = Path(log_name)
+    log_file = log_path.open("w", encoding="utf-8", errors="replace")
+    process = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -304,20 +335,31 @@ def start_gateway(
             "127.0.0.1",
             "--port",
             str(port),
+            "--ws-ping-interval",
+            server_ws_ping_interval,
+            "--ws-ping-timeout",
+            server_ws_ping_timeout,
         ],
         cwd=str(repo_root),
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    return process, log_path, log_file
 
 
-def collect_process_output(process: subprocess.Popen[str]) -> str:
+def collect_process_output(log_path: Path, log_file: Any) -> str:
     try:
-        if process.stdout is None:
-            return ""
-        return process.stdout.read()
+        log_file.flush()
+    except Exception:
+        pass
+    try:
+        log_file.close()
+    except Exception:
+        pass
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -343,10 +385,13 @@ def main() -> int:
             raise FileNotFoundError(f"Prompt file not found: {source_path}")
         prompt_source = "prompt_file"
 
+    config_source_path = find_config_path(repo_root)
+    if config_source_path is not None:
+        load_dotenv(config_source_path.parent / ".env")
     load_dotenv(repo_root / ".env")
 
     workspace = Path.home() / ".spoon-bot" / "workspace"
-    config_path = build_temp_config(repo_root, workspace)
+    config_path = build_temp_config(repo_root, workspace, config_source_path)
 
     session_key = args.session_key or (source_path.stem if source_path else f"replay_{int(time.time())}")
     prompts: list[str] = []
@@ -377,7 +422,7 @@ def main() -> int:
     base_url = f"http://127.0.0.1:{port}"
     ws_url = f"ws://127.0.0.1:{port}/v1/ws"
 
-    gateway = start_gateway(repo_root, config_path, port)
+    gateway, gateway_log_path, gateway_log_file = start_gateway(repo_root, config_path, port)
     gateway_output = ""
     try:
         wait_for_health(base_url)
@@ -390,6 +435,8 @@ def main() -> int:
                     session_key=session_key,
                     timeout_seconds=args.gateway_timeout,
                     print_events=args.print_events,
+                    ws_ping_interval=args.ws_ping_interval,
+                    ws_ping_timeout=args.ws_ping_timeout,
                 )
             )
             results.append(
@@ -419,10 +466,14 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             gateway.kill()
             gateway.wait(timeout=5)
-        gateway_output = collect_process_output(gateway)
+        gateway_output = collect_process_output(gateway_log_path, gateway_log_file)
         if gateway_output.strip():
             print("\n=== gateway log tail ===")
             print(gateway_output[-8000:])
+        try:
+            gateway_log_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         try:
             config_path.unlink(missing_ok=True)
         except Exception:

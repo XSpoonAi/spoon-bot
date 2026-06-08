@@ -459,6 +459,32 @@ def user_friendly_error(exc: Exception) -> str:
     """Get a user-friendly error message from any exception."""
     if isinstance(exc, SpoonBotError):
         return exc.user_message()
+    error_text = str(exc or "").casefold()
+    if any(
+        marker in error_text
+        for marker in (
+            "key limit exceeded",
+            "requires more credits",
+            "insufficient quota",
+            "insufficient_quota",
+            "quota exceeded",
+            "credit limit",
+        )
+    ):
+        return (
+            "The model provider quota or credit limit was reached. "
+            "Switch to an available key/model or increase the quota, then retry."
+        )
+    if any(
+        marker in error_text
+        for marker in (
+            "invalid api key",
+            "authentication failed",
+            "unauthorized",
+            "401",
+        )
+    ):
+        return "Authentication failed with the model provider. Please check the API key."
     # Map common exceptions to friendly messages
     if isinstance(exc, ConnectionError):
         return "Network connection error. Please check your internet connection."

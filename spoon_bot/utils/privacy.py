@@ -73,7 +73,10 @@ _BARE_HEX_PRIVATE_KEY_RE = re.compile(
 _HASH_CONTEXT_FIELDS = (
     r'transactionHash'       # JSON receipt
     r'|transaction[_\s]*hash'  # transaction_hash, transaction hash
+    r'|transaction'           # transaction=0x...
+    r'|tx'                    # tx=0x...
     r'|tx[_\s]*hash'          # tx_hash, tx hash
+    r'|txid'                  # txid=0x...
     r'|block[_\s]*hash'       # blockHash, block_hash
     r'|receipt[_\s]*hash'     # receiptHash
     r'|parent[_\s]*hash'      # parentHash

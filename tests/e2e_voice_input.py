@@ -7,7 +7,7 @@ Tests:
 4. Verify transcription results and agent responses
 
 Usage:
-    python tests/e2e_voice_input.py [--gateway-url http://127.0.0.1:8080]
+    python tests/e2e_voice_input.py [--gateway-url http://127.0.0.1:16600]
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 
-GATEWAY_URL = "http://127.0.0.1:8080"
+GATEWAY_URL = "http://127.0.0.1:16600"
 TEST_PHRASE = "Hello, this is a test of the voice input system."
 TTS_MODEL = "tts-1"
 TTS_VOICE = "alloy"
@@ -255,7 +255,7 @@ async def test_health(client: httpx.AsyncClient) -> bool:
     except httpx.ConnectError:
         print(f"  [FAIL] Cannot connect to gateway at {GATEWAY_URL}")
         print("  Make sure the gateway is running:")
-        print("    uvicorn spoon_bot.gateway.server:create_app --factory --port 8080")
+        print("    uvicorn spoon_bot.gateway.server:create_app --factory --port 16600")
         return False
     except Exception as e:
         print(f"  [FAIL] Error: {e}")
@@ -381,7 +381,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="E2E voice input test")
     parser.add_argument(
         "--gateway-url",
-        default="http://127.0.0.1:8080",
+        default="http://127.0.0.1:16600",
         help="Gateway base URL",
     )
     args = parser.parse_args()

@@ -100,6 +100,11 @@ Documentation = "https://github.com/XSpoonAi/spoon-bot#readme"
 where = ["."]
 include = ["spoon_bot*"]
 
+[tool.setuptools.package-data]
+spoon_bot = [
+    "skills/builtin/**/*",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

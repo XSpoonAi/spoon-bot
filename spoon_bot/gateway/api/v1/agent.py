@@ -35,12 +35,17 @@ from spoon_bot.gateway.models.responses import (
     StreamChunk,
     TranscriptionInfo,
 )
-from spoon_bot.gateway.observability.budget import BudgetExhaustedError
+from spoon_bot.gateway.observability.budget import (
+    BudgetExhaustedError,
+    check_budget,
+    wait_for_budget,
+)
 from spoon_bot.gateway.observability.tracing import (
     TimerSpan,
     build_timing_payload,
     new_trace_id,
 )
+from spoon_bot.gateway.request_context import bind_agent_request_context
 from spoon_bot.gateway.websocket.handler import (
     _derive_media_from_attachments,
     _merge_attachment_context,
@@ -209,6 +214,7 @@ async def _stream_sse(
     session_key: str | None = None,
     trace_id: str | None = None,
     request_id: str | None = None,
+    user_id: str | None = None,
     cancel_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE events from agent streaming."""
@@ -227,74 +233,110 @@ async def _stream_sse(
     resolved_session_key = session_key or "default"
     runtime = await get_session_runtime_registry().get_or_create(resolved_session_key)
     agent = runtime.agent
+    config = get_config()
+    with bind_agent_request_context(
+        agent,
+        user_id=user_id or "anonymous",
+        session_key=resolved_session_key,
+        request_id=resolved_request_id,
+        trace_id=resolved_trace_id,
+        task_id=resolved_request_id,
+        transport="rest_sse",
+    ):
+        async with runtime.lock:
+            runtime.active_task_id = resolved_request_id
 
-    async with runtime.lock:
-        runtime.active_task_id = resolved_request_id
+            kwargs = {"message": message, "thinking": thinking}
+            if reasoning_effort:
+                kwargs["reasoning_effort"] = reasoning_effort
+            if media:
+                kwargs["media"] = media
+            if attachments:
+                kwargs["attachments"] = attachments
 
-        kwargs = {"message": message, "thinking": thinking}
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-        if media:
-            kwargs["media"] = media
-        if attachments:
-            kwargs["attachments"] = attachments
+            try:
+                stream_iter = agent.stream(**kwargs)
+                try:
+                    while True:
+                        try:
+                            chunk_data = await wait_for_budget(
+                                anext(stream_iter),
+                                budget_type="stream",
+                                limit_ms=config.budget.stream_timeout_ms,
+                                elapsed_ms=lambda: span.elapsed_ms,
+                            )
+                        except StopAsyncIteration:
+                            break
 
-        try:
-            async for chunk_data in agent.stream(**kwargs):
-                if cancel_event and cancel_event.is_set():
-                    break
+                        check_budget(
+                            "request",
+                            config.budget.request_timeout_ms,
+                            span.elapsed_ms,
+                        )
+                        check_budget(
+                            "stream",
+                            config.budget.stream_timeout_ms,
+                            span.elapsed_ms,
+                        )
 
-                chunk_type = chunk_data.get("type", "content")
+                        if cancel_event and cancel_event.is_set():
+                            break
 
-                # Propagate error chunks to the client
-                if chunk_type == "error":
-                    error_chunk = StreamChunk(
-                        type="error",
-                        delta=chunk_data.get("delta", ""),
-                        metadata=chunk_data.get("metadata", {}),
-                        source=ResponseSource(**(chunk_data.get("source") or {})),
-                    )
-                    yield f"data: {error_chunk.model_dump_json()}\n\n"
-                    continue
+                        chunk_type = chunk_data.get("type", "content")
 
-                # Filter out "done" chunks; clients use [DONE] as the completion signal.
-                if chunk_type == "done":
-                    done_metadata = chunk_data.get("metadata", {})
-                    done_content = (
-                        done_metadata.get("content", "")
-                        if isinstance(done_metadata, dict)
-                        else ""
-                    )
-                    if not streamed_content and isinstance(done_content, str) and done_content:
-                        fallback_chunk = StreamChunk(
-                            type="content",
-                            delta=done_content,
-                            metadata={"fallback": "done_metadata_content"},
+                        # Propagate error chunks to the client
+                        if chunk_type == "error":
+                            error_chunk = StreamChunk(
+                                type="error",
+                                delta=chunk_data.get("delta", ""),
+                                metadata=chunk_data.get("metadata", {}),
+                                source=ResponseSource(**(chunk_data.get("source") or {})),
+                            )
+                            yield f"data: {error_chunk.model_dump_json()}\n\n"
+                            continue
+
+                        # Filter out "done" chunks; clients use [DONE] as the completion signal.
+                        if chunk_type == "done":
+                            done_metadata = chunk_data.get("metadata", {})
+                            done_content = (
+                                done_metadata.get("content", "")
+                                if isinstance(done_metadata, dict)
+                                else ""
+                            )
+                            if not streamed_content and isinstance(done_content, str) and done_content:
+                                fallback_chunk = StreamChunk(
+                                    type="content",
+                                    delta=done_content,
+                                    metadata={"fallback": "done_metadata_content"},
+                                    source=ResponseSource(**(chunk_data.get("source") or {})),
+                                )
+                                yield f"data: {fallback_chunk.model_dump_json()}\n\n"
+                                streamed_content = done_content
+                            continue
+
+                        chunk = StreamChunk(
+                            type=chunk_type,
+                            delta=chunk_data["delta"],
+                            metadata=chunk_data.get("metadata", {}),
                             source=ResponseSource(**(chunk_data.get("source") or {})),
                         )
-                        yield f"data: {fallback_chunk.model_dump_json()}\n\n"
-                        streamed_content = done_content
-                    continue
-
-                chunk = StreamChunk(
-                    type=chunk_type,
-                    delta=chunk_data["delta"],
-                    metadata=chunk_data.get("metadata", {}),
-                    source=ResponseSource(**(chunk_data.get("source") or {})),
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        if chunk_type == "content" and chunk.delta:
+                            streamed_content += chunk.delta
+                finally:
+                    aclose = getattr(stream_iter, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
+            except Exception as e:
+                error_chunk = StreamChunk(
+                    type="error",
+                    delta="",
+                    metadata={"error": str(e), "trace_id": resolved_trace_id},
+                    source=_get_agent_response_source(agent),
                 )
-                yield f"data: {chunk.model_dump_json()}\n\n"
-                if chunk_type == "content" and chunk.delta:
-                    streamed_content += chunk.delta
-        except Exception as e:
-            error_chunk = StreamChunk(
-                type="error",
-                delta="",
-                metadata={"error": str(e), "trace_id": resolved_trace_id},
-                source=_get_agent_response_source(agent),
-            )
-            yield f"data: {error_chunk.model_dump_json()}\n\n"
-        finally:
-            runtime.active_task_id = None
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
+            finally:
+                runtime.active_task_id = None
 
     span.stop()
     yield _format_sse_event(
@@ -366,6 +408,7 @@ async def chat(
                     session_key=session_key,
                     trace_id=trace_id,
                     request_id=request_id,
+                    user_id=getattr(user, "user_id", "anonymous"),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -378,24 +421,49 @@ async def chat(
 
         runtime = await get_session_runtime_registry().get_or_create(session_key)
         agent = runtime.agent
-        async with runtime.lock:
-            runtime.active_task_id = request_id
-            try:
-                kwargs = {"message": message}
-                if reasoning_effort:
-                    kwargs["reasoning_effort"] = reasoning_effort
-                if media:
-                    kwargs["media"] = media
-                if attachments:
-                    kwargs["attachments"] = attachments
+        config = get_config()
+        with bind_agent_request_context(
+            agent,
+            user_id=getattr(user, "user_id", "anonymous"),
+            session_key=session_key,
+            request_id=request_id,
+            trace_id=trace_id,
+            task_id=request_id,
+            transport="rest",
+        ):
+            async with runtime.lock:
+                runtime.active_task_id = request_id
+                try:
+                    kwargs = {"message": message}
+                    if reasoning_effort:
+                        kwargs["reasoning_effort"] = reasoning_effort
+                    if media:
+                        kwargs["media"] = media
+                    if attachments:
+                        kwargs["attachments"] = attachments
 
-                thinking_content = None
-                if thinking:
-                    response_text, thinking_content = await agent.process_with_thinking(**kwargs)
-                else:
-                    response_text = await agent.process(**kwargs)
-            finally:
-                runtime.active_task_id = None
+                    thinking_content = None
+                    if thinking:
+                        response_text, thinking_content = await wait_for_budget(
+                            agent.process_with_thinking(**kwargs),
+                            budget_type="request",
+                            limit_ms=config.budget.request_timeout_ms,
+                            elapsed_ms=lambda: request_span.elapsed_ms,
+                        )
+                    else:
+                        response_text = await wait_for_budget(
+                            agent.process(**kwargs),
+                            budget_type="request",
+                            limit_ms=config.budget.request_timeout_ms,
+                            elapsed_ms=lambda: request_span.elapsed_ms,
+                        )
+                    check_budget(
+                        "request",
+                        config.budget.request_timeout_ms,
+                        request_span.elapsed_ms,
+                    )
+                finally:
+                    runtime.active_task_id = None
 
         response_source = _get_agent_response_source(agent)
         duration_ms = int((time.time() - start_time) * 1000)
@@ -477,6 +545,7 @@ class TaskStatus(str, Enum):
 class AsyncTask:
     task_id: str
     owner_user_id: str
+    trace_id: str
     status: TaskStatus = TaskStatus.PENDING
     result: str | None = None
     source: dict[str, Any] | None = None
@@ -491,23 +560,45 @@ class AsyncTask:
 _task_store: dict[str, AsyncTask] = {}
 
 
-async def _run_async_task(task: AsyncTask, message: str, session_key: str | None = None):
+async def _run_async_task(
+    task: AsyncTask,
+    message: str,
+    session_key: str | None = None,
+    *,
+    user_id: str | None = None,
+):
     """Background coroutine that drives agent processing for an async task."""
     task.status = TaskStatus.RUNNING
+    started_at = time.time()
     try:
         resolved_session_key = session_key or "default"
         runtime = await get_session_runtime_registry().get_or_create(resolved_session_key)
         agent = runtime.agent
-        async with runtime.lock:
-            runtime.active_task_id = task.task_id
-            try:
-                if task._cancel_event.is_set():
-                    task.status = TaskStatus.CANCELLED
-                    return
-                response = await agent.process(message=message)
-                task.source = _get_agent_response_source(agent).model_dump()
-            finally:
-                runtime.active_task_id = None
+        config = get_config()
+        with bind_agent_request_context(
+            agent,
+            user_id=user_id or task.owner_user_id,
+            session_key=resolved_session_key,
+            request_id=task.task_id,
+            trace_id=task.trace_id,
+            task_id=task.task_id,
+            transport="rest_async",
+        ):
+            async with runtime.lock:
+                runtime.active_task_id = task.task_id
+                try:
+                    if task._cancel_event.is_set():
+                        task.status = TaskStatus.CANCELLED
+                        return
+                    response = await wait_for_budget(
+                        agent.process(message=message),
+                        budget_type="request",
+                        limit_ms=config.budget.request_timeout_ms,
+                        elapsed_ms=lambda: int((time.time() - started_at) * 1000),
+                    )
+                    task.source = _get_agent_response_source(agent).model_dump()
+                finally:
+                    runtime.active_task_id = None
         if task._cancel_event.is_set():
             task.status = TaskStatus.CANCELLED
             return
@@ -533,6 +624,7 @@ async def chat_async(
     Returns a task ID that can be polled for results.
     """
     task_id = f"task_{uuid4().hex[:12]}"
+    trace_id = new_trace_id()
 
     try:
         get_session_runtime_registry()
@@ -545,16 +637,24 @@ async def chat_async(
     session_key = _resolve_session_key(request.session_key, user)
     owner_user_id = getattr(user, "user_id", "anonymous")
 
-    task = AsyncTask(task_id=task_id, owner_user_id=owner_user_id)
+    task = AsyncTask(task_id=task_id, owner_user_id=owner_user_id, trace_id=trace_id)
     _task_store[task_id] = task
 
-    bg = asyncio.create_task(_run_async_task(task, request.message, session_key=session_key))
+    bg = asyncio.create_task(
+        _run_async_task(
+            task,
+            request.message,
+            session_key=session_key,
+            user_id=owner_user_id,
+        )
+    )
     task._bg_task = bg
 
     return {
         "task_id": task_id,
         "status": task.status.value,
         "created_at": task.created_at,
+        "trace_id": trace_id,
     }
 
 
@@ -581,6 +681,7 @@ async def get_task(
         "task_id": task.task_id,
         "status": task.status.value,
         "created_at": task.created_at,
+        "trace_id": task.trace_id,
     }
     if task.result is not None:
         payload["result"] = task.result
@@ -834,6 +935,7 @@ async def voice_chat(
                 session_key=session_key,
                 trace_id=trace_id,
                 request_id=request_id,
+                user_id=getattr(user, "user_id", "anonymous"),
             ),
             media_type="text/event-stream",
             headers={
@@ -846,12 +948,28 @@ async def voice_chat(
 
     runtime = await get_session_runtime_registry().get_or_create(session_key)
     agent = runtime.agent
-    async with runtime.lock:
-        runtime.active_task_id = request_id
-        try:
-            response_text = await agent.process(message=processed_message)
-        finally:
-            runtime.active_task_id = None
+    request_span = TimerSpan("rest_voice_chat")
+    with bind_agent_request_context(
+        agent,
+        user_id=getattr(user, "user_id", "anonymous"),
+        session_key=session_key,
+        request_id=request_id,
+        trace_id=trace_id,
+        task_id=request_id,
+        transport="rest_voice",
+    ):
+        async with runtime.lock:
+            runtime.active_task_id = request_id
+            try:
+                response_text = await wait_for_budget(
+                    agent.process(message=processed_message),
+                    budget_type="request",
+                    limit_ms=config.budget.request_timeout_ms,
+                    elapsed_ms=lambda: request_span.elapsed_ms,
+                )
+            finally:
+                runtime.active_task_id = None
+    request_span.stop()
     response_source = _get_agent_response_source(agent)
     duration_ms = int((time.time() - start_time) * 1000)
 

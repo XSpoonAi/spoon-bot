@@ -29,13 +29,13 @@ from pydantic_settings import BaseSettings
 DEFAULT_SHELL_TIMEOUT: int = 600       # 10 min foreground budget
 DEFAULT_SHELL_MAX_TIMEOUT: int = 7200  # 2 hour per-command cap
 DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT: float = 10.0
-DEFAULT_PROVIDER_SILENCE_TIMEOUT: float = 600.0
-DEFAULT_PROVIDER_TOTAL_TIMEOUT: float = 600.0
+DEFAULT_PROVIDER_SILENCE_TIMEOUT: float = 0.0
+DEFAULT_PROVIDER_TOTAL_TIMEOUT: float = 0.0
 DEFAULT_TOOL_FOLLOWUP_TIMEOUT: float = 600.0
 DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT: int = 200
 DEFAULT_MAX_OUTPUT: int = 10_000
 DEFAULT_MAX_ITERATIONS: int = 20
-DEFAULT_PROVIDER_MAX_RETRIES: int = 5
+DEFAULT_PROVIDER_MAX_RETRIES: int = 1
 DEFAULT_PROVIDER_RETRY_BASE_DELAY: float = 1.0
 DEFAULT_PROVIDER_RETRY_MAX_DELAY: float = 60.0
 DEFAULT_PROVIDER_RETRY_BACKOFF_FACTOR: float = 2.0
@@ -80,6 +80,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "o3-mini":                 200_000,
     # ---- DeepSeek ----
     "deepseek-v3.2":           163_840,
+    "deepseek-v4-pro":       1_000_000,
     "deepseek-chat-v3.1":      32_768,
     "deepseek-chat":           163_840,
     "deepseek-r1":              64_000,

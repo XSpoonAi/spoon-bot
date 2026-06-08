@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass, field
-from typing import Any
+
+
+DEFAULT_GATEWAY_PORT = 16600
+DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 0
+DEFAULT_GATEWAY_STREAM_TIMEOUT_MS = 0
 
 
 @dataclass
@@ -53,9 +57,9 @@ class JWTConfig:
 class BudgetConfig:
     """Execution budget configuration."""
 
-    request_timeout_ms: int = 0            # unlimited by default
+    request_timeout_ms: int = DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     tool_timeout_ms: int = 3_600_000      # 60 minutes default
-    stream_timeout_ms: int = 0            # unlimited by default
+    stream_timeout_ms: int = DEFAULT_GATEWAY_STREAM_TIMEOUT_MS
 
 
 @dataclass
@@ -85,7 +89,7 @@ class GatewayConfig:
 
     # Server settings
     host: str = "127.0.0.1"
-    port: int = 8080
+    port: int = DEFAULT_GATEWAY_PORT
     debug: bool = False
 
     # API settings
@@ -123,7 +127,7 @@ class GatewayConfig:
         """Create config from environment variables."""
         return cls(
             host=os.environ.get("GATEWAY_HOST", "127.0.0.1"),
-            port=int(os.environ.get("GATEWAY_PORT", "8080")),
+            port=int(os.environ.get("GATEWAY_PORT", str(DEFAULT_GATEWAY_PORT))),
             debug=os.environ.get("GATEWAY_DEBUG", "").lower() == "true",
             jwt=JWTConfig(
                 secret_key=os.environ.get("JWT_SECRET", ""),
@@ -133,13 +137,19 @@ class GatewayConfig:
             ),
             budget=BudgetConfig(
                 request_timeout_ms=int(
-                    os.environ.get("GATEWAY_TIMEOUT_REQUEST_MS", "0")
+                    os.environ.get(
+                        "GATEWAY_TIMEOUT_REQUEST_MS",
+                        str(DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS),
+                    )
                 ),
                 tool_timeout_ms=int(
                     os.environ.get("GATEWAY_TIMEOUT_TOOL_MS", "3600000")
                 ),
                 stream_timeout_ms=int(
-                    os.environ.get("GATEWAY_TIMEOUT_STREAM_MS", "0")
+                    os.environ.get(
+                        "GATEWAY_TIMEOUT_STREAM_MS",
+                        str(DEFAULT_GATEWAY_STREAM_TIMEOUT_MS),
+                    )
                 ),
             ),
             audio=AudioConfig(

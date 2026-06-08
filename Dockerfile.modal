@@ -1,0 +1,50 @@
+# Modal-compatible spoon-bot image.
+#
+# Modal's Dockerfile builder does not support COPY --chown with named users, so
+# this image keeps the runtime simple and relies on Modal's isolated container
+# plus mounted /data volume for state.
+
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    tini \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --all-extras
+
+COPY . .
+RUN uv sync --frozen --all-extras
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV SPOON_BOT_MODE=gateway
+ENV GATEWAY_HOST=0.0.0.0
+ENV GATEWAY_PORT=16600
+ENV GATEWAY_DEBUG=false
+ENV GATEWAY_WORKERS=1
+ENV GATEWAY_AUTH_REQUIRED=false
+ENV GATEWAY_TIMEOUT_REQUEST_MS=0
+ENV GATEWAY_TIMEOUT_STREAM_MS=0
+ENV SPOON_BOT_MAX_ITERATIONS=20
+ENV SPOON_BOT_SHELL_TIMEOUT=3600
+ENV SPOON_BOT_SHELL_MAX_TIMEOUT=7200
+ENV SPOON_BOT_MAX_OUTPUT=12000
+ENV SPOON_BOT_LOG_LEVEL=INFO
+ENV SPOON_BOT_WORKSPACE_PATH=/data/workspace
+ENV SPOON_BOT_WALLET_PATH=/data/agent-wallet
+ENV SPOON_BOT_YOLO_MODE=true
+ENV SANDBOX_PROVIDER=modal
+
+RUN mkdir -p /data/workspace /data/agent-wallet

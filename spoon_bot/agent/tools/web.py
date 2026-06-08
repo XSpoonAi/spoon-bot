@@ -15,8 +15,8 @@ from loguru import logger
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
     capture_tool_output,
-    get_request_execution_hints,
-    get_tracked_tool_invocation_counts,
+    current_session_fact_check_blocker,
+    explicit_unavailable_tool_request_blocker,
 )
 
 # Shared httpx client for connection pooling across web tools.
@@ -184,6 +184,15 @@ class WebSearchTool(Tool):
         provider: str | None = None,
         **kwargs: Any,
     ) -> str:
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+        tool_boundary_blocker = explicit_unavailable_tool_request_blocker(self.name)
+        if tool_boundary_blocker is not None:
+            capture_tool_output(tool_boundary_blocker, tool_boundary_blocker)
+            return tool_boundary_blocker
+
         explicit_provider = (provider or "").strip().lower()
         max_results = min(max_results or self._max_results, 20)
 
@@ -618,6 +627,15 @@ class WebFetchTool(Tool):
         Returns:
             Fetched content or error message.
         """
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+        tool_boundary_blocker = explicit_unavailable_tool_request_blocker(self.name)
+        if tool_boundary_blocker is not None:
+            capture_tool_output(tool_boundary_blocker, tool_boundary_blocker)
+            return tool_boundary_blocker
+
         # Validate URL
         is_valid, error_msg = self._validate_url(url)
         if not is_valid:
@@ -691,61 +709,7 @@ class WebFetchTool(Tool):
 
     @staticmethod
     def _build_local_skill_fetch_blocker(url: str) -> str | None:
-        """Defer skill-derived remote probes until a local executable path is tried."""
-        hints = get_request_execution_hints()
-        if not hints or hints.get("allow_remote_probe"):
-            return None
-
-        local_skills = hints.get("local_executable_skills")
-        if not isinstance(local_skills, list) or not local_skills:
-            return None
-
-        invocation_counts = get_tracked_tool_invocation_counts()
-        if invocation_counts.get("shell", 0) > 0:
-            return None
-
-        parsed = urlparse(str(url or ""))
-        target_host = (parsed.hostname or "").lower().strip()
-        target_url = str(url or "").strip().lower()
-        if not target_host and not target_url:
-            return None
-
-        for skill in local_skills:
-            if not isinstance(skill, dict):
-                continue
-            urls = skill.get("urls")
-            if not isinstance(urls, list) or not urls:
-                continue
-
-            matched = False
-            for candidate in urls:
-                parsed_candidate = urlparse(str(candidate or ""))
-                candidate_host = (parsed_candidate.hostname or "").lower().strip()
-                candidate_url = str(candidate or "").strip().lower()
-                if candidate_host and candidate_host == target_host:
-                    matched = True
-                    break
-                if candidate_url and target_url.startswith(candidate_url.rstrip("/")):
-                    matched = True
-                    break
-            if not matched:
-                continue
-
-            commands = skill.get("commands") if isinstance(skill.get("commands"), list) else []
-            command_hint = ""
-            if commands:
-                command_hint = " For example: " + " | ".join(str(cmd) for cmd in commands[:2])
-            skill_name = str(skill.get("name") or "local skill")
-            skill_location = str(skill.get("location") or "")
-            location_hint = f" at {skill_location}" if skill_location else ""
-            return (
-                "Error: Deferred remote fetch from a skill-derived endpoint before any "
-                f"local execution. This request already matches local skill `{skill_name}`"
-                f"{location_hint}. Read its SKILL.md and run one of its documented local "
-                f"commands first.{command_hint} Only probe remote endpoints after the local "
-                "command reports a concrete blocker that requires network inspection."
-            )
-
+        """No-op: web access should not be blocked by local-skill token hints."""
         return None
 
     @staticmethod
@@ -858,6 +822,15 @@ class WebBrowserTool(Tool):
         Returns:
             Page content or error message.
         """
+        fact_check_blocker = current_session_fact_check_blocker()
+        if fact_check_blocker is not None:
+            capture_tool_output(fact_check_blocker, fact_check_blocker)
+            return fact_check_blocker
+        tool_boundary_blocker = explicit_unavailable_tool_request_blocker(self.name)
+        if tool_boundary_blocker is not None:
+            capture_tool_output(tool_boundary_blocker, tool_boundary_blocker)
+            return tool_boundary_blocker
+
         # Basic URL validation
         try:
             parsed = urlparse(url)
