@@ -2,11 +2,11 @@
 
 This document describes the **Gateway API** exposed by spoon-bot. The frontend should connect to these endpoints for agent interactions, session management, tool/skill control, and real-time streaming.
 
-> **Auto-generated** from source code on 2026-05-18 08:41 UTC.  
+> **Auto-generated** from source code on 2026-06-08 10:36 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
-Base URL (local): `http://localhost:16600`
-API Docs (Swagger): `http://localhost:16600/docs`
+Base URL (local): `http://localhost:16600`  
+API Docs (Swagger): `http://localhost:16600/docs`  
 API Docs (ReDoc): `http://localhost:16600/redoc`
 
 ---
@@ -171,7 +171,7 @@ Otherwise returns a standard JSON response.
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:314`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:356`*
 
 ### `POST /v1/agent/voice/chat`
 
@@ -224,7 +224,7 @@ Send voice + optional text to the agent (multipart upload).
 }
 ```
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:780`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:881`*
 
 ---
 
@@ -278,7 +278,7 @@ Get agent status and statistics, including channel health.
 
 **Response Model:** `APIResponse[StatusResponse]`
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:628`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:729`*
 
 ---
 
@@ -290,19 +290,19 @@ Get agent status and statistics, including channel health.
 
 Send a message asynchronously.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:526`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:617`*
 
 ### `GET /v1/agent/tasks/{task_id}`
 
 Get the status of an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:562`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:662`*
 
 ### `POST /v1/agent/tasks/{task_id}/cancel`
 
 Cancel an async task.
 
-*Source: `spoon_bot/gateway/api/v1/agent.py:597`*
+*Source: `spoon_bot/gateway/api/v1/agent.py:698`*
 
 ---
 
@@ -1040,12 +1040,9 @@ Health check response.
 | `GATEWAY_AUTH_REQUIRED` | `true` | server.py |
 | `JWT_SECRET` | *(none)* | config.py |
 | `GATEWAY_HOST` | `127.0.0.1` | config.py |
-| `GATEWAY_PORT` | `16600` | config.py |
 | `GATEWAY_DEBUG` | *(none)* | config.py |
 | `JWT_ACCESS_EXPIRE_MINUTES` | `15` | config.py |
-| `GATEWAY_TIMEOUT_REQUEST_MS` | `0` | config.py |
 | `GATEWAY_TIMEOUT_TOOL_MS` | `3600000` | config.py |
-| `GATEWAY_TIMEOUT_STREAM_MS` | `0` | config.py |
 | `GATEWAY_AUDIO_ENABLED` | `true` | config.py |
 | `GATEWAY_AUDIO_STT_PROVIDER` | `whisper` | config.py |
 | `GATEWAY_AUDIO_STT_MODEL` | `whisper-1` | config.py |
