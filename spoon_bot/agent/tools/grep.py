@@ -14,7 +14,25 @@ from pathlib import Path
 from typing import Any
 
 from spoon_bot.agent.tools.base import Tool
-from spoon_bot.agent.tools.execution_context import capture_tool_output
+from spoon_bot.agent.tools.execution_context import (
+    capture_tool_output,
+    get_request_execution_hints,
+)
+
+_DEFAULT_EXCLUDED_DIRS = frozenset({
+    ".spoon-bot",
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "sessions",
+    "venv",
+})
 
 
 class GrepTool(Tool):
@@ -39,7 +57,9 @@ class GrepTool(Tool):
             "Returns matching lines with file paths and line numbers. "
             "Use this INSTEAD of reading entire files when you need specific info "
             "(e.g., a contract address, function signature, config value). "
-            "Supports regex patterns. Output truncated to limit matches."
+            "Supports regex patterns. Output truncated to limit matches. "
+            "Do not use this to recover current-session conversation facts; "
+            "use search_history for prior user/tool messages."
         )
 
     @property
@@ -71,6 +91,13 @@ class GrepTool(Tool):
                     "type": "integer",
                     "description": "Max matches to return (default: 50)",
                 },
+                "include_ignored": {
+                    "type": "boolean",
+                    "description": (
+                        "Search dependency/cache directories too. Default false "
+                        "unless the requested path is inside one."
+                    ),
+                },
             },
             "required": ["pattern"],
         }
@@ -83,6 +110,7 @@ class GrepTool(Tool):
         ignore_case: bool = False,
         context: int = 0,
         limit: int = 50,
+        include_ignored: bool = False,
         **kwargs: Any,
     ) -> str:
         if not pattern:
@@ -94,14 +122,44 @@ class GrepTool(Tool):
 
         if not os.path.exists(search_path):
             return f"Error: Path not found: {search_path}"
+        if self._is_unrequested_session_transcript_path(search_path):
+            return (
+                "CURRENT_REQUEST_CONTEXT_GUARD: session transcripts are not a "
+                "source for a new workspace/build task. The latest user request "
+                "is already in context; inspect project files or create the "
+                "requested artifact instead of grepping sessions/."
+            )
 
         rg_path = shutil.which("rg")
         grep_path = shutil.which("grep")
+        exclude_dirs = (
+            []
+            if include_ignored or self._path_is_inside_default_excluded_dir(search_path)
+            else sorted(_DEFAULT_EXCLUDED_DIRS)
+        )
 
         if rg_path:
-            args = self._build_rg_args(rg_path, pattern, search_path, glob, ignore_case, context, limit)
+            args = self._build_rg_args(
+                rg_path,
+                pattern,
+                search_path,
+                glob,
+                ignore_case,
+                context,
+                limit,
+                exclude_dirs,
+            )
         elif grep_path:
-            args = self._build_grep_args(grep_path, pattern, search_path, glob, ignore_case, context, limit)
+            args = self._build_grep_args(
+                grep_path,
+                pattern,
+                search_path,
+                glob,
+                ignore_case,
+                context,
+                limit,
+                exclude_dirs,
+            )
         else:
             return "Error: neither rg nor grep found in PATH"
 
@@ -141,12 +199,15 @@ class GrepTool(Tool):
     def _build_rg_args(
         rg_path: str, pattern: str, search_path: str,
         glob: str | None, ignore_case: bool, context: int, limit: int,
+        exclude_dirs: list[str] | None = None,
     ) -> list[str]:
         args = [rg_path, "--line-number", "--color=never", "--no-heading"]
         if ignore_case:
             args.append("--ignore-case")
         if glob:
             args.append(f"--glob={glob}")
+        for dirname in exclude_dirs or []:
+            args.append(f"--glob=!**/{dirname}/**")
         if context > 0:
             args.extend(["-C", str(context)])
         args.extend(["-m", str(limit), pattern, search_path])
@@ -156,6 +217,7 @@ class GrepTool(Tool):
     def _build_grep_args(
         grep_path: str, pattern: str, search_path: str,
         glob: str | None, ignore_case: bool, context: int, limit: int,
+        exclude_dirs: list[str] | None = None,
     ) -> list[str]:
         args = [grep_path, "-Ern", "--color=never"]
         if ignore_case:
@@ -164,5 +226,24 @@ class GrepTool(Tool):
             args.extend(["-C", str(context)])
         if glob:
             args.append(f"--include={glob}")
+        for dirname in exclude_dirs or []:
+            args.append(f"--exclude-dir={dirname}")
         args.extend(["-e", pattern, "--", search_path])
         return args
+
+    @staticmethod
+    def _path_is_inside_default_excluded_dir(path: str) -> bool:
+        try:
+            parts = Path(path).resolve().parts
+        except Exception:
+            parts = Path(str(path or "")).parts
+        normalized_parts = {part.casefold() for part in parts}
+        return bool(normalized_parts & _DEFAULT_EXCLUDED_DIRS)
+
+    @staticmethod
+    def _is_unrequested_session_transcript_path(path: str) -> bool:
+        hints = get_request_execution_hints()
+        if isinstance(hints, dict) and hints.get("current_session_fact_check_required"):
+            return False
+        normalized = str(path or "").replace("\\", "/").casefold().rstrip("/")
+        return normalized.endswith("/sessions") or "/sessions/" in normalized

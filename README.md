@@ -750,7 +750,7 @@ async def main():
     agent = await create_agent(provider="openai", model="gpt-5.2")
 
     # Create gateway app
-    config = GatewayConfig(host="0.0.0.0", port=8080)
+    config = GatewayConfig(host="0.0.0.0")
     app = create_app(config)
 
     # Set agent

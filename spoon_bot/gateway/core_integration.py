@@ -340,7 +340,7 @@ class SpoonCoreIdentity:
                 else:
                     logger.info(
                         f"No on-chain agent identity for wallet {self._wallet_address} "
-                        f"(register via `joker-game-agent register`)"
+                        "(register via the configured identity registration flow)"
                     )
             else:
                 logger.info("ERC8004 client ready (no wallet address set yet)")

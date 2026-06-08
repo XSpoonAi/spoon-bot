@@ -4272,8 +4272,8 @@ wheels = [
 
 [[package]]
 name = "spoon-ai-sdk"
-version = "0.4.2"
-source = { git = "https://github.com/XSpoonAi/spoon-core.git#5210fc2dd9be2e6aff2d34744bb8b20702e6aaba" }
+version = "0.4.10"
+source = { git = "https://github.com/XSpoonAi/spoon-core.git#bb5037f31afcdd5277dac0bfe9a61e8d1a1678e7" }
 dependencies = [
     { name = "aiohappyeyeballs" },
     { name = "aiohttp" },

@@ -1,0 +1,23 @@
+# Minimal Modal runtime configuration.
+# Secrets are provided by Modal Secret, not this file.
+
+agent:
+  model: "${SPOON_BOT_DEFAULT_MODEL}"
+  provider: "${SPOON_BOT_DEFAULT_PROVIDER}"
+  workspace: "/modal-data/workspace"
+  max_iterations: 100
+  context_window: 1000000
+  shell_timeout: 3600
+  shell_max_timeout: 7200
+  tool_profile: "core"
+  yolo_mode: true
+
+channels:
+  telegram:
+    enabled: false
+  discord:
+    enabled: false
+  feishu:
+    enabled: false
+  cli:
+    enabled: false

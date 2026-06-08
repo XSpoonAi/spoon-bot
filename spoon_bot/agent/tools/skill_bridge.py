@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from spoon_bot.agent.tools.base import Tool, ToolParameterSchema
+from spoon_bot.agent.tools.execution_context import bind_tool_workspace
 
 
 class SkillToolBridge(Tool):
@@ -21,8 +22,9 @@ class SkillToolBridge(Tool):
     so the tool can live in the ToolRegistry alongside native tools.
     """
 
-    def __init__(self, base_tool: Any) -> None:
+    def __init__(self, base_tool: Any, *, workspace: str | None = None) -> None:
         self._base_tool = base_tool
+        self._workspace = workspace
 
     @property
     def name(self) -> str:
@@ -37,5 +39,6 @@ class SkillToolBridge(Tool):
         return self._base_tool.parameters
 
     async def execute(self, **kwargs: Any) -> str:
-        result = await self._base_tool.execute(**kwargs)
+        with bind_tool_workspace(self._workspace):
+            result = await self._base_tool.execute(**kwargs)
         return result if isinstance(result, str) else str(result)

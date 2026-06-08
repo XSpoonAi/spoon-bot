@@ -7,12 +7,19 @@ from typing import Any, TypedDict
 
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_invocation,
+    cancelled_tool_run_blocker,
+    classify_tool_invocation_category,
     finalize_tool_invocation,
+    get_tool_owner,
+    mark_current_tool_invocation_guardrail,
+    mark_current_tool_invocation_progress_recorded,
+    read_only_skill_inspection_budget_blocker,
     record_tool_invocation_result,
     suppress_after_consecutive_tool_failures,
     suppress_repeated_tool_invocation,
     suppress_repeated_tool_series,
 )
+from spoon_bot.agent.execution_ledger import record_tool_capture_in_ledger
 
 try:
     from typing import NotRequired
@@ -137,6 +144,73 @@ class Tool(ABC):
 
     _path_touch_callback: Any = None
 
+    @staticmethod
+    def _canonical_parameter_key(key: Any) -> str:
+        """Return a casing-insensitive comparison key for tool parameters."""
+        return "".join(
+            char
+            for char in str(key or "")
+            if char not in {"_", "-", " "}
+        ).casefold()
+
+    def _normalize_invocation_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Normalize common model-emitted parameter casing to schema keys.
+
+        Providers sometimes emit ``filePath`` for a tool whose schema declares
+        ``path``. Keep this data-driven from the tool schema so individual tool
+        loops do not need route-specific repairs.
+        """
+        if not isinstance(kwargs, dict) or not kwargs:
+            return kwargs
+
+        try:
+            schema_properties = dict(self.parameters.get("properties") or {})
+        except Exception:
+            schema_properties = {}
+        if not schema_properties:
+            return kwargs
+
+        canonical_to_schema_key = {
+            self._canonical_parameter_key(key): str(key)
+            for key in schema_properties.keys()
+        }
+        alias_to_schema_key = {
+            "filepath": "path",
+            "filename": "path",
+            "file": "path",
+            "oldstring": "old_text",
+            "oldstr": "old_text",
+            "old": "old_text",
+            "find": "old_text",
+            "search": "old_text",
+            "newstring": "new_text",
+            "newstr": "new_text",
+            "new": "new_text",
+            "replace": "new_text",
+            "replacement": "new_text",
+        }
+        normalized = dict(kwargs)
+        for raw_key, value in list(kwargs.items()):
+            if raw_key in schema_properties:
+                continue
+            canonical = self._canonical_parameter_key(raw_key)
+            schema_key = canonical_to_schema_key.get(canonical)
+            if not schema_key:
+                candidate = alias_to_schema_key.get(canonical)
+                if candidate in schema_properties:
+                    schema_key = candidate
+            if schema_key and schema_key not in normalized:
+                normalized[schema_key] = value
+        return normalized
+
+    def runtime_invocation_category(self, kwargs: dict[str, Any]) -> str | None:
+        """Return request-flow category for this invocation when known.
+
+        Tool subclasses may return ``read_only``, ``setup``, or ``stateful``.
+        The default uses shared tool metadata and the registered tool name.
+        """
+        return classify_tool_invocation_category(self.name, kwargs)
+
     async def __call__(self, *args: Any, **kwargs: Any) -> str:
         """
         Make the tool callable - compatibility with spoon-core SDK.
@@ -145,11 +219,33 @@ class Tool(ABC):
         """
         result: Any = None
         executed = False
-        with bind_tool_invocation(self.name, kwargs):
+        kwargs = self._normalize_invocation_kwargs(kwargs)
+        invocation_category = self.runtime_invocation_category(kwargs)
+        with bind_tool_invocation(self.name, kwargs) as invocation_id:
             try:
+                cancelled_result = cancelled_tool_run_blocker()
+                if cancelled_result is not None:
+                    result = cancelled_result
+                    mark_current_tool_invocation_guardrail(
+                        "request_cancelled",
+                        message=cancelled_result,
+                    )
+                    return result
                 failure_loop_result = suppress_after_consecutive_tool_failures(self.name)
                 if failure_loop_result is not None:
                     result = failure_loop_result
+                    return result
+                inspection_budget_result = read_only_skill_inspection_budget_blocker(
+                    self.name,
+                    kwargs,
+                    invocation_category=invocation_category,
+                )
+                if inspection_budget_result is not None:
+                    result = inspection_budget_result
+                    mark_current_tool_invocation_guardrail(
+                        "read_only_skill_inspection_budget",
+                        message=inspection_budget_result,
+                    )
                     return result
                 dedup_key_func = getattr(self, "tool_invocation_dedup_key", None)
                 dedup_arguments = dedup_key_func(kwargs) if callable(dedup_key_func) else kwargs
@@ -159,6 +255,17 @@ class Tool(ABC):
                         dedup_arguments,
                     )
                     if duplicate_result is not None:
+                        formatter = getattr(
+                            self,
+                            "format_duplicate_invocation_result",
+                            None,
+                        )
+                        if callable(formatter):
+                            duplicate_result = formatter(
+                                duplicate_result,
+                                kwargs,
+                                dedup_arguments,
+                            )
                         result = duplicate_result
                         return result
                 series_key_func = getattr(self, "tool_invocation_series_key", None)
@@ -173,8 +280,29 @@ class Tool(ABC):
                 executed = True
                 result = await self.execute(**kwargs)
             finally:
-                record_tool_invocation_result(self.name, result)
+                progress_hint = record_tool_invocation_result(
+                    self.name,
+                    result,
+                    arguments=kwargs,
+                    invocation_category=invocation_category,
+                )
+                if progress_hint and isinstance(result, str):
+                    if progress_hint not in result:
+                        result = result.rstrip() + "\n\n" + progress_hint
+                mark_current_tool_invocation_progress_recorded()
                 finalize_tool_invocation(result)
+                if invocation_id is None:
+                    try:
+                        record_tool_capture_in_ledger(
+                            owner=get_tool_owner(),
+                            tool_name=self.name,
+                            arguments=kwargs,
+                            summary_output=result,
+                            full_output=result,
+                            category=invocation_category,
+                        )
+                    except Exception:
+                        pass
 
         if executed and self._path_touch_callback is not None:
             _path = kwargs.get("path") or kwargs.get("file_path") or kwargs.get("directory")

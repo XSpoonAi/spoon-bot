@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Live E2E tests against a running gateway (http://localhost:8080).
+Live E2E tests against a running gateway (http://localhost:16600).
 
 Tests all the fixed bugs (#7-#19) against the actual running gateway.
-Requires: gateway running on http://localhost:8080 with auth disabled.
+Requires: gateway running on http://localhost:16600 with auth disabled.
 
 Usage:
     python -m pytest tests/test_e2e_gateway_live.py -v --tb=short
@@ -20,8 +20,8 @@ import time
 
 import httpx
 
-BASE_URL = "http://localhost:8080"
-WS_URL = "ws://localhost:8080/v1/ws"
+BASE_URL = "http://localhost:16600"
+WS_URL = "ws://localhost:16600/v1/ws"
 
 PASSED = 0
 FAILED = 0

@@ -16,6 +16,17 @@ from starlette.websockets import WebSocketState
 from spoon_bot.gateway.websocket.protocol import WSEvent, WSMessage
 
 
+def _utc_now_naive() -> datetime:
+    """Return a UTC timestamp compatible with older naive connection state."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
 def _env_float(name: str, default: float, *, minimum: float = 0.1) -> float:
     """Read a float env var, falling back to ``default`` on missing/invalid values."""
     raw = os.getenv(name)
@@ -70,14 +81,14 @@ class Connection:
     websocket: WebSocket
     user_id: str
     session_key: str
-    connected_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    last_activity: datetime = field(default_factory=lambda: datetime.now(UTC))
+    connected_at: datetime = field(default_factory=_utc_now_naive)
+    last_activity: datetime = field(default_factory=_utc_now_naive)
     subscriptions: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def update_activity(self) -> None:
         """Update last activity timestamp."""
-        self.last_activity = datetime.now(UTC)
+        self.last_activity = _utc_now_naive()
 
 
 class ConnectionManager:
@@ -381,13 +392,13 @@ class ConnectionManager:
             except asyncio.CancelledError:
                 raise
 
-            now = datetime.now(UTC)
+            now = _utc_now_naive()
             for conn_id in list(self._connections.keys()):
                 conn = self._connections.get(conn_id)
                 if conn is None:
                     continue
 
-                idle_seconds = (now - conn.last_activity).total_seconds()
+                idle_seconds = (now - _as_utc_naive(conn.last_activity)).total_seconds()
                 if idle_seconds > self._stale_threshold:
                     logger.debug(
                         f"Evicting stale WebSocket {conn_id}: "

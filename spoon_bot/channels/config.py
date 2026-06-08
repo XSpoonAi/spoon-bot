@@ -784,8 +784,9 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         "provider_max_retries",
     }
     _float_fields = {"provider_retry_base_delay", "provider_retry_max_delay", "provider_retry_backoff_factor"}
+    env_always_overrides = {"provider", "model"}
     for field, env_vars in agent_env_map.items():
-        if resolved.get(field) is None:
+        if resolved.get(field) is None or field in env_always_overrides:
             for var in env_vars:
                 val = os.environ.get(var)
                 if val:
@@ -817,6 +818,12 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
             resolved["base_url"] = os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL")
         elif provider == "anthropic":
             resolved["base_url"] = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
+        elif provider == "openrouter":
+            resolved["base_url"] = os.environ.get("OPENROUTER_BASE_URL") or os.environ.get("BASE_URL")
+        elif provider == "deepseek":
+            resolved["base_url"] = os.environ.get("DEEPSEEK_BASE_URL") or os.environ.get("BASE_URL")
+        elif provider == "gemini":
+            resolved["base_url"] = os.environ.get("GEMINI_BASE_URL") or os.environ.get("BASE_URL")
         else:
             resolved["base_url"] = os.environ.get("BASE_URL")
 

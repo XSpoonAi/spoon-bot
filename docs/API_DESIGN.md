@@ -96,7 +96,7 @@ env: live | test | dev
 
 ```
 Production:  https://api.spoon-bot.ai/v1
-Development: http://localhost:8080/v1
+Development: http://localhost:16600/v1
 ```
 
 ### 2.2 Standard Response Format

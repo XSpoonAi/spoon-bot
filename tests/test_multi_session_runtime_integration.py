@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from spoon_bot.gateway import app as app_module
 from spoon_bot.gateway.app import create_app, set_agent
-from spoon_bot.gateway.config import GatewayConfig
+from spoon_bot.gateway.config import DEFAULT_GATEWAY_PORT, GatewayConfig
 from spoon_bot.gateway.websocket.manager import ConnectionManager
 from spoon_bot.runtime.session_registry import SessionRuntimeRegistry
 
@@ -108,7 +108,9 @@ def _make_app_with_registry(
     max_active: int = 16,
 ) -> tuple[Any, FakeSessions, list[RuntimeAgent]]:
     app_module._auth_required = False
-    application = create_app(GatewayConfig(host="127.0.0.1", port=8080, debug=True))
+    application = create_app(
+        GatewayConfig(host="127.0.0.1", port=DEFAULT_GATEWAY_PORT, debug=True)
+    )
     sessions = FakeSessions()
     default_agent = RuntimeAgent(
         "default",

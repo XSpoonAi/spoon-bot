@@ -5,9 +5,9 @@ This document describes the **Gateway API** exposed by spoon-bot. The frontend s
 > **Auto-generated** from source code on 2026-05-18 08:41 UTC.  
 > Regenerate with: `python scripts/generate_api_docs.py`
 
-Base URL (local): `http://localhost:8080`  
-API Docs (Swagger): `http://localhost:8080/docs`  
-API Docs (ReDoc): `http://localhost:8080/redoc`
+Base URL (local): `http://localhost:16600`
+API Docs (Swagger): `http://localhost:16600/docs`
+API Docs (ReDoc): `http://localhost:16600/redoc`
 
 ---
 
@@ -460,12 +460,12 @@ Deactivate a skill.
 
 ### Connection
 
-**Endpoint:** `ws://localhost:8080/v1/ws`
+**Endpoint:** `ws://localhost:16600/v1/ws`
 
 **Authentication via Query Parameters:**
 ```
-ws://localhost:8080/v1/ws?token=<jwt_access_token>
-ws://localhost:8080/v1/ws?api_key=<api_key>
+ws://localhost:16600/v1/ws?token=<jwt_access_token>
+ws://localhost:16600/v1/ws?api_key=<api_key>
 ```
 
 > If `GATEWAY_AUTH_REQUIRED=false`, no authentication parameters are needed.
@@ -1040,7 +1040,7 @@ Health check response.
 | `GATEWAY_AUTH_REQUIRED` | `true` | server.py |
 | `JWT_SECRET` | *(none)* | config.py |
 | `GATEWAY_HOST` | `127.0.0.1` | config.py |
-| `GATEWAY_PORT` | `8080` | config.py |
+| `GATEWAY_PORT` | `16600` | config.py |
 | `GATEWAY_DEBUG` | *(none)* | config.py |
 | `JWT_ACCESS_EXPIRE_MINUTES` | `15` | config.py |
 | `GATEWAY_TIMEOUT_REQUEST_MS` | `0` | config.py |
@@ -1073,8 +1073,8 @@ cp .env.example .env
 docker compose up -d
 
 # 3. Verify
-curl http://localhost:8080/health
-curl http://localhost:8080/ready
+curl http://localhost:16600/health
+curl http://localhost:16600/ready
 ```
 
 ### Run Modes

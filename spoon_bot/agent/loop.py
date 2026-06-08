@@ -14,11 +14,12 @@ import json
 import logging as stdlib_logging
 import os
 import re
+import shlex
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable
 
 from loguru import logger
 
@@ -73,11 +74,22 @@ except ImportError as e:
 
 # Import spoon-bot native tools and components
 from spoon_bot.agent.context import ContextBuilder, format_current_datetime_context
-from spoon_bot.agent.session_compact import build_session_compact_context
+from spoon_bot.agent.context_snapshot import write_llm_context_snapshot
+from spoon_bot.agent.execution_ledger import (
+    ExecutionLedger,
+    bind_execution_ledger,
+    load_recent_execution_ledger_context,
+    persist_execution_ledger,
+)
+from spoon_bot.agent.session_compact import (
+    build_recent_session_turns_payload,
+    build_session_compact_context,
+)
 from spoon_bot.agent.tools.registry import (
     CORE_TOOLS,
     ToolRegistry,
 )
+from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.filesystem import (
     ReadFileTool,
@@ -90,12 +102,43 @@ from spoon_bot.agent.tools.history_search import SearchHistoryTool
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
     bind_tool_owner,
+    bind_tool_workspace,
     build_tool_owner_key,
     clear_captured_tool_outputs,
     capture_tool_outputs,
     consume_captured_tool_output,
+    get_request_execution_hints,
     normalize_tool_arguments,
+    sanitize_tool_arguments_for_history,
     track_tool_invocations,
+)
+from spoon_bot.agent.request_hints import (
+    build_request_execution_hints,
+    extract_exact_shell_commands_from_request,
+    extract_urls_from_text,
+    format_current_session_fact_check_context,
+    format_exact_shell_command_context,
+    format_explicit_tool_request_context,
+    format_explicit_request_urls_context,
+    format_explicit_request_values_context,
+    ordered_request_matching_tokens,
+    request_is_bare_continuation,
+)
+from spoon_bot.agent.turn_verifiers import (
+    build_tool_event_synthesis_brief,
+    build_user_facing_tool_event_answer,
+    build_user_facing_tool_evidence_answer,
+    dominant_non_latin_scripts,
+    final_answer_denies_available_tool_evidence,
+    latest_tool_event_has_active_background_job,
+    latest_tool_event_has_next_command,
+    latest_tool_event_from_skill_continuation,
+    latest_tool_event_has_user_summary_marker,
+    read_only_tool_turn_needs_continuation,
+    should_run_skill_contract_check,
+    skill_contract_has_progress,
+    skill_contract_inspection_stalled_after_progress,
+    skill_contract_needs_continuation,
 )
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
@@ -116,6 +159,7 @@ from spoon_bot.config import (
     AgentLoopConfig,
     DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
     DEFAULT_MAX_OUTPUT,
+    DEFAULT_PROVIDER_MAX_RETRIES,
     DEFAULT_PROVIDER_SILENCE_TIMEOUT,
     DEFAULT_PROVIDER_TOTAL_TIMEOUT,
     DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT,
@@ -169,22 +213,102 @@ _EXTERNAL_SIDE_EFFECT_BOUNDARY = (
     "[EXTERNAL SIDE-EFFECT BOUNDARY]: For external systems, account/wallet "
     "state, remote jobs, approvals, registrations, entries, submissions, "
     "trades, or any action that spends credits/tokens/funds or changes remote "
-    "state, do at most one unit of side effect per user request unless the "
-    "newest request gives an explicit count or range. After one unit, report "
-    "the result or concrete blocker; do not loop into additional units just "
-    "because tools remain available. Do not batch multiple alternative tool "
-    "attempts in one assistant step; run one attempt, inspect its result, and "
-    "then either answer with the blocker or proceed only when the newest "
-    "request explicitly allows another attempt. If the user gives an exact command for "
+    "state, execute only the side-effect sequence that the newest user request "
+    "or active SKILL.md contract actually selected. If the newest request gives "
+    "an ordered workflow, complete that workflow in order until its first real "
+    "terminal outcome or concrete blocker. Do not branch into alternative "
+    "external actions, restart the same completed side effect, or repeat a paid "
+    "submission just because tools remain available. Do not batch multiple "
+    "alternative tool attempts in one assistant step; run one attempt, inspect "
+    "its result, and then either answer with the blocker or proceed only when "
+    "the newest request or active SKILL.md contract selects the next attempt. "
+    "If the user gives an exact command for "
     "a replay, simulation, dry-run, or no-op check, run that command exactly "
     "as written; never remove protective wrappers such as echo/printf or "
     "dry-run/no-op flags, and never convert a simulated command into a live "
     "side-effecting command.\n"
 )
+_EXACT_COMMAND_BOUNDARY = (
+    "[EXACT COMMAND BOUNDARY]: If the newest user request provides exact shell "
+    "commands to run, run those commands exactly, in order, unless a command is "
+    "unsafe or cannot be executed. Do not replace an exact requested command with "
+    "a nearby or suggested command. If an exact command fails, report that command's "
+    "failure directly instead of switching to a different command.\n"
+)
+_USER_FACING_OUTPUT_BOUNDARY = (
+    "[USER-FACING OUTPUT BOUNDARY]: Final answers are for the user, not for the "
+    "runtime. Match the newest user's natural language unless the user explicitly "
+    "requested another language or a raw machine-readable format. A short "
+    "continuation message still defines the output language; do not inherit the "
+    "language of older requests or mostly-English tool evidence. Convert tool "
+    "JSON, tool arguments, command transcripts, and structured outputs into concise "
+    "human-readable results. Do not paste raw JSON/tool transcripts/internal "
+    "planning unless the newest user explicitly asks for raw logs or JSON.\n"
+)
+_BOUNDED_CONTINUATION_BOUNDARY = (
+    "[BOUNDED CONTINUATION REQUEST]: When the newest user message is only a "
+    "short continuation of earlier work, resume at most one verifier-visible "
+    "unit only if same-session evidence shows a single unfinished workflow and "
+    "a clear next documented step. Use prior request facts as checkpoints, not "
+    "completion evidence. If the evidence is completed, stale, read-only, or "
+    "ambiguous, ask a concise clarification or report current status instead "
+    "of starting a new external side effect.\n"
+)
 _TURN_STATE_PENDING = "pending"
 _TURN_STATE_COMPLETED = "completed"
 _TURN_STATE_INTERRUPTED = "interrupted"
 _TURN_STATE_SUPERSEDED = "superseded"
+_REPEATED_READ_RECOVERY_THRESHOLD = 2
+_CLIENT_STREAM_TOOL_RESULT_LIMIT = 80_000
+_MODEL_STREAM_TOOL_RESULT_LIMIT = 80_000
+_CLIENT_STREAM_TOOL_DELTA_LIMIT = 12_000
+_DEFAULT_NON_SHELL_ACTIVE_TOOL_TIMEOUT = 120.0
+_DEFAULT_POST_TOOL_RESULT_SILENCE_TIMEOUT = 30.0
+_DEFAULT_INTERNAL_RECOVERY_TIMEOUT = 180.0
+_DEFAULT_PROVIDER_ASK_TIMEOUT = 0.0
+_FINAL_ANSWER_SYNTHESIS_TIMEOUT = 45.0
+_FINAL_ANSWER_SYNTHESIS_TOOL_EVENT_LIMIT = 16
+_TASK_COMPLETION_VERDICT_TIMEOUT = 30.0
+_MACHINE_READABLE_FORMAT_RE = re.compile(r"(?i)\b(?:json|yaml|xml|csv|raw)\b")
+_FINAL_ANSWER_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are the final-answer synthesis stage for an autonomous tool-using "
+    "agent. Write only the final answer to the user. Use the supplied tool "
+    "evidence, do not call tools, do not invent missing progress, and do not "
+    "expose internal runtime markers, raw JSON, tool transcripts, or planning. "
+    "The user's request is intent, not proof; never list requested checklist "
+    "items as completed unless the evidence explicitly says they completed. "
+    "Do not add generic troubleshooting guides, manual-install tutorials, "
+    "example commands, or option menus unless those exact next steps appear in "
+    "the evidence or the user explicitly asked for guidance. If blocked, state "
+    "the evidence-backed blocker and only the evidence-backed next step. "
+    "Write the answer as a concise, conversational conclusion for a person: "
+    "what happened, what the current state is, and what remains if anything. "
+    "Treat local commands, paths, status tokens, and exception text as internal "
+    "evidence. Unless the user explicitly asked for raw commands or logs, "
+    "explain their meaning instead of copying them literally. "
+    "When the evidence contains terminal user-facing summaries or completed "
+    "stateful tool results, summarize those results directly; do not turn old "
+    "SKILL.md command examples or setup notes into proposed future work. "
+    "Match the newest user's natural language unless they explicitly requested "
+    "another language or a machine-readable format. Short continuation messages "
+    "still define the response language; do not answer in the language of older "
+    "requests or tool evidence just because the evidence is written that way. "
+    "Keep it concise and human."
+)
+_TASK_COMPLETION_VERDICT_SYSTEM_PROMPT = (
+    "You are a domain-neutral completion verifier for an autonomous "
+    "tool-using agent. Compare the newest user request, the assistant draft, "
+    "and the supplied tool evidence. Return only compact JSON with keys "
+    "`status`, `reason`, and `next_focus`. Use status `needs_continuation` "
+    "only when the evidence does not satisfy the requested outcome and another "
+    "tool action can reasonably make progress. Use status `complete` when the "
+    "evidence satisfies the request, or when the evidence shows a real blocker "
+    "that should be reported instead of retried. Do not use product-specific "
+    "rules, route names, repository names, game names, or natural-language "
+    "phrase matching. The user request is intent, not proof."
+)
+
+
 def _workspace_root_path(workspace: Path | str | None) -> Path:
     """Resolve the workspace root used to validate persisted file references."""
     return Path(workspace or Path.home() / ".spoon-bot" / "workspace").expanduser().resolve()
@@ -374,14 +498,12 @@ class AgentLoop:
     # Minimal per-step prompt. Kept short since it's injected every iteration.
     # The agent builds its own reasoning from the system prompt + memory.
     DEFAULT_NEXT_STEP_PROMPT = (
-        "Continue working on the user's latest request. "
-        "Treat the latest real user request as authoritative, even if earlier history was compacted. "
-        "Prior conversation is reference only; do not continue, finish, or repair an earlier task unless the latest request explicitly asks for that. "
-        "Do NOT repeat previous actions. Do NOT fabricate output. "
-        "Make autonomous choices when input is needed. "
-        "Do NOT summarize prior work unless the user explicitly asked for a summary. "
-        "If the task can be completed now, return the final user-facing answer in the format the user requested and stop. "
-        "If an authoritative request-ending block is present, it is copied verbatim from the newest user message and your final answer must satisfy it exactly."
+        "Continue only if the latest user request still needs another "
+        "tool-backed action. If the latest tool result already satisfies the "
+        "requested workflow, reaches a terminal outcome, or shows a concrete "
+        "blocker, answer the user now. Do not start a new external workflow or "
+        "repeat an external side effect unless the latest user request or the "
+        "active skill contract explicitly asks for that next action."
     )
 
     def __init__(
@@ -414,7 +536,7 @@ class AgentLoop:
         auto_reload_interval: float = 5.0,
         config_path: Path | str | None = None,
         yolo_mode: bool = False,
-        provider_max_retries: int = 5,
+        provider_max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
         provider_retry_base_delay: float = 1.0,
         provider_retry_max_delay: float = 60.0,
         provider_retry_backoff_factor: float = 2.0,
@@ -491,10 +613,21 @@ class AgentLoop:
         self.provider_total_timeout = self._float_env(
             "SPOON_BOT_PROVIDER_TOTAL_TIMEOUT",
             DEFAULT_PROVIDER_TOTAL_TIMEOUT,
+            allow_zero=True,
         )
         self.tool_followup_timeout = self._float_env(
             "SPOON_BOT_TOOL_FOLLOWUP_TIMEOUT",
             DEFAULT_TOOL_FOLLOWUP_TIMEOUT,
+        )
+        self.internal_recovery_timeout = self._float_env(
+            "SPOON_BOT_INTERNAL_RECOVERY_TIMEOUT",
+            _DEFAULT_INTERNAL_RECOVERY_TIMEOUT,
+            allow_zero=True,
+        )
+        self.provider_ask_timeout = self._float_env(
+            "SPOON_BOT_PROVIDER_ASK_TIMEOUT",
+            _DEFAULT_PROVIDER_ASK_TIMEOUT,
+            allow_zero=True,
         )
         self.max_stream_tool_results_without_content = self._int_env(
             "SPOON_BOT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT",
@@ -700,8 +833,8 @@ class AgentLoop:
         )
 
     @staticmethod
-    def _float_env(name: str, default: float) -> float:
-        """Read a positive float env override for runtime stream budgets."""
+    def _float_env(name: str, default: float, *, allow_zero: bool = False) -> float:
+        """Read a float env override for runtime stream budgets."""
         value = os.environ.get(name)
         if value is None or not value.strip():
             return default
@@ -710,7 +843,11 @@ class AgentLoop:
         except ValueError:
             logger.warning(f"Ignoring invalid {name}={value!r}; expected a number")
             return default
-        return parsed if parsed > 0 else default
+        if parsed > 0:
+            return parsed
+        if allow_zero and parsed == 0:
+            return 0.0
+        return default
 
     @staticmethod
     def _positive_runtime_budget(value: Any, default: float) -> float:
@@ -764,6 +901,29 @@ class AgentLoop:
         """Return the latest result source metadata."""
         return dict(getattr(self, "_last_response_source", self._build_response_source()))
 
+    @staticmethod
+    def _align_chatbot_manager_provider(chatbot: Any, provider: str | None) -> None:
+        """Keep spoon-core internal LLM calls on the explicit agent provider."""
+        provider_name = str(provider or "").strip().lower()
+        manager = getattr(chatbot, "llm_manager", None)
+        if not provider_name or manager is None:
+            return
+
+        try:
+            if hasattr(manager, "default_provider"):
+                manager.default_provider = provider_name
+
+            if os.environ.get("LLM_FALLBACK_CHAIN"):
+                return
+
+            set_fallback_chain = getattr(manager, "set_fallback_chain", None)
+            if callable(set_fallback_chain):
+                set_fallback_chain([provider_name])
+            elif hasattr(manager, "fallback_chain"):
+                manager.fallback_chain = [provider_name]
+        except Exception as exc:
+            logger.debug(f"Could not align LLM manager provider: {exc}")
+
     async def initialize(self) -> None:
         """Initialize spoon-core components."""
         if self._initialized:
@@ -797,26 +957,113 @@ class AgentLoop:
             system_prompt += (
                 "\nUse this catalog as available context, not as a hidden router. "
                 "When a skill is directly relevant, read its SKILL.md and follow "
-                "the skill's own procedures. Otherwise use the normal tools.\n"
+                "the skill's own procedures. Treat those procedures, rules, and "
+                "negative instructions as the execution contract for that task. "
+                "Before running skill-provided primary commands, complete any "
+                "Setup, Prerequisites, Install, or dependency steps declared in "
+                "the skill. "
+                "If the skill tells you to decide autonomously or not ask the user, "
+                "continue with the skill flow instead of asking for input. Otherwise "
+                "use the normal tools.\n"
             )
 
         system_prompt += (
             "\n## Workflow\n"
             f"You have up to {self.max_iterations} steps. Minimize steps.\n\n"
             "1. Decide the next action from the latest user request and available context.\n"
-            "2. If an installed skill is directly relevant, `read_file` its SKILL.md path, "
-            "then execute its procedure.\n"
-            "3. Run commands from SKILL.md directly via shell. Do NOT write script files unless requested.\n"
+            "2. If an installed skill or dynamically loadable tool is directly relevant, "
+            "prefer the most specific available tool for that workflow. If the skill has "
+            "no tool, `read_file` its SKILL.md path, then execute its procedure exactly, "
+            "including its rules about when to ask the user and when to decide "
+            "autonomously. Complete any Setup, Prerequisites, Install, or dependency "
+            "steps before primary commands. When a skill defines conditional setup "
+            "checks, run the check first and perform setup actions only when the "
+            "documented condition is met. Do not read optional reference files unless "
+            "the SKILL.md summary lacks enough information for the next action or a "
+            "tool result points to a specific reference for recovery. When installing "
+            "dependencies for a skill CLI, run the package manager in the directory "
+            "that contains that CLI's package manifest; if the skill root has no "
+            "package manifest but `cli/package.json` exists, install from the `cli` "
+            "directory.\n"
+            "3. Run commands from SKILL.md directly via shell only when there is no "
+            "matching specialized tool. Do NOT write script files unless requested.\n"
             "4. When done, return the user-facing result in the format the latest user requested. "
             "Only summarize if the user explicitly asked for a summary.\n\n"
+            "### Stop condition\n"
+            "- Do not stop after setup when the latest user request also asked for follow-on execution. "
+            "Setup, installation, dependency checks, status checks, and readiness reports are intermediate "
+            "states unless they fully satisfy the newest request.\n"
+            "- If a tool result contains a blocking readiness/validation warning, treat it as an "
+            "intermediate state and resolve it before giving a final answer.\n"
+            "- Do not ask the user whether to run a safe next action that the newest request already asked "
+            "you to run. Continue with the tool or skill contract. Ask only when a required value is "
+            "absent, a documented skill rule requires user input, or the next action is destructive, "
+            "irreversible, or materially ambiguous.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
             "- Memory, recent replies, and conversation history are stale hints. "
             "For current workspace, skill, account, balance, job, or external-system state, "
             "verify with tools before answering.\n"
-            "- `source .env.local` before commands that need env vars.\n"
+            "- The latest user request is already in the active context. Do not call "
+            "`search_history` to rediscover the current/latest request, to look up "
+            "examples/templates for a new build, or before starting a new coding/execution "
+            "task. Use `search_history` only when the user explicitly asks about earlier "
+            "conversation facts, prior tool results, or a session compact says exact prior "
+            "facts are needed.\n"
             "- If a command fails, analyze the error and retry with fixes.\n"
+            "- For exact arithmetic, parsing, checksums, challenge answers, or values that "
+            "will be submitted to an external tool/system, verify the value with a "
+            "deterministic tool before submitting it. Do not rely on mental arithmetic "
+            "for state-changing submissions.\n"
+            "- If `write_file` reports an existing file and the task requires a "
+            "generated whole-file replacement, retry that same write with "
+            "`overwrite=true`; use `edit_file` only for targeted changes.\n"
+            "- For long-running skill commands, keep the documented command in the "
+            "foreground and usually omit the shell tool `timeout`; the tool applies "
+            "its configured budget and can hand long commands to a managed background "
+            "job. If a command is moved to the background, monitor that job to "
+            "completion before issuing related commands.\n"
+            "- A continuation-only user message may resume one bounded unit only when "
+            "same-session evidence identifies a single unfinished workflow with a clear "
+            "next step. If the evidence is completed, stale, read-only, or ambiguous, ask "
+            "a concise clarification or report the current status instead of starting a "
+            "new external side effect. It never authorizes indefinite polling, repeated "
+            "retries, or repeated external side effects.\n"
+            "- Do not perform the same irreversible, paid, or externally visible side-effect "
+            "series repeatedly in one user turn. If one successful side effect reaches the "
+            "latest request's explicit terminal verb, report the status and the next safe "
+            "continuation step instead of starting another similar external action.\n"
             "- Follow user instructions exactly - respect specific IDs, names, actions.\n"
+            "- Final user-facing answers must match the newest user's language and summarize "
+            "tool evidence in normal prose. Short continuation messages still define the "
+            "answer language; do not inherit the language of older requests or tool evidence. "
+            "Do not paste raw tool JSON, command transcripts, or internal planning text unless "
+            "the user explicitly asks for raw logs or JSON.\n"
+            "- Minimize sensitive output. Do not include private keys, password paths, "
+            "keystore paths, secret availability flags, raw credentials, tokens, or "
+            "other authentication material in user-facing answers unless the newest "
+            "request explicitly asks for that specific secret-bearing field. When a "
+            "user asks for a public identifier such as a wallet address, answer only "
+            "the requested public identifier and any directly relevant non-sensitive "
+            "context.\n"
+            "- When creating a public browser app with frontend plus API/WebSocket/backend, "
+            "prefer serving all browser-required pieces from one local service before exposing it. "
+            "If multiple services are necessary, expose and verify every browser-required endpoint; "
+            "do not finalize with browser code pointing to localhost, loopback, or unexposed ports.\n"
+            "- In sandbox/runtime environments, when you create or start a browser-facing local "
+            "service, WebSocket service, API, frontend, backend, or preview app, use the "
+            "`service_expose` tool to manage the background process and Cloudflare exposure "
+            "unless the user explicitly asks for local-only access. Do not use one-off shell "
+            "backgrounding as the final service manager when `service_expose` can do the same "
+            "job, and do not finalize with only localhost, loopback, or 0.0.0.0 access.\n"
+            "- Before finalizing a service task, use your own understanding of the newest "
+            "user request to decide whether public access is required. Runtime verifiers only "
+            "trust structured tool evidence; they will not infer this semantic requirement "
+            "from prompt keywords or URL-shaped text for you.\n"
+            "- Before starting or exposing a generated service, complete the smallest local preflight "
+            "that proves it can launch: install declared runtime dependencies, run the relevant "
+            "syntax/build check for the entrypoint when available, and fix failures before calling "
+            "service exposure tools.\n"
             "- Use web search when the task needs live external facts or installed skills/tools are insufficient.\n"
         )
 
@@ -839,7 +1086,11 @@ class AgentLoop:
         # Mirrors opencode task.txt's usage notes and openclaw's
         # sessions-spawn-tool description pattern.
         # ----------------------------------------------------------------
-        if "spawn" in self.tools.get_active_tools():
+        if (
+            os.getenv("SPOON_BOT_ENABLE_ORCHESTRATION_PROMPT", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and "spawn" in self.tools.get_active_tools()
+        ):
             roles_block = format_roles_for_prompt()
             system_prompt += (
                 "\n\n## Multi-Agent Orchestration\n\n"
@@ -888,7 +1139,9 @@ class AgentLoop:
             api_key=self.api_key,
             base_url=self.base_url,
             system_prompt=system_prompt,
+            enable_short_term_memory=False,
         )
+        AgentLoop._align_chatbot_manager_provider(self._chatbot, self.provider)
 
         # Warn about potential provider/model mismatch that may cause fallback noise
         if self.provider and self.model:
@@ -921,7 +1174,7 @@ class AgentLoop:
             import inspect
             _sm_sig = inspect.signature(SkillManager.__init__)
             _sm_kwargs: dict[str, Any] = {
-                "skill_paths": [str(p) for p in self._skill_paths],
+                "skill_paths": [str(p) for p in self._skill_manager_discovery_paths()],
                 "llm": self._chatbot,
                 "auto_discover": True,
             }
@@ -930,8 +1183,9 @@ class AgentLoop:
             self._skill_manager = SkillManager(**_sm_kwargs)
             # Load skill tools into the ToolRegistry (inactive by default)
             self._register_skill_tools()
-            # Only auto-activate skill tools when no skills are shown in prompt
-            # (prevents agent from calling skill_marketplace instead of reading SKILL.md)
+            # Only auto-activate ordinary skill tools when no skills are shown in
+            # the prompt. Core skill-management tools remain governed by the
+            # selected tool profile.
             if not self._build_skills_for_prompt():
                 for skill_tool_name in self._skill_tool_names:
                     self.tools.activate_tool(skill_tool_name)
@@ -950,6 +1204,7 @@ class AgentLoop:
 
         if self._enable_skills:
             agent_kwargs["skill_manager"] = self._skill_manager
+            agent_kwargs["auto_trigger_skills"] = False
             self._agent = SpoonReactSkill(**agent_kwargs)
         else:
             self._agent = SpoonReactMCP(**agent_kwargs)
@@ -1010,6 +1265,7 @@ class AgentLoop:
             working_dir=str(self.workspace),
             allow_chaining=True,
             allow_substitution=True,
+            yolo_mode=bool(getattr(self, "yolo_mode", False)),
         ))
 
         # Filesystem tools - allow reads from the user home directory so that
@@ -1054,6 +1310,11 @@ class AgentLoop:
                 {"name": t.name, "description": t.description}
                 for t in self.tools.get_inactive_tools().values()
             ],
+            list_active_fn=lambda: [
+                {"name": t.name, "description": t.description}
+                for t in self.tools.get_active_tools().values()
+            ],
+            tool_status_fn=self._tool_activation_status,
         ))
 
         cron_tool = CronTool()
@@ -1129,9 +1390,11 @@ class AgentLoop:
                     tools = loader.load_tools(skill_dir)
                     for base_tool in tools:
                         if base_tool.name not in self.tools:
-                            bridge = SkillToolBridge(base_tool)
+                            bridge = SkillToolBridge(base_tool, workspace=self.workspace)
                             self.tools.register(bridge)
                             self._skill_tool_names.add(base_tool.name)
+                            if self._skill_tool_default_active(skill_dir):
+                                self.tools.activate_tool(base_tool.name)
                 except Exception as exc:
                     logger.debug(f"Skill tools from {skill_dir.name}: {exc}")
 
@@ -1140,6 +1403,28 @@ class AgentLoop:
                 f"Registered {len(self._skill_tool_names)} skill tool(s): "
                 f"{sorted(self._skill_tool_names)}"
             )
+
+    @staticmethod
+    def _skill_tool_default_active(skill_dir: Path) -> bool:
+        """Return whether a skill asks its tool wrapper to be active by default."""
+        skill_md = skill_dir / "SKILL.md"
+        try:
+            lines = skill_md.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return False
+        if not lines or lines[0].strip() != "---":
+            return False
+        for raw_line in lines[1:80]:
+            line = raw_line.strip()
+            if line == "---":
+                return False
+            if ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            if key.strip().casefold() != "default_active":
+                continue
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return False
 
     async def _init_mcp_tools(self) -> None:
         """Discover and create MCP tools from ``self._mcp_config``.
@@ -1204,7 +1489,7 @@ class AgentLoop:
         import inspect
         _sm_sig = inspect.signature(SkillManager.__init__)
         _sm_kwargs: dict[str, Any] = {
-            "skill_paths": [str(p) for p in self._skill_paths],
+            "skill_paths": [str(p) for p in self._skill_manager_discovery_paths()],
             "llm": self._chatbot,
             "auto_discover": True,
         }
@@ -1738,6 +2023,39 @@ class AgentLoop:
             logger.debug(f"[{label}] Runtime tool-context normalization skipped: {exc}")
             return 0
 
+    async def _ensure_runtime_user_tail_before_run(self, label: str) -> int:
+        """Ensure provider-bound continuation requests end with a user turn."""
+        if not AgentLoop._provider_requires_user_tail(self):
+            return 0
+        try:
+            messages = AgentLoop._get_runtime_memory_messages(self)
+        except Exception as exc:
+            logger.debug(f"[{label}] Runtime tail check skipped: {exc}")
+            return 0
+
+        if not isinstance(messages, list) or not messages:
+            return 0
+
+        last_role = str(AgentLoop._message_role_value(messages[-1]) or "").strip().lower()
+        if last_role == "user":
+            return 0
+
+        agent = getattr(self, "_agent", None)
+        add_message = getattr(agent, "add_message", None)
+        if not callable(add_message):
+            return 0
+
+        prompt = getattr(agent, "next_step_prompt", None)
+        if not isinstance(prompt, str) or not prompt.strip():
+            prompt = self.DEFAULT_NEXT_STEP_PROMPT
+
+        await add_message("user", prompt.strip())
+        logger.info(
+            f"[{label}] Added continuation user turn before model run "
+            f"(previous_tail_role={last_role or 'unknown'})"
+        )
+        return 1
+
     @staticmethod
     def _truncate_runtime_memory(self, start_index: int) -> None:
         """Remove runtime-only messages appended by an aborted turn."""
@@ -1799,6 +2117,7 @@ class AgentLoop:
                     or AgentLoop._stream_message_attr(msg, "id", None)
                 if tool_call_id:
                     extras["tool_call_id"] = str(tool_call_id)
+                    extras.update(self._stream_tool_result_metadata_for_trace(tool_call_id))
                 name = AgentLoop._stream_message_attr(msg, "name", None)
                 if name:
                     extras["name"] = str(name)
@@ -1867,14 +2186,56 @@ class AgentLoop:
         if not trace:
             return 0
 
-        for entry in trace:
-            try:
-                self._session.add_message(
-                    entry["role"], entry["content"], **entry.get("extras", {})
-                )
-            except Exception as exc:
-                logger.debug(f"Tool-trace persist skipped a message: {exc}")
-        return len(trace)
+        return AgentLoop._persist_tool_trace_entries(self, trace)
+
+    @staticmethod
+    def _tool_trace_entry_key(entry: dict[str, Any]) -> str:
+        """Return a stable key for persisted tool trace de-duplication."""
+        extras = entry.get("extras") if isinstance(entry.get("extras"), dict) else {}
+        safe_extras = {
+            key: value
+            for key, value in extras.items()
+            if key not in {"timestamp", "trace_key", "message_kind"}
+        }
+        payload = {
+            "role": str(entry.get("role") or "").strip().lower(),
+            "content": str(entry.get("content") or ""),
+            "extras": safe_extras,
+        }
+        try:
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return repr(payload)
+
+    def _persisted_tool_trace_keys(self) -> set[str]:
+        """Return trace keys already stored in the current session."""
+        messages = getattr(getattr(self, "_session", None), "messages", None)
+        if not isinstance(messages, list):
+            return set()
+
+        keys: set[str] = set()
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role not in {"assistant", "tool"}:
+                continue
+            if message.get("trace_key"):
+                keys.add(str(message.get("trace_key")))
+                continue
+            extras = {
+                key: value
+                for key, value in message.items()
+                if key not in {"role", "content", "timestamp"}
+            }
+            keys.add(
+                AgentLoop._tool_trace_entry_key({
+                    "role": role,
+                    "content": message.get("content", ""),
+                    "extras": extras,
+                })
+            )
+        return keys
 
     def _persist_tool_trace_entries(self, trace: list[dict[str, Any]]) -> int:
         """Persist already-captured tool trace entries after generic pairing repair."""
@@ -1901,6 +2262,7 @@ class AgentLoop:
             return 0
 
         AgentLoop._normalize_runtime_tool_context(messages, finalized=True)
+        existing_keys = AgentLoop._persisted_tool_trace_keys(self)
 
         persisted = 0
         for msg in messages:
@@ -1917,12 +2279,35 @@ class AgentLoop:
                 for key, value in msg.items()
                 if key not in {"role", "content", "timestamp"}
             }
+            entry = {"role": role, "content": content, "extras": extras}
+            trace_key = AgentLoop._tool_trace_entry_key(entry)
+            if trace_key in existing_keys:
+                continue
+            extras = {**extras, "trace_key": trace_key, "message_kind": "tool_trace"}
             try:
                 self._session.add_message(role, content, **extras)
+                existing_keys.add(trace_key)
                 persisted += 1
             except Exception as exc:
                 logger.debug(f"Tool-trace persist skipped a streamed message: {exc}")
         return persisted
+
+    def _persist_turn_tool_trace_checkpoint(self, start_index: int | None = None) -> int:
+        """Persist currently available tool evidence for in-flight recovery."""
+        if not isinstance(start_index, int) or start_index < 0:
+            return 0
+        try:
+            self._merge_turn_invoked_skills_from_runtime(start_index)
+        except Exception as exc:
+            logger.debug(f"Tool-trace checkpoint skill merge skipped: {exc}")
+        try:
+            persisted = self._persist_turn_tool_trace(start_index)
+            if persisted:
+                AgentLoop._persist_session_if_possible(self)
+            return persisted
+        except Exception as exc:
+            logger.debug(f"Tool-trace checkpoint persist skipped: {exc}")
+            return 0
 
     @staticmethod
     def _tool_call_name_and_arguments(tool_call: Any) -> tuple[str, Any]:
@@ -1974,6 +2359,43 @@ class AgentLoop:
         return None
 
     @staticmethod
+    def _skill_names_from_argument_text(value: Any) -> list[str]:
+        """Extract workspace skill names from structured tool argument text.
+
+        This deliberately keys off the runtime skill path shape rather than
+        product names, prompts, or command-specific routing rules.
+        """
+        if not isinstance(value, str) or not value.strip():
+            return []
+
+        try:
+            tokens = shlex.split(value)
+        except ValueError:
+            tokens = value.split()
+
+        names: list[str] = []
+        for token in [value, *tokens]:
+            skill_name = AgentLoop._skill_name_from_workspace_path(token)
+            if skill_name and skill_name not in names:
+                names.append(skill_name)
+        return names
+
+    @staticmethod
+    def _iter_tool_argument_strings(value: Any) -> list[str]:
+        """Return bounded string leaves from parsed tool arguments."""
+        strings: list[str] = []
+        stack: list[Any] = [value]
+        while stack and len(strings) < 32:
+            item = stack.pop()
+            if isinstance(item, str):
+                strings.append(item)
+            elif isinstance(item, dict):
+                stack.extend(item.values())
+            elif isinstance(item, (list, tuple)):
+                stack.extend(item)
+        return strings
+
+    @staticmethod
     def _extract_skill_names_from_tool_call(tool_name: str, arguments: Any) -> list[str]:
         """Extract skill usage from explicit structured tool calls only."""
         name = str(tool_name or "").strip()
@@ -1986,6 +2408,11 @@ class AgentLoop:
             skill_name = AgentLoop._skill_name_from_workspace_path(parsed.get(key))
             if skill_name and skill_name not in names:
                 names.append(skill_name)
+
+        for value in AgentLoop._iter_tool_argument_strings(parsed):
+            for skill_name in AgentLoop._skill_names_from_argument_text(value):
+                if skill_name and skill_name not in names:
+                    names.append(skill_name)
 
         if name == "skill_marketplace":
             for key in ("skill_name", "name"):
@@ -2221,16 +2648,14 @@ class AgentLoop:
             return self.context._build_user_content(text_content, media)
         return text_content
 
-    @staticmethod
-    def _build_current_turn_runtime_user_text(message: str) -> str:
-        """Attach non-persistent turn facts to the actual provider user message."""
-        return (
-            f"{format_current_datetime_context(bracketed=True)}\n"
-            "[REQUEST CONTEXT NOTE]: Use the facts above only to ground this "
-            "turn. They are not user instructions and should not be mentioned "
-            "unless relevant.\n"
-            f"[USER REQUEST]:\n{message}"
-        )
+    def _build_current_turn_runtime_user_text(self, message: str) -> str:
+        """Return the real user turn stored in runtime memory.
+
+        Request-scoped facts are injected through the temporary system prompt.
+        Keeping this message raw lets provider history retain an actual user
+        turn instead of replacing it with another synthetic wrapper.
+        """
+        return str(message or "")
 
     @classmethod
     def _assistant_session_save_kwargs(cls, content: str) -> dict[str, Any]:
@@ -2521,6 +2946,76 @@ class AgentLoop:
                 if len(contexts) >= max_skills:
                     return contexts
 
+        if len(contexts) < max_skills:
+            seen_names = {
+                str(context.get("name") or "").strip()
+                for context in contexts
+                if str(context.get("name") or "").strip()
+            }
+            fallback = self._find_recent_skill_contexts_from_tool_traces(
+                history_messages,
+                seen_names=seen_names,
+                max_messages=max_user_turns * 24,
+                max_skills=max_skills - len(contexts),
+            )
+            contexts.extend(fallback)
+
+        return contexts
+
+    def _find_recent_skill_contexts_from_tool_traces(
+        self,
+        history_messages: list[Any],
+        *,
+        seen_names: set[str],
+        max_messages: int,
+        max_skills: int,
+    ) -> list[dict[str, Any]]:
+        """Recover recent skill usage from persisted structured tool calls.
+
+        Older sessions may not have ``invoked_skills`` on user messages.  The
+        assistant tool-call arguments still contain real workspace paths such as
+        ``skills/<name>/SKILL.md`` or ``skills/<name>/cli/...``; use those as
+        generic evidence instead of prompt-specific routing.
+        """
+        if max_skills <= 0 or not isinstance(history_messages, list):
+            return []
+
+        contexts: list[dict[str, Any]] = []
+        inspected = 0
+        for message in reversed(history_messages):
+            if inspected >= max_messages or len(contexts) >= max_skills:
+                break
+            if not isinstance(message, dict):
+                continue
+            inspected += 1
+            role = str(message.get("role") or "").strip().lower()
+            if role != "assistant":
+                continue
+
+            tool_calls = message.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                continue
+
+            for tool_call in tool_calls:
+                tool_name, arguments = AgentLoop._tool_call_name_and_arguments(tool_call)
+                for skill_name in AgentLoop._extract_skill_names_from_tool_call(
+                    tool_name,
+                    arguments,
+                ):
+                    skill_name = str(skill_name or "").strip()
+                    if not skill_name or skill_name in seen_names:
+                        continue
+                    context = self._resolve_skill_context_by_name(skill_name)
+                    if context is None:
+                        continue
+                    context = {**context, "source": "tool_trace"}
+                    contexts.append(context)
+                    seen_names.add(skill_name)
+                    if len(contexts) >= max_skills:
+                        break
+                if len(contexts) >= max_skills:
+                    break
+
         return contexts
 
     def _persist_user_turn_to_session(
@@ -2702,6 +3197,72 @@ class AgentLoop:
         except Exception as exc:
             logger.debug(f"Failed-turn persistence skipped: {exc}")
 
+    def _persist_cancelled_turn_context(self, *, start_index: int | None = None) -> None:
+        """Persist available tool trace before marking a cancelled turn interrupted."""
+        if not getattr(self, "_session", None):
+            return
+
+        try:
+            if isinstance(start_index, int) and start_index >= 0:
+                try:
+                    self._merge_turn_invoked_skills_from_runtime(start_index)
+                except Exception as exc:
+                    logger.debug(f"Cancelled-turn skill merge skipped: {exc}")
+                try:
+                    persisted = self._persist_turn_tool_trace(start_index)
+                    if persisted:
+                        AgentLoop._persist_session_if_possible(self)
+                except Exception as exc:
+                    logger.debug(f"Cancelled-turn tool trace persist skipped: {exc}")
+            AgentLoop._mark_latest_user_turn_state(
+                self,
+                _TURN_STATE_INTERRUPTED,
+                reason="task_cancelled",
+            )
+        except Exception as exc:
+            logger.debug(f"Cancelled-turn persistence skipped: {exc}")
+
+    @staticmethod
+    def _persist_interrupted_assistant_reply(
+        self,
+        content: str,
+        *,
+        reason: str = "task_cancelled",
+    ) -> bool:
+        """Persist user-visible assistant text from an interrupted stream."""
+        if not getattr(self, "_session", None):
+            return False
+
+        content = str(content or "")
+        if not content.strip():
+            return False
+
+        try:
+            messages = getattr(self._session, "messages", None)
+            if isinstance(messages, list) and messages:
+                last = messages[-1]
+                if (
+                    isinstance(last, dict)
+                    and last.get("role") == "assistant"
+                    and last.get("incomplete") is True
+                    and str(last.get("content") or "") == content
+                ):
+                    return False
+
+            self._session.add_message(
+                "assistant",
+                content,
+                incomplete=True,
+                incomplete_reason=reason,
+                incomplete_source="stream",
+                **AgentLoop._assistant_session_save_kwargs(content),
+            )
+            AgentLoop._persist_session_if_possible(self)
+            return True
+        except Exception as exc:
+            logger.debug(f"Interrupted assistant reply persistence skipped: {exc}")
+            return False
+
     def _current_tool_owner_key(self, session_key: str | None = None) -> str:
         """Resolve a user-scoped ownership key for background tool jobs."""
         return build_tool_owner_key(
@@ -2731,7 +3292,13 @@ class AgentLoop:
             retry_config = DEFAULT_RETRY_CONFIG
 
         async def _do_run() -> Any:
-            with bind_tool_owner(self._current_tool_owner_key()):
+            with (
+                bind_tool_owner(self._current_tool_owner_key()),
+                bind_tool_workspace(str(getattr(self, "workspace", "") or "")),
+            ):
+                request = run_kwargs.get("request")
+                if not (isinstance(request, str) and request.strip()):
+                    await AgentLoop._ensure_runtime_user_tail_before_run(self, label)
                 return await self._agent.run(**run_kwargs)
 
         def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
@@ -2951,7 +3518,7 @@ class AgentLoop:
         authoritative_message = message
 
         runtime_user_text = self._add_current_turn_skill_zip_context(
-            AgentLoop._build_current_turn_runtime_user_text(authoritative_message)
+            self._build_current_turn_runtime_user_text(authoritative_message)
         )
         runtime_message = self._build_runtime_message_content(
             "user",
@@ -2969,10 +3536,27 @@ class AgentLoop:
             attachments=attachments,
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+
+        direct_clarification = AgentLoop._build_short_request_ambiguity_clarification(
+            self,
+            authoritative_message
+        )
+        if direct_clarification:
+            await self._agent.add_message("user", runtime_message)
+            await self._agent.add_message("assistant", direct_clarification)
+            self._persist_direct_assistant_turn_response(
+                direct_clarification,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
+            return direct_clarification
+
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
 
-        _base_prompt = self._build_step_prompt(authoritative_message)
+        _base_prompt = self._select_next_step_prompt(
+            authoritative_message,
+            thinking=False,
+        )
         self._agent.next_step_prompt = _base_prompt
 
         self._install_anti_loop_tracker(_base_prompt)
@@ -2986,8 +3570,19 @@ class AgentLoop:
         await self._agent.add_message("user", runtime_message)
         self._normalize_runtime_memory_before_run("process")
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+        self._active_turn_memory_start_index = _pre_turn_memory_index
 
         retry_runner = AgentLoop._resolve_retry_runner(self)
+        execution_ledger = ExecutionLedger(
+            owner=self._current_tool_owner_key(),
+            workspace=str(getattr(self, "workspace", "") or ""),
+            session_id=str(getattr(self, "session_key", "") or ""),
+            turn_id=uuid.uuid4().hex,
+            user_request=authoritative_message,
+        )
+        self._active_execution_ledger = execution_ledger
+        ledger_manager = bind_execution_ledger(execution_ledger)
+        ledger_manager.__enter__()
 
         try:
             run_kwargs: dict[str, Any] = {}
@@ -2997,7 +3592,10 @@ class AgentLoop:
             ):
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
-            with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(),
+            ):
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
                     label="process",
@@ -3037,7 +3635,10 @@ class AgentLoop:
                 )
                 await self._agent.add_message("user", repair_prompt)
                 self._agent.next_step_prompt = repair_prompt
-                with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                with (
+                    bind_request_execution_hints(request_execution_hints),
+                    track_tool_invocations(),
+                ):
                     result = await AgentLoop._run_agent_with_context_overflow_recovery(
                         self,
                         label="process_tool_call_repair",
@@ -3050,6 +3651,196 @@ class AgentLoop:
                     if _extracted:
                         final_content = _extracted
 
+            tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                _pre_turn_memory_index
+            )
+            if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                final_content = await self._run_process_history_search_budget_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_history_search_budget_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
+            ):
+                final_content = await self._run_process_repeated_read_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+
+            if should_run_skill_contract_check(tool_result_events):
+                final_content, tool_result_events = await self._continue_skill_contract_until_terminal(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    final_content=final_content,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    memory_start_index=_pre_turn_memory_index,
+                    label="process_skill_contract_continuation",
+                )
+
+            if tool_result_events:
+                final_content, tool_result_events = await self._continue_task_until_terminal(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    final_content=final_content,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    memory_start_index=_pre_turn_memory_index,
+                    label="process_task_continuation",
+                )
+
+            if (
+                tool_result_events
+                and should_run_skill_contract_check(tool_result_events)
+                and skill_contract_has_progress(tool_result_events)
+                and not latest_tool_event_has_user_summary_marker(tool_result_events)
+                and not latest_tool_event_from_skill_continuation(tool_result_events)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+
+            if any(
+                AgentLoop._is_tool_loop_suppression_event(event)
+                for event in tool_result_events
+            ):
+                fallback_content = AgentLoop._build_tool_loop_fallback_response(
+                    tool_result_events,
+                    reason="tool_suppression",
+                    user_message=authoritative_message,
+                )
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=True,
+                    user_message=authoritative_message,
+                    fallback_text=fallback_content,
+                )
+            elif (
+                should_run_skill_contract_check(tool_result_events)
+                and latest_tool_event_has_user_summary_marker(tool_result_events)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif tool_result_events and (
+                AgentLoop._looks_like_raw_tool_transcript_leak(final_content)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif tool_result_events and AgentLoop._final_answer_script_mismatch(
+                authoritative_message,
+                final_content,
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif (
+                tool_result_events
+                and (
+                    bool(request_execution_hints.get("current_session_fact_check_required"))
+                    or bool(request_execution_hints.get("session_evidence_synthesis_preferred"))
+                )
+            ):
+                synthesis_events = self._session_evidence_synthesis_events(
+                    tool_result_events,
+                    user_message=authoritative_message,
+                )
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    synthesis_events,
+                    incomplete=latest_tool_event_has_next_command(synthesis_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        synthesis_events,
+                        incomplete=latest_tool_event_has_next_command(synthesis_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif (
+                tool_result_events
+                and (
+                    bool(request_execution_hints.get("current_session_fact_check_required"))
+                    or bool(request_execution_hints.get("session_evidence_synthesis_preferred"))
+                )
+            ):
+                synthesis_events = self._session_evidence_synthesis_events(
+                    tool_result_events,
+                    user_message=authoritative_message,
+                )
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    synthesis_events,
+                    incomplete=latest_tool_event_has_next_command(synthesis_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        synthesis_events,
+                        incomplete=latest_tool_event_has_next_command(synthesis_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+                thinking_content = None
+            elif (
+                tool_result_events
+                and should_run_skill_contract_check(tool_result_events)
+                and not skill_contract_has_progress(tool_result_events)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
             final_content = AgentLoop._finalize_response_content(
                 self,
                 authoritative_message,
@@ -3057,11 +3848,7 @@ class AgentLoop:
                 turn_memory_start_index=_pre_turn_memory_index,
             )
         except asyncio.CancelledError:
-            AgentLoop._mark_latest_user_turn_state(
-                self,
-                _TURN_STATE_INTERRUPTED,
-                reason="task_cancelled",
-            )
+            self._persist_cancelled_turn_context(start_index=_pre_turn_memory_index)
             raise
         except Exception as e:
             import traceback
@@ -3076,6 +3863,18 @@ class AgentLoop:
             )
             raise
         finally:
+            try:
+                persist_execution_ledger(execution_ledger)
+            except Exception as exc:
+                logger.debug(f"Execution ledger persistence skipped: {exc}")
+            try:
+                ledger_manager.__exit__(None, None, None)
+            except Exception:
+                pass
+            if getattr(self, "_active_execution_ledger", None) is execution_ledger:
+                self._active_execution_ledger = None
+            if getattr(self, "_active_turn_memory_start_index", None) == _pre_turn_memory_index:
+                self._active_turn_memory_start_index = None
             # Always ensure agent is back in IDLE state after processing
             self._restore_agent_think()
             AgentLoop._restore_request_context_system_prompt(
@@ -3289,6 +4088,18 @@ class AgentLoop:
             )
 
         if role == "tool":
+            text_content = content if isinstance(content, str) else ""
+            file_header = re.match(r"^\[file:\s*([^\]\n]+)\]\s*\n", text_content.strip())
+            if not file_header:
+                file_header = re.match(
+                    r"^Observed output of cmd [^\n]* execution:\s*\[file:\s*([^\]\n]+)\]\s*\n",
+                    text_content.strip(),
+                )
+            if file_header:
+                return (
+                    f"[file: {file_header.group(1)}] historical file reference only; "
+                    "read the current local file again for exact text"
+                )
             compressed = cls._compress_message_content(content, max_chars)
             if compressed == content:
                 return content
@@ -3374,7 +4185,15 @@ class AgentLoop:
         if role != 'user':
             return False
         text = msg.content if isinstance(msg.content, str) else ''
-        return text.startswith('[ORIGINAL USER REQUEST]') or text.startswith('Focus on the user')
+        return (
+            text == self.DEFAULT_NEXT_STEP_PROMPT
+            or text.startswith('[ORIGINAL USER REQUEST]')
+            or text.startswith('[INTERNAL ')
+            or text.startswith('[TURN PRIORITY]:')
+            or text.startswith('## Active Request Context')
+            or text.startswith('## Current Session Compact')
+            or text.startswith('Focus on the user')
+        )
 
     @staticmethod
     def _callable_accepts_kwarg(func: Any, kwarg: str) -> bool:
@@ -3466,6 +4285,21 @@ class AgentLoop:
             if tool_call_id:
                 answered_ids.add(tool_call_id)
         return answered_ids
+
+    @classmethod
+    def _tool_call_details_by_id(cls, messages: list) -> dict[str, tuple[str, Any]]:
+        """Return tool-call name/arguments keyed by id from runtime memory."""
+        details: dict[str, tuple[str, Any]] = {}
+        for msg in messages:
+            if cls._message_role_value(msg) != "assistant":
+                continue
+            for tool_call in cls._message_tool_calls_value(msg):
+                tool_call_id = cls._tool_call_id_value(tool_call)
+                if not tool_call_id or tool_call_id in details:
+                    continue
+                name, arguments = cls._tool_call_name_and_arguments(tool_call)
+                details[tool_call_id] = (name, arguments)
+        return details
 
     @classmethod
     def _adjust_message_start_to_preserve_tool_context(
@@ -3695,22 +4529,10 @@ class AgentLoop:
         return "generativelanguage.googleapis.com" in base_url
 
     def _should_skip_runtime_next_step_prompt(self) -> bool:
-        """Avoid synthetic user turns after tool responses for strict function-turn providers."""
+        """Avoid synthetic user turns for strict function-turn providers."""
         if not self._uses_strict_tool_turn_order():
             return False
-        if not self._agent or not hasattr(self._agent, "memory"):
-            return False
-
-        messages = getattr(self._agent.memory, "messages", None)
-        if not isinstance(messages, list):
-            return False
-
-        for message in reversed(messages):
-            role = self._message_role_value(message)
-            if role == "system":
-                continue
-            return role == "tool"
-        return False
+        return self._uses_openai_compatible_tool_api()
 
     @classmethod
     def _snap_drop_end_to_turn_boundary(
@@ -4002,6 +4824,8 @@ class AgentLoop:
         if agent is None:
             return
         self._install_tool_call_protocol_guards()
+        self._install_tool_loop_stop_guard()
+        self._install_session_progress_persistence_guard()
 
         agent_loop = self
         original_think = getattr(agent, "_spoon_bot_base_think", None)
@@ -4015,18 +4839,92 @@ class AgentLoop:
             agent_loop._compress_runtime_context()
 
             desired_next_step_prompt = agent.next_step_prompt or base_prompt
+            request_execution_hints = get_request_execution_hints()
+            runtime_tool_events = agent_loop._collect_runtime_tool_result_events_from_memory()
+
+            def _latest_real_user_text() -> str:
+                runtime_messages = AgentLoop._get_runtime_memory_messages(agent_loop)
+                latest_user_index = agent_loop._latest_real_user_message_index(runtime_messages)
+                if latest_user_index is None or latest_user_index >= len(runtime_messages):
+                    return ""
+                return AgentLoop._stringify_stream_payload(
+                    AgentLoop._stream_message_attr(
+                        runtime_messages[latest_user_index],
+                        "content",
+                        "",
+                    )
+                )
+
+            if (
+                request_execution_hints
+                and should_run_skill_contract_check(runtime_tool_events)
+                and AgentLoop._tool_events_have_repeated_read_guardrail(runtime_tool_events[-3:])
+                and not latest_tool_event_has_user_summary_marker(runtime_tool_events)
+            ):
+                latest_user_text = _latest_real_user_text()
+                desired_next_step_prompt = AgentLoop._build_repeated_read_recovery_prompt(
+                    latest_user_text or base_prompt,
+                )
             suppress_runtime_prompt = AgentLoop._should_skip_runtime_next_step_prompt(agent_loop)
+            try:
+                previous_provider_tail_prompt = vars(agent).get(
+                    "_spoon_bot_provider_tail_prompt",
+                    _MISSING,
+                )
+            except Exception:
+                previous_provider_tail_prompt = getattr(
+                    agent,
+                    "_spoon_bot_provider_tail_prompt",
+                    _MISSING,
+                )
             if suppress_runtime_prompt:
                 logger.info(
                     "Suppressing synthetic next_step_prompt user turn for strict tool-call provider"
                 )
+                agent._spoon_bot_provider_tail_prompt = agent_loop.DEFAULT_NEXT_STEP_PROMPT
                 agent.next_step_prompt = None
             else:
+                if previous_provider_tail_prompt is not _MISSING:
+                    try:
+                        delattr(agent, "_spoon_bot_provider_tail_prompt")
+                    except Exception:
+                        pass
                 agent.next_step_prompt = desired_next_step_prompt
 
+            think_timeout = AgentLoop._positive_runtime_budget(
+                getattr(agent_loop, "provider_ask_timeout", None),
+                _DEFAULT_PROVIDER_ASK_TIMEOUT,
+            )
+            if getattr(agent_loop, "provider_ask_timeout", None) == 0:
+                think_timeout = 0.0
+
             try:
-                result = await original_think(*args, **kwargs)
+                if think_timeout > 0:
+                    try:
+                        result = await asyncio.wait_for(
+                            original_think(*args, **kwargs),
+                            timeout=think_timeout,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        logger.warning(
+                            "Provider think step exceeded {:.1f}s; "
+                            "raising retryable provider timeout.",
+                            think_timeout,
+                        )
+                        raise LLMTimeoutError(
+                            str(getattr(agent_loop, "provider", "provider")),
+                            think_timeout,
+                        ) from exc
+                else:
+                    result = await original_think(*args, **kwargs)
             finally:
+                if previous_provider_tail_prompt is _MISSING:
+                    try:
+                        delattr(agent, "_spoon_bot_provider_tail_prompt")
+                    except Exception:
+                        pass
+                else:
+                    agent._spoon_bot_provider_tail_prompt = previous_provider_tail_prompt
                 agent.next_step_prompt = desired_next_step_prompt
 
             _log_agent_reasoning()
@@ -4090,6 +4988,99 @@ class AgentLoop:
 
         agent_loop = self
 
+        def _latest_request_message_for_provider() -> str:
+            try:
+                runtime_messages = AgentLoop._get_runtime_memory_messages(agent_loop)
+                latest_user_index = agent_loop._latest_real_user_message_index(runtime_messages)
+                if latest_user_index is not None and latest_user_index < len(runtime_messages):
+                    content = AgentLoop._stream_message_attr(
+                        runtime_messages[latest_user_index],
+                        "content",
+                        "",
+                    )
+                    text = AgentLoop._stringify_stream_payload(content).strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+
+            session = getattr(agent_loop, "_session", None)
+            raw_messages = getattr(session, "messages", None)
+            if not isinstance(raw_messages, list):
+                try:
+                    getter = getattr(session, "get_messages", None)
+                    raw_messages = getter() if callable(getter) else []
+                except Exception:
+                    raw_messages = []
+            for message in reversed(raw_messages or []):
+                try:
+                    role = str(message.get("role", "")).strip().lower()
+                    content = message.get("content", "")
+                except AttributeError:
+                    role = AgentLoop._message_role_value(message)
+                    content = getattr(message, "content", "")
+                if role != "user":
+                    continue
+                text = AgentLoop._stringify_stream_payload(content).strip()
+                if text:
+                    return text
+            return ""
+
+        def _active_provider_system_prompt(current_system_prompt: Any) -> str | None:
+            diagnostic: dict[str, Any] = {
+                "current_system_has_context": (
+                    isinstance(current_system_prompt, str)
+                    and "## Active Request Context" in current_system_prompt
+                ),
+                "used_cached_prompt": False,
+                "latest_request_chars": 0,
+                "built_prompt": False,
+                "error": "",
+            }
+            active_system_prompt = getattr(
+                agent_loop,
+                "_active_request_augmented_system_prompt",
+                None,
+            )
+            if isinstance(active_system_prompt, str) and active_system_prompt:
+                diagnostic["used_cached_prompt"] = True
+                diagnostic["built_prompt"] = True
+                agent_loop._last_provider_context_injection = diagnostic
+                return active_system_prompt
+
+            base_prompt = (
+                current_system_prompt
+                if isinstance(current_system_prompt, str) and current_system_prompt.strip()
+                else getattr(agent, "system_prompt", None)
+            )
+            if not isinstance(base_prompt, str) or not base_prompt.strip():
+                diagnostic["error"] = "missing_base_system_prompt"
+                agent_loop._last_provider_context_injection = diagnostic
+                return None
+
+            latest_request = _latest_request_message_for_provider()
+            diagnostic["latest_request_chars"] = len(latest_request)
+            if not latest_request:
+                diagnostic["error"] = "missing_latest_request"
+                agent_loop._last_provider_context_injection = diagnostic
+                return None
+            try:
+                request_context = agent_loop._build_request_context_prompt(latest_request)
+            except Exception as exc:
+                diagnostic["error"] = f"build_request_context_failed:{type(exc).__name__}"
+                agent_loop._last_provider_context_injection = diagnostic
+                return None
+            augmented_prompt = (
+                f"{base_prompt}\n\n"
+                f"## Active Request Context\n"
+                f"{request_context}"
+            )
+            agent_loop._active_request_base_system_prompt = base_prompt
+            agent_loop._active_request_augmented_system_prompt = augmented_prompt
+            diagnostic["built_prompt"] = True
+            agent_loop._last_provider_context_injection = diagnostic
+            return augmented_prompt
+
         async def _guarded_ask_tool(*args: Any, **kwargs: Any):
             should_disable_parallel = agent_loop._should_disable_parallel_tool_calls()
             should_textualize_tool_history = (
@@ -4097,6 +5088,24 @@ class AgentLoop:
             )
             call_args = list(args)
             call_kwargs = dict(kwargs)
+            current_system_prompt = call_kwargs.get("system_msg")
+            active_system_prompt = _active_provider_system_prompt(current_system_prompt)
+            if isinstance(active_system_prompt, str) and active_system_prompt:
+                has_request_context = (
+                    isinstance(current_system_prompt, str)
+                    and "## Active Request Context" in current_system_prompt
+                )
+                if not has_request_context:
+                    call_kwargs["system_msg"] = active_system_prompt
+                    try:
+                        diagnostic = dict(
+                            getattr(agent_loop, "_last_provider_context_injection", {})
+                            or {}
+                        )
+                        diagnostic["injected"] = True
+                        agent_loop._last_provider_context_injection = diagnostic
+                    except Exception:
+                        pass
             if should_textualize_tool_history:
                 if "messages" in call_kwargs:
                     call_kwargs["messages"] = AgentLoop._textualize_tool_history(
@@ -4104,6 +5113,32 @@ class AgentLoop:
                     )
                 elif call_args:
                     call_args[0] = AgentLoop._textualize_tool_history(call_args[0])
+
+            if agent_loop._provider_requires_user_tail():
+                continuation_prompt = getattr(agent, "next_step_prompt", None)
+                if not (isinstance(continuation_prompt, str) and continuation_prompt.strip()):
+                    try:
+                        provider_tail_prompt = vars(agent).get(
+                            "_spoon_bot_provider_tail_prompt"
+                        )
+                    except Exception:
+                        provider_tail_prompt = getattr(
+                            agent,
+                            "_spoon_bot_provider_tail_prompt",
+                            None,
+                        )
+                    if isinstance(provider_tail_prompt, str) and provider_tail_prompt.strip():
+                        continuation_prompt = provider_tail_prompt
+                if "messages" in call_kwargs:
+                    call_kwargs["messages"] = AgentLoop._ensure_provider_messages_end_with_user(
+                        call_kwargs["messages"],
+                        continuation_prompt,
+                    )
+                elif call_args:
+                    call_args[0] = AgentLoop._ensure_provider_messages_end_with_user(
+                        call_args[0],
+                        continuation_prompt,
+                    )
 
             injected_parallel_flag = False
             if should_disable_parallel and "parallel_tool_calls" not in call_kwargs:
@@ -4114,14 +5149,87 @@ class AgentLoop:
                 call_kwargs["max_tokens"] = AgentLoop._tool_call_output_token_budget()
 
             async def _ask_with_parallel_fallback(request_kwargs: dict[str, Any]):
+                retry_config = getattr(agent_loop, "_retry_config", None)
+                if not isinstance(retry_config, RetryConfig):
+                    retry_config = DEFAULT_RETRY_CONFIG
+                ask_timeout = AgentLoop._positive_runtime_budget(
+                    getattr(agent_loop, "provider_ask_timeout", None),
+                    _DEFAULT_PROVIDER_ASK_TIMEOUT,
+                )
+                if getattr(agent_loop, "provider_ask_timeout", None) == 0:
+                    ask_timeout = 0.0
+
                 try:
-                    return await original_ask_tool(*call_args, **request_kwargs)
+                    snapshot_index = int(
+                        getattr(agent_loop, "_llm_context_snapshot_index", 0)
+                    ) + 1
+                    agent_loop._llm_context_snapshot_index = snapshot_index
+                    snapshot_path = write_llm_context_snapshot(
+                        agent_loop,
+                        label=f"ask_tool#{snapshot_index}",
+                        args=call_args,
+                        kwargs=request_kwargs,
+                    )
+                    if snapshot_path is not None:
+                        logger.debug(f"Wrote LLM context snapshot: {snapshot_path}")
                 except Exception as exc:
-                    if injected_parallel_flag and "parallel_tool_calls" in str(exc):
-                        retry_kwargs = dict(request_kwargs)
-                        retry_kwargs.pop("parallel_tool_calls", None)
-                        return await original_ask_tool(*call_args, **retry_kwargs)
-                    raise
+                    logger.debug(f"Failed to write LLM context snapshot: {exc}")
+
+                async def _call_provider(current_kwargs: dict[str, Any]):
+                    async def _invoke_original() -> Any:
+                        if inspect.iscoroutinefunction(original_ask_tool):
+                            return await original_ask_tool(*call_args, **current_kwargs)
+
+                        result = await asyncio.to_thread(
+                            original_ask_tool,
+                            *call_args,
+                            **current_kwargs,
+                        )
+                        if inspect.isawaitable(result):
+                            return await result
+                        return result
+
+                    if ask_timeout <= 0:
+                        return await _invoke_original()
+                    try:
+                        return await asyncio.wait_for(
+                            _invoke_original(),
+                            timeout=ask_timeout,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        logger.warning(
+                            "Provider ask_tool call exceeded {:.1f}s; "
+                            "retrying if provider retry budget remains.",
+                            ask_timeout,
+                        )
+                        raise LLMTimeoutError(str(getattr(agent_loop, "provider", "provider")), ask_timeout) from exc
+
+                async def _attempt():
+                    try:
+                        return await _call_provider(request_kwargs)
+                    except Exception as exc:
+                        if injected_parallel_flag and "parallel_tool_calls" in str(exc):
+                            retry_kwargs = dict(request_kwargs)
+                            retry_kwargs.pop("parallel_tool_calls", None)
+                            return await _call_provider(retry_kwargs)
+                        raise
+
+                def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
+                    logger.warning(
+                        "Provider ask_tool transient error (attempt {}/{}), "
+                        "retrying in {:.1f}s: {}: {}",
+                        attempt + 1,
+                        retry_config.max_retries + 1,
+                        delay,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+                return await with_provider_retry(
+                    _attempt,
+                    config=retry_config,
+                    on_retry=_on_retry,
+                )
 
             try:
                 response = await _ask_with_parallel_fallback(call_kwargs)
@@ -4158,6 +5266,85 @@ class AgentLoop:
         except Exception:
             return
 
+    def _install_tool_loop_stop_guard(self) -> None:
+        """Stop the core action loop when a tool emits a hard guardrail result."""
+        agent = getattr(self, "_agent", None)
+        execute_tool = getattr(agent, "execute_tool", None)
+        if agent is None or not callable(execute_tool):
+            return
+
+        original_execute_tool = getattr(agent, "_spoon_bot_base_execute_tool", None)
+        if original_execute_tool is None:
+            original_execute_tool = execute_tool
+            try:
+                setattr(agent, "_spoon_bot_base_execute_tool", original_execute_tool)
+            except Exception:
+                return
+        else:
+            try:
+                setattr(agent, "execute_tool", original_execute_tool)
+            except Exception:
+                return
+
+        async def _guarded_execute_tool(*args: Any, **kwargs: Any) -> Any:
+            result = await original_execute_tool(*args, **kwargs)
+            if "stop_tool_loop" in AgentLoop._stringify_stream_payload(result).casefold():
+                shutdown_event = getattr(agent, "_shutdown_event", None)
+                if hasattr(shutdown_event, "set"):
+                    try:
+                        shutdown_event.set()
+                    except Exception:
+                        pass
+                try:
+                    agent.state = AgentState.FINISHED
+                except Exception:
+                    pass
+                logger.warning(
+                    "Tool loop guardrail emitted; stopping the current agent action loop."
+                )
+            return result
+
+        try:
+            setattr(agent, "execute_tool", _guarded_execute_tool)
+        except Exception:
+            return
+
+    def _install_session_progress_persistence_guard(self) -> None:
+        """Persist in-flight tool progress after runtime memory receives it."""
+        agent = getattr(self, "_agent", None)
+        add_message = getattr(agent, "add_message", None)
+        if agent is None or not callable(add_message):
+            return
+
+        original_add_message = getattr(agent, "_spoon_bot_base_add_message", None)
+        if original_add_message is None:
+            original_add_message = add_message
+            try:
+                setattr(agent, "_spoon_bot_base_add_message", original_add_message)
+            except Exception:
+                return
+        else:
+            try:
+                setattr(agent, "add_message", original_add_message)
+            except Exception:
+                return
+
+        agent_loop = self
+
+        async def _guarded_add_message(role: Any, content: Any, *args: Any, **kwargs: Any) -> Any:
+            result = await original_add_message(role, content, *args, **kwargs)
+            normalized_role = str(role or "").strip().lower()
+            if normalized_role in {"assistant", "tool"}:
+                start_index = getattr(agent_loop, "_active_turn_memory_start_index", None)
+                if isinstance(start_index, int) and start_index >= 0:
+                    agent_loop._persist_turn_tool_trace_checkpoint(start_index)
+            return result
+
+        try:
+            setattr(agent, "add_message", _guarded_add_message)
+        except Exception:
+            return
+
     def _uses_openai_compatible_tool_api(self) -> bool:
         """Return true when the active provider accepts OpenAI-style tool kwargs."""
         provider_raw = getattr(self, "provider", None)
@@ -4175,20 +5362,76 @@ class AgentLoop:
         """Prefer one tool result turn at a time for strict OpenAI-compatible APIs."""
         import os as _os
 
+        if getattr(self, "_force_serial_tool_calls", False):
+            return True
+
         raw = _os.getenv("SPOON_BOT_PARALLEL_TOOL_CALLS")
         if raw is not None:
             return raw.strip().lower() in {"0", "false", "no", "off"}
         return self._uses_strict_tool_turn_order() and self._uses_openai_compatible_tool_api()
 
     def _should_textualize_tool_history_for_provider(self) -> bool:
-        """Avoid replaying native completed tool-result blocks to strict providers."""
+        """Return true when operators explicitly request text-only tool history.
+
+        Completed OpenAI-style tool-call transcripts are valid provider input as
+        long as assistant(tool_calls) and matching tool messages stay adjacent.
+        Textualizing them by default makes internal tool evidence look like a
+        normal assistant reply and can confuse long autonomous workflows.
+        """
         import os as _os
 
         raw = _os.getenv("SPOON_BOT_TEXTUALIZE_TOOL_HISTORY")
         if raw is not None:
             return raw.strip().lower() in {"1", "true", "yes", "on", "always"}
 
-        return self._uses_strict_tool_turn_order()
+        return False
+
+    def _provider_requires_user_tail(self) -> bool:
+        """Return true for providers that reject assistant-prefill style tails."""
+        import os as _os
+
+        raw = _os.getenv("SPOON_BOT_PROVIDER_USER_TAIL")
+        if raw is not None:
+            return raw.strip().lower() in {"1", "true", "yes", "on", "always"}
+
+        return self._provider_requires_user_tail_legacy_default()
+
+    def _provider_requires_user_tail_legacy_default(self) -> bool:
+        """Default to native provider message order unless env opts in.
+
+        Adding a synthetic ``Continue.`` user tail after each tool result hides
+        the real user request behind runtime plumbing. Modern tool-call APIs can
+        continue from a tool-result tail directly, so the compatibility shim is
+        now opt-in through ``SPOON_BOT_PROVIDER_USER_TAIL``.
+        """
+        return False
+
+    @classmethod
+    def _ensure_provider_messages_end_with_user(
+        cls,
+        messages: Any,
+        continuation_prompt: str | None = None,
+    ) -> Any:
+        """Return provider-bound messages ending in a user turn when required."""
+        if not isinstance(messages, list) or not messages:
+            return messages
+
+        for message in reversed(messages):
+            role = str(cls._message_role_value(message) or "").strip().lower()
+            if role == "system":
+                continue
+            if role == "user":
+                return messages
+            break
+        else:
+            return messages
+
+        prompt = (
+            continuation_prompt.strip()
+            if isinstance(continuation_prompt, str) and continuation_prompt.strip()
+            else cls.DEFAULT_NEXT_STEP_PROMPT
+        )
+        return [*messages, Message(role="user", content=prompt)]
 
     @classmethod
     def _textualize_tool_history(cls, messages: Any) -> Any:
@@ -4311,17 +5554,33 @@ class AgentLoop:
     @staticmethod
     def _coerce_response_to_single_tool_call(response: Any) -> int:
         """Keep one tool call when the transport requires serial tool-result turns."""
-        tool_calls = getattr(response, "tool_calls", None)
-        if not isinstance(tool_calls, list) or len(tool_calls) <= 1:
+        if isinstance(response, dict):
+            tool_calls = response.get("tool_calls")
+        else:
+            tool_calls = getattr(response, "tool_calls", None)
+        if isinstance(tool_calls, tuple):
+            tool_call_list = list(tool_calls)
+        elif isinstance(tool_calls, list):
+            tool_call_list = tool_calls
+        else:
+            return 0
+        if len(tool_call_list) <= 1:
             return 0
 
-        dropped = len(tool_calls) - 1
+        dropped = len(tool_call_list) - 1
         try:
-            response.tool_calls = tool_calls[:1]
+            if isinstance(response, dict):
+                response["tool_calls"] = tool_call_list[:1]
+            else:
+                response.tool_calls = tool_call_list[:1]
         except Exception:
             return 0
 
-        metadata = getattr(response, "metadata", None)
+        metadata = (
+            response.get("metadata")
+            if isinstance(response, dict)
+            else getattr(response, "metadata", None)
+        )
         if isinstance(metadata, dict):
             metadata["serial_tool_calls_enforced"] = True
             metadata["dropped_parallel_tool_calls"] = dropped
@@ -4336,11 +5595,11 @@ class AgentLoop:
         """Return the default completion budget for tool-producing turns."""
         raw = os.getenv("SPOON_BOT_TOOL_CALL_MAX_TOKENS")
         if raw is None:
-            return 16_384
+            return 12_000
         try:
             return max(1_024, min(200_000, int(raw.strip())))
         except (TypeError, ValueError):
-            return 16_384
+            return 12_000
 
     @staticmethod
     def _tool_call_retry_token_budget(current: int | None = None) -> int:
@@ -4636,6 +5895,18 @@ class AgentLoop:
         return result.strip()
 
     @staticmethod
+    def _should_replace_stream_error_preamble(
+        content: str,
+        *,
+        saw_tool_call: bool,
+        saw_content_after_tool_call: bool,
+    ) -> bool:
+        """Return True when provider failure left only a stale pre-tool preamble."""
+        if not str(content or "").strip():
+            return True
+        return saw_tool_call and not saw_content_after_tool_call
+
+    @staticmethod
     def _looks_like_pseudo_tool_call_text(content: str) -> bool:
         """Return True when plain text is pretending that tools were called."""
         text = str(content or "")
@@ -4653,20 +5924,38 @@ class AgentLoop:
         pseudo_content: str,
     ) -> str:
         """Build an internal retry prompt after the model emitted fake tool text."""
-        excerpt = AgentLoop._compact_tool_evidence_text(pseudo_content, limit=900)
         return (
             "[INTERNAL TOOL-CALL REPAIR]\n"
             "Your previous assistant output wrote tool-call-shaped Markdown as plain text. "
             "Those actions were NOT executed by the runtime, and any claimed outputs in that "
             "text are invalid.\n\n"
-            "Discard the invalid text below and continue the latest user request by calling "
-            "the real tools through the tool-call API. Do not describe a tool call, do not "
-            "write `tool_name(...)` in Markdown, and do not claim success until actual tool "
-            "results have been returned. If the needed tool is unavailable or fails, report "
-            "that concrete blocker.\n\n"
-            f"Latest user request:\n{user_request}\n\n"
-            f"Invalid plain-text pseudo tool output:\n{excerpt}"
+            "The invalid text is intentionally omitted from this repair context so it cannot "
+            "be mistaken for evidence. Continue the latest user request from the real tool "
+            "messages already in memory by calling tools through the tool-call API. Do not "
+            "describe a tool call, do not write `tool_name(...)` in Markdown, and do not "
+            "claim success until actual tool results have been returned. If the needed tool "
+            "is unavailable or fails, report that concrete blocker.\n\n"
+            f"Latest user request:\n{user_request}"
         )
+
+    @staticmethod
+    def _build_repeated_read_recovery_prompt(
+        user_request: str,
+        *,
+        request_context: str = "",
+    ) -> str:
+        """Return the neutral continuation token used by the core loop."""
+        return AgentLoop.DEFAULT_NEXT_STEP_PROMPT
+
+    @staticmethod
+    def _build_history_search_budget_recovery_prompt(
+        user_request: str,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        request_context: str = "",
+    ) -> str:
+        """Return the neutral continuation token used by the core loop."""
+        return AgentLoop.DEFAULT_NEXT_STEP_PROMPT
 
     @staticmethod
     def _drop_pseudo_tool_call_assistant_messages(self, start_index: int) -> int:
@@ -4711,23 +6000,45 @@ class AgentLoop:
     def _looks_like_raw_tool_transcript_leak(content: str) -> bool:
         """Return True when provider fallback text is dominated by tool transcript artifacts."""
         text = str(content or "")
-        if "Observed output of cmd" not in text:
-            return False
-        if len(text) >= 4_000:
+        if "Observed output of cmd" in text:
+            if len(text) >= 4_000:
+                return True
+            if re.match(r"(?is)^\s*Observed output of cmd\b.*\bexecution:\s*", text):
+                return True
+            if AgentLoop._looks_like_pseudo_tool_call_text(text):
+                return True
+            return bool(re.search(
+                r"(?is)(?:^|.)\s*Step\s+\d+:\s*Observed output of cmd\b.*\bexecution:\s*",
+                text,
+            ))
+
+        marker_count = sum(
+            1
+            for pattern in (
+                r"(?im)^\s*Thought process\s*$",
+                r"(?im)^\s*Tool\s*[·:]\s*",
+                r"(?im)^\s*Input\s*$",
+                r"(?im)^\s*Output\s*$",
+                r'(?im)^\s*"\s*action\s*"\s*:',
+                r'(?im)^\s*"\s*arguments\s*"\s*:',
+                r'(?im)^\s*"\s*result\s*"\s*:',
+            )
+            if re.search(pattern, text)
+        )
+        if marker_count >= 4 and re.search(r"(?im)^\s*Output\s*$", text):
             return True
-        if re.match(r"(?is)^\s*Observed output of cmd\b.*\bexecution:\s*", text):
-            return True
-        if AgentLoop._looks_like_pseudo_tool_call_text(text):
-            return True
-        return bool(re.search(
-            r"(?is)(?:^|.)\s*Step\s+\d+:\s*Observed output of cmd\b.*\bexecution:\s*",
-            text,
-        ))
+        return False
 
     @staticmethod
     def _compact_tool_evidence_text(value: Any, *, limit: int = 700) -> str:
         text = AgentLoop._stringify_stream_payload(value)
         text = re.sub(r"^Observed output of cmd [^\n]* execution:\s*", "", text.strip())
+        file_header = re.match(r"^\[file:\s*([^\]\n]+)\]\s*\n", text)
+        if file_header:
+            return (
+                f"[file: {file_header.group(1)}] "
+                "historical file reference in fallback; read the current local file again for exact text"
+            )
         lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         if lines:
             text = "\n".join(lines)
@@ -4738,13 +6049,13 @@ class AgentLoop:
         tail = text[-max(120, limit // 3):].lstrip()
         return f"{head}\n... (tool output truncated)\n{tail}"
 
-    def _build_raw_tool_transcript_leak_response(self, start_index: int) -> str:
-        """Build a bounded fallback when raw tool transcript text leaks as final content."""
-        parts = [
-            "The model returned raw tool transcript text instead of a clean final answer.",
-            "Recent tool evidence:",
-        ]
-
+    def _build_raw_tool_transcript_leak_response(
+        self,
+        start_index: int,
+        *,
+        user_message: str | None = None,
+    ) -> str:
+        """Build a user-facing fallback without exposing raw tool transcript text."""
         try:
             messages = AgentLoop._get_runtime_memory_messages(self)
         except Exception:
@@ -4754,29 +6065,20 @@ class AgentLoop:
         if isinstance(start_index, int) and start_index >= 0:
             messages = messages[start_index:]
 
-        tool_lines: list[str] = []
+        tool_outputs: list[str] = []
         for msg in messages:
             if AgentLoop._stream_message_role(msg).lower() != "tool":
                 continue
             content = AgentLoop._stream_message_attr(msg, "text_content", None)
             if content in (None, ""):
                 content = AgentLoop._stream_message_attr(msg, "content", "")
-            summary = AgentLoop._compact_tool_evidence_text(content)
-            if not summary:
-                continue
-            name = str(
-                AgentLoop._stream_message_attr(msg, "name", None)
-                or AgentLoop._stream_message_attr(msg, "tool_name", None)
-                or "tool"
-            )
-            tool_lines.append(f"Tool `{name}` output:\n{summary}")
+            if content not in (None, ""):
+                tool_outputs.append(str(content))
 
-        if tool_lines:
-            parts.extend(tool_lines[-3:])
-        else:
-            parts.append("No bounded tool evidence was captured before cleanup.")
-        parts.append("Please continue or retry if you need the agent to finish the remaining work.")
-        return "\n\n".join(parts)
+        return build_user_facing_tool_evidence_answer(
+            tool_outputs[-8:],
+            user_message=user_message,
+        )
 
     @staticmethod
     def _looks_like_internal_scratchpad_text(text: str) -> bool:
@@ -4809,14 +6111,121 @@ class AgentLoop:
         )
 
     @staticmethod
+    def _sanitize_internal_guardrail_text(text: str) -> str:
+        """Map internal loop-control markers to user-facing wording."""
+        value = str(text or "")
+        replacements = [
+            (
+                r"READ_FILE_CACHE_HIT:\s*requested file range already available in this request\.[^\n]*",
+                "The requested file range is already available in this request; continuing from the existing context.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*redundant file read suppressed\.[^\n]*",
+                "The duplicate file read was skipped because that content range was already available.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*duplicate tool invocation suppressed\.[^\n]*",
+                "The duplicate action was skipped because the same action had already run.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*repeated side-effecting tool series suppressed\.[^\n]*",
+                "The repeated external action was skipped.",
+            ),
+            (
+                r"STOP_TOOL_LOOP:\s*Error:\s*consecutive tool failures suppressed\.[^\n]*",
+                "Repeated tool failures were stopped.",
+            ),
+            (
+                r"redundant file read suppressed",
+                "duplicate file read skipped",
+            ),
+            (
+                r"duplicate tool invocation suppressed",
+                "duplicate action skipped",
+            ),
+            (
+                r"repeated side-effecting tool series suppressed",
+                "repeated external action skipped",
+            ),
+            (
+                r"consecutive tool failures suppressed",
+                "repeated tool failures stopped",
+            ),
+        ]
+        for pattern, replacement in replacements:
+            value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+        return value
+
+    @staticmethod
+    def _needs_tool_evidence_synthesis(
+        content: str | None,
+        *,
+        user_message: str | None = None,
+    ) -> bool:
+        """Return True when current terminal text is absent or unsafe to preserve."""
+        text = str(content or "").strip()
+        if not text or text in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}:
+            return True
+        if AgentLoop._looks_like_internal_scratchpad_text(text):
+            return True
+        if AgentLoop._looks_like_raw_tool_transcript_leak(text):
+            return True
+        if AgentLoop._looks_like_pseudo_tool_call_text(text):
+            return True
+        if AgentLoop._final_answer_script_mismatch(user_message, text):
+            return True
+        return False
+
+    @staticmethod
+    def _deterministic_ledger_final(
+        ledger: ExecutionLedger | None,
+        *,
+        max_chars: int = 5000,
+    ) -> str:
+        """Return a final-answer-safe ledger summary when tool facts exist."""
+        if not isinstance(ledger, ExecutionLedger):
+            return ""
+        if not (ledger.has_stateful_progress() or ledger.open_blockers):
+            return ""
+        return ledger.render_user_facing_summary(max_chars=max_chars)
+
+    @staticmethod
+    def _should_use_deterministic_ledger_final(
+        content: Any,
+        *,
+        user_message: str | None = None,
+    ) -> bool:
+        """Return True when the model answer is unusable and ledger facts must carry final output.
+
+        The ledger summary is intentionally conservative and mechanical. It is a
+        fallback for empty or contaminated answers, not a replacement for a
+        grounded natural-language answer synthesized from the same evidence.
+        """
+        text = str(content or "").strip()
+        if not text:
+            return True
+        if text in {"NO_CONCISE_TOOL_EVIDENCE", "No results"}:
+            return True
+        if AgentLoop._looks_like_internal_scratchpad_text(text):
+            return True
+        if AgentLoop._looks_like_raw_tool_transcript_leak(text):
+            return True
+        if AgentLoop._looks_like_pseudo_tool_call_text(text):
+            return True
+        if AgentLoop._final_answer_script_mismatch(user_message, text):
+            return True
+        return False
+
+    @staticmethod
     def _mask_user_visible_text(text: str) -> str:
         """Mask secrets before content is streamed, persisted, or finalized."""
         try:
             from spoon_bot.utils.privacy import mask_secrets
 
-            return mask_secrets(str(text or ""))
+            masked = mask_secrets(str(text or ""))
         except Exception:
-            return str(text or "")
+            masked = str(text or "")
+        return AgentLoop._sanitize_internal_guardrail_text(masked)
 
     @staticmethod
     def _strip_leaked_scratchpad_prefix(content: str) -> str:
@@ -4872,8 +6281,9 @@ class AgentLoop:
                 AgentLoop._build_raw_tool_transcript_leak_response(
                     self,
                     turn_memory_start_index,
+                    user_message=message,
                 )
-            )
+        )
         filtered = AgentLoop._filter_execution_steps(self, content)
         cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
         return AgentLoop._mask_user_visible_text(cleaned)
@@ -4910,14 +6320,54 @@ class AgentLoop:
         return normalize_tool_arguments(arguments)
 
     @staticmethod
+    def _tool_call_arguments_display(tool_name: Any, arguments: Any) -> str:
+        """Return tool-call arguments suitable for UI/session history."""
+        return sanitize_tool_arguments_for_history(str(tool_name or ""), arguments)
+
+    @staticmethod
     def _cap_stream_metadata_text(value: Any, *, limit: int = 200_000) -> tuple[str, bool, int]:
         """Return a websocket-safe text payload plus truncation metadata."""
         text = AgentLoop._stringify_stream_payload(value)
         original_len = len(text)
         if original_len <= limit:
             return text, False, original_len
-        suffix = f"\n... (stream output truncated, {original_len - limit} more chars)"
-        return text[:limit] + suffix, True, original_len
+        marker = "\n... (stream output middle truncated) ...\n"
+        available = limit - len(marker)
+        if available <= 0:
+            return text[:limit], True, original_len
+        head_limit = max(1, available // 2)
+        tail_limit = max(1, available - head_limit)
+        return (
+            text[:head_limit].rstrip()
+            + marker
+            + text[-tail_limit:].lstrip(),
+            True,
+            original_len,
+        )
+
+    @staticmethod
+    def _client_visible_tool_result_text(value: Any) -> tuple[str, bool]:
+        """Return the current tool result shown to the client.
+
+        Historical compaction may replace old file bodies with references, but
+        the active tool result should carry the file text it just read. This
+        keeps the UI and persisted stream aligned with what the model can use.
+        """
+        text = AgentLoop._stringify_stream_payload(value).strip()
+        text = AgentLoop._mask_user_visible_text(text)
+        return text, False
+
+    @staticmethod
+    def _model_visible_tool_result_text(value: Any) -> tuple[str, bool]:
+        """Return the current tool result available to the model.
+
+        The model needs the latest file contents it explicitly read in this
+        turn. Old file bodies are removed by session compaction instead of being
+        dropped from the active tool result.
+        """
+        text = AgentLoop._stringify_stream_payload(value).strip()
+        text = AgentLoop._mask_user_visible_text(text)
+        return text, False
 
     @staticmethod
     def _merge_stream_tool_result_metadata(
@@ -4936,10 +6386,40 @@ class AgentLoop:
             captured_full = getattr(captured_output, "full_output", "") or captured_summary
             summary_result = captured_summary
             full_result = captured_full
+            captured_metadata = getattr(captured_output, "metadata", None)
+            if isinstance(captured_metadata, dict):
+                for key, value in captured_metadata.items():
+                    if value is not None and key not in merged:
+                        merged[key] = value
 
-        if full_result:
+        guardrail_message = AgentLoop._tool_loop_suppression_message_from_text(
+            full_result or summary_result
+        )
+        client_result, omitted_body = AgentLoop._client_visible_tool_result_text(
+            full_result or summary_result
+        )
+        client_summary, omitted_summary_body = AgentLoop._client_visible_tool_result_text(
+            summary_result or client_result
+        )
+        tool_name = str(merged.get("name") or merged.get("tool") or "").strip()
+        model_source = (
+            full_result
+            if tool_name == "read_file" and full_result
+            else summary_result or client_summary or client_result
+        )
+        model_summary, omitted_model_summary_body = AgentLoop._model_visible_tool_result_text(
+            model_source
+        )
+
+        if guardrail_message:
+            merged["guardrail_stop"] = True
+            merged["guardrail_message"] = guardrail_message
+        if client_result:
             stream_full_result, stream_truncated, stream_original_len = (
-                AgentLoop._cap_stream_metadata_text(full_result)
+                AgentLoop._cap_stream_metadata_text(
+                    client_result,
+                    limit=_CLIENT_STREAM_TOOL_RESULT_LIMIT,
+                )
             )
             merged["result"] = stream_full_result
             merged["content"] = stream_full_result
@@ -4950,13 +6430,138 @@ class AgentLoop:
             if stream_truncated:
                 merged["stream_output_truncated"] = True
                 merged["stream_output_original_chars"] = stream_original_len
-        if summary_result:
-            merged.setdefault("model_result", summary_result)
-            merged.setdefault("model_content", summary_result)
-            merged.setdefault("model_output", summary_result)
+        if model_summary:
+            stream_summary, summary_truncated, summary_original_len = (
+                AgentLoop._cap_stream_metadata_text(
+                    model_summary,
+                    limit=_MODEL_STREAM_TOOL_RESULT_LIMIT,
+                )
+            )
+            merged["model_result"] = stream_summary
+            merged["model_content"] = stream_summary
+            merged["model_output"] = stream_summary
+            if summary_truncated:
+                merged["model_output_truncated"] = True
+                merged["model_output_original_chars"] = summary_original_len
         if full_result and summary_result and full_result != summary_result:
             merged["result_truncated_for_model"] = True
         return merged
+
+    def _remember_stream_tool_result_metadata(
+        self,
+        tool_call_id: Any,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Retain structural tool-result metadata for session trace persistence."""
+        key = str(tool_call_id or "").strip()
+        if not key or not isinstance(metadata, dict):
+            return
+
+        selected: dict[str, Any] = {}
+        for field in (
+            "status",
+            "returncode",
+            "return_code",
+            "exit_code",
+            "guardrail_stop",
+            "guardrail_reason",
+            "guardrail_message",
+            "tool_outcome",
+        ):
+            if field in metadata and metadata[field] is not None:
+                selected[field] = metadata[field]
+        if not selected:
+            return
+
+        cache = getattr(self, "_stream_tool_result_metadata_by_id", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(self, "_stream_tool_result_metadata_by_id", cache)
+        cache[key] = selected
+
+    def _stream_tool_result_metadata_for_trace(self, tool_call_id: Any) -> dict[str, Any]:
+        key = str(tool_call_id or "").strip()
+        if not key:
+            return {}
+        cache = getattr(self, "_stream_tool_result_metadata_by_id", None)
+        if not isinstance(cache, dict):
+            return {}
+        value = cache.get(key)
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _stream_tool_result_event_tool_name(event: dict[str, Any]) -> str:
+        """Return a normalized tool name from a structural tool result event."""
+        metadata = dict(event.get("metadata") or {})
+        return str(metadata.get("name") or metadata.get("tool") or "").strip().lower()
+
+    @staticmethod
+    def _stream_tool_result_event_arguments(event: dict[str, Any]) -> Any:
+        """Return decoded tool arguments from a structural tool result event."""
+        metadata = dict(event.get("metadata") or {})
+        value = (
+            metadata.get("arguments")
+            or metadata.get("input")
+            or metadata.get("args")
+            or ""
+        )
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return ""
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                return stripped
+            return parsed
+        return value
+
+    @staticmethod
+    def _stream_tool_result_event_is_context_only(event: dict[str, Any]) -> bool:
+        """Return True for setup/inspection evidence that should not dominate finals."""
+        tool_name = AgentLoop._stream_tool_result_event_tool_name(event)
+        if tool_name in {
+            "read_file",
+            "list_dir",
+            "grep",
+            "web_fetch",
+            "web_search",
+            "skill_marketplace",
+            "search_history",
+        }:
+            return True
+        if tool_name == "shell":
+            args = AgentLoop._stream_tool_result_event_arguments(event)
+            if isinstance(args, dict):
+                command = str(args.get("command") or "").strip()
+            else:
+                command = str(args or "").strip()
+            return bool(command) and ShellTool.command_is_plain_read_only_inspection(command)
+        return False
+
+    @staticmethod
+    def _select_final_answer_synthesis_events(
+        tool_result_events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Choose evidence for final answer synthesis without replaying old context.
+
+        Read-only skill/file evidence helps the model choose actions during the
+        turn, but after state-changing tools have run it can pollute the final
+        answer with setup recipes. Keep it only when there is no stateful tool
+        evidence to summarize.
+        """
+        events = [
+            event for event in tool_result_events
+            if isinstance(event, dict)
+        ]
+        if not events:
+            return []
+        stateful_events = [
+            event for event in events
+            if not AgentLoop._stream_tool_result_event_is_context_only(event)
+        ]
+        selected = stateful_events or events
+        return selected[-_FINAL_ANSWER_SYNTHESIS_TOOL_EVENT_LIMIT:]
 
     @staticmethod
     def _stream_tool_result_event_summary(event: dict[str, Any], *, limit: int = 2400) -> str:
@@ -4983,9 +6588,29 @@ class AgentLoop:
         return f"Tool `{tool_name}` output:\n{text}"
 
     @staticmethod
+    def _stream_tool_result_visible_delta(delta: Any, metadata: dict[str, Any]) -> str:
+        """Return the user-visible WebSocket delta for a tool_result chunk."""
+        text = AgentLoop._stringify_stream_payload(delta)
+        if not text:
+            text = AgentLoop._stringify_stream_payload(
+                metadata.get("model_result")
+                or metadata.get("model_output")
+                or metadata.get("model_content")
+                or ""
+            )
+        visible, _ = AgentLoop._client_visible_tool_result_text(text)
+        capped, _, _ = AgentLoop._cap_stream_metadata_text(
+            visible,
+            limit=_CLIENT_STREAM_TOOL_DELTA_LIMIT,
+        )
+        return capped
+
+    @staticmethod
     def _is_tool_loop_suppression_event(event: dict[str, Any]) -> bool:
         """Return True for tool guardrail results that should end the current loop."""
         metadata = dict(event.get("metadata") or {})
+        if metadata.get("guardrail_stop") is True:
+            return True
         payload = (
             metadata.get("model_result")
             or metadata.get("model_output")
@@ -4999,6 +6624,32 @@ class AgentLoop:
         )
         text = AgentLoop._stringify_stream_payload(payload).lower()
         return "stop_tool_loop" in text
+
+    @staticmethod
+    def _tool_loop_suppression_message_from_text(value: Any) -> str | None:
+        """Return a user-facing message for a raw STOP_TOOL_LOOP payload."""
+        text = AgentLoop._stringify_stream_payload(value).lower()
+        if "stop_tool_loop" not in text:
+            return None
+        if "exact requested shell command failed" in text:
+            return None
+        if "history search budget" in text:
+            return "I stopped searching old conversation history and continued from the latest request."
+        if "consecutive tool failures suppressed" in text:
+            return "I stopped retrying after repeated failures."
+        if "repeated tool failure pattern suppressed" in text:
+            return "I stopped retrying after the same failure pattern repeated."
+        if "repeated side-effecting tool series suppressed" in text:
+            return "I stopped before repeating the same external action."
+        if "repeated shell file read suppressed" in text:
+            return "I stopped after a repeated shell file inspection produced no new action."
+        if "duplicate shell inspection suppressed" in text:
+            return "I stopped after a repeated status/inspection command produced no new action."
+        if "redundant file read suppressed" in text:
+            return "I skipped a file read whose content was already available."
+        if "duplicate tool invocation suppressed" in text:
+            return "I skipped a repeated action that had already run."
+        return "I stopped before repeating the same action."
 
     @staticmethod
     def _extract_exact_command_failure_blocker(event: dict[str, Any]) -> str | None:
@@ -5037,6 +6688,9 @@ class AgentLoop:
     def _tool_loop_suppression_message(event: dict[str, Any]) -> str | None:
         """Return a user-facing message for an internal STOP_TOOL_LOOP guardrail."""
         metadata = dict(event.get("metadata") or {})
+        guardrail_message = metadata.get("guardrail_message")
+        if isinstance(guardrail_message, str) and guardrail_message.strip():
+            return guardrail_message.strip()
         payload = (
             metadata.get("model_result")
             or metadata.get("model_output")
@@ -5048,18 +6702,25 @@ class AgentLoop:
             or metadata.get("full_result")
             or event.get("delta")
         )
-        text = AgentLoop._stringify_stream_payload(payload).lower()
-        if "stop_tool_loop" not in text:
+        return AgentLoop._tool_loop_suppression_message_from_text(payload)
+
+    @staticmethod
+    def _extract_current_session_fact_check_blocker(text: str) -> str | None:
+        """Extract the user-facing current-session fact-check blocker."""
+        value = str(text or "").strip()
+        lower = value.casefold()
+        marker = "current-session fact check required"
+        index = lower.find(marker)
+        if index < 0:
             return None
-        if "exact requested shell command failed" in text:
+        blocker = value[index:].strip()
+        blocker = re.sub(r"\s+", " ", blocker).strip()
+        if not blocker:
             return None
-        if "consecutive tool failures suppressed" in text:
-            return "I stopped retrying after repeated failures."
-        if "repeated side-effecting tool series suppressed" in text:
-            return "I stopped before repeating the same external action."
-        if "duplicate tool invocation suppressed" in text:
-            return "I skipped a repeated action that had already run."
-        return "I stopped before repeating the same action."
+        return (
+            f"{blocker} No external/live-state lookup was used as proof of "
+            "the prior action."
+        )
 
     @staticmethod
     def _extract_tool_suppression_user_response(
@@ -5080,6 +6741,11 @@ class AgentLoop:
                 continue
             summary = AgentLoop._stream_tool_result_event_summary(event)
             if summary:
+                fact_check_blocker = (
+                    AgentLoop._extract_current_session_fact_check_blocker(summary)
+                )
+                if fact_check_blocker:
+                    return fact_check_blocker
                 return (
                     f"{suppression_message}\n\n"
                     "Latest available result:\n\n"
@@ -5094,6 +6760,7 @@ class AgentLoop:
         tool_result_events: list[dict[str, Any]],
         *,
         reason: str,
+        user_message: str | None = None,
     ) -> str:
         """Return a bounded final answer when a tool loop never yields final content."""
         if reason == "tool_suppression":
@@ -5107,29 +6774,798 @@ class AgentLoop:
             if suppression_response:
                 return suppression_response
 
-        if reason == "tool_followup_timeout":
-            reason_text = "the agent kept running tools without producing a final answer"
-        elif reason == "tool_suppression":
-            reason_text = "a tool guardrail suppressed repeated work for the same action"
+        return build_user_facing_tool_event_answer(
+            tool_result_events[-6:],
+            incomplete=True,
+            user_message=user_message,
+        )
+
+    @staticmethod
+    def _final_answer_script_mismatch(
+        user_message: str | None,
+        final_content: str | None,
+    ) -> bool:
+        """Detect clear script mismatches without classifying prompt routes."""
+        if (
+            not isinstance(user_message, str)
+            or not user_message.strip()
+            or not isinstance(final_content, str)
+            or not final_content.strip()
+            or _MACHINE_READABLE_FORMAT_RE.search(user_message)
+        ):
+            return False
+
+        user_scripts = set(dominant_non_latin_scripts(user_message))
+        if not user_scripts:
+            return False
+        final_scripts = set(dominant_non_latin_scripts(final_content))
+        return not bool(user_scripts & final_scripts)
+
+    async def _synthesize_final_answer_from_tool_events(
+        self,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        user_message: str | None,
+        incomplete: bool = False,
+        fallback_text: str = "",
+    ) -> str:
+        """Ask the configured model to write the final user-facing answer from evidence."""
+        synthesis_events = AgentLoop._select_final_answer_synthesis_events(
+            tool_result_events
+        )
+        evidence_brief = build_tool_event_synthesis_brief(
+            synthesis_events,
+            incomplete=incomplete,
+            user_message=user_message,
+        )
+        active_ledger = getattr(self, "_active_execution_ledger", None)
+        ledger_fallback = ""
+        if isinstance(active_ledger, ExecutionLedger):
+            ledger_context = active_ledger.render_context(max_chars=8000)
+            if ledger_context.strip():
+                evidence_brief = (
+                    "[STRUCTURED VERIFIED EVIDENCE]\n"
+                    f"{ledger_context}\n"
+                    f"{evidence_brief}"
+                )
+            ledger_fallback = active_ledger.render_user_facing_summary(max_chars=5000)
+        deterministic_fallback = (
+            ledger_fallback
+            or str(fallback_text or "").strip()
+            or build_user_facing_tool_event_answer(
+                synthesis_events,
+                incomplete=incomplete,
+                user_message=user_message,
+            )
+        )
+        chatbot = getattr(self, "_chatbot", None)
+        manager = getattr(chatbot, "llm_manager", None)
+        chat = getattr(manager, "chat", None)
+        ask = getattr(chatbot, "ask", None)
+        if not callable(chat) and not callable(ask):
+            return deterministic_fallback
+
+        retry_config = getattr(self, "_retry_config", None)
+        if not isinstance(retry_config, RetryConfig):
+            retry_config = DEFAULT_RETRY_CONFIG
+
+        async def _chat_with_brief(brief: str, *, label: str) -> Any:
+            messages = [
+                Message(role="system", content=_FINAL_ANSWER_SYNTHESIS_SYSTEM_PROMPT),
+                Message(role="user", content=brief),
+            ]
+
+            async def _do_synthesis() -> Any:
+                async def _invoke() -> Any:
+                    if callable(chat):
+                        result = chat(
+                            messages=messages,
+                            provider=getattr(self, "provider", None),
+                        )
+                    else:
+                        result = ask(
+                            messages=[Message(role="user", content=brief)],
+                            system_msg=_FINAL_ANSWER_SYNTHESIS_SYSTEM_PROMPT,
+                        )
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+
+                return await asyncio.wait_for(
+                    _invoke(),
+                    timeout=_FINAL_ANSWER_SYNTHESIS_TIMEOUT,
+                )
+
+            return await with_provider_retry(
+                _do_synthesis,
+                config=retry_config,
+                on_retry=lambda attempt, exc, delay: logger.warning(
+                    f"{label} transient error "
+                    f"(attempt {attempt + 1}/{retry_config.max_retries + 1}), "
+                    f"retrying in {delay:.1f}s: {type(exc).__name__}: {exc}"
+                ),
+            )
+
+        try:
+            response = await _chat_with_brief(
+                evidence_brief,
+                label="Final-answer synthesis",
+            )
+        except Exception as exc:
+            logger.warning(f"Final-answer synthesis failed; using fallback: {exc}")
+            return deterministic_fallback
+
+        synthesized = AgentLoop._extract_run_result_text(response).strip()
+        if not synthesized:
+            content = getattr(response, "content", "")
+            synthesized = str(content or "").strip()
+        if not synthesized:
+            return deterministic_fallback
+        if AgentLoop._final_answer_script_mismatch(user_message, synthesized):
+            logger.warning(
+                "Final-answer synthesis returned a script mismatch; "
+                "requesting a language repair from the synthesis model."
+            )
+        synthesized = AgentLoop._mask_user_visible_text(
+            AgentLoop._strip_leaked_scratchpad_prefix(synthesized)
+        )
+        if AgentLoop._final_answer_script_mismatch(user_message, synthesized):
+            language_repair_brief = (
+                evidence_brief
+                + "\n\n[SYNTHESIS LANGUAGE CHECK]\n"
+                + "The previous draft did not match the newest user's language. "
+                + "Rewrite the final answer from the same verified evidence, "
+                + "using the newest user's language and no raw tool transcript."
+            )
+            try:
+                language_repair_response = await _chat_with_brief(
+                    language_repair_brief,
+                    label="Final-answer synthesis language repair",
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Final-answer synthesis language repair failed; using fallback: {exc}"
+                )
+                return deterministic_fallback
+            repaired_language = AgentLoop._extract_run_result_text(
+                language_repair_response
+            ).strip()
+            if not repaired_language:
+                content = getattr(language_repair_response, "content", "")
+                repaired_language = str(content or "").strip()
+            repaired_language = AgentLoop._mask_user_visible_text(
+                AgentLoop._strip_leaked_scratchpad_prefix(repaired_language)
+            )
+            if (
+                repaired_language
+                and not AgentLoop._final_answer_script_mismatch(
+                    user_message,
+                    repaired_language,
+                )
+            ):
+                synthesized = repaired_language
+            elif deterministic_fallback and not AgentLoop._final_answer_script_mismatch(
+                user_message,
+                deterministic_fallback,
+            ):
+                return deterministic_fallback
+        if final_answer_denies_available_tool_evidence(synthesized, synthesis_events):
+            repair_brief = (
+                evidence_brief
+                + "\n\n[SYNTHESIS QUALITY CHECK]\n"
+                + "The previous draft denied or ignored available tool evidence. "
+                + "Rewrite the final answer from the verified chronological evidence "
+                + "and direct user-facing evidence above. If one requested detail is "
+                + "not confirmed, say that narrowly while still reporting the "
+                + "confirmed completed facts."
+            )
+            try:
+                repair_response = await _chat_with_brief(
+                    repair_brief,
+                    label="Final-answer synthesis repair",
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Final-answer synthesis repair failed; using fallback: {exc}"
+                )
+                return deterministic_fallback
+
+            repaired = AgentLoop._extract_run_result_text(repair_response).strip()
+            if not repaired:
+                content = getattr(repair_response, "content", "")
+                repaired = str(content or "").strip()
+            repaired = AgentLoop._mask_user_visible_text(
+                AgentLoop._strip_leaked_scratchpad_prefix(repaired)
+            )
+            if (
+                repaired
+                and not AgentLoop._final_answer_script_mismatch(user_message, repaired)
+                and not final_answer_denies_available_tool_evidence(
+                    repaired,
+                    synthesis_events,
+                )
+            ):
+                return repaired
+            logger.warning(
+                "Final-answer synthesis denied available tool evidence after repair; "
+                "using deterministic evidence summary."
+            )
+            return deterministic_fallback
+        return synthesized
+
+    def _session_evidence_synthesis_events(
+        self,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        user_message: str | None,
+    ) -> list[dict[str, Any]]:
+        """Append same-session compact evidence for prior-state answer synthesis."""
+        synthesis_events = list(tool_result_events)
+        try:
+            raw_messages = (
+                self._session.get_messages()
+                if hasattr(self._session, "get_messages")
+                else self._session.get_history()
+            )
+        except Exception as exc:
+            logger.debug(f"Session turn evidence load skipped: {exc}")
+            raw_messages = []
+
+        try:
+            payload = build_recent_session_turns_payload(
+                raw_messages,
+                limit=8,
+                max_content_length=700,
+            )
+        except Exception as exc:
+            logger.debug(f"Session turn evidence build skipped: {exc}")
+            payload = {}
+
+        appended_turn_evidence = False
+        turn_payloads = payload.get("substantive_turns") if isinstance(payload, dict) else []
+        if not isinstance(turn_payloads, list):
+            turn_payloads = []
+        for index, turn in enumerate(turn_payloads[:8], start=1):
+            if not isinstance(turn, dict):
+                continue
+            lines = [
+                f"Recent session turn {index}:",
+                f"user_request: {turn.get('user_request') or ''}",
+            ]
+            invoked = turn.get("invoked_skills")
+            if invoked:
+                lines.append(f"invoked_skills: {invoked}")
+            if turn.get("latest_stateful_tool_result"):
+                lines.append(
+                    f"latest_stateful_tool_result: {turn.get('latest_stateful_tool_result')}"
+                )
+            recent_results = turn.get("recent_tool_results")
+            if isinstance(recent_results, list) and recent_results:
+                for result_index, result in enumerate(recent_results[:3], start=1):
+                    lines.append(f"recent_tool_result_{result_index}: {result}")
+            if turn.get("assistant_summary"):
+                lines.append(f"assistant_summary: {turn.get('assistant_summary')}")
+            synthesis_events.append({
+                "metadata": {
+                    "name": "current_session_turn",
+                    "full_output": "\n".join(str(line) for line in lines if str(line).strip()),
+                }
+            })
+            appended_turn_evidence = True
+
+        if not appended_turn_evidence:
+            try:
+                session_compact_evidence = self._build_session_recall_context(
+                    user_message or ""
+                ).strip()
+            except Exception as exc:
+                logger.debug(f"Session compact evidence build skipped: {exc}")
+                session_compact_evidence = ""
         else:
-            reason_text = "the request reached the response time budget while tools were still active"
-        parts = [
-            f"The agent stopped the tool loop because {reason_text}.",
-            "Recent tool evidence:",
+            session_compact_evidence = ""
+        if session_compact_evidence:
+            synthesis_events.append({
+                "metadata": {
+                    "name": "current_session_compact",
+                    "full_output": session_compact_evidence,
+                }
+            })
+        return synthesis_events
+
+    @staticmethod
+    def _extract_json_object_text(text: str | None) -> str:
+        """Extract a single JSON object from model text."""
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        if value.startswith("```"):
+            lines = value.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            value = "\n".join(lines).strip()
+        if value.startswith("{") and value.endswith("}"):
+            return value
+        start = value.find("{")
+        end = value.rfind("}")
+        if start >= 0 and end > start:
+            return value[start:end + 1]
+        return ""
+
+    @staticmethod
+    def _skill_contract_evidence_fingerprint(
+        events: list[dict[str, Any]],
+    ) -> tuple[tuple[str, str, str], ...]:
+        fingerprint: set[tuple[str, str, str]] = set()
+        for event in events:
+            metadata = dict(event.get("metadata") or {})
+            name = str(metadata.get("name") or metadata.get("tool") or "").strip()
+            arguments = AgentLoop._stringify_stream_payload(
+                metadata.get("arguments")
+                or metadata.get("input")
+                or metadata.get("args")
+                or ""
+            )
+            summary = AgentLoop._stream_tool_result_event_summary(event, limit=240)
+            fingerprint.add((
+                name,
+                AgentLoop._normalize_comparable_text(arguments),
+                AgentLoop._normalize_comparable_text(summary),
+            ))
+        return tuple(sorted(fingerprint))
+
+    @staticmethod
+    def _skill_contract_tool_call_brief(
+        events: list[dict[str, Any]],
+        *,
+        limit: int = 10,
+    ) -> str:
+        """Summarize observed tool calls without interpreting task intent."""
+        rows: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for event in events:
+            metadata = dict(event.get("metadata") or {})
+            name = str(metadata.get("name") or metadata.get("tool") or "").strip()
+            if not name:
+                continue
+            arguments = AgentLoop._stringify_stream_payload(
+                metadata.get("arguments")
+                or metadata.get("input")
+                or metadata.get("args")
+                or ""
+            ).strip()
+            key = (
+                name,
+                AgentLoop._normalize_comparable_text(arguments),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            if arguments:
+                arguments = AgentLoop._compress_message_content(arguments, 360)
+                rows.append(f"- {name} input={arguments}")
+            else:
+                rows.append(f"- {name}")
+        if not rows:
+            return "- No tool calls captured."
+        return "\n".join(rows[-limit:])
+
+    @staticmethod
+    def _continuation_tool_event_brief(event: dict[str, Any], *, limit: int = 1200) -> list[str]:
+        """Return compact, non-body evidence lines for continuation prompts."""
+        metadata = dict(event.get("metadata") or {})
+        name = str(metadata.get("name") or metadata.get("tool") or "").strip()
+        arguments = AgentLoop._stringify_stream_payload(
+            metadata.get("arguments")
+            or metadata.get("input")
+            or metadata.get("args")
+            or ""
+        ).strip()
+        heading = name or "tool_result"
+        if arguments:
+            heading += " input=" + AgentLoop._compress_message_content(arguments, 360)
+
+        summary = AgentLoop._stream_tool_result_event_summary(event, limit=limit)
+        if name == "read_file":
+            first_line = ""
+            for raw_line in str(summary or "").splitlines():
+                if raw_line.strip():
+                    first_line = raw_line.strip()
+                    break
+            body_ref = first_line if first_line.startswith("[file:") else "file content was read successfully"
+            return [
+                f"- {heading}",
+                f"{body_ref}. Use this as the current local file state; do not answer by repeating the file body.",
+            ]
+        if name in {"list_dir", "grep", "search_history", "web_search", "web_fetch"}:
+            if summary:
+                return [
+                    f"- {heading}",
+                    AgentLoop._compress_message_content(summary, min(limit, 360)),
+                ]
+            return [f"- {heading}"]
+        if summary:
+            return [
+                f"- {heading}",
+                AgentLoop._compress_message_content(summary, limit),
+            ]
+        return [f"- {heading}"]
+
+    @staticmethod
+    def _skill_contract_continuation_attempt_limit() -> int:
+        raw = os.getenv("SPOON_BOT_SKILL_COMPLETION_MAX_CONTINUATIONS")
+        if raw is not None:
+            try:
+                return max(0, int(raw.strip()))
+            except ValueError:
+                pass
+        return 3
+
+    @staticmethod
+    def _task_completion_continuation_attempt_limit() -> int:
+        raw = os.getenv("SPOON_BOT_TASK_COMPLETION_MAX_CONTINUATIONS")
+        if raw is not None:
+            try:
+                return max(0, int(raw.strip()))
+            except ValueError:
+                pass
+        return 2
+
+    @staticmethod
+    def _parse_task_completion_verdict(value: Any) -> dict[str, str] | None:
+        text = AgentLoop._stringify_stream_payload(value).strip()
+        if not text:
+            return None
+        parsed: Any
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            try:
+                parsed = json.loads(text[start : end + 1])
+            except Exception:
+                return None
+        if not isinstance(parsed, dict):
+            return None
+        status = str(parsed.get("status") or "").strip().casefold()
+        if status not in {"complete", "needs_continuation"}:
+            return None
+        return {
+            "status": status,
+            "reason": str(parsed.get("reason") or "").strip(),
+            "next_focus": str(parsed.get("next_focus") or "").strip(),
+        }
+
+    def _build_task_completion_verdict_brief(
+        self,
+        *,
+        authoritative_message: str,
+        final_content: str | None,
+        tool_result_events: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            "[TASK COMPLETION VERIFICATION]",
+            "Decide whether another tool-using step is needed.",
+            "",
+            "[NEWEST USER REQUEST]",
+            str(authoritative_message or "").strip(),
         ]
-        summaries = [
-            AgentLoop._stream_tool_result_event_summary(event)
-            for event in tool_result_events[-3:]
+        if final_content and str(final_content).strip():
+            lines.extend([
+                "",
+                "[ASSISTANT DRAFT]",
+                AgentLoop._compress_message_content(str(final_content).strip(), 1800),
+            ])
+        active_ledger = getattr(self, "_active_execution_ledger", None)
+        if isinstance(active_ledger, ExecutionLedger):
+            ledger_context = active_ledger.render_context(max_chars=5000)
+            if ledger_context.strip():
+                lines.extend(["", "[STRUCTURED TOOL EVIDENCE]", ledger_context])
+
+        evidence_lines: list[str] = []
+        for event in tool_result_events[-12:]:
+            metadata = dict(event.get("metadata") or {})
+            name = str(metadata.get("name") or metadata.get("tool") or "").strip()
+            arguments = AgentLoop._stringify_stream_payload(
+                metadata.get("arguments")
+                or metadata.get("input")
+                or metadata.get("args")
+                or ""
+            ).strip()
+            heading = name or "tool_result"
+            if arguments:
+                heading += " input=" + AgentLoop._compress_message_content(arguments, 260)
+            evidence_lines.append(f"- {heading}")
+            summary = AgentLoop._stream_tool_result_event_summary(event, limit=900)
+            if summary:
+                evidence_lines.append(
+                    AgentLoop._compress_message_content(summary, 900)
+                )
+        if evidence_lines:
+            lines.extend(["", "[RECENT TOOL EVENTS]", *evidence_lines])
+
+        lines.extend([
+            "",
+            "[OUTPUT FORMAT]",
+            '{"status":"complete|needs_continuation","reason":"short evidence-based reason","next_focus":"next tool objective or empty"}',
+        ])
+        return "\n".join(line for line in lines if line is not None)
+
+    async def _evaluate_task_completion_verdict(
+        self,
+        *,
+        authoritative_message: str,
+        final_content: str | None,
+        tool_result_events: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Ask a generic verifier whether the tool-backed request is terminal."""
+        if not tool_result_events:
+            return {"status": "complete", "reason": "No tool evidence.", "next_focus": ""}
+        if any(AgentLoop._is_tool_loop_suppression_event(event) for event in tool_result_events):
+            return {
+                "status": "complete",
+                "reason": "Tool guardrail produced a blocker to report.",
+                "next_focus": "",
+            }
+        if latest_tool_event_has_user_summary_marker(tool_result_events):
+            return {
+                "status": "complete",
+                "reason": "Latest tool evidence contains a user-facing terminal summary.",
+                "next_focus": "",
+            }
+        if latest_tool_event_has_active_background_job(tool_result_events):
+            return {
+                "status": "complete",
+                "reason": "Latest evidence is a running background job.",
+                "next_focus": "",
+            }
+
+        final_text = str(final_content or "").strip()
+        if not final_text or final_text in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}:
+            return {
+                "status": "needs_continuation",
+                "reason": "No terminal assistant content after tool use.",
+                "next_focus": "",
+            }
+        if read_only_tool_turn_needs_continuation(final_content, tool_result_events):
+            return {
+                "status": "needs_continuation",
+                "reason": (
+                    "Only read-only tool evidence is present and the assistant "
+                    "draft is raw tool output, not a grounded terminal answer."
+                ),
+                "next_focus": (
+                    "Continue from the current files/tool evidence. If the "
+                    "latest request requires a workspace change, call the "
+                    "appropriate mutation tool; otherwise answer from the "
+                    "read-only evidence in user-facing prose."
+                ),
+            }
+
+        chatbot = getattr(self, "_chatbot", None)
+        manager = getattr(chatbot, "llm_manager", None)
+        chat = getattr(manager, "chat", None)
+        ask = getattr(chatbot, "ask", None)
+        if not callable(chat) and not callable(ask):
+            return {"status": "complete", "reason": "No verifier model available.", "next_focus": ""}
+
+        brief = self._build_task_completion_verdict_brief(
+            authoritative_message=authoritative_message,
+            final_content=final_content,
+            tool_result_events=tool_result_events,
+        )
+        messages = [
+            Message(role="system", content=_TASK_COMPLETION_VERDICT_SYSTEM_PROMPT),
+            Message(role="user", content=brief),
         ]
-        if summaries:
-            parts.extend(summaries)
-        else:
-            parts.append("No tool result text was captured before the stop condition.")
-        if reason == "tool_suppression":
-            parts.append("Stop here and report the latest result or blocker; do not retry the same tool action.")
-        else:
-            parts.append("Continue the task to let the agent proceed from this tool evidence.")
-        return "\n\n".join(parts)
+
+        try:
+            async def _invoke() -> Any:
+                if callable(chat):
+                    result = chat(
+                        messages=messages,
+                        provider=getattr(self, "provider", None),
+                    )
+                else:
+                    result = ask(
+                        messages=[Message(role="user", content=brief)],
+                        system_msg=_TASK_COMPLETION_VERDICT_SYSTEM_PROMPT,
+                    )
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            response = await asyncio.wait_for(
+                _invoke(),
+                timeout=_TASK_COMPLETION_VERDICT_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.debug(f"Task completion verifier skipped: {exc}")
+            return {"status": "complete", "reason": "Verifier unavailable.", "next_focus": ""}
+
+        response_text = AgentLoop._extract_run_result_text(response).strip()
+        if not response_text:
+            response_text = str(getattr(response, "content", "") or "").strip()
+        parsed = AgentLoop._parse_task_completion_verdict(response_text)
+        if parsed is None:
+            logger.debug(f"Task completion verifier returned unparsable output: {response_text[:300]}")
+            return {"status": "complete", "reason": "Verifier output unparsable.", "next_focus": ""}
+        return parsed
+
+    async def _evaluate_skill_completion_verdict(
+        self,
+        *,
+        authoritative_message: str,
+        final_content: str | None,
+        tool_result_events: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Use only structured event state to decide if another model step is needed."""
+        if not should_run_skill_contract_check(tool_result_events):
+            return {"status": "complete", "reason": "No skill contract evidence.", "next_focus": ""}
+        if latest_tool_event_has_user_summary_marker(tool_result_events):
+            return {
+                "status": "complete",
+                "reason": "Latest tool evidence contains a user-facing terminal summary.",
+                "next_focus": "",
+            }
+        active_ledger = getattr(self, "_active_execution_ledger", None)
+        if (
+            isinstance(active_ledger, ExecutionLedger)
+            and active_ledger.has_stateful_progress()
+            and str(final_content or "").strip()
+            and str(final_content or "").strip() not in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}
+        ):
+            return {
+                "status": "complete",
+                "reason": "Ledger contains stateful tool evidence and terminal content.",
+                "next_focus": "",
+            }
+        if skill_contract_needs_continuation(final_content, tool_result_events):
+            return {
+                "status": "needs_continuation",
+                "reason": "Skill-backed turn has no terminal response or only setup/read evidence.",
+                "next_focus": "",
+            }
+        return {"status": "complete", "reason": "Skill turn has terminal content or progress.", "next_focus": ""}
+
+    async def _continue_task_until_terminal(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        final_content: str,
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        memory_start_index: int,
+        label: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        attempts = 0
+        limit = AgentLoop._task_completion_continuation_attempt_limit()
+        while attempts < limit and tool_result_events:
+            if latest_tool_event_has_user_summary_marker(tool_result_events):
+                break
+            verdict = await self._evaluate_task_completion_verdict(
+                authoritative_message=authoritative_message,
+                final_content=final_content,
+                tool_result_events=tool_result_events,
+            )
+            if (
+                not isinstance(verdict, dict)
+                or verdict.get("status") != "needs_continuation"
+            ):
+                break
+
+            before_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                tool_result_events,
+            )
+            attempts += 1
+            final_content = await self._run_process_task_continuation(
+                authoritative_message=authoritative_message,
+                request_execution_hints=request_execution_hints,
+                tool_result_events=tool_result_events,
+                retry_runner=retry_runner,
+                run_kwargs=run_kwargs,
+                label=f"{label}_{attempts}",
+                previous_draft=final_content,
+                continuation_reason=verdict.get("reason"),
+                continuation_focus=verdict.get("next_focus"),
+            )
+            tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                memory_start_index
+            )
+            after_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                tool_result_events,
+            )
+            if after_fingerprint == before_fingerprint:
+                logger.warning(
+                    "Task continuation produced no new tool evidence; stopping."
+                )
+                active_ledger = getattr(self, "_active_execution_ledger", None)
+                if isinstance(active_ledger, ExecutionLedger):
+                    if not (
+                        active_ledger.has_stateful_progress()
+                        or active_ledger.file_reads
+                    ):
+                        active_ledger.record_blocker(
+                            tool_name="agent_loop",
+                            reason="continuation_without_tool_progress",
+                            summary=(
+                                "The request still needed another tool step, but "
+                                "the internal continuation produced no new verified "
+                                "tool evidence."
+                            ),
+                        )
+                    ledger_summary = active_ledger.render_user_facing_summary(max_chars=5000)
+                    if ledger_summary:
+                        final_content = ledger_summary
+                break
+        return final_content, tool_result_events
+
+    async def _continue_skill_contract_until_terminal(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        final_content: str,
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        memory_start_index: int,
+        label: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        attempts = 0
+        limit = AgentLoop._skill_contract_continuation_attempt_limit()
+        while (
+            attempts < limit
+            and tool_result_events
+            and should_run_skill_contract_check(tool_result_events)
+        ):
+            if latest_tool_event_has_user_summary_marker(tool_result_events):
+                break
+            verdict = await self._evaluate_skill_completion_verdict(
+                authoritative_message=authoritative_message,
+                final_content=final_content,
+                tool_result_events=tool_result_events,
+            )
+            if (
+                not isinstance(verdict, dict)
+                or verdict.get("status") != "needs_continuation"
+            ):
+                break
+
+            before_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                tool_result_events,
+            )
+            attempts += 1
+            final_content = await self._run_process_skill_contract_continuation(
+                authoritative_message=authoritative_message,
+                request_execution_hints=request_execution_hints,
+                tool_result_events=tool_result_events,
+                retry_runner=retry_runner,
+                run_kwargs=run_kwargs,
+                label=f"{label}_{attempts}",
+                previous_draft=final_content,
+                    continuation_reason=verdict.get("reason"),
+                    continuation_focus=verdict.get("next_focus"),
+            )
+            tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                memory_start_index
+            )
+            after_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                tool_result_events,
+            )
+            if after_fingerprint == before_fingerprint:
+                logger.warning(
+                    "Skill continuation produced no new tool evidence; "
+                    "stopping bounded continuation."
+                )
+                break
+        return final_content, tool_result_events
 
     def _get_runtime_memory_messages(self) -> list[Any]:
         """Return runtime memory messages exposed by the active inner agent."""
@@ -5137,6 +7573,10 @@ class AgentLoop:
             return []
 
         memory = self._agent.memory
+        messages = getattr(memory, "messages", None)
+        if isinstance(messages, list):
+            return messages
+
         if hasattr(memory, "get_messages"):
             try:
                 messages = memory.get_messages()
@@ -5145,8 +7585,388 @@ class AgentLoop:
             except Exception as exc:
                 logger.debug(f"Failed to read runtime memory via get_messages(): {exc}")
 
-        messages = getattr(memory, "messages", None)
-        return messages if isinstance(messages, list) else []
+        return []
+
+    def _collect_runtime_tool_result_events_from_memory(
+        self,
+        start_index: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Collect tool result events from runtime memory for non-stream flows."""
+        messages = AgentLoop._get_runtime_memory_messages(self)
+        if start_index < 0 or start_index > len(messages):
+            start_index = 0
+        tool_call_details = AgentLoop._tool_call_details_by_id(messages)
+
+        events: list[dict[str, Any]] = []
+        for msg in messages[start_index:]:
+            if AgentLoop._stream_message_role(msg) != "tool":
+                continue
+
+            tool_call_id = (
+                AgentLoop._stream_message_attr(msg, "tool_call_id", "")
+                or AgentLoop._stream_message_attr(msg, "id", "")
+            )
+            result_payload = AgentLoop._stream_message_attr(msg, "text_content", None)
+            if result_payload in (None, ""):
+                result_payload = AgentLoop._stream_message_attr(msg, "content", "")
+            serialized_result = AgentLoop._stringify_stream_payload(result_payload)
+            tool_name = AgentLoop._stream_message_attr(msg, "name", "")
+            tool_arguments = ""
+            if tool_call_id:
+                inferred_name, inferred_arguments = tool_call_details.get(tool_call_id, ("", ""))
+                if inferred_name and not tool_name:
+                    tool_name = inferred_name
+                if inferred_arguments not in (None, ""):
+                    tool_arguments = AgentLoop._tool_call_arguments_key(inferred_arguments)
+            metadata: dict[str, Any] = {
+                "name": tool_name,
+                "result": serialized_result,
+                "content": serialized_result,
+                "output": serialized_result,
+                "full_result": serialized_result,
+                "full_content": serialized_result,
+                "full_output": serialized_result,
+                "model_result": serialized_result,
+                "model_content": serialized_result,
+                "model_output": serialized_result,
+            }
+            if tool_arguments:
+                metadata["arguments"] = AgentLoop._tool_call_arguments_display(
+                    tool_name,
+                    tool_arguments,
+                )
+            if tool_call_id:
+                metadata["id"] = tool_call_id
+                metadata["tool_call_id"] = tool_call_id
+            events.append({
+                "type": "tool_result",
+                "delta": serialized_result,
+                "metadata": metadata,
+            })
+        return events
+
+    @staticmethod
+    def _tool_events_have_repeated_read_guardrail(
+        events: list[dict[str, Any]],
+    ) -> bool:
+        """Return True when tool evidence shows repeated read suppression."""
+        for event in events:
+            metadata = dict(event.get("metadata") or {})
+            if str(metadata.get("name") or "").strip() != "read_file":
+                continue
+            payload = (
+                metadata.get("model_result")
+                or metadata.get("model_output")
+                or metadata.get("model_content")
+                or metadata.get("output")
+                or metadata.get("result")
+                or metadata.get("content")
+                or event.get("delta")
+            )
+            text = AgentLoop._stringify_stream_payload(payload).lower()
+            if (
+                "repeated redundant read_file suppressed" in text
+                or "requested file range was already provided" in text
+                or "requested file range already available" in text
+                or "already available in this request" in text
+                or "file content already available" in text
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _tool_events_have_history_search_budget(
+        events: list[dict[str, Any]],
+    ) -> bool:
+        """Return True when history lookup budget is exhausted for this turn."""
+        for event in events:
+            metadata = dict(event.get("metadata") or {})
+            if str(metadata.get("name") or "").strip() != "search_history":
+                continue
+            payload = (
+                metadata.get("model_result")
+                or metadata.get("model_output")
+                or metadata.get("model_content")
+                or metadata.get("output")
+                or metadata.get("result")
+                or metadata.get("content")
+                or event.get("delta")
+            )
+            text = AgentLoop._stringify_stream_payload(payload).strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("budget_exhausted") is True:
+                return True
+            if "history search budget reached for this request" in text.casefold():
+                return True
+        return False
+
+    async def _run_process_repeated_read_recovery(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+    ) -> str:
+        """Retry once for non-stream flows when repeated read_file consumed the loop."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        repair_prompt = AgentLoop._build_repeated_read_recovery_prompt(
+            authoritative_message,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label="process_repeated_read_recovery",
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
+        return AgentLoop._extract_run_result_text(result)
+
+    async def _run_process_history_search_budget_recovery(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        label: str,
+    ) -> str:
+        """Retry once after unproductive history lookup consumes the turn."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        repair_prompt = AgentLoop._build_history_search_budget_recovery_prompt(
+            authoritative_message,
+            tool_result_events,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        recovery_hints = dict(request_execution_hints)
+        recovery_hints["history_search_budget_exhausted"] = True
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(recovery_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label=label,
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+
+        return AgentLoop._extract_run_result_text(result)
+
+    @staticmethod
+    def _build_skill_contract_continuation_prompt(
+        authoritative_message: str,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        previous_draft: str | None = None,
+        continuation_reason: str | None = None,
+        continuation_focus: str | None = None,
+    ) -> str:
+        """Build a generic continuation prompt grounded in tool evidence."""
+        lines = [
+            "[SKILL CONTRACT CONTINUATION]",
+            AgentLoop.DEFAULT_NEXT_STEP_PROMPT,
+            "",
+            "[LATEST USER REQUEST]",
+            str(authoritative_message or "").strip(),
+        ]
+        if previous_draft and str(previous_draft).strip():
+            lines.extend([
+                "",
+                "[PREVIOUS ASSISTANT DRAFT OR PLAN]",
+                AgentLoop._compress_message_content(str(previous_draft).strip(), 1600),
+            ])
+        if continuation_reason:
+            lines.extend(["", "[CONTINUATION REASON]", str(continuation_reason).strip()])
+        if continuation_focus:
+            lines.extend(["", "[CONTINUATION FOCUS]", str(continuation_focus).strip()])
+
+        evidence_lines = []
+        for event in tool_result_events[-10:]:
+            evidence_lines.extend(AgentLoop._continuation_tool_event_brief(event, limit=1200))
+        if evidence_lines:
+            lines.extend(["", "[RECENT TOOL EVIDENCE]", *evidence_lines])
+        lines.append("")
+        lines.append(
+            "Continue from the evidence above. If the requested workflow is "
+            "already terminal, answer now; otherwise call the next appropriate "
+            "tool from the active skill contract."
+        )
+        return "\n".join(line for line in lines if line is not None)
+
+    @staticmethod
+    def _build_task_continuation_prompt(
+        authoritative_message: str,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        previous_draft: str | None = None,
+        continuation_reason: str | None = None,
+        continuation_focus: str | None = None,
+    ) -> str:
+        """Build a generic continuation prompt from tool evidence."""
+        lines = [
+            "[TASK CONTINUATION]",
+            AgentLoop.DEFAULT_NEXT_STEP_PROMPT,
+            "",
+            "[LATEST USER REQUEST]",
+            str(authoritative_message or "").strip(),
+        ]
+        if previous_draft and str(previous_draft).strip():
+            lines.extend([
+                "",
+                "[PREVIOUS ASSISTANT DRAFT]",
+                AgentLoop._compress_message_content(str(previous_draft).strip(), 1600),
+            ])
+        if continuation_reason:
+            lines.extend(["", "[CONTINUATION REASON]", str(continuation_reason).strip()])
+        if continuation_focus:
+            lines.extend(["", "[CONTINUATION FOCUS]", str(continuation_focus).strip()])
+
+        evidence_lines = []
+        for event in tool_result_events[-10:]:
+            evidence_lines.extend(AgentLoop._continuation_tool_event_brief(event, limit=1200))
+        if evidence_lines:
+            lines.extend(["", "[RECENT TOOL EVIDENCE]", *evidence_lines])
+        lines.append("")
+        lines.append(
+            "Continue from the evidence above. If the requested outcome is "
+            "already terminal or evidence shows a real blocker, answer now. "
+            "Otherwise call the next appropriate tool. Do not repeat completed "
+            "tool calls; use existing files and tool evidence as the current state."
+        )
+        lines.append(
+            "If the request asks to create, update, build, deploy, start, or verify "
+            "a workspace artifact and the evidence so far is only read/list/search "
+            "output, the next step must be a mutation or execution tool such as "
+            "write_file, edit_file, shell, service_expose, or an explicit blocker "
+            "grounded in tool evidence."
+        )
+        return "\n".join(line for line in lines if line is not None)
+
+    async def _run_process_skill_contract_continuation(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        label: str,
+        previous_draft: str | None = None,
+        continuation_reason: str | None = None,
+        continuation_focus: str | None = None,
+    ) -> str:
+        """Retry once when a skill turn stops after contract setup."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        repair_prompt = AgentLoop._build_skill_contract_continuation_prompt(
+            authoritative_message,
+            tool_result_events,
+            previous_draft=previous_draft,
+            continuation_reason=continuation_reason,
+            continuation_focus=continuation_focus,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label=label,
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+        return AgentLoop._extract_run_result_text(result)
+
+    async def _run_process_task_continuation(
+        self,
+        *,
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any],
+        tool_result_events: list[dict[str, Any]],
+        retry_runner: Callable[..., Awaitable[Any]],
+        run_kwargs: dict[str, Any],
+        label: str,
+        previous_draft: str | None = None,
+        continuation_reason: str | None = None,
+        continuation_focus: str | None = None,
+    ) -> str:
+        """Retry once when a tool-backed turn stopped before requested outcome."""
+        AgentLoop._drain_agent_output_queue(self)
+        self._reset_agent_state_for_retry()
+        repair_prompt = AgentLoop._build_task_continuation_prompt(
+            authoritative_message,
+            tool_result_events,
+            previous_draft=previous_draft,
+            continuation_reason=continuation_reason,
+            continuation_focus=continuation_focus,
+        )
+        await self._agent.add_message("user", repair_prompt)
+        self._agent.next_step_prompt = repair_prompt
+
+        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+        self._force_serial_tool_calls = True
+        try:
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(max_repeats=1),
+            ):
+                result = await AgentLoop._run_agent_with_context_overflow_recovery(
+                    self,
+                    label=label,
+                    retry_runner=retry_runner,
+                    **run_kwargs,
+                )
+        finally:
+            if previous_force_serial:
+                self._force_serial_tool_calls = True
+            elif hasattr(self, "_force_serial_tool_calls"):
+                delattr(self, "_force_serial_tool_calls")
+        return AgentLoop._extract_run_result_text(result)
 
     def _collect_stream_tool_result_events(
         self,
@@ -5163,6 +7983,7 @@ class AgentLoop:
 
         events: list[dict[str, Any]] = []
         next_index = start_index
+        tool_call_details = AgentLoop._tool_call_details_by_id(messages)
         for index, msg in enumerate(messages[start_index:], start=start_index):
             if AgentLoop._stream_message_role(msg) != "tool":
                 next_index = index + 1
@@ -5173,7 +7994,11 @@ class AgentLoop:
                 or AgentLoop._stream_message_attr(msg, "id", "")
             )
             if tool_call_id and tool_call_id not in tool_call_arguments_by_id:
-                break
+                inferred_name, inferred_arguments = tool_call_details.get(tool_call_id, ("", ""))
+                if inferred_arguments not in (None, ""):
+                    tool_call_arguments_by_id[tool_call_id] = (
+                        AgentLoop._tool_call_arguments_key(inferred_arguments)
+                    )
             if tool_call_id and tool_call_id in emitted_tool_result_ids:
                 next_index = index + 1
                 continue
@@ -5183,6 +8008,10 @@ class AgentLoop:
                 result_payload = AgentLoop._stream_message_attr(msg, "content", "")
             serialized_result = AgentLoop._stringify_stream_payload(result_payload)
             tool_name = AgentLoop._stream_message_attr(msg, "name", "")
+            if tool_call_id and not tool_name:
+                inferred_name, _ = tool_call_details.get(tool_call_id, ("", ""))
+                if inferred_name:
+                    tool_name = inferred_name
             captured_output = consume_captured_tool_output(
                 tool_output_capture_scope,
                 tool_name=tool_name,
@@ -5190,6 +8019,12 @@ class AgentLoop:
             )
 
             metadata: dict[str, Any] = {"name": tool_name}
+            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+            if arguments:
+                metadata["arguments"] = AgentLoop._tool_call_arguments_display(
+                    tool_name,
+                    arguments,
+                )
             if tool_call_id:
                 metadata["id"] = tool_call_id
                 metadata["tool_call_id"] = tool_call_id
@@ -5199,10 +8034,12 @@ class AgentLoop:
                 streamed_result=serialized_result,
                 captured_output=captured_output,
             )
+            self._remember_stream_tool_result_metadata(tool_call_id, metadata)
+            visible_delta = AgentLoop._stream_tool_result_visible_delta("", metadata)
 
             events.append({
                 "type": "tool_result",
-                "delta": "",
+                "delta": visible_delta,
                 "metadata": metadata,
             })
             next_index = index + 1
@@ -5285,7 +8122,24 @@ class AgentLoop:
         pending_fallback_content_emit = False
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
+        tool_loop_fallback_active = False
+        initial_content_passthrough_started = False
         stream_error_reason: BaseException | str | None = None
+        interrupted_assistant_reply_persisted = False
+        execution_ledger: ExecutionLedger | None = None
+        ledger_manager = None
+
+        def _persist_interrupted_stream_reply(reason: str = "task_cancelled") -> None:
+            nonlocal interrupted_assistant_reply_persisted
+            if interrupted_assistant_reply_persisted:
+                return
+            interrupted_assistant_reply_persisted = (
+                AgentLoop._persist_interrupted_assistant_reply(
+                    self,
+                    full_content,
+                    reason=reason,
+                )
+            )
 
         # Trim and inject persisted history into runtime memory
         await self._prepare_request_context(message)
@@ -5293,7 +8147,7 @@ class AgentLoop:
         authoritative_message = message
 
         runtime_user_text = self._add_current_turn_skill_zip_context(
-            AgentLoop._build_current_turn_runtime_user_text(authoritative_message)
+            self._build_current_turn_runtime_user_text(authoritative_message)
         )
         runtime_message = self._build_runtime_message_content(
             "user",
@@ -5310,6 +8164,33 @@ class AgentLoop:
             attachments=attachments,
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+
+        direct_clarification = AgentLoop._build_short_request_ambiguity_clarification(
+            self,
+            authoritative_message
+        )
+        if direct_clarification:
+            await self._agent.add_message("user", runtime_message)
+            await self._agent.add_message("assistant", direct_clarification)
+            full_content = direct_clarification
+            stream_completed = True
+            self._persist_direct_assistant_turn_response(
+                direct_clarification,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
+            yield {
+                "type": "content",
+                "delta": direct_clarification,
+                "metadata": {"clarification": "short_request_ambiguity"},
+                "source": AgentLoop.get_last_response_source(self),
+            }
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": direct_clarification},
+                "source": AgentLoop.get_last_response_source(self),
+            }
+            return
 
         try:
             capture_manager = capture_tool_outputs()
@@ -5343,12 +8224,38 @@ class AgentLoop:
             await self._agent.add_message("user", runtime_message)
             self._normalize_runtime_memory_before_run("stream")
             _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+            self._active_turn_memory_start_index = _pre_turn_memory_index
+            execution_ledger = ExecutionLedger(
+                owner=self._current_tool_owner_key(),
+                workspace=str(getattr(self, "workspace", "") or ""),
+                session_id=str(getattr(self, "session_key", "") or ""),
+                turn_id=uuid.uuid4().hex,
+                user_request=authoritative_message,
+            )
+            self._active_execution_ledger = execution_ledger
+            ledger_manager = bind_execution_ledger(execution_ledger)
+            ledger_manager.__enter__()
             stream_tool_result_index = len(AgentLoop._get_runtime_memory_messages(self))
             emitted_tool_result_ids: set[str] = set()
             tool_call_arguments_by_id: dict[str, str] = {}
             recent_tool_result_events: list[dict[str, Any]] = []
+            all_tool_result_events: list[dict[str, Any]] = []
             stream_tool_result_count = 0
             stream_tool_call_count = 0
+            read_file_result_argument_counts: dict[str, int] = {}
+            read_file_result_generations: dict[str, int] = {}
+            read_context_generation = 0
+            active_tool_call_names_by_id: dict[str, str] = {}
+            last_tool_call_names: tuple[str, ...] = ()
+            non_read_tool_call_count = 0
+            repeated_read_recovery_attempted = False
+            repeated_read_guardrail_seen = False
+            history_search_budget_recovery_attempted = False
+            history_search_budget_seen = False
+            skill_contract_continuation_attempted = False
+            skill_contract_continuation_attempts = 0
+            post_tool_result_silence_recovery_seen = False
+            turn_tool_invocation_state: dict[str, Any] | None = None
             # 2. Start run() in background
             run_result_text = ""
             provider_silence_retry_count = 0
@@ -5357,9 +8264,10 @@ class AgentLoop:
                 int(getattr(self, "provider_silence_retries", 1) or 0),
             )
             retry_reasoning_effort: str | None = None
+            request_execution_hints = self._build_request_execution_hints(authoritative_message)
 
             async def _run_and_signal() -> None:
-                nonlocal run_result_text, stream_error_reason
+                nonlocal run_result_text, stream_error_reason, turn_tool_invocation_state
                 try:
                     retry_runner = AgentLoop._resolve_retry_runner(self)
                     run_kwargs: dict[str, Any] = {}
@@ -5376,8 +8284,13 @@ class AgentLoop:
                         while not self._agent.output_queue.empty():
                             self._agent.output_queue.get_nowait()
 
-                    request_execution_hints = self._build_request_execution_hints(authoritative_message)
-                    with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                    with (
+                        bind_request_execution_hints(request_execution_hints),
+                        track_tool_invocations(
+                            initial_state=turn_tool_invocation_state,
+                        ) as invocation_state,
+                    ):
+                        turn_tool_invocation_state = invocation_state
                         result = await AgentLoop._run_agent_with_context_overflow_recovery(
                             self,
                             label="stream",
@@ -5394,11 +8307,15 @@ class AgentLoop:
                 except Exception as exc:
                     stream_error_reason = exc
                     logger.error(f"Background agent run failed: {exc}")
+                    friendly_error = user_friendly_error(exc)
                     try:
                         await self._agent.output_queue.put({
                             "type": "error",
-                            "delta": str(exc),
-                            "metadata": {"error": str(exc), "error_code": type(exc).__name__},
+                            "delta": friendly_error,
+                            "metadata": {
+                                "error": friendly_error,
+                                "error_code": type(exc).__name__,
+                            },
                         })
                     except Exception:
                         pass
@@ -5406,7 +8323,10 @@ class AgentLoop:
                     self._agent.task_done.set()
 
             logger.debug(f"Creating bg task, agent state={self._agent.state}")
-            with bind_tool_owner(self._current_tool_owner_key()):
+            with (
+                bind_tool_owner(self._current_tool_owner_key()),
+                bind_tool_workspace(str(getattr(self, "workspace", "") or "")),
+            ):
                 bg_task = asyncio.create_task(_run_and_signal())
 
             # Force a yield to allow the background task to start
@@ -5443,6 +8363,16 @@ class AgentLoop:
                 else:
                     current_stream_segment_type = event_type
 
+                if event_type == "tool_result":
+                    # The matching tool_call event already carries the public
+                    # input preview. Re-sending arguments on result chunks
+                    # makes delta-based frontends merge nested strings as if
+                    # they were incremental text, which bloats long sessions
+                    # and can corrupt digest fields. Internal verifier events
+                    # keep their own metadata before this presentation step.
+                    metadata.pop("arguments", None)
+                    metadata.pop("input", None)
+
                 return {
                     **event,
                     "metadata": metadata,
@@ -5468,9 +8398,9 @@ class AgentLoop:
                 getattr(self, "provider_silence_timeout", DEFAULT_PROVIDER_SILENCE_TIMEOUT)
                 or DEFAULT_PROVIDER_SILENCE_TIMEOUT
             )
+            provider_silence_enabled = provider_silence_timeout > 0
             provider_total_timeout = float(
                 getattr(self, "provider_total_timeout", DEFAULT_PROVIDER_TOTAL_TIMEOUT)
-                or DEFAULT_PROVIDER_TOTAL_TIMEOUT
             )
             tool_followup_timeout = max(
                 0.1,
@@ -5483,13 +8413,41 @@ class AgentLoop:
                 getattr(self, "shell_timeout", None),
                 DEFAULT_SHELL_TIMEOUT,
             )
+            shell_max_timeout = AgentLoop._positive_runtime_budget(
+                getattr(self, "shell_max_timeout", None),
+                DEFAULT_SHELL_MAX_TIMEOUT,
+            )
             shell_handoff_timeout = AgentLoop._float_env(
                 "SPOON_BOT_SHELL_BACKGROUND_HANDOFF_TIMEOUT",
                 DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT,
             )
-            active_tool_timeout = max(
-                tool_followup_timeout,
-                shell_foreground_timeout + shell_handoff_timeout + 5.0,
+            shell_active_tool_timeout = max(
+                0.1,
+                max(shell_foreground_timeout, shell_max_timeout)
+                + shell_handoff_timeout
+                + 5.0,
+            )
+            non_shell_active_tool_timeout = max(
+                0.1,
+                AgentLoop._float_env(
+                    "SPOON_BOT_NON_SHELL_TOOL_ACTIVE_TIMEOUT",
+                    _DEFAULT_NON_SHELL_ACTIVE_TOOL_TIMEOUT,
+                ),
+            )
+            post_tool_result_silence_timeout = max(
+                0.1,
+                AgentLoop._float_env(
+                    "SPOON_BOT_POST_TOOL_RESULT_SILENCE_TIMEOUT",
+                    _DEFAULT_POST_TOOL_RESULT_SILENCE_TIMEOUT,
+                ),
+            )
+            internal_recovery_timeout = AgentLoop._float_env(
+                "SPOON_BOT_INTERNAL_RECOVERY_TIMEOUT",
+                AgentLoop._positive_runtime_budget(
+                    getattr(self, "internal_recovery_timeout", None),
+                    _DEFAULT_INTERNAL_RECOVERY_TIMEOUT,
+                ),
+                allow_zero=True,
             )
             max_tool_results_without_content = max(
                 1,
@@ -5502,30 +8460,66 @@ class AgentLoop:
                     or DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT
                 ),
             )
-
             def _record_tool_result_events(events: list[dict[str, Any]]) -> None:
                 nonlocal last_tool_progress_at, last_tool_progress_kind, stream_tool_result_count
+                nonlocal read_file_result_argument_counts, read_file_result_generations
+                nonlocal read_context_generation
+                nonlocal saw_content_after_tool_call
                 if not events:
                     return
                 last_tool_progress_at = time.monotonic()
                 last_tool_progress_kind = "tool_result"
+                saw_content_after_tool_call = False
                 stream_tool_result_count += len(events)
                 recent_tool_result_events.extend(events)
+                all_tool_result_events.extend(events)
                 del recent_tool_result_events[:-6]
+                for event in events:
+                    metadata = dict(event.get("metadata") or {})
+                    result_tool_name = str(metadata.get("name") or "").strip()
+                    if result_tool_name and result_tool_name != "read_file":
+                        read_context_generation += 1
+                    tool_call_id = (
+                        metadata.get("tool_call_id")
+                        or metadata.get("id")
+                        or event.get("tool_call_id")
+                        or event.get("id")
+                    )
+                    if tool_call_id:
+                        active_tool_call_names_by_id.pop(str(tool_call_id), None)
+                    elif result_tool_name:
+                        for active_id, active_name in list(active_tool_call_names_by_id.items()):
+                            if active_name == result_tool_name:
+                                active_tool_call_names_by_id.pop(active_id, None)
+                                break
+                    if result_tool_name == "read_file":
+                        arguments_key = AgentLoop._tool_call_arguments_key(
+                            metadata.get("arguments") or ""
+                        )
+                        if arguments_key:
+                            read_file_result_argument_counts[arguments_key] = (
+                                read_file_result_argument_counts.get(arguments_key, 0) + 1
+                            )
+                            read_file_result_generations[arguments_key] = (
+                                read_context_generation
+                            )
 
             def _stop_tool_loop(reason: str) -> None:
                 nonlocal run_result_text, pre_tool_scratchpad_events, pre_tool_scratchpad_buffer
                 nonlocal post_tool_content_events, post_tool_content_buffer
-                if recent_tool_result_events:
+                nonlocal tool_loop_fallback_active
+                evidence_events = recent_tool_result_events or all_tool_result_events
+                if evidence_events:
                     run_result_text = AgentLoop._build_tool_loop_fallback_response(
-                        recent_tool_result_events,
+                        evidence_events,
                         reason=reason,
+                        user_message=authoritative_message,
                     )
                 else:
                     run_result_text = (
-                        "The task did not reach a final answer before the request "
-                        "timeout. Please retry or continue this task."
+                        "NO_TOOL_RESULT_CAPTURED_BEFORE_STOP_CONDITION"
                     )
+                tool_loop_fallback_active = True
                 if bg_task is not None and not bg_task.done():
                     bg_task.cancel()
                 pre_tool_scratchpad_events = []
@@ -5538,6 +8532,8 @@ class AgentLoop:
                     pass
 
             def _stop_if_total_timeout() -> bool:
+                if provider_total_timeout <= 0:
+                    return False
                 now = time.monotonic()
                 if now - stream_started_at < provider_total_timeout:
                     return False
@@ -5552,9 +8548,44 @@ class AgentLoop:
                 _stop_tool_loop("total_timeout")
                 return True
 
-            async def _run_pseudo_tool_call_repair(pseudo_content: str) -> tuple[str, list[dict[str, Any]]]:
+            async def _await_internal_recovery_run(
+                awaitable: Awaitable[Any],
+                *,
+                label: str,
+            ) -> Any | None:
+                nonlocal stream_error_reason
+                if internal_recovery_timeout <= 0:
+                    return await awaitable
+                try:
+                    return await asyncio.wait_for(
+                        awaitable,
+                        timeout=internal_recovery_timeout,
+                    )
+                except asyncio.TimeoutError as exc:
+                    logger.warning(
+                        "{} exceeded internal recovery timeout {:.1f}s; "
+                        "continuing with captured tool evidence.",
+                        label,
+                        internal_recovery_timeout,
+                    )
+                    return None
+
+            def _internal_recovery_run_kwargs() -> dict[str, Any]:
+                kwargs: dict[str, Any] = {}
+                if self._callable_accepts_kwarg(self._agent.run, "reasoning_effort"):
+                    kwargs["reasoning_effort"] = "low"
+                return kwargs
+
+            async def _run_pseudo_tool_call_repair(
+                pseudo_content: str,
+                *,
+                repair_prompt_override: str | None = None,
+                repair_reason: str = "pseudo_tool_call_text",
+                request_hint_overrides: dict[str, Any] | None = None,
+            ) -> tuple[str, list[dict[str, Any]]]:
                 """Retry once when the model wrote fake tool calls as text."""
-                nonlocal stream_tool_result_index
+                nonlocal stream_error_reason, stream_tool_result_index
+                nonlocal turn_tool_invocation_state
 
                 AgentLoop._drop_pseudo_tool_call_assistant_messages(
                     self,
@@ -5563,34 +8594,57 @@ class AgentLoop:
                 AgentLoop._drain_agent_output_queue(self)
                 self._reset_agent_state_for_retry()
 
-                repair_prompt = AgentLoop._build_pseudo_tool_call_repair_prompt(
+                repair_prompt = repair_prompt_override or AgentLoop._build_pseudo_tool_call_repair_prompt(
                     authoritative_message,
                     pseudo_content,
                 )
                 await self._agent.add_message("user", repair_prompt)
                 self._agent.next_step_prompt = repair_prompt
 
-                repair_kwargs: dict[str, Any] = {}
-                if thinking and self._callable_accepts_kwarg(self._agent.run, "thinking"):
-                    repair_kwargs["thinking"] = True
-                repair_reasoning_effort = retry_reasoning_effort or effective_reasoning_effort
-                if (
-                    repair_reasoning_effort
-                    and self._callable_accepts_kwarg(self._agent.run, "reasoning_effort")
-                ):
-                    repair_kwargs["reasoning_effort"] = repair_reasoning_effort
+                repair_kwargs = _internal_recovery_run_kwargs()
 
                 request_execution_hints = self._build_request_execution_hints(authoritative_message)
-                with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
-                    result = await AgentLoop._run_agent_with_context_overflow_recovery(
-                        self,
-                        label="stream_tool_call_repair",
-                        retry_runner=AgentLoop._resolve_retry_runner(self),
-                        pre_overflow_retry_cleanup=lambda: AgentLoop._drain_agent_output_queue(self),
-                        **repair_kwargs,
-                    )
-
-                repair_text = AgentLoop._extract_run_result_text(result)
+                if request_hint_overrides:
+                    request_execution_hints = {
+                        **request_execution_hints,
+                        **request_hint_overrides,
+                    }
+                result: Any | None = None
+                previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+                self._force_serial_tool_calls = True
+                try:
+                    with (
+                        bind_request_execution_hints(request_execution_hints),
+                        track_tool_invocations(
+                            initial_state=turn_tool_invocation_state,
+                        ) as invocation_state,
+                    ):
+                        turn_tool_invocation_state = invocation_state
+                        result = await _await_internal_recovery_run(
+                            AgentLoop._run_agent_with_context_overflow_recovery(
+                                self,
+                                label="stream_tool_call_repair",
+                                retry_runner=AgentLoop._resolve_retry_runner(self),
+                                pre_overflow_retry_cleanup=lambda: AgentLoop._drain_agent_output_queue(self),
+                                **repair_kwargs,
+                            ),
+                            label="stream_tool_call_repair",
+                        )
+                except Exception as exc:
+                    stream_error_reason = exc
+                    logger.error(f"Repair run failed: {exc}")
+                    return "", []
+                finally:
+                    if previous_force_serial:
+                        self._force_serial_tool_calls = True
+                    elif hasattr(self, "_force_serial_tool_calls"):
+                        delattr(self, "_force_serial_tool_calls")
+                repair_text = ""
+                if result is None:
+                    if stream_error_reason is None:
+                        stream_error_reason = RuntimeError("Repair run returned no result")
+                else:
+                    repair_text = AgentLoop._extract_run_result_text(result)
                 repair_events: list[dict[str, Any]] = []
                 queued_content_parts: list[str] = []
 
@@ -5614,14 +8668,15 @@ class AgentLoop:
                                 fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
                             if tc_id:
                                 tool_call_arguments_by_id[tc_id] = AgentLoop._tool_call_arguments_key(fn_args)
+                            display_args = AgentLoop._tool_call_arguments_display(fn_name, fn_args)
                             repair_events.append({
                                 "type": "tool_call",
                                 "delta": "",
                                 "metadata": {
                                     "id": tc_id,
                                     "name": fn_name,
-                                    "arguments": fn_args,
-                                    "repair": "pseudo_tool_call_text",
+                                    "arguments": display_args,
+                                    "repair": repair_reason,
                                 },
                             })
                         continue
@@ -5652,13 +8707,20 @@ class AgentLoop:
                         if tool_call_id:
                             metadata.setdefault("tool_call_id", tool_call_id)
                             metadata.setdefault("id", tool_call_id)
+                            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+                            if arguments:
+                                metadata.setdefault(
+                                    "arguments",
+                                    AgentLoop._tool_call_arguments_display(tool_name, arguments),
+                                )
                             emitted_tool_result_ids.add(tool_call_id)
-                        metadata["repair"] = "pseudo_tool_call_text"
+                        metadata["repair"] = repair_reason
                         metadata = AgentLoop._merge_stream_tool_result_metadata(
                             metadata,
                             streamed_result=serialized_result,
                             captured_output=captured_output,
                         )
+                        self._remember_stream_tool_result_metadata(tool_call_id, metadata)
                         repair_events.append({
                             "type": "tool_result",
                             "delta": "",
@@ -5689,7 +8751,183 @@ class AgentLoop:
                 )
                 for event in tool_result_events:
                     metadata = dict(event.get("metadata") or {})
-                    metadata["repair"] = "pseudo_tool_call_text"
+                    metadata["repair"] = repair_reason
+                    repair_events.append({**event, "metadata": metadata})
+
+                return repair_text, repair_events
+
+            async def _run_repeated_read_recovery() -> tuple[str, list[dict[str, Any]]]:
+                """Retry once when duplicate read_file calls consume the tool loop."""
+                nonlocal stream_error_reason, stream_tool_result_index
+                nonlocal turn_tool_invocation_state
+
+                AgentLoop._drain_agent_output_queue(self)
+                try:
+                    AgentLoop._normalize_runtime_tool_context(
+                        AgentLoop._get_runtime_memory_messages(self),
+                        finalized=True,
+                    )
+                except Exception as exc:
+                    logger.debug(f"Repeated-read recovery memory normalization skipped: {exc}")
+                self._reset_agent_state_for_retry()
+
+                request_execution_hints = self._build_request_execution_hints(authoritative_message)
+                repair_prompt = AgentLoop._build_repeated_read_recovery_prompt(
+                    authoritative_message,
+                )
+                await self._agent.add_message("user", repair_prompt)
+                self._agent.next_step_prompt = repair_prompt
+
+                repair_kwargs = _internal_recovery_run_kwargs()
+
+                previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
+                self._force_serial_tool_calls = True
+                result: Any | None = None
+                try:
+                    try:
+                        with (
+                            bind_request_execution_hints(request_execution_hints),
+                            track_tool_invocations(
+                                max_repeats=1,
+                                initial_state=turn_tool_invocation_state,
+                            ) as invocation_state,
+                        ):
+                            turn_tool_invocation_state = invocation_state
+                            result = await _await_internal_recovery_run(
+                                AgentLoop._run_agent_with_context_overflow_recovery(
+                                    self,
+                                    label="stream_repeated_read_recovery",
+                                    retry_runner=AgentLoop._resolve_retry_runner(self),
+                                    pre_overflow_retry_cleanup=lambda: AgentLoop._drain_agent_output_queue(self),
+                                    **repair_kwargs,
+                                ),
+                                label="stream_repeated_read_recovery",
+                            )
+                    except Exception as exc:
+                        stream_error_reason = exc
+                        logger.error(f"Repeated-read recovery run failed: {exc}")
+                        return "", []
+                finally:
+                    if previous_force_serial:
+                        self._force_serial_tool_calls = True
+                    elif hasattr(self, "_force_serial_tool_calls"):
+                        delattr(self, "_force_serial_tool_calls")
+
+                repair_text = ""
+                if result is None:
+                    if stream_error_reason is None:
+                        stream_error_reason = RuntimeError(
+                            "Repeated-read recovery returned no result"
+                        )
+                else:
+                    repair_text = AgentLoop._extract_run_result_text(result)
+                repair_events: list[dict[str, Any]] = []
+                queued_content_parts: list[str] = []
+
+                while not self._agent.output_queue.empty():
+                    try:
+                        queued = self._agent.output_queue.get_nowait()
+                    except Exception:
+                        break
+
+                    if isinstance(queued, dict) and queued.get("tool_calls"):
+                        for tc in queued.get("tool_calls") or []:
+                            if isinstance(tc, dict):
+                                fn = tc.get("function", {})
+                                tc_id = tc.get("id", "")
+                                fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+                                fn_args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
+                            else:
+                                tc_id = getattr(tc, "id", "")
+                                fn_obj = getattr(tc, "function", None)
+                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                            if tc_id:
+                                tool_call_arguments_by_id[tc_id] = AgentLoop._tool_call_arguments_key(fn_args)
+                            display_args = AgentLoop._tool_call_arguments_display(fn_name, fn_args)
+                            repair_events.append({
+                                "type": "tool_call",
+                                "delta": "",
+                                "metadata": {
+                                    "id": tc_id,
+                                    "name": fn_name,
+                                    "arguments": display_args,
+                                    "repair": "repeated_read_recovery",
+                                },
+                            })
+                        continue
+
+                    if isinstance(queued, dict) and queued.get("type") == "tool_result":
+                        metadata = dict(queued.get("metadata") or {})
+                        tool_name = queued.get("name") or metadata.get("name") or ""
+                        tool_result = (
+                            queued.get("result")
+                            or queued.get("content")
+                            or queued.get("response")
+                            or queued.get("output")
+                        )
+                        serialized_result = AgentLoop._stringify_stream_payload(tool_result)
+                        tool_call_id = (
+                            queued.get("tool_call_id")
+                            or queued.get("id")
+                            or metadata.get("tool_call_id")
+                            or metadata.get("id")
+                        )
+                        captured_output = consume_captured_tool_output(
+                            tool_output_capture_scope,
+                            tool_name=tool_name,
+                            arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                        )
+                        if tool_name:
+                            metadata.setdefault("name", tool_name)
+                        if tool_call_id:
+                            metadata.setdefault("tool_call_id", tool_call_id)
+                            metadata.setdefault("id", tool_call_id)
+                            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+                            if arguments:
+                                metadata.setdefault(
+                                    "arguments",
+                                    AgentLoop._tool_call_arguments_display(tool_name, arguments),
+                                )
+                            emitted_tool_result_ids.add(tool_call_id)
+                        metadata["repair"] = "repeated_read_recovery"
+                        metadata = AgentLoop._merge_stream_tool_result_metadata(
+                            metadata,
+                            streamed_result=serialized_result,
+                            captured_output=captured_output,
+                        )
+                        self._remember_stream_tool_result_metadata(tool_call_id, metadata)
+                        repair_events.append({
+                            "type": "tool_result",
+                            "delta": "",
+                            "metadata": metadata,
+                        })
+                        continue
+
+                    if isinstance(queued, dict):
+                        text = queued.get("content") or queued.get("delta") or ""
+                    else:
+                        text = getattr(queued, "content", None) or (
+                            queued if isinstance(queued, str) else ""
+                        )
+                    if text:
+                        queued_content_parts.append(str(text))
+
+                if not repair_text.strip() and queued_content_parts:
+                    repair_text = "".join(queued_content_parts)
+
+                tool_result_events, stream_tool_result_index = (
+                    AgentLoop._collect_stream_tool_result_events(
+                        self,
+                        stream_tool_result_index,
+                        emitted_tool_result_ids,
+                        tool_output_capture_scope=tool_output_capture_scope,
+                        tool_call_arguments_by_id=tool_call_arguments_by_id,
+                    )
+                )
+                for event in tool_result_events:
+                    metadata = dict(event.get("metadata") or {})
+                    metadata["repair"] = "repeated_read_recovery"
                     repair_events.append({**event, "metadata": metadata})
 
                 return repair_text, repair_events
@@ -5698,9 +8936,147 @@ class AgentLoop:
                 if not saw_tool_call or last_tool_progress_kind != "tool_call":
                     return False
                 now = time.monotonic() if now is None else now
-                return now - last_tool_progress_at < active_tool_timeout
+                active_names = {
+                    name
+                    for name in last_tool_call_names
+                    if isinstance(name, str) and name
+                }
+                if not active_names:
+                    active_names = {
+                        name
+                        for name in active_tool_call_names_by_id.values()
+                        if isinstance(name, str) and name
+                    }
+                budget = (
+                    shell_active_tool_timeout
+                    if "shell" in active_names
+                    else non_shell_active_tool_timeout
+                )
+                return now - last_tool_progress_at < budget
+
+            def _repeated_read_storm_active() -> bool:
+                return (
+                    not repeated_read_recovery_attempted
+                    and any(
+                        count >= _REPEATED_READ_RECOVERY_THRESHOLD
+                        for count in read_file_result_argument_counts.values()
+                    )
+                )
+
+            def _read_file_call_repeats_current_context(arguments_key: str) -> bool:
+                if not arguments_key:
+                    return False
+                if read_file_result_argument_counts.get(arguments_key, 0) <= 0:
+                    return False
+                return (
+                    read_file_result_generations.get(arguments_key)
+                    == read_context_generation
+                )
+
+            def _redundant_read_tool_result_event(
+                *,
+                tool_call_id: str,
+                tool_name: str,
+                arguments: str,
+            ) -> dict[str, Any]:
+                result = (
+                    "READ_FILE_CACHE_HIT: requested file range was already "
+                    "provided earlier in this request. Continue from the "
+                    "existing file evidence and advance the task instead of "
+                    "waiting for another identical read_file result."
+                )
+                metadata: dict[str, Any] = {
+                    "name": tool_name or "read_file",
+                    "arguments": AgentLoop._tool_call_arguments_display(
+                        tool_name or "read_file",
+                        arguments,
+                    ),
+                    "result": result,
+                    "repair": "repeated_read_call_guard",
+                }
+                if tool_call_id:
+                    metadata["id"] = tool_call_id
+                    metadata["tool_call_id"] = tool_call_id
+                metadata = AgentLoop._merge_stream_tool_result_metadata(
+                    metadata,
+                    streamed_result=result,
+                    captured_output=None,
+                )
+                self._remember_stream_tool_result_metadata(tool_call_id, metadata)
+                return {
+                    "type": "tool_result",
+                    "delta": AgentLoop._stream_tool_result_visible_delta(
+                        "",
+                        metadata,
+                    ),
+                    "metadata": metadata,
+                }
+
+            def _events_have_repeated_read_guardrail(
+                events: list[dict[str, Any]],
+            ) -> bool:
+                for event in events:
+                    metadata = dict(event.get("metadata") or {})
+                    if str(metadata.get("name") or "").strip() != "read_file":
+                        continue
+                    payload = (
+                        metadata.get("model_result")
+                        or metadata.get("model_output")
+                        or metadata.get("model_content")
+                        or metadata.get("output")
+                        or metadata.get("result")
+                        or metadata.get("content")
+                        or event.get("delta")
+                    )
+                    text = AgentLoop._stringify_stream_payload(payload).lower()
+                    if (
+                        "repeated redundant read_file suppressed" in text
+                        or "requested file range was already provided" in text
+                        or "requested file range already available" in text
+                        or "already available in this request" in text
+                        or "file content already available" in text
+                    ):
+                        return True
+                return False
+
+            def _stop_current_run_for_repeated_read_recovery() -> None:
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    td.set()
+                except Exception:
+                    pass
+
+            def _stop_current_run_for_history_search_budget_recovery() -> None:
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    td.set()
+                except Exception:
+                    pass
+
+            def _stop_current_run_for_post_tool_result_silence_recovery() -> None:
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    td.set()
+                except Exception:
+                    pass
+
+            def _can_run_skill_contract_continuation() -> bool:
+                return (
+                    skill_contract_continuation_attempts
+                    < AgentLoop._skill_contract_continuation_attempt_limit()
+                )
+
+            def _mark_skill_contract_continuation_attempt() -> None:
+                nonlocal skill_contract_continuation_attempted
+                nonlocal skill_contract_continuation_attempts
+                skill_contract_continuation_attempted = True
+                skill_contract_continuation_attempts += 1
 
             while not (td.is_set() and oq.empty()):
+                now = time.monotonic()
                 if _stop_if_total_timeout():
                     break
 
@@ -5717,13 +9093,91 @@ class AgentLoop:
                     )
                 )
                 _record_tool_result_events(tool_result_events)
+                if _events_have_repeated_read_guardrail(tool_result_events):
+                    repeated_read_guardrail_seen = True
+                    if not repeated_read_recovery_attempted:
+                        logger.warning(
+                            "Repeated read_file guardrail returned; switching to "
+                            "internal continuation recovery."
+                        )
+                        _stop_current_run_for_repeated_read_recovery()
+                        break
+                if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                    history_search_budget_seen = True
                 for event in tool_result_events:
                     yield _decorate_stream_event(event)
+                if (
+                    history_search_budget_seen
+                    and not history_search_budget_recovery_attempted
+                ):
+                    logger.warning(
+                        "History search budget was exhausted without task progress; "
+                        "switching to internal continuation recovery."
+                    )
+                    _stop_current_run_for_history_search_budget_recovery()
+                    break
                 if any(AgentLoop._is_tool_loop_suppression_event(event) for event in tool_result_events):
                     logger.warning("Stopping tool loop after repeated-tool guardrail result.")
                     _stop_tool_loop("tool_suppression")
                     break
+                if _repeated_read_storm_active():
+                    logger.warning(
+                        "Repeated read_file results are no longer making progress; "
+                        "switching to internal continuation recovery."
+                    )
+                    _stop_current_run_for_repeated_read_recovery()
+                    break
+                if (
+                    _can_run_skill_contract_continuation()
+                    and skill_contract_inspection_stalled_after_progress(
+                        all_tool_result_events
+                    )
+                ):
+                    logger.warning(
+                        "Skill turn returned to repeated setup/read-only inspection "
+                        "after progress; switching to internal continuation recovery."
+                    )
+                    post_tool_result_silence_recovery_seen = True
+                    _stop_current_run_for_post_tool_result_silence_recovery()
+                    break
                 if _stop_if_total_timeout():
+                    break
+                if (
+                    saw_tool_call
+                    and last_tool_progress_kind == "tool_call"
+                    and not _active_tool_within_budget()
+                ):
+                    logger.warning(
+                        "Stopping tool loop because an active tool call "
+                        "did not produce a result within its bounded active budget."
+                    )
+                    _stop_tool_loop("active_tool_timeout")
+                    break
+
+                if (
+                    saw_tool_call
+                    and last_tool_progress_kind == "tool_result"
+                    and not saw_content_after_tool_call
+                    and recent_tool_result_events
+                    and now - last_tool_progress_at >= post_tool_result_silence_timeout
+                ):
+                    if (
+                        should_run_skill_contract_check(all_tool_result_events)
+                        and _can_run_skill_contract_continuation()
+                    ):
+                        logger.warning(
+                            "Provider was silent after skill tool results; "
+                            "switching to internal skill-contract continuation."
+                        )
+                        post_tool_result_silence_recovery_seen = True
+                        _stop_current_run_for_post_tool_result_silence_recovery()
+                    else:
+                        logger.warning(
+                            "Stopping tool loop because provider produced no "
+                            "content after the latest tool result within the "
+                            "post-tool silence budget."
+                        )
+                        _stop_tool_loop("post_tool_result_silence_timeout")
                     break
 
                 if (
@@ -5754,16 +9208,29 @@ class AgentLoop:
                     # Use oq.get() without timeout kwarg - works for both
                     # asyncio.Queue and ThreadSafeOutputQueue. Timeout is
                     # handled by the outer asyncio.wait_for.
-                    queue_poll_timeout = min(
-                        2.0,
-                        max(0.05, provider_silence_timeout),
+                    queue_poll_timeout = (
+                        min(2.0, max(0.05, provider_silence_timeout))
+                        if provider_silence_enabled
+                        else 2.0
                     )
                     chunk = await asyncio.wait_for(oq.get(), timeout=queue_poll_timeout)
                     chunk_count += 1
                     logger.debug(f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}")
                 except asyncio.TimeoutError:
                     if (
-                        not td.is_set()
+                        saw_tool_call
+                        and last_tool_progress_kind == "tool_call"
+                        and not _active_tool_within_budget()
+                    ):
+                        logger.warning(
+                            "Stopping tool loop because an active tool call "
+                            "did not produce a result within its bounded active budget."
+                        )
+                        _stop_tool_loop("active_tool_timeout")
+                        break
+                    if (
+                        provider_silence_enabled
+                        and not td.is_set()
                         and not saw_tool_call
                         and not full_content
                         and time.monotonic() - stream_started_at >= provider_silence_timeout
@@ -5793,7 +9260,10 @@ class AgentLoop:
                                 td.clear()
                             except Exception:
                                 pass
-                            with bind_tool_owner(self._current_tool_owner_key()):
+                            with (
+                                bind_tool_owner(self._current_tool_owner_key()),
+                                bind_tool_workspace(str(getattr(self, "workspace", "") or "")),
+                            ):
                                 bg_task = asyncio.create_task(_run_and_signal())
                             await asyncio.sleep(0)
                             stream_started_at = time.monotonic()
@@ -5864,10 +9334,18 @@ class AgentLoop:
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
+                        if self._should_disable_parallel_tool_calls() and isinstance(
+                            chunk.get("tool_calls"), (list, tuple)
+                        ):
+                            raw_tool_calls = list(chunk.get("tool_calls") or [])
+                            if len(raw_tool_calls) > 1:
+                                chunk = dict(chunk)
+                                chunk["tool_calls"] = raw_tool_calls[:1]
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
                         last_tool_progress_at = time.monotonic()
                         last_tool_progress_kind = "tool_call"
+                        current_tool_call_names: list[str] = []
                         # Initial content before a tool call is tool preamble by
                         # structure; do not classify it with language phrases.
                         if pre_tool_scratchpad_events:
@@ -5876,6 +9354,7 @@ class AgentLoop:
                         if post_tool_content_buffer:
                             post_tool_content_events = []
                             post_tool_content_buffer = ""
+                        repeated_read_call_guard_events: list[dict[str, Any]] = []
                         for tc in chunk["tool_calls"]:
                             # tc may be a ToolCall pydantic object or a dict
                             if isinstance(tc, dict):
@@ -5888,17 +9367,62 @@ class AgentLoop:
                                 fn_obj = getattr(tc, "function", None)
                                 fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
                                 fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                            arguments_key = AgentLoop._tool_call_arguments_key(fn_args)
+                            normalized_fn_name = str(fn_name or "").strip()
+                            if normalized_fn_name:
+                                current_tool_call_names.append(normalized_fn_name)
                             if tc_id:
-                                tool_call_arguments_by_id[tc_id] = AgentLoop._tool_call_arguments_key(fn_args)
+                                tool_call_arguments_by_id[tc_id] = arguments_key
+                                if normalized_fn_name:
+                                    active_tool_call_names_by_id[str(tc_id)] = normalized_fn_name
+                            if normalized_fn_name != "read_file":
+                                non_read_tool_call_count += 1
                             yield _decorate_stream_event({
                                 "type": "tool_call",
                                 "delta": "",
                                 "metadata": {
                                     "id": tc_id,
                                     "name": fn_name,
-                                    "arguments": fn_args,
+                                    "arguments": AgentLoop._tool_call_arguments_display(
+                                        fn_name,
+                                        fn_args,
+                                    ),
                                 },
                             })
+                            if (
+                                normalized_fn_name == "read_file"
+                                and _read_file_call_repeats_current_context(
+                                    arguments_key
+                                )
+                            ):
+                                repeated_read_call_guard_events.append(
+                                    _redundant_read_tool_result_event(
+                                        tool_call_id=str(tc_id or ""),
+                                        tool_name=normalized_fn_name,
+                                        arguments=fn_args,
+                                    )
+                                )
+                        if current_tool_call_names:
+                            last_tool_call_names = tuple(current_tool_call_names)
+                        if repeated_read_call_guard_events:
+                            repeated_read_guardrail_seen = True
+                            for event in repeated_read_call_guard_events:
+                                metadata = dict(event.get("metadata") or {})
+                                tool_call_id = (
+                                    metadata.get("tool_call_id")
+                                    or metadata.get("id")
+                                )
+                                if tool_call_id:
+                                    emitted_tool_result_ids.add(str(tool_call_id))
+                                _record_tool_result_events([event])
+                                yield _decorate_stream_event(event)
+                            logger.warning(
+                                "Repeated read_file call matched already completed "
+                                "tool evidence; closing the tool event and switching "
+                                "to internal continuation recovery."
+                            )
+                            _stop_current_run_for_repeated_read_recovery()
+                            break
                         if _stop_if_total_timeout():
                             break
                         continue
@@ -5938,12 +9462,19 @@ class AgentLoop:
                         if tool_call_id:
                             metadata.setdefault("tool_call_id", tool_call_id)
                             metadata.setdefault("id", tool_call_id)
+                            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+                            if arguments:
+                                metadata.setdefault(
+                                    "arguments",
+                                    AgentLoop._tool_call_arguments_display(tool_name, arguments),
+                                )
                             emitted_tool_result_ids.add(tool_call_id)
                         metadata = AgentLoop._merge_stream_tool_result_metadata(
                             metadata,
                             streamed_result=serialized_result,
                             captured_output=captured_output,
                         )
+                        self._remember_stream_tool_result_metadata(tool_call_id, metadata)
                         _record_tool_result_events([{
                             "type": "tool_result",
                             "delta": delta,
@@ -5958,22 +9489,64 @@ class AgentLoop:
 
                 # -- Object chunks with content --
                 elif hasattr(chunk, "content") and chunk.content:
-                    delta = chunk.content
+                    delta = str(chunk.content)
 
                 # -- Plain string chunks --
                 elif isinstance(chunk, str):
                     delta = chunk
 
                 if chunk_type == "tool_result":
+                    delta = AgentLoop._stream_tool_result_visible_delta(delta, metadata)
                     tool_result_event = {
                         "type": chunk_type,
                         "delta": delta,
                         "metadata": metadata,
                     }
                     yield _decorate_stream_event(tool_result_event)
+                    if _events_have_repeated_read_guardrail([tool_result_event]):
+                        repeated_read_guardrail_seen = True
+                        if not repeated_read_recovery_attempted:
+                            logger.warning(
+                                "Repeated read_file guardrail returned; switching to "
+                                "internal continuation recovery."
+                            )
+                            _stop_current_run_for_repeated_read_recovery()
+                            break
+                    if AgentLoop._tool_events_have_history_search_budget([tool_result_event]):
+                        history_search_budget_seen = True
+                    if (
+                        history_search_budget_seen
+                        and not history_search_budget_recovery_attempted
+                    ):
+                        logger.warning(
+                            "History search budget was exhausted without task progress; "
+                            "switching to internal continuation recovery."
+                        )
+                        _stop_current_run_for_history_search_budget_recovery()
+                        break
                     if AgentLoop._is_tool_loop_suppression_event(tool_result_event):
                         logger.warning("Stopping tool loop after repeated-tool guardrail result.")
                         _stop_tool_loop("tool_suppression")
+                        break
+                    if _repeated_read_storm_active():
+                        logger.warning(
+                            "Repeated read_file results are no longer making progress; "
+                            "switching to internal continuation recovery."
+                        )
+                        _stop_current_run_for_repeated_read_recovery()
+                        break
+                    if (
+                        _can_run_skill_contract_continuation()
+                        and skill_contract_inspection_stalled_after_progress(
+                            all_tool_result_events
+                        )
+                    ):
+                        logger.warning(
+                            "Skill turn returned to repeated setup/read-only inspection "
+                            "after progress; switching to internal continuation recovery."
+                        )
+                        post_tool_result_silence_recovery_seen = True
+                        _stop_current_run_for_post_tool_result_silence_recovery()
                         break
                     if _stop_if_total_timeout():
                         break
@@ -6011,11 +9584,20 @@ class AgentLoop:
                     else:
                         event = {"type": chunk_type, "delta": delta, "metadata": metadata}
                         if chunk_type == "content":
-                            if thinking and not saw_tool_call:
+                            if (
+                                not saw_tool_call
+                                and not initial_content_passthrough_started
+                                and len(pre_tool_scratchpad_buffer + delta) <= 300
+                            ):
                                 pre_tool_scratchpad_buffer += delta
                                 pre_tool_scratchpad_events.append(event)
                                 continue
+                            if pre_tool_scratchpad_buffer:
+                                delta = pre_tool_scratchpad_buffer + delta
+                                pre_tool_scratchpad_events = []
+                                pre_tool_scratchpad_buffer = ""
                             if not saw_tool_call:
+                                initial_content_passthrough_started = True
                                 delta = AgentLoop._mask_user_visible_text(delta)
                                 if not delta:
                                     continue
@@ -6049,10 +9631,154 @@ class AgentLoop:
                     tool_call_arguments_by_id=tool_call_arguments_by_id,
                 )
             )
+            _record_tool_result_events(tool_result_events)
+            if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                history_search_budget_seen = True
             for event in tool_result_events:
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
+
+            if (
+                history_search_budget_seen
+                and not history_search_budget_recovery_attempted
+            ):
+                logger.warning(
+                    "History search budget consumed the tool loop; running "
+                    "internal continuation recovery."
+                )
+                history_search_budget_recovery_attempted = True
+                repair_prompt = AgentLoop._build_history_search_budget_recovery_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    "History search budget reached before task completion.",
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="history_search_budget_recovery",
+                    request_hint_overrides={"history_search_budget_exhausted": True},
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        metadata = dict(event.get("metadata") or {})
+                        event = {
+                            **event,
+                            "delta": AgentLoop._stream_tool_result_visible_delta(
+                                event.get("delta", ""),
+                                metadata,
+                            ),
+                            "metadata": metadata,
+                        }
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                run_result_text = repair_text
+                post_tool_content_buffer = repair_text
+                post_tool_content_events = []
+
+            if all_tool_result_events or should_run_skill_contract_check(
+                all_tool_result_events,
+            ):
+                buffer_stream_content = True
+
+            repeated_read_storm = (
+                not latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and (
+                    _repeated_read_storm_active()
+                    or (
+                        not repeated_read_recovery_attempted
+                        and repeated_read_guardrail_seen
+                    )
+                )
+            )
+            if repeated_read_storm:
+                logger.warning(
+                    "Repeated read_file calls consumed the tool loop; "
+                    "running internal continuation recovery."
+                )
+                repeated_read_recovery_attempted = True
+                if (
+                    _can_run_skill_contract_continuation()
+                    and skill_contract_needs_continuation(
+                        run_result_text,
+                        all_tool_result_events,
+                    )
+                ):
+                    _mark_skill_contract_continuation_attempt()
+                    repair_prompt = AgentLoop._build_skill_contract_continuation_prompt(
+                        authoritative_message,
+                        all_tool_result_events,
+                        previous_draft=run_result_text or full_content,
+                    )
+                    repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                        run_result_text or "Repeated skill file reads stopped progress.",
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="skill_contract_continuation",
+                    )
+                    tool_loop_fallback_active = False
+                else:
+                    repair_text, repair_events = await _run_repeated_read_recovery()
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        metadata = dict(event.get("metadata") or {})
+                        event = {
+                            **event,
+                            "delta": AgentLoop._stream_tool_result_visible_delta(
+                                event.get("delta", ""),
+                                metadata,
+                            ),
+                            "metadata": metadata,
+                        }
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                run_result_text = repair_text
+                post_tool_content_buffer = repair_text
+                post_tool_content_events = []
+
+            if (
+                post_tool_result_silence_recovery_seen
+                and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and _can_run_skill_contract_continuation()
+                and (
+                    skill_contract_needs_continuation(
+                        run_result_text,
+                        all_tool_result_events,
+                    )
+                    or skill_contract_inspection_stalled_after_progress(
+                        all_tool_result_events
+                    )
+                )
+            ):
+                logger.warning(
+                    "Tool result silence paused a skill turn before completion; "
+                    "running internal skill-contract continuation."
+                )
+                _mark_skill_contract_continuation_attempt()
+                repair_prompt = AgentLoop._build_skill_contract_continuation_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                    previous_draft=run_result_text or full_content,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    run_result_text or "Provider was silent after skill tool results.",
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="skill_contract_continuation",
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        metadata = dict(event.get("metadata") or {})
+                        event = {
+                            **event,
+                            "delta": AgentLoop._stream_tool_result_visible_delta(
+                                event.get("delta", ""),
+                                metadata,
+                            ),
+                            "metadata": metadata,
+                        }
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                run_result_text = repair_text
+                post_tool_content_buffer = repair_text
+                post_tool_content_events = []
 
             if pre_tool_scratchpad_buffer and not saw_tool_call:
                 full_content += AgentLoop._mask_user_visible_text(pre_tool_scratchpad_buffer)
@@ -6108,6 +9834,42 @@ class AgentLoop:
                             "metadata": {"validated": True},
                         })
 
+            if (
+                tool_loop_fallback_active
+                and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and _can_run_skill_contract_continuation()
+                and skill_contract_needs_continuation(
+                    run_result_text,
+                    all_tool_result_events,
+                )
+            ):
+                logger.warning(
+                    "Tool-loop guard stopped a skill turn after contract setup; "
+                    "running internal skill-contract continuation."
+                )
+                _mark_skill_contract_continuation_attempt()
+                repair_prompt = AgentLoop._build_skill_contract_continuation_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                    previous_draft=run_result_text or full_content,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    run_result_text or "Tool guard stopped before skill-contract progress.",
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="skill_contract_continuation",
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                if repair_text.strip():
+                    run_result_text = repair_text
+                    full_content = repair_text
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "skill_contract_continuation"
+                    pending_fallback_delta = repair_text
+                    tool_loop_fallback_active = False
+
             fallback_after_tool_only_preamble = (
                 saw_tool_call
                 and not saw_content_after_tool_call
@@ -6125,7 +9887,10 @@ class AgentLoop:
                     "falling back to run() result text."
                 )
                 fallback_delta = run_result_text
-                if full_content and fallback_after_tool_only_preamble:
+                if full_content and fallback_after_tool_only_preamble and tool_loop_fallback_active:
+                    full_content = run_result_text
+                    fallback_reason = "tool_loop_guardrail"
+                elif full_content and fallback_after_tool_only_preamble:
                     full_content, fallback_delta = AgentLoop._resolve_stream_fallback_delta(
                         full_content,
                         run_result_text,
@@ -6164,6 +9929,435 @@ class AgentLoop:
                 pending_fallback_content_emit = True
                 pending_fallback_reason = "pseudo_tool_call_repair"
                 pending_fallback_delta = repair_text
+
+            def _has_stateful_terminal_content(text: str | None) -> bool:
+                active_ledger = getattr(self, "_active_execution_ledger", None)
+                normalized = str(text or "").strip()
+                return (
+                    isinstance(active_ledger, ExecutionLedger)
+                    and active_ledger.has_stateful_progress()
+                    and bool(normalized)
+                    and normalized not in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}
+                )
+
+            while (
+                not _has_stateful_terminal_content(full_content)
+                and _can_run_skill_contract_continuation()
+                and skill_contract_needs_continuation(
+                    full_content,
+                    all_tool_result_events,
+                )
+            ):
+                before_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                    all_tool_result_events,
+                )
+                logger.warning(
+                    "Final stream content stopped after skill setup/read-only work; "
+                    "continuing with an internal skill-contract continuation prompt."
+                )
+                _mark_skill_contract_continuation_attempt()
+                repair_prompt = AgentLoop._build_skill_contract_continuation_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                    previous_draft=full_content,
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    full_content,
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="skill_contract_continuation",
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                if (
+                    not repair_text.strip()
+                    or repair_text.strip() == "NO_CONCISE_TOOL_EVIDENCE"
+                ) and any(event.get("type") == "tool_result" for event in repair_events):
+                    repair_text = build_user_facing_tool_event_answer(
+                        repair_events,
+                        user_message=authoritative_message,
+                    )
+                if repair_text.strip():
+                    full_content = repair_text
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "skill_contract_continuation"
+                    pending_fallback_delta = repair_text
+                after_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                    all_tool_result_events,
+                )
+                if after_fingerprint == before_fingerprint:
+                    logger.warning(
+                        "Skill-contract continuation produced no new tool "
+                        "evidence; stopping internal continuation and summarizing state."
+                    )
+                    break
+
+            task_continuation_attempts = 0
+            while (
+                all_tool_result_events
+                and task_continuation_attempts
+                < AgentLoop._task_completion_continuation_attempt_limit()
+            ):
+                if latest_tool_event_has_user_summary_marker(all_tool_result_events):
+                    break
+                verdict = await self._evaluate_task_completion_verdict(
+                    authoritative_message=authoritative_message,
+                    final_content=full_content,
+                    tool_result_events=all_tool_result_events,
+                )
+                if (
+                    not isinstance(verdict, dict)
+                    or verdict.get("status") != "needs_continuation"
+                ):
+                    break
+
+                before_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                    all_tool_result_events,
+                )
+                task_continuation_attempts += 1
+                logger.warning(
+                    "Final stream content did not satisfy tool-backed request; "
+                    "continuing with a generic task continuation prompt."
+                )
+                repair_prompt = AgentLoop._build_task_continuation_prompt(
+                    authoritative_message,
+                    all_tool_result_events,
+                    previous_draft=full_content,
+                    continuation_reason=verdict.get("reason"),
+                    continuation_focus=verdict.get("next_focus"),
+                )
+                repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    full_content,
+                    repair_prompt_override=repair_prompt,
+                    repair_reason="task_continuation",
+                )
+                for event in repair_events:
+                    if event.get("type") == "tool_result":
+                        metadata = dict(event.get("metadata") or {})
+                        event = {
+                            **event,
+                            "delta": AgentLoop._stream_tool_result_visible_delta(
+                                event.get("delta", ""),
+                                metadata,
+                            ),
+                            "metadata": metadata,
+                        }
+                        _record_tool_result_events([event])
+                    yield _decorate_stream_event(event)
+                if (
+                    not repair_text.strip()
+                    or repair_text.strip() == "NO_CONCISE_TOOL_EVIDENCE"
+                ) and any(event.get("type") == "tool_result" for event in repair_events):
+                    repair_text = build_user_facing_tool_event_answer(
+                        repair_events,
+                        user_message=authoritative_message,
+                    )
+                after_fingerprint = AgentLoop._skill_contract_evidence_fingerprint(
+                    all_tool_result_events,
+                )
+                if after_fingerprint == before_fingerprint:
+                    logger.warning(
+                        "Generic task continuation produced no new tool evidence; "
+                        "stopping continuation."
+                    )
+                    existing_terminal_content = str(full_content or "").strip()
+                    if (
+                        existing_terminal_content
+                        and existing_terminal_content
+                        not in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}
+                        and not AgentLoop._looks_like_internal_scratchpad_text(
+                            existing_terminal_content
+                        )
+                    ):
+                        pending_fallback_content_emit = True
+                        pending_fallback_reason = (
+                            pending_fallback_reason or "preserved_terminal_content"
+                        )
+                        pending_fallback_delta = existing_terminal_content
+                        break
+                    active_ledger = getattr(self, "_active_execution_ledger", None)
+                    if isinstance(active_ledger, ExecutionLedger):
+                        if not (
+                            active_ledger.has_stateful_progress()
+                            or active_ledger.file_reads
+                        ):
+                            active_ledger.record_blocker(
+                                tool_name="agent_loop",
+                                reason="continuation_without_tool_progress",
+                                summary=(
+                                    "The request still needed another tool step, but "
+                                    "the internal continuation produced no new verified "
+                                    "tool evidence."
+                                ),
+                            )
+                        ledger_summary = active_ledger.render_user_facing_summary(max_chars=5000)
+                    else:
+                        ledger_summary = ""
+                    full_content = (
+                        ledger_summary
+                        or build_user_facing_tool_event_answer(
+                            all_tool_result_events,
+                            incomplete=True,
+                            user_message=authoritative_message,
+                        )
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = pending_fallback_reason or "continuation_no_progress"
+                    pending_fallback_delta = full_content
+                    break
+                if repair_text.strip():
+                    full_content = repair_text
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = pending_fallback_reason or "task_continuation"
+                    pending_fallback_delta = repair_text
+
+            if (
+                should_run_skill_contract_check(all_tool_result_events)
+                and skill_contract_has_progress(all_tool_result_events)
+                and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and not latest_tool_event_from_skill_continuation(all_tool_result_events)
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        all_tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "skill_progress_summary"
+                pending_fallback_delta = full_content
+
+            if (
+                full_content.strip()
+                and should_run_skill_contract_check(all_tool_result_events)
+                and latest_tool_event_has_user_summary_marker(all_tool_result_events)
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        all_tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "skill_summary"
+                pending_fallback_delta = full_content
+
+            if stream_error_reason is not None:
+                if all_tool_result_events and (
+                    AgentLoop._should_replace_stream_error_preamble(
+                        full_content,
+                        saw_tool_call=saw_tool_call,
+                        saw_content_after_tool_call=saw_content_after_tool_call,
+                    )
+                ):
+                    full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                        self,
+                        all_tool_result_events,
+                        incomplete=True,
+                        user_message=authoritative_message,
+                        fallback_text=build_user_facing_tool_event_answer(
+                            all_tool_result_events,
+                            incomplete=True,
+                            user_message=authoritative_message,
+                        ),
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "runtime_error_tool_evidence"
+                    pending_fallback_delta = full_content
+                elif not full_content.strip():
+                    if isinstance(stream_error_reason, Exception):
+                        friendly_error = user_friendly_error(stream_error_reason)
+                    else:
+                        friendly_error = "An unexpected error occurred. Please try again."
+                    full_content = friendly_error
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "runtime_error"
+                    pending_fallback_delta = full_content
+
+            if (
+                tool_loop_fallback_active
+                and all_tool_result_events
+                and full_content.strip()
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    incomplete=True,
+                    user_message=authoritative_message,
+                    fallback_text=full_content,
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "tool_loop_guardrail"
+                pending_fallback_delta = full_content
+
+            if full_content.strip() and AgentLoop._looks_like_raw_tool_transcript_leak(full_content):
+                synthesis_events = all_tool_result_events or self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                if synthesis_events:
+                    all_tool_result_events = all_tool_result_events or synthesis_events
+                    full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                        self,
+                        synthesis_events,
+                        user_message=authoritative_message,
+                        fallback_text=build_user_facing_tool_event_answer(
+                            synthesis_events,
+                            user_message=authoritative_message,
+                        ),
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = pending_fallback_reason or "raw_tool_transcript"
+                    pending_fallback_delta = full_content
+
+            if (
+                all_tool_result_events
+                and full_content.strip()
+                and AgentLoop._looks_like_raw_tool_transcript_leak(full_content)
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        all_tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "raw_tool_transcript"
+                pending_fallback_delta = full_content
+
+            if (
+                all_tool_result_events
+                and full_content.strip()
+                and AgentLoop._final_answer_script_mismatch(
+                    authoritative_message,
+                    full_content,
+                )
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        all_tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "language_mismatch"
+                pending_fallback_delta = full_content
+            elif (
+                all_tool_result_events
+                and (
+                    bool(request_execution_hints.get("current_session_fact_check_required"))
+                    or bool(request_execution_hints.get("session_evidence_synthesis_preferred"))
+                )
+            ):
+                synthesis_events = self._session_evidence_synthesis_events(
+                    all_tool_result_events,
+                    user_message=authoritative_message,
+                )
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    synthesis_events,
+                    incomplete=latest_tool_event_has_next_command(synthesis_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        synthesis_events,
+                        incomplete=latest_tool_event_has_next_command(synthesis_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "session_evidence"
+                pending_fallback_delta = full_content
+            elif (
+                all_tool_result_events
+                and should_run_skill_contract_check(all_tool_result_events)
+                and not skill_contract_has_progress(all_tool_result_events)
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        all_tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "skill_evidence_summary"
+                pending_fallback_delta = full_content
+
+            if (
+                full_content.strip() == "NO_CONCISE_TOOL_EVIDENCE"
+                and all_tool_result_events
+                and latest_tool_event_from_skill_continuation(all_tool_result_events)
+            ):
+                full_content = build_user_facing_tool_event_answer(
+                    all_tool_result_events,
+                    user_message=authoritative_message,
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "skill_continuation_evidence"
+                pending_fallback_delta = full_content
+
+            active_ledger = getattr(self, "_active_execution_ledger", None)
+            ledger_final = AgentLoop._deterministic_ledger_final(
+                active_ledger,
+                max_chars=5000,
+            )
+            if (
+                all_tool_result_events
+                and ledger_final
+                and AgentLoop._should_use_deterministic_ledger_final(
+                    full_content,
+                    user_message=authoritative_message,
+                )
+            ):
+                full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    all_tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=ledger_final,
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = pending_fallback_reason or "execution_ledger_deterministic"
+                pending_fallback_delta = full_content
+            elif (
+                all_tool_result_events
+                and isinstance(active_ledger, ExecutionLedger)
+                and active_ledger.has_stateful_progress()
+                and (active_ledger.file_writes or active_ledger.services)
+                and AgentLoop._needs_tool_evidence_synthesis(
+                    full_content,
+                    user_message=authoritative_message,
+                )
+            ):
+                ledger_fallback = active_ledger.render_user_facing_summary(max_chars=5000)
+                if ledger_fallback:
+                    full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                        self,
+                        all_tool_result_events,
+                        user_message=authoritative_message,
+                        fallback_text=ledger_fallback,
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = pending_fallback_reason or "execution_ledger"
+                    pending_fallback_delta = full_content
 
             pre_finalize_full_content = full_content
             final_content = AgentLoop._finalize_response_content(
@@ -6215,6 +10409,7 @@ class AgentLoop:
             logger.warning("Streaming cancelled")
             AgentLoop._drain_agent_output_queue(self)
             AgentLoop._truncate_runtime_memory(self, _pre_turn_memory_index)
+            _persist_interrupted_stream_reply("task_cancelled")
             AgentLoop._mark_latest_user_turn_state(
                 self,
                 _TURN_STATE_INTERRUPTED,
@@ -6239,6 +10434,20 @@ class AgentLoop:
                 "source": current_source,
             }
         finally:
+            if execution_ledger is not None:
+                try:
+                    persist_execution_ledger(execution_ledger)
+                except Exception as exc:
+                    logger.debug(f"Execution ledger persistence skipped: {exc}")
+            if ledger_manager is not None:
+                try:
+                    ledger_manager.__exit__(None, None, None)
+                except Exception:
+                    pass
+            if getattr(self, "_active_execution_ledger", None) is execution_ledger:
+                self._active_execution_ledger = None
+            if getattr(self, "_active_turn_memory_start_index", None) == _pre_turn_memory_index:
+                self._active_turn_memory_start_index = None
             if capture_manager is not None:
                 try:
                     capture_manager.__exit__(None, None, None)
@@ -6259,13 +10468,14 @@ class AgentLoop:
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
             if not stream_completed and not stream_cancelled:
+                _persist_interrupted_stream_reply("task_cancelled")
                 AgentLoop._mark_latest_user_turn_state(
                     self,
                     _TURN_STATE_INTERRUPTED,
                     reason="task_cancelled",
                 )
 
-        if stream_error_reason is not None and not full_content and not stream_cancelled:
+        if stream_error_reason is not None and not stream_cancelled:
             AgentLoop._persist_failed_turn_context(
                 self,
                 label="stream",
@@ -6273,7 +10483,12 @@ class AgentLoop:
                 start_index=_pre_turn_memory_index,
             )
 
-        if full_content and stream_completed and not stream_cancelled:
+        if (
+            full_content
+            and stream_completed
+            and not stream_cancelled
+            and stream_error_reason is None
+        ):
             try:
                 self._merge_turn_invoked_skills_from_runtime(_pre_turn_memory_index)
                 AgentLoop._mark_latest_user_turn_state(
@@ -6361,7 +10576,7 @@ class AgentLoop:
         authoritative_message = message
 
         runtime_user_text = self._add_current_turn_skill_zip_context(
-            AgentLoop._build_current_turn_runtime_user_text(authoritative_message)
+            self._build_current_turn_runtime_user_text(authoritative_message)
         )
         runtime_message = self._build_runtime_message_content(
             "user",
@@ -6379,6 +10594,22 @@ class AgentLoop:
         )
         _pre_turn_memory_index = self._runtime_memory_snapshot_index()
 
+        direct_clarification = AgentLoop._build_short_request_ambiguity_clarification(
+            self,
+            authoritative_message
+        )
+        if direct_clarification:
+            await self._agent.add_message("user", runtime_message)
+            await self._agent.add_message("assistant", direct_clarification)
+            self._persist_direct_assistant_turn_response(
+                direct_clarification,
+                turn_memory_start_index=_pre_turn_memory_index,
+            )
+            return direct_clarification, ""
+
+        execution_ledger: ExecutionLedger | None = None
+        ledger_manager = None
+
         try:
             retry_runner = AgentLoop._resolve_retry_runner(self)
             _base_prompt = self._select_next_step_prompt(authoritative_message, thinking=True)
@@ -6394,6 +10625,17 @@ class AgentLoop:
             await self._agent.add_message("user", runtime_message)
             self._normalize_runtime_memory_before_run("process_with_thinking")
             _pre_turn_memory_index = self._runtime_memory_snapshot_index()
+            self._active_turn_memory_start_index = _pre_turn_memory_index
+            execution_ledger = ExecutionLedger(
+                owner=self._current_tool_owner_key(),
+                workspace=str(getattr(self, "workspace", "") or ""),
+                session_id=str(getattr(self, "session_key", "") or ""),
+                turn_id=uuid.uuid4().hex,
+                user_request=authoritative_message,
+            )
+            self._active_execution_ledger = execution_ledger
+            ledger_manager = bind_execution_ledger(execution_ledger)
+            ledger_manager.__enter__()
 
             # Run agent with thinking enabled
             run_kwargs: dict[str, Any] = {}
@@ -6406,7 +10648,10 @@ class AgentLoop:
             ):
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
-            with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+            with (
+                bind_request_execution_hints(request_execution_hints),
+                track_tool_invocations(),
+            ):
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
                     label="process_with_thinking",
@@ -6445,7 +10690,10 @@ class AgentLoop:
                 )
                 await self._agent.add_message("user", repair_prompt)
                 self._agent.next_step_prompt = repair_prompt
-                with bind_request_execution_hints(request_execution_hints), track_tool_invocations():
+                with (
+                    bind_request_execution_hints(request_execution_hints),
+                    track_tool_invocations(),
+                ):
                     result = await AgentLoop._run_agent_with_context_overflow_recovery(
                         self,
                         label="process_with_thinking_tool_call_repair",
@@ -6463,6 +10711,195 @@ class AgentLoop:
                         result.metadata.get("thinking")
                         or result.metadata.get("reasoning")
                     )
+
+            tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                _pre_turn_memory_index
+            )
+            if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+                final_content = await self._run_process_history_search_budget_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    label="process_with_thinking_history_search_budget_recovery",
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                thinking_content = None
+
+            if (
+                should_run_skill_contract_check(tool_result_events)
+                and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
+            ):
+                final_content = await self._run_process_repeated_read_recovery(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                )
+                tool_result_events = self._collect_runtime_tool_result_events_from_memory(
+                    _pre_turn_memory_index
+                )
+                thinking_content = None
+
+            if should_run_skill_contract_check(tool_result_events):
+                final_content, tool_result_events = await self._continue_skill_contract_until_terminal(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    final_content=final_content,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    memory_start_index=_pre_turn_memory_index,
+                    label="process_with_thinking_skill_contract_continuation",
+                )
+                thinking_content = None
+
+            if tool_result_events:
+                final_content, tool_result_events = await self._continue_task_until_terminal(
+                    authoritative_message=authoritative_message,
+                    request_execution_hints=request_execution_hints,
+                    final_content=final_content,
+                    tool_result_events=tool_result_events,
+                    retry_runner=retry_runner,
+                    run_kwargs=run_kwargs,
+                    memory_start_index=_pre_turn_memory_index,
+                    label="process_with_thinking_task_continuation",
+                )
+                thinking_content = None
+
+            if (
+                tool_result_events
+                and should_run_skill_contract_check(tool_result_events)
+                and skill_contract_has_progress(tool_result_events)
+                and not latest_tool_event_has_user_summary_marker(tool_result_events)
+                and not latest_tool_event_from_skill_continuation(tool_result_events)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+                thinking_content = None
+
+            if any(
+                AgentLoop._is_tool_loop_suppression_event(event)
+                for event in tool_result_events
+            ):
+                fallback_content = AgentLoop._build_tool_loop_fallback_response(
+                    tool_result_events,
+                    reason="tool_suppression",
+                    user_message=authoritative_message,
+                )
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=True,
+                    user_message=authoritative_message,
+                    fallback_text=fallback_content,
+                )
+            elif (
+                should_run_skill_contract_check(tool_result_events)
+                and latest_tool_event_has_user_summary_marker(tool_result_events)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif tool_result_events and (
+                AgentLoop._looks_like_raw_tool_transcript_leak(final_content)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif tool_result_events and AgentLoop._final_answer_script_mismatch(
+                authoritative_message,
+                final_content,
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+            elif (
+                tool_result_events
+                and should_run_skill_contract_check(tool_result_events)
+                and not skill_contract_has_progress(tool_result_events)
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=build_user_facing_tool_event_answer(
+                        tool_result_events,
+                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        user_message=authoritative_message,
+                    ),
+                )
+            active_ledger = getattr(self, "_active_execution_ledger", None)
+            ledger_final = AgentLoop._deterministic_ledger_final(
+                active_ledger,
+                max_chars=5000,
+            )
+            if (
+                tool_result_events
+                and ledger_final
+                and AgentLoop._should_use_deterministic_ledger_final(
+                    final_content,
+                    user_message=authoritative_message,
+                )
+            ):
+                final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                    self,
+                    tool_result_events,
+                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    user_message=authoritative_message,
+                    fallback_text=ledger_final,
+                )
+            elif (
+                tool_result_events
+                and isinstance(active_ledger, ExecutionLedger)
+                and active_ledger.has_stateful_progress()
+                and (active_ledger.file_writes or active_ledger.services)
+                and AgentLoop._needs_tool_evidence_synthesis(
+                    final_content,
+                    user_message=authoritative_message,
+                )
+            ):
+                ledger_fallback = active_ledger.render_user_facing_summary(max_chars=5000)
+                if ledger_fallback:
+                    final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                        self,
+                        tool_result_events,
+                        user_message=authoritative_message,
+                        fallback_text=ledger_fallback,
+                    )
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
             final_content = AgentLoop._finalize_response_content(
@@ -6473,11 +10910,7 @@ class AgentLoop:
             )
 
         except asyncio.CancelledError:
-            AgentLoop._mark_latest_user_turn_state(
-                self,
-                _TURN_STATE_INTERRUPTED,
-                reason="task_cancelled",
-            )
+            self._persist_cancelled_turn_context(start_index=_pre_turn_memory_index)
             raise
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
@@ -6489,6 +10922,20 @@ class AgentLoop:
             )
             raise
         finally:
+            if execution_ledger is not None:
+                try:
+                    persist_execution_ledger(execution_ledger)
+                except Exception as exc:
+                    logger.debug(f"Execution ledger persistence skipped: {exc}")
+            if ledger_manager is not None:
+                try:
+                    ledger_manager.__exit__(None, None, None)
+                except Exception:
+                    pass
+            if getattr(self, "_active_execution_ledger", None) is execution_ledger:
+                self._active_execution_ledger = None
+            if getattr(self, "_active_turn_memory_start_index", None) == _pre_turn_memory_index:
+                self._active_turn_memory_start_index = None
             self._restore_agent_think()
             AgentLoop._restore_request_context_system_prompt(
                 self,
@@ -6670,12 +11117,53 @@ class AgentLoop:
             return result
 
         fm_text = fm.group(1)
+        try:
+            import yaml
+
+            parsed = yaml.safe_load(fm_text) or {}
+        except Exception:
+            parsed = {}
+
+        if isinstance(parsed, dict):
+            description = parsed.get("description")
+            when_to_use = parsed.get("when_to_use", parsed.get("whenToUse", ""))
+            paths = parsed.get("paths")
+            triggers = parsed.get("triggers")
+
+            if isinstance(description, str):
+                result["description"] = description
+            if isinstance(when_to_use, str):
+                result["when_to_use"] = when_to_use
+            if isinstance(paths, list):
+                result["paths"] = [str(path) for path in paths if str(path).strip()]
+
+            trigger_fragments: list[str] = []
+
+            def _collect_strings(value: object) -> None:
+                if isinstance(value, str):
+                    trigger_fragments.append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        _collect_strings(item)
+                elif isinstance(value, dict):
+                    for item in value.values():
+                        _collect_strings(item)
+
+            _collect_strings(triggers)
+            result["triggers"] = "|".join(trigger_fragments)
+
+            if result["description"]:
+                result["description"] = str(result["description"]).strip()[:300]
+                result["when_to_use"] = str(result["when_to_use"]).strip()[:200]
+                return result
+
         in_multiline = ""
         in_paths_list = False
         trigger_fragments: list[str] = []
         paths_list: list[str] = []
 
         for line in fm_text.split("\n"):
+            is_top_level = bool(line.strip()) and not line.startswith((" ", "\t"))
             stripped = line.strip()
 
             if in_paths_list:
@@ -6699,21 +11187,21 @@ class AgentLoop:
                 else:
                     in_multiline = ""
 
-            if stripped.startswith("description:"):
+            if is_top_level and stripped.startswith("description:"):
                 val = stripped.split(":", 1)[1].strip().strip("'\"")
                 if val and val not in (">", "|"):
                     result["description"] = val
                 elif val in (">", "|"):
                     in_multiline = "description"
 
-            elif stripped.startswith(("when_to_use:", "whenToUse:")):
+            elif is_top_level and stripped.startswith(("when_to_use:", "whenToUse:")):
                 val = stripped.split(":", 1)[1].strip().strip("'\"")
                 if val and val not in (">", "|"):
                     result["when_to_use"] = val
                 elif val in (">", "|"):
                     in_multiline = "when_to_use"
 
-            elif stripped.startswith("paths:"):
+            elif is_top_level and stripped.startswith("paths:"):
                 inline = stripped.split(":", 1)[1].strip()
                 if inline.startswith("[") and inline.endswith("]"):
                     for p in inline[1:-1].split(","):
@@ -6723,7 +11211,7 @@ class AgentLoop:
                 else:
                     in_paths_list = True
 
-            elif "triggers" in stripped.lower() or "trigger" in stripped.lower():
+            elif is_top_level and ("triggers" in stripped.lower() or "trigger" in stripped.lower()):
                 trigger_fragments.extend(_re.findall(r'"([^"]+)"', stripped))
 
         if not result["description"]:
@@ -6738,6 +11226,56 @@ class AgentLoop:
         result["triggers"] = "|".join(trigger_fragments)
         result["paths"] = paths_list
         return result
+
+    @staticmethod
+    def _has_valid_skill_frontmatter(skill_md: Path) -> bool:
+        """Return True when a SKILL.md starts with a YAML frontmatter block."""
+        try:
+            lines = skill_md.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return False
+        if not lines or lines[0].strip() != "---":
+            return False
+        return any(line.strip() == "---" for line in lines[1:80])
+
+    def _skill_manager_discovery_paths(self) -> list[Path]:
+        """Return valid skill directories for the spoon-core SkillManager.
+
+        spoon-core logs an error for every invalid SKILL.md it sees.  The local
+        prompt builder can tolerate stale user folders, but the runtime manager
+        should only receive directories that contain parseable skill metadata.
+        """
+        paths: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                return
+            key = str(resolved)
+            if key in seen:
+                return
+            seen.add(key)
+            paths.append(resolved)
+
+        for base in getattr(self, "_skill_paths", []):
+            root = Path(base)
+            if not root.is_dir():
+                continue
+            direct_skill_md = root / "SKILL.md"
+            if direct_skill_md.exists():
+                if self._has_valid_skill_frontmatter(direct_skill_md):
+                    add(root)
+                continue
+            for child in root.iterdir():
+                if not child.is_dir():
+                    continue
+                skill_md = child / "SKILL.md"
+                if self._has_valid_skill_frontmatter(skill_md):
+                    add(child)
+
+        return paths
 
     def _iter_skill_candidates(
         self, *, include_dormant: bool = False,
@@ -6833,13 +11371,50 @@ class AgentLoop:
             base_dir = _re.sub(r"^([A-Za-z]):", lambda m: f"/{m.group(1).lower()}", base_dir)
 
         skill_rel = f"skills/{skill_name}" if is_organized else skill_name
+        skill_md = skill_dir / "SKILL.md"
         return {
             "name": skill_name,
             "base_dir": base_dir,
             "workspace_relative_path": f"{skill_rel}/",
-            "location": f"{skill_rel}/SKILL.md",
+            "location": self._skill_prompt_location(
+                skill_name,
+                skill_dir,
+                skill_md,
+                is_organized=is_organized,
+            ),
             "organized": bool(is_organized),
         }
+
+    def _skill_prompt_location(
+        self,
+        skill_name: str,
+        skill_dir: Path,
+        skill_md: Path,
+        *,
+        is_organized: bool,
+    ) -> str:
+        """Return a model-readable SKILL.md location that actually exists.
+
+        Skills under the active runtime ``workspace/skills`` keep the familiar
+        relative form. Skills discovered from configured or bundled/dev paths
+        must use their real path; otherwise the model is shown a relative path
+        that points at a nonexistent runtime skill.
+        """
+        try:
+            workspace_skills = (self.workspace / "skills").resolve()
+            resolved_dir = skill_dir.resolve()
+            resolved_md = skill_md.resolve()
+            if (
+                is_organized
+                and (resolved_dir == workspace_skills or workspace_skills in resolved_dir.parents)
+            ):
+                return f"skills/{skill_name}/SKILL.md"
+            try:
+                return str(resolved_md.relative_to(self.workspace)).replace("\\", "/")
+            except (OSError, ValueError):
+                return str(resolved_md).replace("\\", "/")
+        except Exception:
+            return f"skills/{skill_name}/SKILL.md" if is_organized else f"{skill_name}/SKILL.md"
 
     def _resolve_skill_context_by_name(self, skill_name: str) -> dict[str, Any] | None:
         """Resolve a persisted skill name against the current skill catalog."""
@@ -6857,6 +11432,260 @@ class AgentLoop:
                 )
         return None
 
+    @staticmethod
+    def _token_identifier_variants(
+        text: str,
+        *,
+        combine_adjacent: bool = True,
+    ) -> set[str]:
+        """Return compact identifier tokens from free text without routing intent."""
+        tokens = [
+            token
+            for token in ordered_request_matching_tokens(str(text or ""))
+            if len(token) >= 3
+        ]
+        variants: set[str] = set(tokens)
+        if not combine_adjacent:
+            return variants
+        for index in range(len(tokens) - 1):
+            left = tokens[index]
+            right = tokens[index + 1]
+            if left.isascii() and right.isascii():
+                variants.add(f"{left}{right}")
+        if len(tokens) >= 3:
+            for index in range(len(tokens) - 2):
+                first = tokens[index]
+                second = tokens[index + 1]
+                third = tokens[index + 2]
+                if first.isascii() and second.isascii() and third.isascii():
+                    variants.add(f"{first}{second}{third}")
+        return variants
+
+    def _recent_skill_ambiguity_candidates(self) -> list[dict[str, Any]]:
+        """Return recent skill-backed workflows as generic clarification candidates."""
+        recent = getattr(self, "_recent_invoked_skill_contexts", [])
+        if not isinstance(recent, list) or len(recent) < 2:
+            return []
+
+        catalog_by_name: dict[str, dict[str, Any]] = {}
+        for item in self._collect_request_skill_candidates():
+            name = str(item.get("name") or "").strip()
+            if name:
+                catalog_by_name[name] = item
+
+        candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in recent:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            catalog = catalog_by_name.get(name, {})
+            identifier_text = " ".join(
+                str(value or "")
+                for value in (
+                    name,
+                    item.get("location"),
+                    item.get("workspace_relative_path"),
+                    catalog.get("description"),
+                    catalog.get("when_to_use"),
+                )
+                if str(value or "").strip()
+            )
+            candidates.append({
+                "name": name,
+                "location": str(item.get("location") or ""),
+                "tokens": self._token_identifier_variants(identifier_text),
+            })
+        return candidates if len(candidates) >= 2 else []
+
+    def _short_request_ambiguity_candidates(self, message: str) -> list[dict[str, Any]]:
+        """Return recent workflow candidates when a short request selects none.
+
+        This uses only recent skill metadata and request tokens. It does not
+        route by product names, CLI commands, or domain-specific phrases.
+        """
+        text = str(message or "").strip()
+        if not text:
+            return []
+        if len([char for char in text if not char.isspace()]) > 36:
+            return []
+        if len(ordered_request_matching_tokens(text)) > 5:
+            return []
+        if extract_urls_from_text(text):
+            return []
+        if extract_exact_shell_commands_from_request(text):
+            return []
+
+        candidates = self._recent_skill_ambiguity_candidates()
+        if len(candidates) < 2:
+            return []
+
+        request_tokens = self._token_identifier_variants(text, combine_adjacent=False)
+        if not request_tokens:
+            return []
+
+        token_owners: dict[str, set[str]] = {}
+        for candidate in candidates:
+            name = candidate["name"]
+            for token in candidate.get("tokens") or set():
+                token_owners.setdefault(token, set()).add(name)
+
+        if not any(token in token_owners for token in request_tokens):
+            visible_chars = len([char for char in text if not char.isspace()])
+            if visible_chars > 4:
+                return []
+
+        uniquely_selected: set[str] = set()
+        for token in request_tokens:
+            owners = token_owners.get(token)
+            if owners and len(owners) == 1:
+                uniquely_selected.update(owners)
+        if uniquely_selected:
+            return []
+
+        return candidates
+
+    def _format_short_request_ambiguity_context(self, message: str) -> str:
+        """Warn the model when a short request does not select a recent workflow.
+
+        This is deliberately context only. It does not route to a skill, and it
+        does not classify domain terms. The model may still answer read-only
+        questions, but it must not pick one recent state-changing workflow
+        solely from recency.
+        """
+        candidates = self._short_request_ambiguity_candidates(message)
+        if len(candidates) < 2:
+            return ""
+
+        lines = [
+            "[SHORT REQUEST AMBIGUITY BOUNDARY]:",
+            (
+                "The newest request is short and does not uniquely identify one "
+                "of the recent skill-backed workflows below."
+            ),
+            (
+                "If satisfying it would require a state-changing, paid, remote, "
+                "or externally visible action from one of these workflows, ask "
+                "one concise clarification before calling side-effecting tools. "
+                "Do not choose a workflow from recency alone. Read-only status "
+                "questions may still be verified with tools."
+            ),
+            "Recent workflow candidates:",
+        ]
+        for candidate in candidates[:6]:
+            location = str(candidate.get("location") or "").strip()
+            if location:
+                lines.append(f"- {candidate['name']} ({location})")
+            else:
+                lines.append(f"- {candidate['name']}")
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _message_prefers_cjk_response(message: str) -> bool:
+        for char in str(message or ""):
+            if "\u3400" <= char <= "\u9fff":
+                return True
+        return False
+
+    def _build_short_request_ambiguity_clarification(self, message: str) -> str:
+        candidates = self._short_request_ambiguity_candidates(message)
+        if len(candidates) < 2:
+            return ""
+        names: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates[:6]:
+            name = str(candidate.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        if len(names) < 2:
+            return ""
+        if self._message_prefers_cjk_response(message):
+            return "我需要先确认要使用哪个 workflow：" + "、".join(names) + "？"
+        return "Which workflow should I use: " + ", ".join(names) + "?"
+
+    def _persist_direct_assistant_turn_response(
+        self,
+        content: str,
+        *,
+        turn_memory_start_index: int,
+    ) -> None:
+        AgentLoop._mark_latest_user_turn_state(self, _TURN_STATE_COMPLETED)
+        try:
+            self._persist_turn_tool_trace(turn_memory_start_index)
+        except Exception:
+            pass
+        self._session.add_message(
+            "assistant",
+            content,
+            **AgentLoop._assistant_session_save_kwargs(content),
+        )
+        AgentLoop._persist_session_if_possible(self)
+
+    def _build_request_context_sections(self, message: str) -> str:
+        """Build reusable request-derived context without changing user intent."""
+        hint_source = self._request_hint_source_text(message)
+        hints = self._build_request_execution_hints_from_text(hint_source)
+        sections = [
+            _BOUNDED_CONTINUATION_BOUNDARY
+            if request_is_bare_continuation(message)
+            else "",
+            self._format_short_request_ambiguity_context(message),
+            format_explicit_request_urls_context(hint_source),
+            format_explicit_request_values_context(hint_source),
+            self._format_local_skill_execution_context(hints),
+            self._format_recent_execution_ledger_context(),
+            format_explicit_tool_request_context(hints),
+            format_current_session_fact_check_context(message),
+            format_exact_shell_command_context(message),
+        ]
+        return "".join(section for section in sections if section)
+
+    def _format_recent_execution_ledger_context(self) -> str:
+        try:
+            return load_recent_execution_ledger_context(
+                workspace=getattr(self, "workspace", None),
+                owner=self._current_tool_owner_key(),
+            )
+        except Exception as exc:
+            logger.debug(f"Recent execution ledger context skipped: {exc}")
+            return ""
+
+    @staticmethod
+    def _format_local_skill_execution_context(hints: dict[str, Any]) -> str:
+        """Format installed skill command hints without selecting a route."""
+        skills = hints.get("local_executable_skills") if isinstance(hints, dict) else None
+        if not isinstance(skills, list) or not skills:
+            return ""
+        lines = ["[LOCAL SKILL EXECUTION CONTEXT]:"]
+        lines.append(
+            "Installed skills below expose documented commands. Treat prior "
+            "request facts as checkpoints, not completion. When continuing a "
+            "skill workflow, use SKILL.md and latest tool evidence to choose "
+            "the next documented command; do not infer completion from a plan."
+        )
+        for skill in skills[:4]:
+            if not isinstance(skill, dict):
+                continue
+            name = str(skill.get("name") or "").strip()
+            commands = skill.get("commands")
+            if name:
+                lines.append(f"- {name}:")
+            if isinstance(commands, list):
+                for command in commands[:8]:
+                    command_text = str(command or "").strip()
+                    if command_text:
+                        lines.append(f"  - {command_text}")
+        if len(lines) <= 2:
+            return ""
+        lines.append("")
+        return "\n".join(lines)
+
     def _build_step_prompt(self, message: str) -> str:
         """Build a minimal per-step prompt from the user's request.
 
@@ -6871,9 +11700,19 @@ class AgentLoop:
             "unless the newest user message explicitly says to continue it.\n"
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            "[HISTORY VERIFICATION]: If the newest request asks what happened earlier, "
+            "mentions previous actions/results, or challenges your prior answer, verify exact "
+            "current-session user/tool facts first. Use search_history(mode='recent', "
+            "scope='current') for last completed action/result questions, or targeted "
+            "search_history(scope='current') when you already have a stable id/path/hash. "
+            "If exact evidence is absent, say what is absent instead of filling the gap "
+            "from memory or inference.\n"
             f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
+            f"{_EXACT_COMMAND_BOUNDARY}"
+            f"{_USER_FACING_OUTPUT_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{self._build_request_context_sections(message)}"
             f"[WORKSPACE]: {_ws}/\n\n"
             + self.DEFAULT_NEXT_STEP_PROMPT
         )
@@ -6886,6 +11725,9 @@ class AgentLoop:
                 f"[PREVIOUS TURN STATUS]: {recent_turn_notice.strip()}\n"
                 + prompt
             )
+        session_recall = self._build_session_recall_context(message)
+        if isinstance(session_recall, str) and session_recall.strip():
+            prompt = f"{session_recall.strip()}\n" + prompt
         env_section = self._extract_env_for_prompt()
         if env_section:
             prompt += env_section
@@ -6901,9 +11743,19 @@ class AgentLoop:
             "unless the newest user message explicitly says to continue it.\n"
             "[HISTORY BOUNDARY]: Prior conversation is reference only. Do not run prior tasks, "
             "do not append prior-task work, and stop as soon as the newest request is satisfied.\n"
+            "[HISTORY VERIFICATION]: If the newest request asks what happened earlier, "
+            "mentions previous actions/results, or challenges your prior answer, verify exact "
+            "current-session user/tool facts first. Use search_history(mode='recent', "
+            "scope='current') for last completed action/result questions, or targeted "
+            "search_history(scope='current') when you already have a stable id/path/hash. "
+            "If exact evidence is absent, say what is absent instead of filling the gap "
+            "from memory or inference.\n"
             f"{_EXTERNAL_SIDE_EFFECT_BOUNDARY}"
+            f"{_EXACT_COMMAND_BOUNDARY}"
+            f"{_USER_FACING_OUTPUT_BOUNDARY}"
             f"{format_current_datetime_context(bracketed=True)}\n"
             f"[USER REQUEST]: {_truncated}\n"
+            f"{self._build_request_context_sections(message)}"
             f"[WORKSPACE]: {_ws}/\n"
         )
         skill_zip_context = self._current_turn_skill_zip_context()
@@ -6923,126 +11775,170 @@ class AgentLoop:
             prompt += env_section
         return prompt
 
-    @staticmethod
-    def _tokenize_request_matching_text(text: str) -> set[str]:
-        """Return normalized keyword tokens for lightweight skill matching."""
-        return {
-            token
-            for token in re.findall(r"[a-z0-9][a-z0-9_-]{1,}", str(text or "").lower())
-            if len(token) >= 2
-        }
-
-    @staticmethod
-    def _request_explicitly_needs_remote_lookup(message: str) -> bool:
-        """Return True when the latest request clearly asks for web/API lookup."""
-        text = str(message or "").lower()
-        if "http://" in text or "https://" in text:
-            return True
-        return bool(re.search(
-            r"(?i)\b(web_fetch|web_search|curl|http|https|api|docs?|documentation|"
-            r"search|browse|lookup|look up|fetch|官网|文档|接口|网页|搜索)\b",
-            text,
-        ))
-
-    @staticmethod
-    def _extract_exact_shell_commands_from_request(message: str) -> list[str]:
-        """Extract explicit shell commands quoted in the latest user request."""
-        commands: list[str] = []
-        seen: set[str] = set()
-        for match in re.findall(r"`([^`\n]{3,300})`", str(message or "")):
-            candidate = " ".join(match.strip().split())
-            if not candidate:
-                continue
-            if not re.match(r"(?i)^(node|python|uv|bash|sh|curl|cast|git|npm|pnpm|yarn)\b", candidate):
-                continue
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            commands.append(candidate)
-        return commands[:4]
-
-    @staticmethod
-    def _extract_skill_command_hints(skill_md: Path) -> tuple[list[str], list[str]]:
-        """Extract runnable command hints and referenced URLs from a SKILL.md file."""
+    def _collect_request_skill_candidates(self) -> list[dict[str, Any]]:
+        """Collect installed skill metadata for request-scoped hinting."""
+        skill_candidates: list[dict[str, Any]] = []
         try:
-            content = skill_md.read_text(encoding="utf-8", errors="replace")
+            candidates = self._iter_skill_candidates(include_dormant=True)
         except Exception:
-            return [], []
+            candidates = []
+        for name, _skill_dir, skill_md, is_organized in candidates:
+            fm = self._parse_skill_frontmatter(skill_md)
+            skill_candidates.append({
+                "name": name,
+                "skill_md": skill_md,
+                "is_organized": is_organized,
+                "description": fm.get("description") or "",
+                "when_to_use": fm.get("when_to_use") or "",
+            })
+        return skill_candidates
 
-        commands: list[str] = []
-        seen_commands: set[str] = set()
+    def _collect_available_tool_identifiers(self) -> list[str]:
+        """Collect registered tool and MCP identifiers for request-scoped hints."""
+        names: set[str] = set()
 
-        cli_match = re.search(r"CLI\s*:?=\s*(.+)", content)
-        cli_value = cli_match.group(1).strip() if cli_match else ""
+        registry_tools = getattr(getattr(self, "tools", None), "_tools", {})
+        if isinstance(registry_tools, dict):
+            names.update(str(name) for name in registry_tools if str(name).strip())
+            for tool in registry_tools.values():
+                tool_name = getattr(tool, "name", None)
+                if tool_name:
+                    names.add(str(tool_name))
 
-        def _push_command(command: str) -> None:
-            normalized = " ".join(str(command or "").strip().split())
-            if not normalized or normalized in seen_commands:
-                return
-            seen_commands.add(normalized)
-            commands.append(normalized)
+        manager_tools = getattr(
+            getattr(getattr(self, "_agent", None), "available_tools", None),
+            "tool_map",
+            {},
+        )
+        if isinstance(manager_tools, dict):
+            names.update(str(name) for name in manager_tools if str(name).strip())
+            for tool in manager_tools.values():
+                tool_name = getattr(tool, "name", None)
+                if tool_name:
+                    names.add(str(tool_name))
 
-        if cli_value:
-            _push_command(cli_value)
+        try:
+            for entry in self.get_mcp_catalog():
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if name:
+                    names.add(str(name))
+                tools = entry.get("tools")
+                if isinstance(tools, list):
+                    names.update(str(tool) for tool in tools if str(tool).strip())
+        except Exception:
+            pass
 
-        for line in content.splitlines():
-            stripped = line.strip()
-            if not stripped:
+        return sorted(names)
+
+    def _request_hint_source_text(self, message: str) -> str:
+        """Return text used for routing-neutral request facts."""
+        current = str(message or "")
+        if not request_is_bare_continuation(current):
+            return current
+        previous = AgentLoop._previous_user_request_for_continuation(self, current)
+        if not previous:
+            return current
+        return f"{previous.rstrip()}\n{current.strip()}"
+
+    @staticmethod
+    def _previous_user_request_for_continuation(self: Any, current_message: str) -> str:
+        """Return the nearest prior real user request for a short continuation."""
+        session = getattr(self, "_session", None)
+        messages = []
+        if session is not None and hasattr(session, "get_messages"):
+            try:
+                messages = session.get_messages()
+            except Exception:
+                messages = []
+        if not isinstance(messages, list):
+            messages = []
+        current_norm = AgentLoop._normalize_comparable_text(current_message)
+        for item in reversed(messages):
+            if not isinstance(item, dict):
                 continue
-            if stripped.startswith("$CLI "):
-                expanded = stripped.replace("$CLI", cli_value or "$CLI", 1)
-                _push_command(expanded)
+            if str(item.get("role") or "").strip().lower() != "user":
                 continue
-            if stripped.startswith("node ") or stripped.startswith("python ") or stripped.startswith("uv "):
-                _push_command(stripped)
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            if AgentLoop._normalize_comparable_text(content) == current_norm:
+                continue
+            return content
+        return ""
 
-        urls = list(dict.fromkeys(
-            match.rstrip(").,")
-            for match in re.findall(r"https?://[^\s`<>\"]+", content)
-        ))
-        return commands[:8], urls[:12]
+    def _build_request_execution_hints_from_text(self, message: str) -> dict[str, Any]:
+        """Build request hints from a chosen text source and current skill catalog."""
+        return build_request_execution_hints(
+            message,
+            self._collect_request_skill_candidates(),
+            self._collect_available_tool_identifiers(),
+        )
 
     def _build_request_execution_hints(self, message: str) -> dict[str, Any]:
-        """Build request-scoped generic execution hints for tool-side guardrails."""
-        message_text = str(message or "")
-        request_tokens = AgentLoop._tokenize_request_matching_text(message_text)
-        local_executable_skills: list[dict[str, Any]] = []
+        """Build request hints from the newest message and current skill catalog."""
+        hints = self._build_request_execution_hints_from_text(
+            self._request_hint_source_text(message),
+        )
+        AgentLoop._configure_request_scoped_history_tool(self, hints)
+        AgentLoop._bind_request_execution_hints_to_tools(self, hints)
+        return hints
 
-        for name, _skill_dir, skill_md, is_organized in self._iter_skill_candidates(include_dormant=True):
-            fm = self._parse_skill_frontmatter(skill_md)
-            name_tokens = AgentLoop._tokenize_request_matching_text(name.replace("-", " "))
-            desc_tokens = AgentLoop._tokenize_request_matching_text(
-                " ".join(
-                    part for part in (
-                        fm.get("description") or "",
-                        fm.get("when_to_use") or "",
-                    ) if part
-                )
-            )
-            overlap = len(request_tokens & (name_tokens | desc_tokens))
-            direct_name_match = name.lower() in message_text.lower()
-            if not direct_name_match and overlap < 2:
+    def _configure_request_scoped_history_tool(self, hints: dict[str, Any]) -> None:
+        """Expose history search only for turns that need earlier transcript facts."""
+        if not hasattr(self, "tools"):
+            return
+        try:
+            # Keep the read-only history tool available so the model can obey
+            # the generic history-verification rule without language-specific
+            # intent detection. The tool itself is scoped and budgeted.
+            self.add_tool("search_history")
+        except Exception as exc:
+            logger.debug(f"Failed to adjust request-scoped history tool: {exc}")
+        try:
+            requests = hints.get("explicit_tool_requests") if isinstance(hints, dict) else None
+            requested_names = {
+                "".join(ch for ch in str(request.get("name") or "").casefold() if ch.isalnum())
+                for request in (requests or [])
+                if isinstance(request, dict) and bool(request.get("available"))
+            }
+            if requested_names.intersection({"spawn", "subagent", "subagents"}):
+                self.add_tool("spawn")
+            else:
+                self.remove_tool("spawn")
+        except Exception as exc:
+            logger.debug(f"Failed to adjust request-scoped spawn tool: {exc}")
+
+    def _bind_request_execution_hints_to_tools(self, hints: dict[str, Any]) -> None:
+        """Make request hints available to tool calls that lose contextvars."""
+        tool_sources: list[Any] = []
+        registry_tools = getattr(getattr(self, "tools", None), "_tools", {})
+        if isinstance(registry_tools, dict):
+            tool_sources.extend(registry_tools.values())
+        manager_tools = getattr(getattr(getattr(self, "_agent", None), "available_tools", None), "tool_map", {})
+        if isinstance(manager_tools, dict):
+            tool_sources.extend(manager_tools.values())
+        normalized = hints if isinstance(hints, dict) else {}
+        seen: set[int] = set()
+        for tool in tool_sources:
+            identity = id(tool)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                setattr(tool, "_request_execution_hints", normalized)
+            except Exception:
                 continue
 
-            commands, urls = AgentLoop._extract_skill_command_hints(skill_md)
-            if not commands:
-                continue
-
-            skill_rel = f"skills/{name}/SKILL.md" if is_organized else f"{name}/SKILL.md"
-            local_executable_skills.append({
-                "name": name,
-                "location": skill_rel,
-                "commands": commands,
-                "urls": urls,
-                "score": (100 if direct_name_match else 0) + overlap,
-            })
-
-        local_executable_skills.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
-        return {
-            "allow_remote_probe": AgentLoop._request_explicitly_needs_remote_lookup(message_text),
-            "exact_shell_commands": AgentLoop._extract_exact_shell_commands_from_request(message_text),
-            "local_executable_skills": local_executable_skills[:3],
-        }
+    def _tool_activation_status(self, name: str) -> str:
+        """Return whether a registered tool is active, inactive, or missing."""
+        tool_name = str(name or "").strip()
+        if not tool_name or tool_name not in self.tools:
+            return "missing"
+        if tool_name in self.tools.get_active_tools():
+            return "active"
+        return "inactive"
 
     @staticmethod
     def _truncate_request_for_prompt(
@@ -7083,6 +11979,8 @@ class AgentLoop:
             f"## Active Request Context\n"
             f"{request_context}"
         )
+        self._active_request_base_system_prompt = current_prompt
+        self._active_request_augmented_system_prompt = augmented_prompt
         self._agent.system_prompt = augmented_prompt
 
         original_base_prompt = _MISSING
@@ -7109,25 +12007,23 @@ class AgentLoop:
             self._agent.system_prompt = original_prompt
         if original_base_prompt is not _MISSING and hasattr(self._agent, "_original_system_prompt"):
             self._agent._original_system_prompt = original_base_prompt
+        self._active_request_base_system_prompt = None
+        self._active_request_augmented_system_prompt = None
 
     def _select_next_step_prompt(self, message: str, *, thinking: bool) -> str:
         """Choose the per-step prompt shape for the current request.
 
-        Thinking runs keep a lightweight per-step prompt across all providers.
-        The active request context is injected into the system prompt instead,
-        so runtime pruning still preserves user/workspace/env guidance without
-        reintroducing the heavier synthetic user-turn prompt that suppresses
-        streamed reasoning on some providers.
+        Keep provider-visible continuation turns short and domain-neutral.
+        The active request context is injected into the temporary system prompt
+        instead, so tool-loop user tails cannot overtake the real user request
+        or replay session compacts as executable instructions.
         """
-        if thinking:
-            return self.DEFAULT_NEXT_STEP_PROMPT
-        return self._build_step_prompt(message)
+        return self.DEFAULT_NEXT_STEP_PROMPT
 
     def _extract_env_for_prompt(self) -> str:
         """Extract env vars from .env.local for the step prompt.
 
-        Non-sensitive values shown directly. Private keys masked -
-        agent told to use ``source .env.local`` then ``$VAR``.
+        Non-sensitive values are shown directly while private keys are masked.
         Persists across short-term memory pruning.
         """
         env_file = self.workspace / ".env.local"
@@ -7156,7 +12052,7 @@ class AgentLoop:
         if not env_vars:
             return ""
 
-        parts = ["\n[ENV - from .env.local - do NOT re-read, use `source .env.local` for secrets]:"]
+        parts = ["\n[ENV - from .env.local - do NOT re-read; skill CLI shell calls load it automatically]:"]
         for k, v in env_vars.items():
             parts.append(f"  {k}={v}")
         return "\n".join(parts) + "\n"
@@ -7187,7 +12083,12 @@ class AgentLoop:
             when_to_use = fm["when_to_use"]
             skill_paths = fm.get("paths", [])
 
-            location = f"skills/{name}/SKILL.md" if is_organized else f"{name}/SKILL.md"
+            location = self._skill_prompt_location(
+                name,
+                _dir,
+                skill_md,
+                is_organized=is_organized,
+            )
 
             parts = [
                 f'<skill name="{name}">',
@@ -7224,9 +12125,15 @@ class AgentLoop:
         """
         lines: list[str] = [
             "\n\n## Dynamically Loadable Tools\n\n"
-            "Prefer specialized tools over broad search when a matching tool exists.\n\n"
-            "Call `activate_tool(action='activate', tool_name='<name>')` to load any of these. "
-            "Activate what you need BEFORE answering.\n"
+            "The callable tool list already contains active tools. Call active tools "
+            "directly; do not activate a tool that is already callable.\n\n"
+            "If the needed capability is not in the callable tool list, inspect this "
+            "inactive catalog and call `activate_tool(action='activate', "
+            "tool_name='<name>')` for the matching capability. Tool names and "
+            "descriptions are the source of truth. Do not recreate a cataloged "
+            "capability with generic shell commands before activating the matching "
+            "tool. After activation, follow the tool schema. Use shell only when "
+            "no listed tool fits or tool activation fails.\n"
         ]
 
         for tool in inactive_tools.values():

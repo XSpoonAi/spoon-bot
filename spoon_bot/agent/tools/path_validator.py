@@ -177,11 +177,14 @@ class PathValidator:
         """
         normalized = self._normalize_path_for_check(resolved_path)
         is_within_workspace = self._is_within_workspace(resolved_path)
+        normalized_workspace = self._normalize_path_for_check(self._workspace)
 
         # Check against blocklist patterns
         # Only block patterns outside workspace (allows project-specific .env, etc.)
         for pattern in self._blocklist:
             if pattern in normalized:
+                if is_within_workspace and pattern in normalized_workspace:
+                    continue
                 # Allow certain patterns within workspace (project-specific files)
                 workspace_allowed_patterns = ['/.env', '\\.env', '/secrets', '\\secrets']
                 if is_within_workspace and any(p in pattern for p in workspace_allowed_patterns):

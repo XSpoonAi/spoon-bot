@@ -25,6 +25,11 @@ import re
 from typing import Any, Callable, Iterable, Optional, TYPE_CHECKING
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import (
+    get_request_execution_hints,
+    get_tracked_tool_invocation_counts,
+)
+from spoon_bot.agent.session_compact import build_recent_session_turns_payload
 
 if TYPE_CHECKING:  # pragma: no cover - import for typing only
     from spoon_bot.session.manager import SessionManager
@@ -186,7 +191,13 @@ class SearchHistoryTool(Tool):
             "matching. Use this to recover information after the runtime "
             "context has been compacted, for example to look up an earlier "
             "tool result, attachment id, user question, or assistant tool-"
-            "call trace. By default the current session is searched and "
+            "call trace. Use mode='recent' when the user asks about the last "
+            "completed action/result and you need recent same-session tool "
+            "evidence without inventing a search phrase. Do not use this tool "
+            "to rediscover the current/latest "
+            "user request, to search for examples/templates, or before starting "
+            "a new build/coding/execution task; the active request is already "
+            "in context. By default the current session is searched and "
             "plain assistant replies are omitted to avoid reviving stale "
             "plans; pass roles=['assistant'] when you explicitly need the "
             "literal earlier assistant wording. Pass scope='all' only when "
@@ -208,7 +219,17 @@ class SearchHistoryTool(Tool):
                         "Substring (default) or regex (when regex=true) to "
                         "search for in message content and, unless "
                         "include_extras=false, serialized tool_call_id / "
-                        "tool_calls / attachments metadata."
+                        "tool_calls / attachments metadata. Optional when "
+                        "mode='recent'."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["search", "recent"],
+                    "description": (
+                        "'search' performs text matching. 'recent' returns "
+                        "recent same-session turns grouped by user request, "
+                        "including state-changing tool evidence when present."
                     ),
                 },
                 "scope": {
@@ -275,8 +296,88 @@ class SearchHistoryTool(Tool):
                     "maximum": 20000,
                 },
             },
-            "required": ["query"],
         }
+
+    @staticmethod
+    def _history_search_budget_response(
+        *,
+        query: str,
+        target_session_key: str | None,
+        requested_scope: str,
+        limit: int,
+        offset: int,
+        stop_loop: bool = False,
+    ) -> str:
+        import json
+
+        stop_message = (
+            "STOP_TOOL_LOOP: Error: history search budget exhausted. The latest "
+            "user request is already in context; continue the current task "
+            "without calling search_history again."
+            if stop_loop
+            else None
+        )
+        payload: dict[str, Any] = {
+            "query": query,
+            "scope": "session" if target_session_key is not None else requested_scope,
+            "session_key": target_session_key,
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+            "hits": [],
+            "budget_exhausted": True,
+            "next_action": "continue_latest_request_without_history_search",
+            "note": (
+                "History search budget reached for this request. The newest "
+                "user request is already in the active context; do not call "
+                "search_history again unless the user explicitly asks about "
+                "earlier conversation facts. Continue the current task from "
+                "the latest request and available tool evidence."
+            ),
+        }
+        if stop_message is not None:
+            payload["guardrail_stop"] = True
+            payload["error"] = stop_message
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    def _recent_session_turns_payload(
+        self,
+        *,
+        target_session_key: str | None,
+        limit: int,
+        max_content_length: int,
+    ) -> dict[str, Any] | None:
+        """Return recent same-session tool-backed evidence when available."""
+        if target_session_key is None:
+            return None
+        session = None
+        getter = getattr(self._sessions_manager, "get", None)
+        if callable(getter):
+            session = getter(target_session_key)
+        if session is None:
+            getter = getattr(self._sessions_manager, "get_or_create", None)
+            if callable(getter):
+                session = getter(target_session_key)
+        if session is None:
+            return None
+
+        try:
+            raw_messages = (
+                session.get_messages()
+                if hasattr(session, "get_messages")
+                else session.get_history()
+            )
+        except Exception:
+            raw_messages = []
+        return build_recent_session_turns_payload(
+            raw_messages,
+            limit=limit,
+            max_content_length=max_content_length,
+        )
 
     # ------------------------------------------------------------------
     # Execution
@@ -284,7 +385,8 @@ class SearchHistoryTool(Tool):
 
     async def execute(
         self,
-        query: str,
+        query: str = "",
+        mode: str = "search",
         scope: str = "current",
         session_key: str | None = None,
         regex: bool = False,
@@ -298,7 +400,10 @@ class SearchHistoryTool(Tool):
     ) -> str:
         import json
 
-        if not isinstance(query, str) or not query.strip():
+        selected_mode = str(mode or "search").strip().casefold()
+        if selected_mode not in {"search", "recent"}:
+            return "Error: mode must be 'search' or 'recent'."
+        if selected_mode == "search" and (not isinstance(query, str) or not query.strip()):
             return "Error: 'query' must be a non-empty string."
 
         try:
@@ -336,6 +441,62 @@ class SearchHistoryTool(Tool):
             # Always ask the resolver first so we pick up WS-driven
             # session switches that bypass AgentLoop's internal hooks.
             target_session_key = active_session_key
+
+        if selected_mode == "recent":
+            if target_session_key is None:
+                return json.dumps(
+                    {
+                        "mode": "recent",
+                        "scope": requested_scope,
+                        "session_key": None,
+                        "total": 0,
+                        "turns": [],
+                        "latest_substantive_turn": None,
+                        "error": (
+                            "mode='recent' requires a concrete current session; "
+                            "use scope='current' or pass session_key."
+                        ),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            payload = self._recent_session_turns_payload(
+                target_session_key=target_session_key,
+                limit=limit_int,
+                max_content_length=mcl or 1000,
+            ) or {
+                "latest_substantive_turn": None,
+                "substantive_turns": [],
+                "total": 0,
+                "turns": [],
+            }
+            payload.update({
+                "mode": "recent",
+                "query": query,
+                "scope": "session",
+                "session_key": target_session_key,
+                "limit": limit_int,
+                "offset": 0,
+            })
+            return json.dumps(payload, ensure_ascii=False, default=str)
+
+        invocation_counts = get_tracked_tool_invocation_counts()
+        request_hints = get_request_execution_hints()
+        if (
+            (
+                bool(request_hints.get("history_search_budget_exhausted"))
+                or int(invocation_counts.get(self.name, 0) or 0) >= 3
+            )
+            and not bool(request_hints.get("current_session_fact_check_required"))
+        ):
+            return self._history_search_budget_response(
+                query=query,
+                target_session_key=target_session_key,
+                requested_scope=requested_scope,
+                limit=limit_int,
+                offset=offset_int,
+                stop_loop=bool(request_hints.get("history_search_budget_exhausted")),
+            )
 
         roles_list: list[str] | None
         if roles is None:
@@ -469,6 +630,21 @@ class SearchHistoryTool(Tool):
                 for h in hits
             ],
         }
+        if bool(request_hints.get("current_session_fact_check_required")):
+            recent_payload = self._recent_session_turns_payload(
+                target_session_key=target_session_key,
+                limit=min(10, max(3, limit_int)),
+                max_content_length=mcl or 1000,
+            )
+            if recent_payload is not None:
+                payload["same_session_recent"] = recent_payload
+                payload["same_session_recent_note"] = (
+                    "For prior-result or continuation questions, choose the "
+                    "substantive turn or turns that are relevant to the newest "
+                    "request. Query hits can include repeated user questions "
+                    "or stale read-only diagnostics; state-changing tool results "
+                    "are stronger evidence when they answer the requested fact."
+                )
         if explicit_scope_all and target_session_key is not None:
             payload["requested_scope"] = "all"
 
