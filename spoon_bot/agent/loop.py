@@ -9342,6 +9342,10 @@ class AgentLoop:
                             if len(raw_tool_calls) > 1:
                                 chunk = dict(chunk)
                                 chunk["tool_calls"] = raw_tool_calls[:1]
+                        if full_content:
+                            full_content = ""
+                        saw_content_after_tool_call = False
+                        post_tool_content_passthrough_started = False
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
                         last_tool_progress_at = time.monotonic()
