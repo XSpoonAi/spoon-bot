@@ -5821,6 +5821,113 @@ class AgentLoop:
 
         return streamed + final, final
 
+    @staticmethod
+    def _normalized_text_with_source_end_offsets(text: str) -> tuple[str, list[int]]:
+        """Normalize whitespace while retaining source end offsets for each char."""
+        normalized_chars: list[str] = []
+        source_end_offsets: list[int] = []
+        in_whitespace = False
+        for index, char in enumerate(text):
+            if char.isspace():
+                if normalized_chars and not in_whitespace:
+                    normalized_chars.append(" ")
+                    source_end_offsets.append(index + 1)
+                    in_whitespace = True
+                continue
+            normalized_chars.append(char)
+            source_end_offsets.append(index + 1)
+            in_whitespace = False
+
+        while normalized_chars and normalized_chars[-1] == " ":
+            normalized_chars.pop()
+            source_end_offsets.pop()
+        return "".join(normalized_chars), source_end_offsets
+
+    @staticmethod
+    def _whitespace_free_text_with_source_end_offsets(text: str) -> tuple[str, list[int]]:
+        """Remove whitespace while retaining source end offsets for each char."""
+        normalized_chars: list[str] = []
+        source_end_offsets: list[int] = []
+        for index, char in enumerate(text):
+            if char.isspace():
+                continue
+            normalized_chars.append(char)
+            source_end_offsets.append(index + 1)
+        return "".join(normalized_chars), source_end_offsets
+
+    @staticmethod
+    def _remove_all_whitespace(text: str | None) -> str:
+        return "".join(str(text or "").split())
+
+    @staticmethod
+    def _looks_like_incomplete_repeated_stream_prefix(
+        incoming_text: str | None,
+        already_emitted_text: str | None,
+    ) -> bool:
+        incoming_normalized = AgentLoop._remove_all_whitespace(incoming_text)
+        emitted_normalized = AgentLoop._remove_all_whitespace(already_emitted_text)
+        return (
+            len(incoming_normalized) >= 12
+            and len(emitted_normalized) >= 24
+            and len(incoming_normalized) < len(emitted_normalized)
+            and emitted_normalized.startswith(incoming_normalized)
+        )
+
+    @staticmethod
+    def _trim_repeated_stream_prefix(
+        incoming_text: str | None,
+        already_emitted_text: str | None,
+    ) -> str:
+        """Remove a repeated prefix that has already been streamed to the user."""
+        incoming = str(incoming_text or "")
+        emitted_normalized = AgentLoop._normalize_comparable_text(already_emitted_text)
+        if not incoming or len(emitted_normalized) < 24:
+            return incoming
+
+        incoming_normalized, incoming_source_ends = (
+            AgentLoop._normalized_text_with_source_end_offsets(incoming)
+        )
+        if not incoming_normalized:
+            return incoming
+
+        matched_len = 0
+        if incoming_normalized.startswith(emitted_normalized):
+            matched_len = len(emitted_normalized)
+        else:
+            min_match_len = 24
+            max_start = max(0, len(emitted_normalized) - 2000)
+            for start in range(max_start, len(emitted_normalized) - min_match_len + 1):
+                suffix = emitted_normalized[start:]
+                if incoming_normalized.startswith(suffix):
+                    matched_len = len(suffix)
+                    break
+
+        if matched_len < 24 or matched_len > len(incoming_source_ends):
+            emitted_compact = AgentLoop._remove_all_whitespace(already_emitted_text)
+            incoming_compact, incoming_compact_source_ends = (
+                AgentLoop._whitespace_free_text_with_source_end_offsets(incoming)
+            )
+            matched_compact_len = 0
+            if incoming_compact.startswith(emitted_compact):
+                matched_compact_len = len(emitted_compact)
+            else:
+                min_match_len = 24
+                max_start = max(0, len(emitted_compact) - 2000)
+                for start in range(max_start, len(emitted_compact) - min_match_len + 1):
+                    suffix = emitted_compact[start:]
+                    if incoming_compact.startswith(suffix):
+                        matched_compact_len = len(suffix)
+                        break
+            if (
+                matched_compact_len < 24
+                or matched_compact_len > len(incoming_compact_source_ends)
+            ):
+                return incoming
+            cut_at = incoming_compact_source_ends[matched_compact_len - 1]
+            return incoming[cut_at:].lstrip()
+        cut_at = incoming_source_ends[matched_len - 1]
+        return incoming[cut_at:].lstrip()
+
     def _looks_like_duplicate_thinking(
         self,
         thinking_text: str | None,
@@ -6268,6 +6375,77 @@ class AgentLoop:
             text = stripped
         return text
 
+    @staticmethod
+    def _dedupe_repeated_links(content: str) -> str:
+        """Remove repeated user-visible links while preserving the last mention.
+
+        Streaming task updates often include a live/status URL before the final
+        result, and the model may repeat the exact same URL in the closing
+        summary. Keep the final occurrence and remove earlier link labels so the
+        final answer does not read like it restarted the summary.
+        """
+        text = str(content or "")
+        if not text.strip():
+            return text
+
+        url_re = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+        matches = list(url_re.finditer(text))
+        if len(matches) < 2:
+            return text
+
+        last_by_url: dict[str, int] = {}
+        for match in matches:
+            last_by_url[match.group(0)] = match.start()
+
+        pieces: list[str] = []
+        cursor = 0
+        for match in matches:
+            url = match.group(0)
+            if match.start() == last_by_url.get(url):
+                continue
+
+            prefix_start = match.start()
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            prefix = text[line_start:match.start()]
+            if re.search(
+                r"(?i)(?:\*\*)?\s*(?:live\s*battle|观战链接|直播链接|直播|链接)\s*[:：]?\s*(?:\*\*)?\s*$",
+                prefix,
+            ):
+                prefix_start = line_start
+
+            pieces.append(text[cursor:prefix_start])
+            cursor = match.end()
+
+        pieces.append(text[cursor:])
+        cleaned = "".join(pieces)
+        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(
+            r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?(?:live\s*battle|观战链接|直播链接|直播|链接)\s*[:：]?\s*(?:\*\*)?\s*$\n?",
+            "",
+            cleaned,
+        )
+        return cleaned.strip() if text.strip() == text else cleaned
+
+    @staticmethod
+    def _dedupe_repeated_final_fragments(content: str) -> str:
+        """Apply conservative de-duplication to the final user-visible answer."""
+        text = AgentLoop._dedupe_repeated_links(content)
+        if not text.strip():
+            return text
+
+        lines = text.splitlines()
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for line in lines:
+            key = AgentLoop._normalize_comparable_text(line)
+            if key and len(key) >= 24 and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(line)
+        return "\n".join(deduped)
+
     def _finalize_response_content(
         self,
         message: str,
@@ -6286,7 +6464,8 @@ class AgentLoop:
         )
         filtered = AgentLoop._filter_execution_steps(self, content)
         cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
-        return AgentLoop._mask_user_visible_text(cleaned)
+        deduped = AgentLoop._dedupe_repeated_final_fragments(cleaned)
+        return AgentLoop._mask_user_visible_text(deduped)
     @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
         """Read a message field from either dict or object runtime payloads."""
@@ -8110,6 +8289,7 @@ class AgentLoop:
         post_tool_content_events: list[dict[str, Any]] = []
         saw_tool_call = False
         saw_content_after_tool_call = False
+        streamed_content_after_latest_tool_call = False
         pseudo_tool_repair_attempted = False
         stream_completed = False
         stream_cancelled = False
@@ -8118,12 +8298,13 @@ class AgentLoop:
         original_base_system_prompt: object = _MISSING
         tool_output_capture_scope: str | None = None
         capture_manager = None
-        withheld_initial_content = False
         pending_fallback_content_emit = False
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
         tool_loop_fallback_active = False
         initial_content_passthrough_started = False
+        post_tool_content_passthrough_started = False
+        emitted_content_text = ""
         stream_error_reason: BaseException | str | None = None
         interrupted_assistant_reply_persisted = False
         execution_ledger: ExecutionLedger | None = None
@@ -9341,6 +9522,11 @@ class AgentLoop:
                             if len(raw_tool_calls) > 1:
                                 chunk = dict(chunk)
                                 chunk["tool_calls"] = raw_tool_calls[:1]
+                        if full_content:
+                            full_content = ""
+                        saw_content_after_tool_call = False
+                        streamed_content_after_latest_tool_call = False
+                        post_tool_content_passthrough_started = False
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
                         last_tool_progress_at = time.monotonic()
@@ -9603,12 +9789,43 @@ class AgentLoop:
                                     continue
                                 full_content += delta
                             else:
-                                post_tool_content_buffer += delta
-                                post_tool_content_events.append(event)
-                                continue
+                                if not post_tool_content_passthrough_started:
+                                    post_tool_content_buffer += delta
+                                    post_tool_content_events.append(event)
+                                    pending_content = AgentLoop._strip_leaked_scratchpad_prefix(
+                                        post_tool_content_buffer
+                                    )
+                                    compact_pending = " ".join(pending_content.strip().split())
+                                    if (
+                                        not compact_pending
+                                        or len(compact_pending) < 12
+                                        or AgentLoop._looks_like_internal_scratchpad_text(
+                                            pending_content
+                                        )
+                                        or AgentLoop._looks_like_incomplete_repeated_stream_prefix(
+                                            pending_content,
+                                            emitted_content_text,
+                                        )
+                                    ):
+                                        continue
+                                    delta = pending_content
+                                    post_tool_content_events = []
+                                    post_tool_content_buffer = ""
+                                    post_tool_content_passthrough_started = True
+                                delta = AgentLoop._trim_repeated_stream_prefix(
+                                    delta,
+                                    emitted_content_text,
+                                )
+                                delta = AgentLoop._mask_user_visible_text(delta)
+                                if not delta:
+                                    continue
+                                saw_content_after_tool_call = True
+                                streamed_content_after_latest_tool_call = True
+                                full_content += delta
                             if buffer_stream_content:
                                 continue
                             event["delta"] = delta
+                            emitted_content_text += delta
                         yield _decorate_stream_event(event)
                         if _stop_if_total_timeout():
                             break
@@ -9781,8 +9998,18 @@ class AgentLoop:
                 post_tool_content_events = []
 
             if pre_tool_scratchpad_buffer and not saw_tool_call:
-                full_content += AgentLoop._mask_user_visible_text(pre_tool_scratchpad_buffer)
-                withheld_initial_content = True
+                for buffered_event in pre_tool_scratchpad_events:
+                    buffered_delta = AgentLoop._mask_user_visible_text(
+                        str(buffered_event.get("delta") or "")
+                    )
+                    if not buffered_delta:
+                        continue
+                    full_content += buffered_delta
+                    emitted_content_text += buffered_delta
+                    yield _decorate_stream_event({
+                        **buffered_event,
+                        "delta": buffered_delta,
+                    })
                 pre_tool_scratchpad_events = []
                 pre_tool_scratchpad_buffer = ""
 
@@ -9824,8 +10051,16 @@ class AgentLoop:
                     if not pending_content.strip():
                         pending_content = ""
                 if pending_content.strip():
+                    pending_content = AgentLoop._trim_repeated_stream_prefix(
+                        pending_content,
+                        emitted_content_text,
+                    )
                     pending_content = AgentLoop._mask_user_visible_text(pending_content)
+                    if not pending_content.strip():
+                        pending_content = ""
+                if pending_content.strip():
                     saw_content_after_tool_call = True
+                    streamed_content_after_latest_tool_call = True
                     full_content += pending_content
                     if not buffer_stream_content:
                         yield _decorate_stream_event({
@@ -9833,6 +10068,7 @@ class AgentLoop:
                             "delta": pending_content,
                             "metadata": {"validated": True},
                         })
+                        emitted_content_text += pending_content
 
             if (
                 tool_loop_fallback_active
@@ -10117,6 +10353,7 @@ class AgentLoop:
                 and skill_contract_has_progress(all_tool_result_events)
                 and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
                 and not latest_tool_event_from_skill_continuation(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10135,6 +10372,7 @@ class AgentLoop:
                 full_content.strip()
                 and should_run_skill_contract_check(all_tool_result_events)
                 and latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10262,6 +10500,7 @@ class AgentLoop:
                     bool(request_execution_hints.get("current_session_fact_check_required"))
                     or bool(request_execution_hints.get("session_evidence_synthesis_preferred"))
                 )
+                and not streamed_content_after_latest_tool_call
             ):
                 synthesis_events = self._session_evidence_synthesis_events(
                     all_tool_result_events,
@@ -10285,6 +10524,7 @@ class AgentLoop:
                 all_tool_result_events
                 and should_run_skill_contract_check(all_tool_result_events)
                 and not skill_contract_has_progress(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10366,10 +10606,19 @@ class AgentLoop:
                 full_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
+            final_content_changed = (
+                self._normalize_comparable_text(final_content)
+                != self._normalize_comparable_text(pre_finalize_full_content)
+            )
             if (
                 (
-                    buffer_stream_content
-                    or withheld_initial_content
+                    (
+                        buffer_stream_content
+                        and (
+                            not emitted_content_text.strip()
+                            or final_content_changed
+                        )
+                    )
                     or pending_fallback_content_emit
                 )
                 and final_content
@@ -10381,18 +10630,24 @@ class AgentLoop:
                     == self._normalize_comparable_text(pre_finalize_full_content)
                 ):
                     emit_delta = pending_fallback_delta or final_content
+                trimmed_emit_delta = AgentLoop._trim_repeated_stream_prefix(
+                    emit_delta,
+                    emitted_content_text,
+                )
+                trimmed_emit_delta = AgentLoop._mask_user_visible_text(trimmed_emit_delta)
+                emit_delta = trimmed_emit_delta
                 emit_metadata = {
                     "buffered": bool(buffer_stream_content),
-                    "withheld_initial_content": bool(withheld_initial_content),
                     "validated": True,
                 }
                 if pending_fallback_reason:
                     emit_metadata["fallback"] = pending_fallback_reason
-                yield _decorate_stream_event({
-                    "type": "content",
-                    "delta": emit_delta,
-                    "metadata": emit_metadata,
-                })
+                if emit_delta.strip():
+                    yield _decorate_stream_event({
+                        "type": "content",
+                        "delta": emit_delta,
+                        "metadata": emit_metadata,
+                    })
             full_content = final_content
 
             # Emit done
