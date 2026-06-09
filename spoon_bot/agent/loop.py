@@ -5821,6 +5821,113 @@ class AgentLoop:
 
         return streamed + final, final
 
+    @staticmethod
+    def _normalized_text_with_source_end_offsets(text: str) -> tuple[str, list[int]]:
+        """Normalize whitespace while retaining source end offsets for each char."""
+        normalized_chars: list[str] = []
+        source_end_offsets: list[int] = []
+        in_whitespace = False
+        for index, char in enumerate(text):
+            if char.isspace():
+                if normalized_chars and not in_whitespace:
+                    normalized_chars.append(" ")
+                    source_end_offsets.append(index + 1)
+                    in_whitespace = True
+                continue
+            normalized_chars.append(char)
+            source_end_offsets.append(index + 1)
+            in_whitespace = False
+
+        while normalized_chars and normalized_chars[-1] == " ":
+            normalized_chars.pop()
+            source_end_offsets.pop()
+        return "".join(normalized_chars), source_end_offsets
+
+    @staticmethod
+    def _whitespace_free_text_with_source_end_offsets(text: str) -> tuple[str, list[int]]:
+        """Remove whitespace while retaining source end offsets for each char."""
+        normalized_chars: list[str] = []
+        source_end_offsets: list[int] = []
+        for index, char in enumerate(text):
+            if char.isspace():
+                continue
+            normalized_chars.append(char)
+            source_end_offsets.append(index + 1)
+        return "".join(normalized_chars), source_end_offsets
+
+    @staticmethod
+    def _remove_all_whitespace(text: str | None) -> str:
+        return "".join(str(text or "").split())
+
+    @staticmethod
+    def _looks_like_incomplete_repeated_stream_prefix(
+        incoming_text: str | None,
+        already_emitted_text: str | None,
+    ) -> bool:
+        incoming_normalized = AgentLoop._remove_all_whitespace(incoming_text)
+        emitted_normalized = AgentLoop._remove_all_whitespace(already_emitted_text)
+        return (
+            len(incoming_normalized) >= 12
+            and len(emitted_normalized) >= 24
+            and len(incoming_normalized) < len(emitted_normalized)
+            and emitted_normalized.startswith(incoming_normalized)
+        )
+
+    @staticmethod
+    def _trim_repeated_stream_prefix(
+        incoming_text: str | None,
+        already_emitted_text: str | None,
+    ) -> str:
+        """Remove a repeated prefix that has already been streamed to the user."""
+        incoming = str(incoming_text or "")
+        emitted_normalized = AgentLoop._normalize_comparable_text(already_emitted_text)
+        if not incoming or len(emitted_normalized) < 24:
+            return incoming
+
+        incoming_normalized, incoming_source_ends = (
+            AgentLoop._normalized_text_with_source_end_offsets(incoming)
+        )
+        if not incoming_normalized:
+            return incoming
+
+        matched_len = 0
+        if incoming_normalized.startswith(emitted_normalized):
+            matched_len = len(emitted_normalized)
+        else:
+            min_match_len = 24
+            max_start = max(0, len(emitted_normalized) - 2000)
+            for start in range(max_start, len(emitted_normalized) - min_match_len + 1):
+                suffix = emitted_normalized[start:]
+                if incoming_normalized.startswith(suffix):
+                    matched_len = len(suffix)
+                    break
+
+        if matched_len < 24 or matched_len > len(incoming_source_ends):
+            emitted_compact = AgentLoop._remove_all_whitespace(already_emitted_text)
+            incoming_compact, incoming_compact_source_ends = (
+                AgentLoop._whitespace_free_text_with_source_end_offsets(incoming)
+            )
+            matched_compact_len = 0
+            if incoming_compact.startswith(emitted_compact):
+                matched_compact_len = len(emitted_compact)
+            else:
+                min_match_len = 24
+                max_start = max(0, len(emitted_compact) - 2000)
+                for start in range(max_start, len(emitted_compact) - min_match_len + 1):
+                    suffix = emitted_compact[start:]
+                    if incoming_compact.startswith(suffix):
+                        matched_compact_len = len(suffix)
+                        break
+            if (
+                matched_compact_len < 24
+                or matched_compact_len > len(incoming_compact_source_ends)
+            ):
+                return incoming
+            cut_at = incoming_compact_source_ends[matched_compact_len - 1]
+            return incoming[cut_at:].lstrip()
+        cut_at = incoming_source_ends[matched_len - 1]
+        return incoming[cut_at:].lstrip()
+
     def _looks_like_duplicate_thinking(
         self,
         thinking_text: str | None,
@@ -9621,12 +9728,20 @@ class AgentLoop:
                                         or AgentLoop._looks_like_internal_scratchpad_text(
                                             pending_content
                                         )
+                                        or AgentLoop._looks_like_incomplete_repeated_stream_prefix(
+                                            pending_content,
+                                            emitted_content_text,
+                                        )
                                     ):
                                         continue
                                     delta = pending_content
                                     post_tool_content_events = []
                                     post_tool_content_buffer = ""
                                     post_tool_content_passthrough_started = True
+                                delta = AgentLoop._trim_repeated_stream_prefix(
+                                    delta,
+                                    emitted_content_text,
+                                )
                                 delta = AgentLoop._mask_user_visible_text(delta)
                                 if not delta:
                                     continue
@@ -9861,7 +9976,14 @@ class AgentLoop:
                     if not pending_content.strip():
                         pending_content = ""
                 if pending_content.strip():
+                    pending_content = AgentLoop._trim_repeated_stream_prefix(
+                        pending_content,
+                        emitted_content_text,
+                    )
                     pending_content = AgentLoop._mask_user_visible_text(pending_content)
+                    if not pending_content.strip():
+                        pending_content = ""
+                if pending_content.strip():
                     saw_content_after_tool_call = True
                     full_content += pending_content
                     if not buffer_stream_content:
@@ -9870,6 +9992,7 @@ class AgentLoop:
                             "delta": pending_content,
                             "metadata": {"validated": True},
                         })
+                        emitted_content_text += pending_content
 
             if (
                 tool_loop_fallback_active

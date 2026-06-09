@@ -1352,6 +1352,55 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[-1]["content"] == segments[-1]
 
     @pytest.mark.asyncio
+    async def test_stream_trims_repeated_progress_prefix_from_final_content(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        first_progress = "好的，来玩一局 JokerGame！先检查一下钱包状态。"
+        second_progress = "钱包一切正常：GLD=391.0，GAS=0.21，AgentID=443。现在加入游戏！"
+        final_answer = "目前没有可加入的游戏房间。所有游戏要么已满员，要么正在进行中。"
+        repeated_final_chunk = (
+            "好的，来玩一局 JokerGame！先检查一下钱包状态。 "
+            "钱包一切正常：GLD=391.0，GAS=0.21，AgentID=443。现在加入游戏！ "
+            + final_answer
+        )
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _InterleavedToolContentRuntimeAgent([
+            first_progress,
+            second_progress,
+            repeated_final_chunk,
+        ])
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_post_tool_repeated_final")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="来把游戏"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert [c["delta"] for c in content_chunks] == [
+            first_progress,
+            second_progress,
+            final_answer,
+        ]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == final_answer
+        assert loop._session.messages[-1]["content"] == final_answer
+
+    @pytest.mark.asyncio
     async def test_stream_persists_original_user_text_instead_of_attachment_prose(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop, _ensure_attachment_context
 
