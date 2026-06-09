@@ -6375,6 +6375,77 @@ class AgentLoop:
             text = stripped
         return text
 
+    @staticmethod
+    def _dedupe_repeated_links(content: str) -> str:
+        """Remove repeated user-visible links while preserving the last mention.
+
+        Streaming task updates often include a live/status URL before the final
+        result, and the model may repeat the exact same URL in the closing
+        summary. Keep the final occurrence and remove earlier link labels so the
+        final answer does not read like it restarted the summary.
+        """
+        text = str(content or "")
+        if not text.strip():
+            return text
+
+        url_re = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+        matches = list(url_re.finditer(text))
+        if len(matches) < 2:
+            return text
+
+        last_by_url: dict[str, int] = {}
+        for match in matches:
+            last_by_url[match.group(0)] = match.start()
+
+        pieces: list[str] = []
+        cursor = 0
+        for match in matches:
+            url = match.group(0)
+            if match.start() == last_by_url.get(url):
+                continue
+
+            prefix_start = match.start()
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            prefix = text[line_start:match.start()]
+            if re.search(
+                r"(?i)(?:\*\*)?\s*(?:live\s*battle|观战链接|直播链接|直播|链接)\s*[:：]?\s*(?:\*\*)?\s*$",
+                prefix,
+            ):
+                prefix_start = line_start
+
+            pieces.append(text[cursor:prefix_start])
+            cursor = match.end()
+
+        pieces.append(text[cursor:])
+        cleaned = "".join(pieces)
+        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(
+            r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?(?:live\s*battle|观战链接|直播链接|直播|链接)\s*[:：]?\s*(?:\*\*)?\s*$\n?",
+            "",
+            cleaned,
+        )
+        return cleaned.strip() if text.strip() == text else cleaned
+
+    @staticmethod
+    def _dedupe_repeated_final_fragments(content: str) -> str:
+        """Apply conservative de-duplication to the final user-visible answer."""
+        text = AgentLoop._dedupe_repeated_links(content)
+        if not text.strip():
+            return text
+
+        lines = text.splitlines()
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for line in lines:
+            key = AgentLoop._normalize_comparable_text(line)
+            if key and len(key) >= 24 and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            deduped.append(line)
+        return "\n".join(deduped)
+
     def _finalize_response_content(
         self,
         message: str,
@@ -6393,7 +6464,8 @@ class AgentLoop:
         )
         filtered = AgentLoop._filter_execution_steps(self, content)
         cleaned = AgentLoop._strip_leaked_scratchpad_prefix(filtered)
-        return AgentLoop._mask_user_visible_text(cleaned)
+        deduped = AgentLoop._dedupe_repeated_final_fragments(cleaned)
+        return AgentLoop._mask_user_visible_text(deduped)
     @staticmethod
     def _stream_message_attr(message: Any, key: str, default: Any = None) -> Any:
         """Read a message field from either dict or object runtime payloads."""
@@ -10563,12 +10635,6 @@ class AgentLoop:
                     emitted_content_text,
                 )
                 trimmed_emit_delta = AgentLoop._mask_user_visible_text(trimmed_emit_delta)
-                if (
-                    trimmed_emit_delta.strip()
-                    and self._normalize_comparable_text(trimmed_emit_delta)
-                    != self._normalize_comparable_text(emit_delta)
-                ):
-                    final_content = trimmed_emit_delta
                 emit_delta = trimmed_emit_delta
                 emit_metadata = {
                     "buffered": bool(buffer_stream_content),

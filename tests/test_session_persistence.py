@@ -1254,6 +1254,32 @@ class TestAgentLoopCurrentRequestMultimodal:
 
 
 class TestAgentLoopStreamFallback:
+    def test_finalize_response_dedupes_repeated_live_links(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._filter_execution_steps = lambda content: content
+
+        repeated_url = "https://app.agentcypher.org/live-battle?gameId=1328722525"
+        content = (
+            "开新一局 JokerGame！\n\n"
+            f"**LIVE BATTLE:** {repeated_url}游戏结束！🏁\n\n"
+            "**第 3 名 / 6 人** — 获得约 20% 奖池分成。\n\n"
+            f"📺 观战链接：{repeated_url}"
+        )
+
+        finalized = AgentLoop._finalize_response_content(
+            loop,
+            "再开把joker game",
+            content,
+            turn_memory_start_index=0,
+        )
+
+        assert finalized.count(repeated_url) == 1
+        assert "**LIVE BATTLE:**" not in finalized
+        assert "游戏结束！🏁" in finalized
+        assert "📺 观战链接：" in finalized
+
     @pytest.mark.asyncio
     async def test_stream_falls_back_to_run_result_when_no_chunks(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
