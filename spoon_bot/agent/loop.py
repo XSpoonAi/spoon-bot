@@ -8217,6 +8217,7 @@ class AgentLoop:
         post_tool_content_events: list[dict[str, Any]] = []
         saw_tool_call = False
         saw_content_after_tool_call = False
+        streamed_content_after_latest_tool_call = False
         pseudo_tool_repair_attempted = False
         stream_completed = False
         stream_cancelled = False
@@ -9452,6 +9453,7 @@ class AgentLoop:
                         if full_content:
                             full_content = ""
                         saw_content_after_tool_call = False
+                        streamed_content_after_latest_tool_call = False
                         post_tool_content_passthrough_started = False
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
@@ -9746,6 +9748,7 @@ class AgentLoop:
                                 if not delta:
                                     continue
                                 saw_content_after_tool_call = True
+                                streamed_content_after_latest_tool_call = True
                                 full_content += delta
                             if buffer_stream_content:
                                 continue
@@ -9985,6 +9988,7 @@ class AgentLoop:
                         pending_content = ""
                 if pending_content.strip():
                     saw_content_after_tool_call = True
+                    streamed_content_after_latest_tool_call = True
                     full_content += pending_content
                     if not buffer_stream_content:
                         yield _decorate_stream_event({
@@ -10277,6 +10281,7 @@ class AgentLoop:
                 and skill_contract_has_progress(all_tool_result_events)
                 and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
                 and not latest_tool_event_from_skill_continuation(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10295,6 +10300,7 @@ class AgentLoop:
                 full_content.strip()
                 and should_run_skill_contract_check(all_tool_result_events)
                 and latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10422,6 +10428,7 @@ class AgentLoop:
                     bool(request_execution_hints.get("current_session_fact_check_required"))
                     or bool(request_execution_hints.get("session_evidence_synthesis_preferred"))
                 )
+                and not streamed_content_after_latest_tool_call
             ):
                 synthesis_events = self._session_evidence_synthesis_events(
                     all_tool_result_events,
@@ -10445,6 +10452,7 @@ class AgentLoop:
                 all_tool_result_events
                 and should_run_skill_contract_check(all_tool_result_events)
                 and not skill_contract_has_progress(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10550,17 +10558,30 @@ class AgentLoop:
                     == self._normalize_comparable_text(pre_finalize_full_content)
                 ):
                     emit_delta = pending_fallback_delta or final_content
+                trimmed_emit_delta = AgentLoop._trim_repeated_stream_prefix(
+                    emit_delta,
+                    emitted_content_text,
+                )
+                trimmed_emit_delta = AgentLoop._mask_user_visible_text(trimmed_emit_delta)
+                if (
+                    trimmed_emit_delta.strip()
+                    and self._normalize_comparable_text(trimmed_emit_delta)
+                    != self._normalize_comparable_text(emit_delta)
+                ):
+                    final_content = trimmed_emit_delta
+                emit_delta = trimmed_emit_delta
                 emit_metadata = {
                     "buffered": bool(buffer_stream_content),
                     "validated": True,
                 }
                 if pending_fallback_reason:
                     emit_metadata["fallback"] = pending_fallback_reason
-                yield _decorate_stream_event({
-                    "type": "content",
-                    "delta": emit_delta,
-                    "metadata": emit_metadata,
-                })
+                if emit_delta.strip():
+                    yield _decorate_stream_event({
+                        "type": "content",
+                        "delta": emit_delta,
+                        "metadata": emit_metadata,
+                    })
             full_content = final_content
 
             # Emit done

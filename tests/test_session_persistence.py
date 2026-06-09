@@ -879,6 +879,52 @@ class _InterleavedToolContentRuntimeAgent:
         return type("RunResult", (), {"content": "".join(self._content_segments)})()
 
 
+class _SkillSummaryThenContentRuntimeAgent:
+    """Runtime agent that emits terminal skill evidence followed by final text."""
+
+    def __init__(self, final_summary: str) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._final_summary = final_summary
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        command = "node skills/spot-agent-cypher/cli/index.js settlement 318"
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": "call_settlement",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": command}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "shell",
+            "delta": (
+                "Read it aloud: SETTLEMENT game=318 rank=1/4 "
+                "reward=20 status=FINALIZE_CONFIRMED"
+            ),
+            "metadata": {
+                "name": "shell",
+                "arguments": json.dumps({"command": command}),
+            },
+        })
+        await self.output_queue.put({"type": "content", "delta": self._final_summary})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": self._final_summary})()
+
+
 class _RetryRuntimeAgent:
     """Runtime agent that fails once, then succeeds on retry."""
 
@@ -1399,6 +1445,62 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == final_answer
         assert loop._session.messages[-1]["content"] == final_answer
+
+    @pytest.mark.asyncio
+    async def test_stream_does_not_resummarize_after_terminal_skill_content(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        final_summary = (
+            "游戏 318 已结束！来看看结果：\n\n"
+            "| 项目 | 详情 |\n"
+            "|---|---|\n"
+            "| **你的选择** | B |\n"
+            "| **结果** | 平局退款 |"
+        )
+        synthesized_duplicate = (
+            "你这局 Spot Game 已经打完了，以下是结果：游戏编号 318，"
+            "你选 B，最终平局退款。"
+        )
+        synthesize = AsyncMock(return_value=synthesized_duplicate)
+        monkeypatch.setattr(
+            AgentLoop,
+            "_synthesize_final_answer_from_tool_events",
+            synthesize,
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _SkillSummaryThenContentRuntimeAgent(final_summary)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_terminal_skill_summary")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="那玩spot game吧"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert [c["delta"] for c in content_chunks] == [final_summary]
+        synthesize.assert_not_called()
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == final_summary
+        assert loop._session.messages[-1]["content"] == final_summary
 
     @pytest.mark.asyncio
     async def test_stream_persists_original_user_text_instead_of_attachment_prose(self, tmp_dir: Path):
