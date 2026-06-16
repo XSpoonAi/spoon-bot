@@ -11504,8 +11504,8 @@ class AgentLoop:
     def _short_request_ambiguity_candidates(self, message: str) -> list[dict[str, Any]]:
         """Return recent workflow candidates when a short request selects none.
 
-        This uses only recent skill metadata and request tokens. It does not
-        route by product names, CLI commands, or domain-specific phrases.
+        This uses recent skill metadata and request tokens. It does not route
+        to a skill; it only decides whether the user must pick a workflow.
         """
         text = str(message or "").strip()
         if not text:
@@ -11528,14 +11528,24 @@ class AgentLoop:
             return []
 
         token_owners: dict[str, set[str]] = {}
+        tokens_by_candidate: dict[str, set[str]] = {}
         for candidate in candidates:
             name = candidate["name"]
+            candidate_tokens = {
+                str(token)
+                for token in (candidate.get("tokens") or set())
+                if str(token).strip()
+            }
+            tokens_by_candidate[name] = candidate_tokens
             for token in candidate.get("tokens") or set():
                 token_owners.setdefault(token, set()).add(name)
 
         if not any(token in token_owners for token in request_tokens):
             visible_chars = len([char for char in text if not char.isspace()])
-            if visible_chars > 4:
+            if visible_chars > 4 and not self._looks_like_ambiguous_game_action(
+                text,
+                candidates,
+            ):
                 return []
 
         uniquely_selected: set[str] = set()
@@ -11543,18 +11553,130 @@ class AgentLoop:
             owners = token_owners.get(token)
             if owners and len(owners) == 1:
                 uniquely_selected.update(owners)
+                continue
+            fuzzy_owners = self._fuzzy_identifier_token_owners(
+                token,
+                tokens_by_candidate,
+            )
+            if len(fuzzy_owners) == 1:
+                uniquely_selected.update(fuzzy_owners)
         if uniquely_selected:
             return []
 
         return candidates
 
+    @staticmethod
+    def _looks_like_ambiguous_game_action(
+        message: str,
+        candidates: list[dict[str, Any]],
+    ) -> bool:
+        """Return true for short generic game actions across game skills."""
+        if len(candidates) < 2:
+            return False
+        game_candidates = 0
+        for candidate in candidates:
+            tokens = {
+                str(token)
+                for token in (candidate.get("tokens") or set())
+                if str(token).strip()
+            }
+            if "game" in tokens or any(token.endswith("game") for token in tokens):
+                game_candidates += 1
+        if game_candidates < 2:
+            return False
+
+        text = str(message or "").casefold()
+        tokens = set(ordered_request_matching_tokens(text))
+        ascii_actions = {
+            "join",
+            "play",
+            "start",
+            "game",
+            "round",
+            "battle",
+            "match",
+        }
+        if tokens & ascii_actions:
+            return True
+        return any(
+            phrase in text
+            for phrase in (
+                "加入",
+                "进游戏",
+                "玩游戏",
+                "开一局",
+                "来一局",
+                "来一把",
+                "打一把",
+                "游戏",
+            )
+        )
+
+    @staticmethod
+    def _fuzzy_identifier_token_owners(
+        token: str,
+        tokens_by_candidate: dict[str, set[str]],
+    ) -> set[str]:
+        """Return candidate owners for one small typo in an ASCII identifier."""
+        token = str(token or "").casefold().strip()
+        if len(token) < 4 or not token.isascii() or not token.isalnum():
+            return set()
+
+        owners: set[str] = set()
+        for name, candidate_tokens in tokens_by_candidate.items():
+            for candidate_token in candidate_tokens:
+                candidate_token = str(candidate_token or "").casefold().strip()
+                if (
+                    len(candidate_token) < 4
+                    or not candidate_token.isascii()
+                    or not candidate_token.isalnum()
+                ):
+                    continue
+                length_delta = abs(len(token) - len(candidate_token))
+                if length_delta > 1:
+                    continue
+                if AgentLoop._identifier_edit_distance_at_most_one(
+                    token,
+                    candidate_token,
+                ):
+                    owners.add(name)
+                    break
+        return owners
+
+    @staticmethod
+    def _identifier_edit_distance_at_most_one(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        if abs(len(left) - len(right)) > 1:
+            return False
+        if len(left) > len(right):
+            left, right = right, left
+
+        edits = 0
+        i = 0
+        j = 0
+        same_length = len(left) == len(right)
+        while i < len(left) and j < len(right):
+            if left[i] == right[j]:
+                i += 1
+                j += 1
+                continue
+            edits += 1
+            if edits > 1:
+                return False
+            if same_length:
+                i += 1
+            j += 1
+        if i < len(left) or j < len(right):
+            edits += 1
+        return edits <= 1
+
     def _format_short_request_ambiguity_context(self, message: str) -> str:
         """Warn the model when a short request does not select a recent workflow.
 
-        This is deliberately context only. It does not route to a skill, and it
-        does not classify domain terms. The model may still answer read-only
-        questions, but it must not pick one recent state-changing workflow
-        solely from recency.
+        This is deliberately context only. It does not route to a skill. The
+        model may still answer read-only questions, but it must not pick one
+        recent state-changing workflow solely from recency.
         """
         candidates = self._short_request_ambiguity_candidates(message)
         if len(candidates) < 2:
