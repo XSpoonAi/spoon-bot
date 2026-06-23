@@ -899,21 +899,22 @@ class WebSocketHandler:
                                         if isinstance(metadata, dict)
                                         else ""
                                     )
-                                    if not full_content and isinstance(done_content, str) and done_content:
+                                    if isinstance(done_content, str) and done_content:
+                                        if not full_content:
+                                            await manager.send_message(
+                                                self.connection_id,
+                                                WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
+                                                    "task_id": task_id,
+                                                    "request_id": request_id,
+                                                    "session_key": session_key,
+                                                    "type": "content",
+                                                    "delta": done_content,
+                                                    "metadata": {"fallback": "done_metadata_content"},
+                                                    "trace_id": trace_id,
+                                                    "source": source,
+                                                }),
+                                            )
                                         full_content = done_content
-                                        await manager.send_message(
-                                            self.connection_id,
-                                            WSEvent(event=ServerEvent.AGENT_STREAM_CHUNK.value, data={
-                                                "task_id": task_id,
-                                                "request_id": request_id,
-                                                "session_key": session_key,
-                                                "type": "content",
-                                                "delta": done_content,
-                                                "metadata": {"fallback": "done_metadata_content"},
-                                                "trace_id": trace_id,
-                                                "source": source,
-                                            }),
-                                        )
                                     if not str(full_content or "").strip():
                                         full_content = _fallback_empty_agent_response(
                                             had_error=had_error,
@@ -1727,7 +1728,12 @@ class WebSocketHandler:
         if not target.exists():
             raise ValueError(f"Path not found: {sub_path}")
 
-        nodes = _build_tree(target, max_depth=depth, include_hidden=include_hidden)
+        nodes = _build_tree(
+            target,
+            max_depth=depth,
+            include_hidden=include_hidden,
+            workspace_root=workspace,
+        )
         return {"tree": [n.model_dump() for n in nodes]}
 
     async def _handle_fs_list(self, params: dict[str, Any]) -> dict[str, Any]:

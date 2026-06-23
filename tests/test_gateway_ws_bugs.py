@@ -52,6 +52,7 @@ from spoon_bot.gateway.websocket.handler import (
     _CONCURRENT_REQUEST_LIMIT,
     _resolve_workspace_file,
 )
+from spoon_bot.runtime.session_registry import SessionRuntimeRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ from spoon_bot.gateway.websocket.handler import (
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_agent():
+def _make_mock_agent(session_key: str = "default", sessions=None):
     """Create a mock agent that behaves enough for gateway tests."""
     agent = AsyncMock()
     agent.model = "test-model"
@@ -68,22 +69,25 @@ def _make_mock_agent():
     agent.tools.list_tools.return_value = ["web_search"]
     agent.tools.__len__ = lambda self: 1
     agent.skills = []
-    agent.session_key = "default"
+    agent.session_key = session_key
 
     # Session manager mock
-    session = MagicMock()
-    session.session_key = "default"
-    session.messages = []
-    def _session_add_message(role, content, **kwargs):
-        session.messages.append({"role": role, "content": content, **kwargs})
-    session.add_message = MagicMock(side_effect=_session_add_message)
-    session.clear = MagicMock()
+    if sessions is None:
+        session = MagicMock()
+        session.session_key = session_key
+        session.messages = []
+        def _session_add_message(role, content, **kwargs):
+            session.messages.append({"role": role, "content": content, **kwargs})
+        session.add_message = MagicMock(side_effect=_session_add_message)
+        session.clear = MagicMock()
 
-    sessions = MagicMock()
-    sessions.list_sessions.return_value = [session]
-    sessions.get.return_value = session
-    sessions.get_or_create.return_value = session
-    sessions.save = MagicMock()
+        sessions = MagicMock()
+        sessions.list_sessions.return_value = [session]
+        sessions.get.return_value = session
+        sessions.get_or_create.return_value = session
+        sessions.save = MagicMock()
+    else:
+        session = sessions.get_or_create(session_key)
 
     agent.sessions = sessions
     agent._session = session
@@ -99,7 +103,26 @@ def _make_mock_agent():
         yield {"type": "done", "delta": "", "metadata": {}}
 
     agent.stream = _fake_stream
+    agent.build_creation_kwargs = MagicMock(return_value={})
     return agent
+
+
+def _install_mock_session_registry(agent):
+    async def _factory(**kwargs):
+        clone = _make_mock_agent(
+            kwargs.get("session_key", "default"),
+            sessions=kwargs.get("session_manager"),
+        )
+        clone.process = agent.process
+        clone.process_with_thinking = agent.process_with_thinking
+        clone.stream = agent.stream
+        return clone
+
+    app_module._session_runtime_registry = SessionRuntimeRegistry(
+        agent,
+        agent_factory=_factory,
+        creation_kwargs={"test": True},
+    )
 
 
 def _auth_headers(
@@ -150,6 +173,7 @@ def app(config):
     application = create_app(config)
     agent = _make_mock_agent()
     set_agent(agent)
+    _install_mock_session_registry(agent)
 
     # Initialize ConnectionManager (normally done in lifespan)
     app_module._connection_manager = ConnectionManager()
@@ -165,6 +189,7 @@ def app_auth(auth_config):
     application = create_app(auth_config)
     agent = _make_mock_agent()
     set_agent(agent)
+    _install_mock_session_registry(agent)
 
     # Initialize ConnectionManager
     app_module._connection_manager = ConnectionManager()
@@ -316,20 +341,20 @@ class TestSessionSwitchValidation:
             resp = ws.receive_json()
             assert resp["type"] == "error"
 
-    def test_valid_string_session_key_accepted(self, client):
-        """session.switch with valid string session_key succeeds."""
+    def test_default_string_session_key_accepted(self, client):
+        """session.switch with valid default session_key succeeds."""
         with client.websocket_connect("/v1/ws") as ws:
             ws.receive_json()
             ws.send_json({
                 "type": "request",
                 "id": "sw4",
                 "method": "session.switch",
-                "params": {"session_key": "my-session"},
+                "params": {"session_key": "default"},
             })
             resp = ws.receive_json()
             assert resp["type"] == "response"
             assert resp["result"]["switched"] is True
-            assert resp["result"]["session_key"] == "my-session"
+            assert resp["result"]["session_key"] == "default"
 
 
 # ===================================================================
@@ -535,8 +560,8 @@ class TestJWTSessionValidation:
 class TestWSSessionBinding:
     """#11: WS chat.send should bind runtime session to requested session_key."""
 
-    def test_chat_switches_agent_session(self, client):
-        """chat.send with session_key should call _switch_agent_session."""
+    def test_chat_uses_default_agent_session(self, client):
+        """chat.send with default session_key should keep the runtime session bound."""
         with client.websocket_connect("/v1/ws") as ws:
             ws.receive_json()  # connection.established
 
@@ -546,7 +571,7 @@ class TestWSSessionBinding:
                 "method": "chat.send",
                 "params": {
                     "message": "hello",
-                    "session_key": "custom-session",
+                    "session_key": "default",
                     "stream": False,
                 },
             })
@@ -562,7 +587,7 @@ class TestWSSessionBinding:
             # The response should echo the session_key
             response = next((m for m in msgs if m.get("type") == "response"), None)
             assert response is not None
-            assert response["result"]["session_key"] == "custom-session"
+            assert response["result"]["session_key"] == "default"
 
 
 # ===================================================================
@@ -992,7 +1017,10 @@ class TestRESTSessionRouting:
         agent = app_module._agent
         assert agent is not None
 
+        created_keys: list[str] = []
+
         def _session_factory(key: str):
+            created_keys.append(key)
             session = MagicMock()
             session.session_key = key
             session.messages = []
@@ -1007,7 +1035,9 @@ class TestRESTSessionRouting:
             headers=_auth_headers("routing-user", session_key="token-session"),
         )
         assert resp.status_code == 200
-        assert agent.session_key == "explicit-session"
+        assert "explicit-session" in created_keys
+        assert "token-session" not in created_keys
+        assert agent.session_key == "default"
 
 
 class TestRESTConcurrency:
@@ -1018,6 +1048,7 @@ class TestRESTConcurrency:
         """Concurrent /chat requests should not produce non-IDLE 500 errors."""
         agent = _make_mock_agent()
         set_agent(agent)
+        _install_mock_session_registry(agent)
 
         busy = False
 
@@ -1601,6 +1632,53 @@ class TestWSStreamingContent:
             ]
             assert len(done_events) >= 1
             assert done_events[0]["data"]["content"] == "fallback done content"
+
+    def test_stream_done_metadata_replaces_accumulated_content(self, client):
+        """done.metadata.content is the authoritative final response body."""
+        agent = app_module._agent
+        assert agent is not None
+
+        async def _stream_with_final_metadata(**kwargs):
+            yield {"type": "content", "delta": "starting task", "metadata": {}}
+            yield {"type": "content", "delta": " continuing", "metadata": {}}
+            yield {
+                "type": "done",
+                "delta": "",
+                "metadata": {"content": "final concise result"},
+            }
+
+        agent.stream = _stream_with_final_metadata
+
+        with client.websocket_connect("/v1/ws") as ws:
+            ws.receive_json()  # connection.established
+
+            ws.send_json({
+                "type": "request",
+                "id": "stream_done_final_metadata",
+                "method": "chat.send",
+                "params": {
+                    "message": "hello stream",
+                    "stream": True,
+                },
+            })
+
+            events = []
+            for _ in range(20):
+                msg = ws.receive_json()
+                events.append(msg)
+                if msg.get("type") == "response":
+                    break
+
+            response = next((e for e in events if e.get("type") == "response"), None)
+            assert response is not None
+            assert response["result"]["content"] == "final concise result"
+
+            done_events = [
+                e for e in events
+                if e.get("type") == "event" and e.get("event") == "agent.stream.done"
+            ]
+            assert len(done_events) >= 1
+            assert done_events[0]["data"]["content"] == "final concise result"
 
     def test_stream_complete_event_keeps_full_response(self, client):
         """agent.complete should carry the full response body, not a preview slice."""
