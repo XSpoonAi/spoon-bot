@@ -9,6 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from spoon_bot.gateway.workspace_visibility import (
+    is_workspace_wallet_runtime_path,
+    should_hide_workspace_path,
+)
 
 SANDBOX_WORKSPACE_ROOT = "/workspace"
 
@@ -156,7 +160,18 @@ class WorkspaceFSService:
     def _list_sync(self, path: str, *, cursor: str | None, limit: int) -> dict[str, Any]:
         directory, _ = self._resolve_existing_path(path, expect_directory=True)
         effective_limit = max(1, min(int(limit), 1000))
-        entries = [self._build_entry(entry) for entry in directory.iterdir()]
+        if is_workspace_wallet_runtime_path(directory, workspace_root=self._workspace_root):
+            return {"entries": [], "has_more": False}
+
+        entries = [
+            self._build_entry(entry)
+            for entry in directory.iterdir()
+            if not should_hide_workspace_path(
+                entry,
+                workspace_root=self._workspace_root,
+                include_hidden=True,
+            )
+        ]
         entries.sort(key=lambda item: (item["type"] != "dir", item["name"].lower()))
 
         start = 0

@@ -2117,7 +2117,12 @@ class AgentLoop:
                     or AgentLoop._stream_message_attr(msg, "id", None)
                 if tool_call_id:
                     extras["tool_call_id"] = str(tool_call_id)
-                    extras.update(self._stream_tool_result_metadata_for_trace(tool_call_id))
+                    extras.update(
+                        AgentLoop._stream_tool_result_metadata_for_trace(
+                            self,
+                            tool_call_id,
+                        )
+                    )
                 name = AgentLoop._stream_message_attr(msg, "name", None)
                 if name:
                     extras["name"] = str(name)
@@ -3535,20 +3540,6 @@ class AgentLoop:
             media=media,
             attachments=attachments,
         )
-        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
-
-        direct_clarification = AgentLoop._build_short_request_ambiguity_clarification(
-            self,
-            authoritative_message
-        )
-        if direct_clarification:
-            await self._agent.add_message("user", runtime_message)
-            await self._agent.add_message("assistant", direct_clarification)
-            self._persist_direct_assistant_turn_response(
-                direct_clarification,
-                turn_memory_start_index=_pre_turn_memory_index,
-            )
-            return direct_clarification
 
         original_system_prompt: str | None = None
         original_base_system_prompt: object = _MISSING
@@ -5820,6 +5811,113 @@ class AgentLoop:
                 return final, final[len(prefix):]
 
         return streamed + final, final
+
+    @staticmethod
+    def _normalized_text_with_source_end_offsets(text: str) -> tuple[str, list[int]]:
+        """Normalize whitespace while retaining source end offsets for each char."""
+        normalized_chars: list[str] = []
+        source_end_offsets: list[int] = []
+        in_whitespace = False
+        for index, char in enumerate(text):
+            if char.isspace():
+                if normalized_chars and not in_whitespace:
+                    normalized_chars.append(" ")
+                    source_end_offsets.append(index + 1)
+                    in_whitespace = True
+                continue
+            normalized_chars.append(char)
+            source_end_offsets.append(index + 1)
+            in_whitespace = False
+
+        while normalized_chars and normalized_chars[-1] == " ":
+            normalized_chars.pop()
+            source_end_offsets.pop()
+        return "".join(normalized_chars), source_end_offsets
+
+    @staticmethod
+    def _whitespace_free_text_with_source_end_offsets(text: str) -> tuple[str, list[int]]:
+        """Remove whitespace while retaining source end offsets for each char."""
+        normalized_chars: list[str] = []
+        source_end_offsets: list[int] = []
+        for index, char in enumerate(text):
+            if char.isspace():
+                continue
+            normalized_chars.append(char)
+            source_end_offsets.append(index + 1)
+        return "".join(normalized_chars), source_end_offsets
+
+    @staticmethod
+    def _remove_all_whitespace(text: str | None) -> str:
+        return "".join(str(text or "").split())
+
+    @staticmethod
+    def _looks_like_incomplete_repeated_stream_prefix(
+        incoming_text: str | None,
+        already_emitted_text: str | None,
+    ) -> bool:
+        incoming_normalized = AgentLoop._remove_all_whitespace(incoming_text)
+        emitted_normalized = AgentLoop._remove_all_whitespace(already_emitted_text)
+        return (
+            len(incoming_normalized) >= 12
+            and len(emitted_normalized) >= 24
+            and len(incoming_normalized) < len(emitted_normalized)
+            and emitted_normalized.startswith(incoming_normalized)
+        )
+
+    @staticmethod
+    def _trim_repeated_stream_prefix(
+        incoming_text: str | None,
+        already_emitted_text: str | None,
+    ) -> str:
+        """Remove a repeated prefix that has already been streamed to the user."""
+        incoming = str(incoming_text or "")
+        emitted_normalized = AgentLoop._normalize_comparable_text(already_emitted_text)
+        if not incoming or len(emitted_normalized) < 24:
+            return incoming
+
+        incoming_normalized, incoming_source_ends = (
+            AgentLoop._normalized_text_with_source_end_offsets(incoming)
+        )
+        if not incoming_normalized:
+            return incoming
+
+        matched_len = 0
+        if incoming_normalized.startswith(emitted_normalized):
+            matched_len = len(emitted_normalized)
+        else:
+            min_match_len = 24
+            max_start = max(0, len(emitted_normalized) - 2000)
+            for start in range(max_start, len(emitted_normalized) - min_match_len + 1):
+                suffix = emitted_normalized[start:]
+                if incoming_normalized.startswith(suffix):
+                    matched_len = len(suffix)
+                    break
+
+        if matched_len < 24 or matched_len > len(incoming_source_ends):
+            emitted_compact = AgentLoop._remove_all_whitespace(already_emitted_text)
+            incoming_compact, incoming_compact_source_ends = (
+                AgentLoop._whitespace_free_text_with_source_end_offsets(incoming)
+            )
+            matched_compact_len = 0
+            if incoming_compact.startswith(emitted_compact):
+                matched_compact_len = len(emitted_compact)
+            else:
+                min_match_len = 24
+                max_start = max(0, len(emitted_compact) - 2000)
+                for start in range(max_start, len(emitted_compact) - min_match_len + 1):
+                    suffix = emitted_compact[start:]
+                    if incoming_compact.startswith(suffix):
+                        matched_compact_len = len(suffix)
+                        break
+            if (
+                matched_compact_len < 24
+                or matched_compact_len > len(incoming_compact_source_ends)
+            ):
+                return incoming
+            cut_at = incoming_compact_source_ends[matched_compact_len - 1]
+            return incoming[cut_at:].lstrip()
+        cut_at = incoming_source_ends[matched_len - 1]
+        return incoming[cut_at:].lstrip()
 
     def _looks_like_duplicate_thinking(
         self,
@@ -8110,6 +8208,7 @@ class AgentLoop:
         post_tool_content_events: list[dict[str, Any]] = []
         saw_tool_call = False
         saw_content_after_tool_call = False
+        streamed_content_after_latest_tool_call = False
         pseudo_tool_repair_attempted = False
         stream_completed = False
         stream_cancelled = False
@@ -8118,16 +8217,18 @@ class AgentLoop:
         original_base_system_prompt: object = _MISSING
         tool_output_capture_scope: str | None = None
         capture_manager = None
-        withheld_initial_content = False
         pending_fallback_content_emit = False
         pending_fallback_reason: str | None = None
         pending_fallback_delta = ""
         tool_loop_fallback_active = False
         initial_content_passthrough_started = False
+        post_tool_content_passthrough_started = False
+        emitted_content_text = ""
         stream_error_reason: BaseException | str | None = None
         interrupted_assistant_reply_persisted = False
         execution_ledger: ExecutionLedger | None = None
         ledger_manager = None
+        _pre_turn_memory_index: int | None = None
 
         def _persist_interrupted_stream_reply(reason: str = "task_cancelled") -> None:
             nonlocal interrupted_assistant_reply_persisted
@@ -8163,34 +8264,6 @@ class AgentLoop:
             media=media,
             attachments=attachments,
         )
-        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
-
-        direct_clarification = AgentLoop._build_short_request_ambiguity_clarification(
-            self,
-            authoritative_message
-        )
-        if direct_clarification:
-            await self._agent.add_message("user", runtime_message)
-            await self._agent.add_message("assistant", direct_clarification)
-            full_content = direct_clarification
-            stream_completed = True
-            self._persist_direct_assistant_turn_response(
-                direct_clarification,
-                turn_memory_start_index=_pre_turn_memory_index,
-            )
-            yield {
-                "type": "content",
-                "delta": direct_clarification,
-                "metadata": {"clarification": "short_request_ambiguity"},
-                "source": AgentLoop.get_last_response_source(self),
-            }
-            yield {
-                "type": "done",
-                "delta": "",
-                "metadata": {"content": direct_clarification},
-                "source": AgentLoop.get_last_response_source(self),
-            }
-            return
 
         try:
             capture_manager = capture_tool_outputs()
@@ -9341,6 +9414,11 @@ class AgentLoop:
                             if len(raw_tool_calls) > 1:
                                 chunk = dict(chunk)
                                 chunk["tool_calls"] = raw_tool_calls[:1]
+                        if full_content:
+                            full_content = ""
+                        saw_content_after_tool_call = False
+                        streamed_content_after_latest_tool_call = False
+                        post_tool_content_passthrough_started = False
                         saw_tool_call = True
                         stream_tool_call_count += len(chunk["tool_calls"])
                         last_tool_progress_at = time.monotonic()
@@ -9603,12 +9681,43 @@ class AgentLoop:
                                     continue
                                 full_content += delta
                             else:
-                                post_tool_content_buffer += delta
-                                post_tool_content_events.append(event)
-                                continue
+                                if not post_tool_content_passthrough_started:
+                                    post_tool_content_buffer += delta
+                                    post_tool_content_events.append(event)
+                                    pending_content = AgentLoop._strip_leaked_scratchpad_prefix(
+                                        post_tool_content_buffer
+                                    )
+                                    compact_pending = " ".join(pending_content.strip().split())
+                                    if (
+                                        not compact_pending
+                                        or len(compact_pending) < 12
+                                        or AgentLoop._looks_like_internal_scratchpad_text(
+                                            pending_content
+                                        )
+                                        or AgentLoop._looks_like_incomplete_repeated_stream_prefix(
+                                            pending_content,
+                                            emitted_content_text,
+                                        )
+                                    ):
+                                        continue
+                                    delta = pending_content
+                                    post_tool_content_events = []
+                                    post_tool_content_buffer = ""
+                                    post_tool_content_passthrough_started = True
+                                delta = AgentLoop._trim_repeated_stream_prefix(
+                                    delta,
+                                    emitted_content_text,
+                                )
+                                delta = AgentLoop._mask_user_visible_text(delta)
+                                if not delta:
+                                    continue
+                                saw_content_after_tool_call = True
+                                streamed_content_after_latest_tool_call = True
+                                full_content += delta
                             if buffer_stream_content:
                                 continue
                             event["delta"] = delta
+                            emitted_content_text += delta
                         yield _decorate_stream_event(event)
                         if _stop_if_total_timeout():
                             break
@@ -9781,8 +9890,18 @@ class AgentLoop:
                 post_tool_content_events = []
 
             if pre_tool_scratchpad_buffer and not saw_tool_call:
-                full_content += AgentLoop._mask_user_visible_text(pre_tool_scratchpad_buffer)
-                withheld_initial_content = True
+                for buffered_event in pre_tool_scratchpad_events:
+                    buffered_delta = AgentLoop._mask_user_visible_text(
+                        str(buffered_event.get("delta") or "")
+                    )
+                    if not buffered_delta:
+                        continue
+                    full_content += buffered_delta
+                    emitted_content_text += buffered_delta
+                    yield _decorate_stream_event({
+                        **buffered_event,
+                        "delta": buffered_delta,
+                    })
                 pre_tool_scratchpad_events = []
                 pre_tool_scratchpad_buffer = ""
 
@@ -9824,8 +9943,16 @@ class AgentLoop:
                     if not pending_content.strip():
                         pending_content = ""
                 if pending_content.strip():
+                    pending_content = AgentLoop._trim_repeated_stream_prefix(
+                        pending_content,
+                        emitted_content_text,
+                    )
                     pending_content = AgentLoop._mask_user_visible_text(pending_content)
+                    if not pending_content.strip():
+                        pending_content = ""
+                if pending_content.strip():
                     saw_content_after_tool_call = True
+                    streamed_content_after_latest_tool_call = True
                     full_content += pending_content
                     if not buffer_stream_content:
                         yield _decorate_stream_event({
@@ -9833,6 +9960,7 @@ class AgentLoop:
                             "delta": pending_content,
                             "metadata": {"validated": True},
                         })
+                        emitted_content_text += pending_content
 
             if (
                 tool_loop_fallback_active
@@ -10117,6 +10245,7 @@ class AgentLoop:
                 and skill_contract_has_progress(all_tool_result_events)
                 and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
                 and not latest_tool_event_from_skill_continuation(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10135,6 +10264,7 @@ class AgentLoop:
                 full_content.strip()
                 and should_run_skill_contract_check(all_tool_result_events)
                 and latest_tool_event_has_user_summary_marker(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10262,6 +10392,7 @@ class AgentLoop:
                     bool(request_execution_hints.get("current_session_fact_check_required"))
                     or bool(request_execution_hints.get("session_evidence_synthesis_preferred"))
                 )
+                and not streamed_content_after_latest_tool_call
             ):
                 synthesis_events = self._session_evidence_synthesis_events(
                     all_tool_result_events,
@@ -10285,6 +10416,7 @@ class AgentLoop:
                 all_tool_result_events
                 and should_run_skill_contract_check(all_tool_result_events)
                 and not skill_contract_has_progress(all_tool_result_events)
+                and not streamed_content_after_latest_tool_call
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -10366,10 +10498,19 @@ class AgentLoop:
                 full_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
+            final_content_changed = (
+                self._normalize_comparable_text(final_content)
+                != self._normalize_comparable_text(pre_finalize_full_content)
+            )
             if (
                 (
-                    buffer_stream_content
-                    or withheld_initial_content
+                    (
+                        buffer_stream_content
+                        and (
+                            not emitted_content_text.strip()
+                            or final_content_changed
+                        )
+                    )
                     or pending_fallback_content_emit
                 )
                 and final_content
@@ -10381,18 +10522,24 @@ class AgentLoop:
                     == self._normalize_comparable_text(pre_finalize_full_content)
                 ):
                     emit_delta = pending_fallback_delta or final_content
+                trimmed_emit_delta = AgentLoop._trim_repeated_stream_prefix(
+                    emit_delta,
+                    emitted_content_text,
+                )
+                trimmed_emit_delta = AgentLoop._mask_user_visible_text(trimmed_emit_delta)
+                emit_delta = trimmed_emit_delta
                 emit_metadata = {
                     "buffered": bool(buffer_stream_content),
-                    "withheld_initial_content": bool(withheld_initial_content),
                     "validated": True,
                 }
                 if pending_fallback_reason:
                     emit_metadata["fallback"] = pending_fallback_reason
-                yield _decorate_stream_event({
-                    "type": "content",
-                    "delta": emit_delta,
-                    "metadata": emit_metadata,
-                })
+                if emit_delta.strip():
+                    yield _decorate_stream_event({
+                        "type": "content",
+                        "delta": emit_delta,
+                        "metadata": emit_metadata,
+                    })
             full_content = final_content
 
             # Emit done
@@ -10592,23 +10739,10 @@ class AgentLoop:
             media=media,
             attachments=attachments,
         )
-        _pre_turn_memory_index = self._runtime_memory_snapshot_index()
-
-        direct_clarification = AgentLoop._build_short_request_ambiguity_clarification(
-            self,
-            authoritative_message
-        )
-        if direct_clarification:
-            await self._agent.add_message("user", runtime_message)
-            await self._agent.add_message("assistant", direct_clarification)
-            self._persist_direct_assistant_turn_response(
-                direct_clarification,
-                turn_memory_start_index=_pre_turn_memory_index,
-            )
-            return direct_clarification, ""
 
         execution_ledger: ExecutionLedger | None = None
         ledger_manager = None
+        _pre_turn_memory_index: int | None = None
 
         try:
             retry_runner = AgentLoop._resolve_retry_runner(self)
@@ -11432,201 +11566,6 @@ class AgentLoop:
                 )
         return None
 
-    @staticmethod
-    def _token_identifier_variants(
-        text: str,
-        *,
-        combine_adjacent: bool = True,
-    ) -> set[str]:
-        """Return compact identifier tokens from free text without routing intent."""
-        tokens = [
-            token
-            for token in ordered_request_matching_tokens(str(text or ""))
-            if len(token) >= 3
-        ]
-        variants: set[str] = set(tokens)
-        if not combine_adjacent:
-            return variants
-        for index in range(len(tokens) - 1):
-            left = tokens[index]
-            right = tokens[index + 1]
-            if left.isascii() and right.isascii():
-                variants.add(f"{left}{right}")
-        if len(tokens) >= 3:
-            for index in range(len(tokens) - 2):
-                first = tokens[index]
-                second = tokens[index + 1]
-                third = tokens[index + 2]
-                if first.isascii() and second.isascii() and third.isascii():
-                    variants.add(f"{first}{second}{third}")
-        return variants
-
-    def _recent_skill_ambiguity_candidates(self) -> list[dict[str, Any]]:
-        """Return recent skill-backed workflows as generic clarification candidates."""
-        recent = getattr(self, "_recent_invoked_skill_contexts", [])
-        if not isinstance(recent, list) or len(recent) < 2:
-            return []
-
-        catalog_by_name: dict[str, dict[str, Any]] = {}
-        for item in self._collect_request_skill_candidates():
-            name = str(item.get("name") or "").strip()
-            if name:
-                catalog_by_name[name] = item
-
-        candidates: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in recent:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            catalog = catalog_by_name.get(name, {})
-            identifier_text = " ".join(
-                str(value or "")
-                for value in (
-                    name,
-                    item.get("location"),
-                    item.get("workspace_relative_path"),
-                    catalog.get("description"),
-                    catalog.get("when_to_use"),
-                )
-                if str(value or "").strip()
-            )
-            candidates.append({
-                "name": name,
-                "location": str(item.get("location") or ""),
-                "tokens": self._token_identifier_variants(identifier_text),
-            })
-        return candidates if len(candidates) >= 2 else []
-
-    def _short_request_ambiguity_candidates(self, message: str) -> list[dict[str, Any]]:
-        """Return recent workflow candidates when a short request selects none.
-
-        This uses only recent skill metadata and request tokens. It does not
-        route by product names, CLI commands, or domain-specific phrases.
-        """
-        text = str(message or "").strip()
-        if not text:
-            return []
-        if len([char for char in text if not char.isspace()]) > 36:
-            return []
-        if len(ordered_request_matching_tokens(text)) > 5:
-            return []
-        if extract_urls_from_text(text):
-            return []
-        if extract_exact_shell_commands_from_request(text):
-            return []
-
-        candidates = self._recent_skill_ambiguity_candidates()
-        if len(candidates) < 2:
-            return []
-
-        request_tokens = self._token_identifier_variants(text, combine_adjacent=False)
-        if not request_tokens:
-            return []
-
-        token_owners: dict[str, set[str]] = {}
-        for candidate in candidates:
-            name = candidate["name"]
-            for token in candidate.get("tokens") or set():
-                token_owners.setdefault(token, set()).add(name)
-
-        if not any(token in token_owners for token in request_tokens):
-            visible_chars = len([char for char in text if not char.isspace()])
-            if visible_chars > 4:
-                return []
-
-        uniquely_selected: set[str] = set()
-        for token in request_tokens:
-            owners = token_owners.get(token)
-            if owners and len(owners) == 1:
-                uniquely_selected.update(owners)
-        if uniquely_selected:
-            return []
-
-        return candidates
-
-    def _format_short_request_ambiguity_context(self, message: str) -> str:
-        """Warn the model when a short request does not select a recent workflow.
-
-        This is deliberately context only. It does not route to a skill, and it
-        does not classify domain terms. The model may still answer read-only
-        questions, but it must not pick one recent state-changing workflow
-        solely from recency.
-        """
-        candidates = self._short_request_ambiguity_candidates(message)
-        if len(candidates) < 2:
-            return ""
-
-        lines = [
-            "[SHORT REQUEST AMBIGUITY BOUNDARY]:",
-            (
-                "The newest request is short and does not uniquely identify one "
-                "of the recent skill-backed workflows below."
-            ),
-            (
-                "If satisfying it would require a state-changing, paid, remote, "
-                "or externally visible action from one of these workflows, ask "
-                "one concise clarification before calling side-effecting tools. "
-                "Do not choose a workflow from recency alone. Read-only status "
-                "questions may still be verified with tools."
-            ),
-            "Recent workflow candidates:",
-        ]
-        for candidate in candidates[:6]:
-            location = str(candidate.get("location") or "").strip()
-            if location:
-                lines.append(f"- {candidate['name']} ({location})")
-            else:
-                lines.append(f"- {candidate['name']}")
-        lines.append("")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _message_prefers_cjk_response(message: str) -> bool:
-        for char in str(message or ""):
-            if "\u3400" <= char <= "\u9fff":
-                return True
-        return False
-
-    def _build_short_request_ambiguity_clarification(self, message: str) -> str:
-        candidates = self._short_request_ambiguity_candidates(message)
-        if len(candidates) < 2:
-            return ""
-        names: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates[:6]:
-            name = str(candidate.get("name") or "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            names.append(name)
-        if len(names) < 2:
-            return ""
-        if self._message_prefers_cjk_response(message):
-            return "我需要先确认要使用哪个 workflow：" + "、".join(names) + "？"
-        return "Which workflow should I use: " + ", ".join(names) + "?"
-
-    def _persist_direct_assistant_turn_response(
-        self,
-        content: str,
-        *,
-        turn_memory_start_index: int,
-    ) -> None:
-        AgentLoop._mark_latest_user_turn_state(self, _TURN_STATE_COMPLETED)
-        try:
-            self._persist_turn_tool_trace(turn_memory_start_index)
-        except Exception:
-            pass
-        self._session.add_message(
-            "assistant",
-            content,
-            **AgentLoop._assistant_session_save_kwargs(content),
-        )
-        AgentLoop._persist_session_if_possible(self)
-
     def _build_request_context_sections(self, message: str) -> str:
         """Build reusable request-derived context without changing user intent."""
         hint_source = self._request_hint_source_text(message)
@@ -11635,7 +11574,6 @@ class AgentLoop:
             _BOUNDED_CONTINUATION_BOUNDARY
             if request_is_bare_continuation(message)
             else "",
-            self._format_short_request_ambiguity_context(message),
             format_explicit_request_urls_context(hint_source),
             format_explicit_request_values_context(hint_source),
             self._format_local_skill_execution_context(hints),

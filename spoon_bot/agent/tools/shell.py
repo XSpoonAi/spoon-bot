@@ -6,8 +6,8 @@ import asyncio
 import hashlib
 import os
 import re
-import shutil
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,8 +28,8 @@ from spoon_bot.agent.tools.execution_context import (
     get_request_execution_hints,
     get_tool_owner,
     observed_cli_command_matches,
-    suppress_repeated_background_job_poll,
     suppress_redundant_shell_file_read,
+    suppress_repeated_background_job_poll,
 )
 from spoon_bot.config import (
     DEFAULT_MAX_OUTPUT,
@@ -1696,6 +1696,16 @@ class ShellTool(Tool):
         normalized = str(command or "").replace("\\", "/")
         return "~/.agent-wallet" in normalized or "/.agent-wallet" in normalized
 
+    @staticmethod
+    def _wallet_compat_home(wallet_root: Path) -> Path:
+        base = Path(
+            os.environ.get("SPOON_BOT_WALLET_COMPAT_HOME_ROOT")
+            or os.environ.get("TMPDIR")
+            or "/tmp"
+        ).expanduser()
+        digest = hashlib.sha256(str(wallet_root).encode("utf-8")).hexdigest()[:16]
+        return (base / "spoon-bot-wallet-homes" / digest).resolve(strict=False)
+
     def _align_wallet_home_for_command(
         self,
         env: dict[str, str],
@@ -1747,8 +1757,12 @@ class ShellTool(Tool):
                 wallet_root.mkdir(parents=True, exist_ok=True)
             if not wallet_root.is_dir():
                 return
-            compat_home = wallet_root.parent / f".home-{wallet_root.name}"
+            compat_home = self._wallet_compat_home(wallet_root)
             compat_home.mkdir(parents=True, exist_ok=True)
+            try:
+                compat_home.chmod(0o700)
+            except OSError:
+                pass
             compat_wallet = compat_home / ".agent-wallet"
             if compat_wallet.is_symlink():
                 compat_wallet.unlink()

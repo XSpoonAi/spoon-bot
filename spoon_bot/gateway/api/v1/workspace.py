@@ -11,6 +11,10 @@ from pydantic import BaseModel
 from spoon_bot.gateway.app import get_agent
 from spoon_bot.gateway.auth.dependencies import CurrentUser
 from spoon_bot.gateway.models.responses import APIResponse, MetaInfo
+from spoon_bot.gateway.workspace_visibility import (
+    is_workspace_wallet_runtime_path,
+    should_hide_workspace_path,
+)
 
 router = APIRouter()
 
@@ -31,9 +35,12 @@ def _build_tree(
     max_depth: int = 5,
     current_depth: int = 0,
     include_hidden: bool = False,
+    workspace_root: Path | None = None,
 ) -> list[TreeNode]:
     """Recursively build a directory tree, respecting depth and hidden-file filters."""
     if current_depth >= max_depth or not root.is_dir():
+        return []
+    if is_workspace_wallet_runtime_path(root, workspace_root=workspace_root):
         return []
 
     nodes: list[TreeNode] = []
@@ -43,9 +50,11 @@ def _build_tree(
         return []
 
     for entry in entries:
-        if not include_hidden and entry.name.startswith("."):
-            continue
-        if entry.name in ("__pycache__", "node_modules", ".git"):
+        if should_hide_workspace_path(
+            entry,
+            workspace_root=workspace_root,
+            include_hidden=include_hidden,
+        ):
             continue
 
         rel = str(entry.relative_to(root.parent)).replace("\\", "/")
@@ -56,6 +65,7 @@ def _build_tree(
                 max_depth=max_depth,
                 current_depth=current_depth + 1,
                 include_hidden=include_hidden,
+                workspace_root=workspace_root,
             )
             nodes.append(TreeNode(
                 name=entry.name,
@@ -104,7 +114,12 @@ async def get_workspace_tree(
             detail={"code": "PATH_NOT_FOUND", "message": f"Path not found: {path}"},
         )
 
-    tree = _build_tree(target, max_depth=depth, include_hidden=include_hidden)
+    tree = _build_tree(
+        target,
+        max_depth=depth,
+        include_hidden=include_hidden,
+        workspace_root=workspace,
+    )
 
     return APIResponse(
         success=True,

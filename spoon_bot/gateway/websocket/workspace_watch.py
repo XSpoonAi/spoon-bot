@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from spoon_bot.gateway.workspace_visibility import is_workspace_wallet_runtime_path
 
 WorkspaceWatchCallback = Callable[[dict[str, Any]], Awaitable[None]]
 SANDBOX_WORKSPACE_ROOT = "/workspace"
@@ -172,6 +173,8 @@ class WorkspaceWatchService:
     def _snapshot_target(self, target: Path, *, recursive: bool) -> dict[str, dict[str, Any]]:
         if not target.exists():
             return {}
+        if is_workspace_wallet_runtime_path(target, workspace_root=self._workspace_root):
+            return {}
 
         if target.is_file():
             try:
@@ -200,6 +203,8 @@ class WorkspaceWatchService:
             try:
                 relative = entry.relative_to(self._workspace_root)
             except ValueError:
+                continue
+            if is_workspace_wallet_runtime_path(entry, workspace_root=self._workspace_root):
                 continue
             try:
                 entries[self._sandbox_path_for(relative)] = self._entry_snapshot(entry)
