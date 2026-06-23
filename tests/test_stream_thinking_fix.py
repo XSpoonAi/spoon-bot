@@ -225,6 +225,33 @@ class TestStreamWaitBehavior:
         assert agent._agent.system_prompt == "base system"
         assert agent._agent._original_system_prompt == "base original"
 
+    @pytest.mark.asyncio
+    async def test_stream_cancel_emits_structured_cancelled_chunk(self):
+        """A cancelled stream should expose a machine-readable cancellation reason."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        started = asyncio.Event()
+
+        async def mock_run(**kwargs):
+            started.set()
+            await asyncio.sleep(60)
+
+        agent, _, _ = _make_mock_stream_agent(mock_run)
+
+        stream = AgentLoop.stream(agent, message="test")
+        next_chunk = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        next_chunk.cancel()
+        chunk = await asyncio.wait_for(next_chunk, timeout=1)
+        await stream.aclose()
+
+        assert chunk["type"] == "cancelled"
+        assert chunk["delta"] == "Task cancelled."
+        assert chunk["metadata"]["cancelled"] is True
+        assert chunk["metadata"]["code"] == "CANCELLED"
+        assert chunk["metadata"]["reason"] == "task_cancelled"
+
 
 # ============================================================
 # ConnectionManager send_message retry

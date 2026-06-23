@@ -2053,7 +2053,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 "delta": friendly_error,
                                 "metadata": {
                                     "error": friendly_error,
+                                    "message": friendly_error,
+                                    "code": type(exc).__name__,
                                     "error_code": type(exc).__name__,
+                                    "reason": "agent_run_failed",
                                 },
                             }
                         )
@@ -4233,22 +4236,42 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 _TURN_STATE_INTERRUPTED,
                 reason="task_cancelled",
             )
+            current_source = AgentLoop.get_last_response_source(self)
+            yield {
+                "type": "cancelled",
+                "delta": "Task cancelled.",
+                "metadata": {
+                    "cancelled": True,
+                    "code": "CANCELLED",
+                    "error_code": "CANCELLED",
+                    "message": "Task cancelled.",
+                    "reason": "task_cancelled",
+                },
+                "source": current_source,
+            }
             raise
         except Exception as e:
             logger.error(f"Streaming error: {e}")
             stream_error_reason = e
             stream_completed = True
             current_source = AgentLoop.get_last_response_source(self)
+            error_metadata = {
+                "error": str(e),
+                "message": str(e),
+                "code": type(e).__name__,
+                "error_code": type(e).__name__,
+                "reason": "stream_failed",
+            }
             yield {
                 "type": "error",
                 "delta": str(e),
-                "metadata": {"error": str(e)},
+                "metadata": error_metadata,
                 "source": current_source,
             }
             yield {
                 "type": "done",
                 "delta": "",
-                "metadata": {"error": str(e)},
+                "metadata": error_metadata,
                 "source": current_source,
             }
         finally:
