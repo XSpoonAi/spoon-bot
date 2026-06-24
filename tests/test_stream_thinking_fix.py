@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -195,6 +196,45 @@ class TestStreamWaitBehavior:
         assert content_chunks[0]["delta"] == "late chunk"
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "late chunk"
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_heartbeat_during_silent_active_run(self):
+        """A live background run should emit agent-level progress during stream silence."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        async def mock_run(**kwargs):
+            await asyncio.sleep(0.12)
+            await oq.put({"type": "content", "delta": "finished", "metadata": {}})
+            result = MagicMock()
+            result.content = "finished"
+            return result
+
+        agent, oq, _ = _make_mock_stream_agent(mock_run)
+
+        chunks = []
+        with patch.dict(
+            os.environ,
+            {
+                "SPOON_BOT_STREAM_HEARTBEAT_INITIAL_DELAY": "0.05",
+                "SPOON_BOT_STREAM_HEARTBEAT_INTERVAL": "0.05",
+            },
+        ):
+            async for chunk in AgentLoop.stream(agent, message="test"):
+                chunks.append(chunk)
+
+        heartbeat_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.get("type") == "notice"
+            and chunk.get("metadata", {}).get("kind") == "agent_progress_heartbeat"
+        ]
+        assert heartbeat_chunks
+        assert heartbeat_chunks[0].get("part") == {
+            "type": "thinking",
+            "text": "Agent is still running.",
+        }
+        content_chunks = [chunk for chunk in chunks if chunk["type"] == "content"]
+        assert content_chunks[-1]["delta"] == "finished"
 
     @pytest.mark.asyncio
     async def test_stream_restores_system_prompt_when_add_message_fails(self):

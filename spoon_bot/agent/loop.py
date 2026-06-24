@@ -181,6 +181,10 @@ from spoon_bot.agent.loop_state import (
 )
 
 
+_DEFAULT_STREAM_HEARTBEAT_INITIAL_DELAY = 15.0
+_DEFAULT_STREAM_HEARTBEAT_INTERVAL = 30.0
+
+
 class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
     """
     The agent loop is the core processing engine using spoon-core SDK.
@@ -2139,6 +2143,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 f"Entering stream loop: td={td.is_set()}, qempty={oq.empty()}, qsize={oq.qsize()}"
             )
             stream_started_at = time.monotonic()
+            last_stream_activity_at = stream_started_at
+            last_stream_heartbeat_at = 0.0
+            stream_heartbeat_count = 0
             last_tool_progress_at = stream_started_at
             last_tool_progress_kind: str | None = None
             provider_silence_timeout = float(
@@ -2204,6 +2211,19 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     )
                     or DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT
                 ),
+            )
+            stream_heartbeat_initial_delay = AgentLoop._float_env(
+                "SPOON_BOT_STREAM_HEARTBEAT_INITIAL_DELAY",
+                _DEFAULT_STREAM_HEARTBEAT_INITIAL_DELAY,
+                allow_zero=True,
+            )
+            stream_heartbeat_interval = AgentLoop._float_env(
+                "SPOON_BOT_STREAM_HEARTBEAT_INTERVAL",
+                _DEFAULT_STREAM_HEARTBEAT_INTERVAL,
+                allow_zero=True,
+            )
+            stream_heartbeat_enabled = (
+                stream_heartbeat_initial_delay > 0 and stream_heartbeat_interval > 0
             )
 
             def _record_tool_result_events(events: list[dict[str, Any]]) -> None:
@@ -2844,13 +2864,62 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 skill_contract_continuation_attempted = True
                 skill_contract_continuation_attempts += 1
 
+            def _mark_stream_activity(event: dict[str, Any]) -> dict[str, Any]:
+                nonlocal last_stream_activity_at
+                last_stream_activity_at = time.monotonic()
+                return event
+
+            def _heartbeat_poll_timeout(base_timeout: float) -> float:
+                if not stream_heartbeat_enabled:
+                    return base_timeout
+                heartbeat_timeout = min(
+                    stream_heartbeat_initial_delay,
+                    stream_heartbeat_interval,
+                )
+                return min(base_timeout, max(0.05, heartbeat_timeout))
+
+            def _should_emit_stream_heartbeat(now: float) -> bool:
+                if not stream_heartbeat_enabled or td.is_set():
+                    return False
+                if _active_tool_within_budget(now):
+                    return False
+                last_visible_at = max(last_stream_activity_at, last_stream_heartbeat_at)
+                wait_seconds = (
+                    stream_heartbeat_initial_delay
+                    if stream_heartbeat_count == 0
+                    else stream_heartbeat_interval
+                )
+                return now - last_visible_at >= wait_seconds
+
+            def _stream_heartbeat_event(now: float) -> dict[str, Any]:
+                nonlocal last_stream_heartbeat_at, stream_heartbeat_count
+                last_stream_heartbeat_at = now
+                stream_heartbeat_count += 1
+                elapsed_seconds = max(0, int(now - stream_started_at))
+                return _decorate_stream_event(
+                    {
+                        "type": "notice",
+                        "delta": "",
+                        "part": {
+                            "type": "thinking",
+                            "text": "Agent is still running.",
+                        },
+                        "metadata": {
+                            "kind": "agent_progress_heartbeat",
+                            "status": "running",
+                            "elapsed_seconds": elapsed_seconds,
+                            "synthetic": True,
+                        },
+                    }
+                )
+
             while not (td.is_set() and oq.empty()):
                 now = time.monotonic()
                 if _stop_if_total_timeout():
                     break
 
                 for event in _drain_runtime_notice_events():
-                    yield event
+                    yield _mark_stream_activity(event)
 
                 tool_result_events, stream_tool_result_index = (
                     AgentLoop._collect_stream_tool_result_events(
@@ -2874,7 +2943,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
                     history_search_budget_seen = True
                 for event in tool_result_events:
-                    yield _decorate_stream_event(event)
+                    yield _mark_stream_activity(_decorate_stream_event(event))
                 if history_search_budget_seen and not history_search_budget_recovery_attempted:
                     logger.warning(
                         "History search budget was exhausted without task progress; "
@@ -2979,6 +3048,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         if provider_silence_enabled
                         else 2.0
                     )
+                    queue_poll_timeout = _heartbeat_poll_timeout(queue_poll_timeout)
                     chunk = await asyncio.wait_for(oq.get(), timeout=queue_poll_timeout)
                     chunk_count += 1
                     logger.debug(
@@ -2996,6 +3066,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         )
                         _stop_tool_loop("active_tool_timeout")
                         break
+                    heartbeat_now = time.monotonic()
+                    if _should_emit_stream_heartbeat(heartbeat_now):
+                        yield _mark_stream_activity(_stream_heartbeat_event(heartbeat_now))
                     if (
                         provider_silence_enabled
                         and not td.is_set()
@@ -3097,12 +3170,14 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 or "stream_error"
                             )
                             stream_error_reason = RuntimeError(str(error_text))
-                        yield {
-                            "type": "error",
-                            "delta": chunk.get("delta", ""),
-                            "metadata": chunk.get("metadata", {}),
-                            "source": current_source,
-                        }
+                        yield _mark_stream_activity(
+                            {
+                                "type": "error",
+                                "delta": chunk.get("delta", ""),
+                                "metadata": chunk.get("metadata", {}),
+                                "source": current_source,
+                            }
+                        )
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
@@ -3162,19 +3237,21 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                     active_tool_call_names_by_id[str(tc_id)] = normalized_fn_name
                             if normalized_fn_name != "read_file":
                                 non_read_tool_call_count += 1
-                            yield _decorate_stream_event(
-                                {
-                                    "type": "tool_call",
-                                    "delta": "",
-                                    "metadata": {
-                                        "id": tc_id,
-                                        "name": fn_name,
-                                        "arguments": AgentLoop._tool_call_arguments_display(
-                                            fn_name,
-                                            fn_args,
-                                        ),
-                                    },
-                                }
+                            yield _mark_stream_activity(
+                                _decorate_stream_event(
+                                    {
+                                        "type": "tool_call",
+                                        "delta": "",
+                                        "metadata": {
+                                            "id": tc_id,
+                                            "name": fn_name,
+                                            "arguments": AgentLoop._tool_call_arguments_display(
+                                                fn_name,
+                                                fn_args,
+                                            ),
+                                        },
+                                    }
+                                )
                             )
                             if (
                                 normalized_fn_name == "read_file"
@@ -3197,7 +3274,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 if tool_call_id:
                                     emitted_tool_result_ids.add(str(tool_call_id))
                                 _record_tool_result_events([event])
-                                yield _decorate_stream_event(event)
+                                yield _mark_stream_activity(_decorate_stream_event(event))
                             logger.warning(
                                 "Repeated read_file call matched already completed "
                                 "tool evidence; closing the tool event and switching "
@@ -3284,7 +3361,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         "delta": delta,
                         "metadata": metadata,
                     }
-                    yield _decorate_stream_event(tool_result_event)
+                    yield _mark_stream_activity(_decorate_stream_event(tool_result_event))
                     if _events_have_repeated_read_guardrail([tool_result_event]):
                         repeated_read_guardrail_seen = True
                         if not repeated_read_recovery_attempted:
@@ -3331,12 +3408,14 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
                 if chunk_type == "thinking":
                     if thinking and delta:
-                        yield _decorate_stream_event(
-                            {
-                                "type": "thinking",
-                                "delta": delta,
-                                "metadata": metadata,
-                            }
+                        yield _mark_stream_activity(
+                            _decorate_stream_event(
+                                {
+                                    "type": "thinking",
+                                    "delta": delta,
+                                    "metadata": metadata,
+                                }
+                            )
                         )
                         if _stop_if_total_timeout():
                             break
@@ -3348,15 +3427,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         chunk_type == "content" and thinking and metadata_phase == "think"
                     )
                     if chunk_type == "content" and explicit_pre_tool_phase:
-                        yield _decorate_stream_event(
-                            {
-                                "type": "thinking",
-                                "delta": delta,
-                                "metadata": {
-                                    **metadata,
-                                    "source": metadata.get("source", "phase_think"),
-                                },
-                            }
+                        yield _mark_stream_activity(
+                            _decorate_stream_event(
+                                {
+                                    "type": "thinking",
+                                    "delta": delta,
+                                    "metadata": {
+                                        **metadata,
+                                        "source": metadata.get("source", "phase_think"),
+                                    },
+                                }
+                            )
                         )
                         if _stop_if_total_timeout():
                             break
@@ -3419,7 +3500,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 continue
                             event["delta"] = delta
                             emitted_content_text += delta
-                        yield _decorate_stream_event(event)
+                        yield _mark_stream_activity(_decorate_stream_event(event))
                         if _stop_if_total_timeout():
                             break
 
