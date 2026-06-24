@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable
 
 from loguru import logger
 
@@ -2310,44 +2310,240 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 _stop_tool_loop("total_timeout")
                 return True
 
-            async def _await_internal_recovery_run(
-                awaitable: Awaitable[Any],
-                *,
-                label: str,
-            ) -> Any | None:
-                nonlocal stream_error_reason
-                if internal_recovery_timeout <= 0:
-                    return await awaitable
-                try:
-                    return await asyncio.wait_for(
-                        awaitable,
-                        timeout=internal_recovery_timeout,
-                    )
-                except asyncio.TimeoutError as exc:
-                    logger.warning(
-                        "{} exceeded internal recovery timeout {:.1f}s; "
-                        "continuing with captured tool evidence.",
-                        label,
-                        internal_recovery_timeout,
-                    )
-                    return None
-
             def _internal_recovery_run_kwargs() -> dict[str, Any]:
                 kwargs: dict[str, Any] = {}
                 if self._callable_accepts_kwarg(self._agent.run, "reasoning_effort"):
                     kwargs["reasoning_effort"] = "low"
                 return kwargs
 
-            async def _run_pseudo_tool_call_repair(
+            def _repair_events_from_queued_item(
+                queued: Any,
+                *,
+                repair_reason: str,
+                queued_content_parts: list[str],
+            ) -> list[dict[str, Any]]:
+                events: list[dict[str, Any]] = []
+
+                if isinstance(queued, dict) and queued.get("tool_calls"):
+                    for tc in queued.get("tool_calls") or []:
+                        if isinstance(tc, dict):
+                            fn = tc.get("function", {})
+                            tc_id = tc.get("id", "")
+                            fn_name = (
+                                fn.get("name", "")
+                                if isinstance(fn, dict)
+                                else getattr(fn, "name", "")
+                            )
+                            fn_args = (
+                                fn.get("arguments", "")
+                                if isinstance(fn, dict)
+                                else getattr(fn, "arguments", "")
+                            )
+                        else:
+                            tc_id = getattr(tc, "id", "")
+                            fn_obj = getattr(tc, "function", None)
+                            fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
+                            fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
+                        if tc_id:
+                            tool_call_arguments_by_id[tc_id] = (
+                                AgentLoop._tool_call_arguments_key(fn_args)
+                            )
+                        display_args = AgentLoop._tool_call_arguments_display(fn_name, fn_args)
+                        events.append(
+                            {
+                                "type": "tool_call",
+                                "delta": "",
+                                "metadata": {
+                                    "id": tc_id,
+                                    "name": fn_name,
+                                    "arguments": display_args,
+                                    "repair": repair_reason,
+                                },
+                            }
+                        )
+                    return events
+
+                if isinstance(queued, dict) and queued.get("type") == "tool_result":
+                    metadata = dict(queued.get("metadata") or {})
+                    tool_name = queued.get("name") or metadata.get("name") or ""
+                    tool_result = (
+                        queued.get("result")
+                        or queued.get("content")
+                        or queued.get("response")
+                        or queued.get("output")
+                        or queued.get("delta")
+                    )
+                    serialized_result = AgentLoop._stringify_stream_payload(tool_result)
+                    tool_call_id = (
+                        queued.get("tool_call_id")
+                        or queued.get("id")
+                        or metadata.get("tool_call_id")
+                        or metadata.get("id")
+                    )
+                    captured_output = consume_captured_tool_output(
+                        tool_output_capture_scope,
+                        tool_name=tool_name,
+                        arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                    )
+                    if tool_name:
+                        metadata.setdefault("name", tool_name)
+                    if tool_call_id:
+                        metadata.setdefault("tool_call_id", tool_call_id)
+                        metadata.setdefault("id", tool_call_id)
+                        arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+                        if arguments:
+                            metadata.setdefault(
+                                "arguments",
+                                AgentLoop._tool_call_arguments_display(tool_name, arguments),
+                            )
+                        emitted_tool_result_ids.add(tool_call_id)
+                    metadata["repair"] = repair_reason
+                    metadata = AgentLoop._merge_stream_tool_result_metadata(
+                        metadata,
+                        streamed_result=serialized_result,
+                        captured_output=captured_output,
+                    )
+                    self._remember_stream_tool_result_metadata(tool_call_id, metadata)
+                    events.append(
+                        {
+                            "type": "tool_result",
+                            "delta": "",
+                            "metadata": metadata,
+                        }
+                    )
+                    return events
+
+                if isinstance(queued, dict):
+                    text = queued.get("content") or queued.get("delta") or ""
+                else:
+                    text = getattr(queued, "content", None) or (
+                        queued if isinstance(queued, str) else ""
+                    )
+                if text:
+                    queued_content_parts.append(str(text))
+                return events
+
+            async def _stream_internal_recovery_run(
+                run_factory: Callable[[], Awaitable[Any]],
+                *,
+                label: str,
+                repair_reason: str,
+                result_holder: dict[str, Any],
+            ) -> AsyncGenerator[dict[str, Any], None]:
+                """Run internal recovery while forwarding queued tool events immediately."""
+                nonlocal stream_error_reason, stream_tool_result_index
+
+                queued_content_parts: list[str] = []
+                result: Any | None = None
+                timed_out = False
+                deadline = (
+                    time.monotonic() + internal_recovery_timeout
+                    if internal_recovery_timeout > 0
+                    else None
+                )
+
+                task = asyncio.create_task(run_factory())
+                try:
+                    while True:
+                        if task.done() and self._agent.output_queue.empty():
+                            break
+
+                        timeout = 0.25
+                        if deadline is not None:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0 and not task.done():
+                                timed_out = True
+                                task.cancel()
+                                break
+                            timeout = min(timeout, max(0.01, remaining))
+
+                        try:
+                            queued = await asyncio.wait_for(
+                                self._agent.output_queue.get(),
+                                timeout=timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception as exc:
+                            logger.debug(f"{label} output queue polling failed: {exc}")
+                            continue
+
+                        for event in _repair_events_from_queued_item(
+                            queued,
+                            repair_reason=repair_reason,
+                            queued_content_parts=queued_content_parts,
+                        ):
+                            yield event
+
+                    if timed_out:
+                        logger.warning(
+                            "{} exceeded internal recovery timeout {:.1f}s; "
+                            "continuing with captured tool evidence.",
+                            label,
+                            internal_recovery_timeout,
+                        )
+                        try:
+                            await asyncio.wait_for(task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                            pass
+                    else:
+                        result = await task
+
+                    while not self._agent.output_queue.empty():
+                        try:
+                            queued = self._agent.output_queue.get_nowait()
+                        except Exception:
+                            break
+                        for event in _repair_events_from_queued_item(
+                            queued,
+                            repair_reason=repair_reason,
+                            queued_content_parts=queued_content_parts,
+                        ):
+                            yield event
+                except asyncio.CancelledError:
+                    if not task.done():
+                        task.cancel()
+                    raise
+                except Exception as exc:
+                    stream_error_reason = exc
+                    logger.error(f"{label} failed: {exc}")
+                    result_holder["text"] = ""
+                    return
+
+                repair_text = ""
+                if result is None:
+                    if stream_error_reason is None:
+                        stream_error_reason = RuntimeError(f"{label} returned no result")
+                else:
+                    repair_text = AgentLoop._extract_run_result_text(result)
+                if not repair_text.strip() and queued_content_parts:
+                    repair_text = "".join(queued_content_parts)
+                result_holder["text"] = repair_text
+
+                tool_result_events, stream_tool_result_index = (
+                    AgentLoop._collect_stream_tool_result_events(
+                        self,
+                        stream_tool_result_index,
+                        emitted_tool_result_ids,
+                        tool_output_capture_scope=tool_output_capture_scope,
+                        tool_call_arguments_by_id=tool_call_arguments_by_id,
+                    )
+                )
+                for event in tool_result_events:
+                    metadata = dict(event.get("metadata") or {})
+                    metadata["repair"] = repair_reason
+                    yield {**event, "metadata": metadata}
+
+            async def _stream_pseudo_tool_call_repair(
                 pseudo_content: str,
                 *,
+                result_holder: dict[str, Any],
                 repair_prompt_override: str | None = None,
                 repair_reason: str = "pseudo_tool_call_text",
                 request_hint_overrides: dict[str, Any] | None = None,
-            ) -> tuple[str, list[dict[str, Any]]]:
+            ) -> AsyncGenerator[dict[str, Any], None]:
                 """Retry once when the model wrote fake tool calls as text."""
-                nonlocal stream_error_reason, stream_tool_result_index
-                nonlocal turn_tool_invocation_state
+                nonlocal stream_error_reason, turn_tool_invocation_state
 
                 AgentLoop._drop_pseudo_tool_call_assistant_messages(
                     self,
@@ -2374,10 +2570,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         **request_execution_hints,
                         **request_hint_overrides,
                     }
-                result: Any | None = None
                 previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
                 self._force_serial_tool_calls = True
-                try:
+
+                async def _run_repair() -> Any:
+                    nonlocal turn_tool_invocation_state
                     with (
                         bind_request_execution_hints(request_execution_hints),
                         track_tool_invocations(
@@ -2385,161 +2582,35 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         ) as invocation_state,
                     ):
                         turn_tool_invocation_state = invocation_state
-                        result = await _await_internal_recovery_run(
-                            AgentLoop._run_agent_with_context_overflow_recovery(
-                                self,
-                                label="stream_tool_call_repair",
-                                retry_runner=AgentLoop._resolve_retry_runner(self),
-                                pre_overflow_retry_cleanup=lambda: (
-                                    AgentLoop._drain_agent_output_queue(self)
-                                ),
-                                **repair_kwargs,
-                            ),
+                        return await AgentLoop._run_agent_with_context_overflow_recovery(
+                            self,
                             label="stream_tool_call_repair",
+                            retry_runner=AgentLoop._resolve_retry_runner(self),
+                            pre_overflow_retry_cleanup=lambda: (
+                                AgentLoop._drain_agent_output_queue(self)
+                            ),
+                            **repair_kwargs,
                         )
-                except Exception as exc:
-                    stream_error_reason = exc
-                    logger.error(f"Repair run failed: {exc}")
-                    return "", []
+
+                try:
+                    async for event in _stream_internal_recovery_run(
+                        _run_repair,
+                        label="stream_tool_call_repair",
+                        repair_reason=repair_reason,
+                        result_holder=result_holder,
+                    ):
+                        yield event
                 finally:
                     if previous_force_serial:
                         self._force_serial_tool_calls = True
                     elif hasattr(self, "_force_serial_tool_calls"):
                         delattr(self, "_force_serial_tool_calls")
-                repair_text = ""
-                if result is None:
-                    if stream_error_reason is None:
-                        stream_error_reason = RuntimeError("Repair run returned no result")
-                else:
-                    repair_text = AgentLoop._extract_run_result_text(result)
-                repair_events: list[dict[str, Any]] = []
-                queued_content_parts: list[str] = []
 
-                while not self._agent.output_queue.empty():
-                    try:
-                        queued = self._agent.output_queue.get_nowait()
-                    except Exception:
-                        break
-
-                    if isinstance(queued, dict) and queued.get("tool_calls"):
-                        for tc in queued.get("tool_calls") or []:
-                            if isinstance(tc, dict):
-                                fn = tc.get("function", {})
-                                tc_id = tc.get("id", "")
-                                fn_name = (
-                                    fn.get("name", "")
-                                    if isinstance(fn, dict)
-                                    else getattr(fn, "name", "")
-                                )
-                                fn_args = (
-                                    fn.get("arguments", "")
-                                    if isinstance(fn, dict)
-                                    else getattr(fn, "arguments", "")
-                                )
-                            else:
-                                tc_id = getattr(tc, "id", "")
-                                fn_obj = getattr(tc, "function", None)
-                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
-                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
-                            if tc_id:
-                                tool_call_arguments_by_id[tc_id] = (
-                                    AgentLoop._tool_call_arguments_key(fn_args)
-                                )
-                            display_args = AgentLoop._tool_call_arguments_display(fn_name, fn_args)
-                            repair_events.append(
-                                {
-                                    "type": "tool_call",
-                                    "delta": "",
-                                    "metadata": {
-                                        "id": tc_id,
-                                        "name": fn_name,
-                                        "arguments": display_args,
-                                        "repair": repair_reason,
-                                    },
-                                }
-                            )
-                        continue
-
-                    if isinstance(queued, dict) and queued.get("type") == "tool_result":
-                        metadata = dict(queued.get("metadata") or {})
-                        tool_name = queued.get("name") or metadata.get("name") or ""
-                        tool_result = (
-                            queued.get("result")
-                            or queued.get("content")
-                            or queued.get("response")
-                            or queued.get("output")
-                        )
-                        serialized_result = AgentLoop._stringify_stream_payload(tool_result)
-                        tool_call_id = (
-                            queued.get("tool_call_id")
-                            or queued.get("id")
-                            or metadata.get("tool_call_id")
-                            or metadata.get("id")
-                        )
-                        captured_output = consume_captured_tool_output(
-                            tool_output_capture_scope,
-                            tool_name=tool_name,
-                            arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
-                        )
-                        if tool_name:
-                            metadata.setdefault("name", tool_name)
-                        if tool_call_id:
-                            metadata.setdefault("tool_call_id", tool_call_id)
-                            metadata.setdefault("id", tool_call_id)
-                            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
-                            if arguments:
-                                metadata.setdefault(
-                                    "arguments",
-                                    AgentLoop._tool_call_arguments_display(tool_name, arguments),
-                                )
-                            emitted_tool_result_ids.add(tool_call_id)
-                        metadata["repair"] = repair_reason
-                        metadata = AgentLoop._merge_stream_tool_result_metadata(
-                            metadata,
-                            streamed_result=serialized_result,
-                            captured_output=captured_output,
-                        )
-                        self._remember_stream_tool_result_metadata(tool_call_id, metadata)
-                        repair_events.append(
-                            {
-                                "type": "tool_result",
-                                "delta": "",
-                                "metadata": metadata,
-                            }
-                        )
-                        continue
-
-                    if isinstance(queued, dict):
-                        text = queued.get("content") or queued.get("delta") or ""
-                    else:
-                        text = getattr(queued, "content", None) or (
-                            queued if isinstance(queued, str) else ""
-                        )
-                    if text:
-                        queued_content_parts.append(str(text))
-
-                if not repair_text.strip() and queued_content_parts:
-                    repair_text = "".join(queued_content_parts)
-
-                tool_result_events, stream_tool_result_index = (
-                    AgentLoop._collect_stream_tool_result_events(
-                        self,
-                        stream_tool_result_index,
-                        emitted_tool_result_ids,
-                        tool_output_capture_scope=tool_output_capture_scope,
-                        tool_call_arguments_by_id=tool_call_arguments_by_id,
-                    )
-                )
-                for event in tool_result_events:
-                    metadata = dict(event.get("metadata") or {})
-                    metadata["repair"] = repair_reason
-                    repair_events.append({**event, "metadata": metadata})
-
-                return repair_text, repair_events
-
-            async def _run_repeated_read_recovery() -> tuple[str, list[dict[str, Any]]]:
+            async def _stream_repeated_read_recovery(
+                *,
+                result_holder: dict[str, Any],
+            ) -> AsyncGenerator[dict[str, Any], None]:
                 """Retry once when duplicate read_file calls consume the tool loop."""
-                nonlocal stream_error_reason, stream_tool_result_index
                 nonlocal turn_tool_invocation_state
 
                 AgentLoop._drain_agent_output_queue(self)
@@ -2563,171 +2634,63 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
                 previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
                 self._force_serial_tool_calls = True
-                result: Any | None = None
+
+                async def _run_recovery() -> Any:
+                    nonlocal turn_tool_invocation_state
+                    with (
+                        bind_request_execution_hints(request_execution_hints),
+                        track_tool_invocations(
+                            max_repeats=1,
+                            initial_state=turn_tool_invocation_state,
+                        ) as invocation_state,
+                    ):
+                        turn_tool_invocation_state = invocation_state
+                        return await AgentLoop._run_agent_with_context_overflow_recovery(
+                            self,
+                            label="stream_repeated_read_recovery",
+                            retry_runner=AgentLoop._resolve_retry_runner(self),
+                            pre_overflow_retry_cleanup=lambda: (
+                                AgentLoop._drain_agent_output_queue(self)
+                            ),
+                            **repair_kwargs,
+                        )
+
                 try:
-                    try:
-                        with (
-                            bind_request_execution_hints(request_execution_hints),
-                            track_tool_invocations(
-                                max_repeats=1,
-                                initial_state=turn_tool_invocation_state,
-                            ) as invocation_state,
-                        ):
-                            turn_tool_invocation_state = invocation_state
-                            result = await _await_internal_recovery_run(
-                                AgentLoop._run_agent_with_context_overflow_recovery(
-                                    self,
-                                    label="stream_repeated_read_recovery",
-                                    retry_runner=AgentLoop._resolve_retry_runner(self),
-                                    pre_overflow_retry_cleanup=lambda: (
-                                        AgentLoop._drain_agent_output_queue(self)
-                                    ),
-                                    **repair_kwargs,
-                                ),
-                                label="stream_repeated_read_recovery",
-                            )
-                    except Exception as exc:
-                        stream_error_reason = exc
-                        logger.error(f"Repeated-read recovery run failed: {exc}")
-                        return "", []
+                    async for event in _stream_internal_recovery_run(
+                        _run_recovery,
+                        label="stream_repeated_read_recovery",
+                        repair_reason="repeated_read_recovery",
+                        result_holder=result_holder,
+                    ):
+                        yield event
                 finally:
                     if previous_force_serial:
                         self._force_serial_tool_calls = True
                     elif hasattr(self, "_force_serial_tool_calls"):
                         delattr(self, "_force_serial_tool_calls")
 
-                repair_text = ""
-                if result is None:
-                    if stream_error_reason is None:
-                        stream_error_reason = RuntimeError(
-                            "Repeated-read recovery returned no result"
-                        )
-                else:
-                    repair_text = AgentLoop._extract_run_result_text(result)
-                repair_events: list[dict[str, Any]] = []
-                queued_content_parts: list[str] = []
-
-                while not self._agent.output_queue.empty():
-                    try:
-                        queued = self._agent.output_queue.get_nowait()
-                    except Exception:
-                        break
-
-                    if isinstance(queued, dict) and queued.get("tool_calls"):
-                        for tc in queued.get("tool_calls") or []:
-                            if isinstance(tc, dict):
-                                fn = tc.get("function", {})
-                                tc_id = tc.get("id", "")
-                                fn_name = (
-                                    fn.get("name", "")
-                                    if isinstance(fn, dict)
-                                    else getattr(fn, "name", "")
-                                )
-                                fn_args = (
-                                    fn.get("arguments", "")
-                                    if isinstance(fn, dict)
-                                    else getattr(fn, "arguments", "")
-                                )
-                            else:
-                                tc_id = getattr(tc, "id", "")
-                                fn_obj = getattr(tc, "function", None)
-                                fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
-                                fn_args = getattr(fn_obj, "arguments", "") if fn_obj else ""
-                            if tc_id:
-                                tool_call_arguments_by_id[tc_id] = (
-                                    AgentLoop._tool_call_arguments_key(fn_args)
-                                )
-                            display_args = AgentLoop._tool_call_arguments_display(fn_name, fn_args)
-                            repair_events.append(
-                                {
-                                    "type": "tool_call",
-                                    "delta": "",
-                                    "metadata": {
-                                        "id": tc_id,
-                                        "name": fn_name,
-                                        "arguments": display_args,
-                                        "repair": "repeated_read_recovery",
-                                    },
-                                }
-                            )
-                        continue
-
-                    if isinstance(queued, dict) and queued.get("type") == "tool_result":
-                        metadata = dict(queued.get("metadata") or {})
-                        tool_name = queued.get("name") or metadata.get("name") or ""
-                        tool_result = (
-                            queued.get("result")
-                            or queued.get("content")
-                            or queued.get("response")
-                            or queued.get("output")
-                        )
-                        serialized_result = AgentLoop._stringify_stream_payload(tool_result)
-                        tool_call_id = (
-                            queued.get("tool_call_id")
-                            or queued.get("id")
-                            or metadata.get("tool_call_id")
-                            or metadata.get("id")
-                        )
-                        captured_output = consume_captured_tool_output(
-                            tool_output_capture_scope,
-                            tool_name=tool_name,
-                            arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
-                        )
-                        if tool_name:
-                            metadata.setdefault("name", tool_name)
-                        if tool_call_id:
-                            metadata.setdefault("tool_call_id", tool_call_id)
-                            metadata.setdefault("id", tool_call_id)
-                            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
-                            if arguments:
-                                metadata.setdefault(
-                                    "arguments",
-                                    AgentLoop._tool_call_arguments_display(tool_name, arguments),
-                                )
-                            emitted_tool_result_ids.add(tool_call_id)
-                        metadata["repair"] = "repeated_read_recovery"
-                        metadata = AgentLoop._merge_stream_tool_result_metadata(
-                            metadata,
-                            streamed_result=serialized_result,
-                            captured_output=captured_output,
-                        )
-                        self._remember_stream_tool_result_metadata(tool_call_id, metadata)
-                        repair_events.append(
-                            {
-                                "type": "tool_result",
-                                "delta": "",
+            async def _emit_repair_event_stream(
+                repair_stream: AsyncGenerator[dict[str, Any], None],
+                *,
+                visible_tool_result_delta: bool = False,
+                collected_events: list[dict[str, Any]] | None = None,
+            ) -> AsyncGenerator[dict[str, Any], None]:
+                async for event in repair_stream:
+                    if event.get("type") == "tool_result":
+                        if visible_tool_result_delta:
+                            metadata = dict(event.get("metadata") or {})
+                            event = {
+                                **event,
+                                "delta": AgentLoop._stream_tool_result_visible_delta(
+                                    event.get("delta", ""),
+                                    metadata,
+                                ),
                                 "metadata": metadata,
                             }
-                        )
-                        continue
-
-                    if isinstance(queued, dict):
-                        text = queued.get("content") or queued.get("delta") or ""
-                    else:
-                        text = getattr(queued, "content", None) or (
-                            queued if isinstance(queued, str) else ""
-                        )
-                    if text:
-                        queued_content_parts.append(str(text))
-
-                if not repair_text.strip() and queued_content_parts:
-                    repair_text = "".join(queued_content_parts)
-
-                tool_result_events, stream_tool_result_index = (
-                    AgentLoop._collect_stream_tool_result_events(
-                        self,
-                        stream_tool_result_index,
-                        emitted_tool_result_ids,
-                        tool_output_capture_scope=tool_output_capture_scope,
-                        tool_call_arguments_by_id=tool_call_arguments_by_id,
-                    )
-                )
-                for event in tool_result_events:
-                    metadata = dict(event.get("metadata") or {})
-                    metadata["repair"] = "repeated_read_recovery"
-                    repair_events.append({**event, "metadata": metadata})
-
-                return repair_text, repair_events
+                        _record_tool_result_events([event])
+                    if collected_events is not None:
+                        collected_events.append(event)
+                    yield _decorate_stream_event(event)
 
             def _active_tool_within_budget(now: float | None = None) -> bool:
                 if not saw_tool_call or last_tool_progress_kind != "tool_call":
@@ -3542,25 +3505,19 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     authoritative_message,
                     all_tool_result_events,
                 )
-                repair_text, repair_events = await _run_pseudo_tool_call_repair(
-                    "History search budget reached before task completion.",
-                    repair_prompt_override=repair_prompt,
-                    repair_reason="history_search_budget_recovery",
-                    request_hint_overrides={"history_search_budget_exhausted": True},
-                )
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        metadata = dict(event.get("metadata") or {})
-                        event = {
-                            **event,
-                            "delta": AgentLoop._stream_tool_result_visible_delta(
-                                event.get("delta", ""),
-                                metadata,
-                            ),
-                            "metadata": metadata,
-                        }
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                repair_state: dict[str, Any] = {}
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        "History search budget reached before task completion.",
+                        result_holder=repair_state,
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="history_search_budget_recovery",
+                        request_hint_overrides={"history_search_budget_exhausted": True},
+                    ),
+                    visible_tool_result_delta=True,
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 run_result_text = repair_text
                 post_tool_content_buffer = repair_text
                 post_tool_content_events = []
@@ -3592,27 +3549,23 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         all_tool_result_events,
                         previous_draft=run_result_text or full_content,
                     )
-                    repair_text, repair_events = await _run_pseudo_tool_call_repair(
+                    repair_state = {}
+                    repair_stream = _stream_pseudo_tool_call_repair(
                         run_result_text or "Repeated skill file reads stopped progress.",
+                        result_holder=repair_state,
                         repair_prompt_override=repair_prompt,
                         repair_reason="skill_contract_continuation",
                     )
                     tool_loop_fallback_active = False
                 else:
-                    repair_text, repair_events = await _run_repeated_read_recovery()
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        metadata = dict(event.get("metadata") or {})
-                        event = {
-                            **event,
-                            "delta": AgentLoop._stream_tool_result_visible_delta(
-                                event.get("delta", ""),
-                                metadata,
-                            ),
-                            "metadata": metadata,
-                        }
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                    repair_state = {}
+                    repair_stream = _stream_repeated_read_recovery(result_holder=repair_state)
+                async for event in _emit_repair_event_stream(
+                    repair_stream,
+                    visible_tool_result_delta=True,
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 run_result_text = repair_text
                 post_tool_content_buffer = repair_text
                 post_tool_content_events = []
@@ -3639,24 +3592,18 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     all_tool_result_events,
                     previous_draft=run_result_text or full_content,
                 )
-                repair_text, repair_events = await _run_pseudo_tool_call_repair(
-                    run_result_text or "Provider was silent after skill tool results.",
-                    repair_prompt_override=repair_prompt,
-                    repair_reason="skill_contract_continuation",
-                )
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        metadata = dict(event.get("metadata") or {})
-                        event = {
-                            **event,
-                            "delta": AgentLoop._stream_tool_result_visible_delta(
-                                event.get("delta", ""),
-                                metadata,
-                            ),
-                            "metadata": metadata,
-                        }
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                repair_state = {}
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        run_result_text or "Provider was silent after skill tool results.",
+                        result_holder=repair_state,
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="skill_contract_continuation",
+                    ),
+                    visible_tool_result_delta=True,
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 run_result_text = repair_text
                 post_tool_content_buffer = repair_text
                 post_tool_content_events = []
@@ -3695,11 +3642,15 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         "of actual tool calls; retrying once with an internal repair prompt."
                     )
                     pseudo_tool_repair_attempted = True
-                    repair_text, repair_events = await _run_pseudo_tool_call_repair(pending_content)
-                    for event in repair_events:
-                        if event.get("type") == "tool_result":
-                            _record_tool_result_events([event])
-                        yield _decorate_stream_event(event)
+                    repair_state = {}
+                    async for event in _emit_repair_event_stream(
+                        _stream_pseudo_tool_call_repair(
+                            pending_content,
+                            result_holder=repair_state,
+                        ),
+                    ):
+                        yield event
+                    repair_text = str(repair_state.get("text") or "")
                     run_result_text = repair_text
                     pending_content = ""
                 if pending_content.strip() and not AgentLoop._looks_like_internal_scratchpad_text(
@@ -3754,15 +3705,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     all_tool_result_events,
                     previous_draft=run_result_text or full_content,
                 )
-                repair_text, repair_events = await _run_pseudo_tool_call_repair(
-                    run_result_text or "Tool guard stopped before skill-contract progress.",
-                    repair_prompt_override=repair_prompt,
-                    repair_reason="skill_contract_continuation",
-                )
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                repair_state = {}
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        run_result_text or "Tool guard stopped before skill-contract progress.",
+                        result_holder=repair_state,
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="skill_contract_continuation",
+                    ),
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 if repair_text.strip():
                     run_result_text = repair_text
                     full_content = repair_text
@@ -3820,11 +3773,15 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     "of actual tool calls; retrying once with an internal repair prompt."
                 )
                 pseudo_tool_repair_attempted = True
-                repair_text, repair_events = await _run_pseudo_tool_call_repair(full_content)
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                repair_state = {}
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        full_content,
+                        result_holder=repair_state,
+                    ),
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 full_content = repair_text
                 pending_fallback_content_emit = True
                 pending_fallback_reason = "pseudo_tool_call_repair"
@@ -3861,15 +3818,19 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     all_tool_result_events,
                     previous_draft=full_content,
                 )
-                repair_text, repair_events = await _run_pseudo_tool_call_repair(
-                    full_content,
-                    repair_prompt_override=repair_prompt,
-                    repair_reason="skill_contract_continuation",
-                )
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                repair_state = {}
+                repair_events: list[dict[str, Any]] = []
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        full_content,
+                        result_holder=repair_state,
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="skill_contract_continuation",
+                    ),
+                    collected_events=repair_events,
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 if (
                     not repair_text.strip() or repair_text.strip() == "NO_CONCISE_TOOL_EVIDENCE"
                 ) and any(event.get("type") == "tool_result" for event in repair_events):
@@ -3923,24 +3884,20 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     continuation_reason=verdict.get("reason"),
                     continuation_focus=verdict.get("next_focus"),
                 )
-                repair_text, repair_events = await _run_pseudo_tool_call_repair(
-                    full_content,
-                    repair_prompt_override=repair_prompt,
-                    repair_reason="task_continuation",
-                )
-                for event in repair_events:
-                    if event.get("type") == "tool_result":
-                        metadata = dict(event.get("metadata") or {})
-                        event = {
-                            **event,
-                            "delta": AgentLoop._stream_tool_result_visible_delta(
-                                event.get("delta", ""),
-                                metadata,
-                            ),
-                            "metadata": metadata,
-                        }
-                        _record_tool_result_events([event])
-                    yield _decorate_stream_event(event)
+                repair_state = {}
+                repair_events = []
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        full_content,
+                        result_holder=repair_state,
+                        repair_prompt_override=repair_prompt,
+                        repair_reason="task_continuation",
+                    ),
+                    visible_tool_result_delta=True,
+                    collected_events=repair_events,
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
                 if (
                     not repair_text.strip() or repair_text.strip() == "NO_CONCISE_TOOL_EVIDENCE"
                 ) and any(event.get("type") == "tool_result" for event in repair_events):
