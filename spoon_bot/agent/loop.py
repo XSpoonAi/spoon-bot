@@ -3985,8 +3985,6 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 and task_continuation_attempts
                 < AgentLoop._task_completion_continuation_attempt_limit()
             ):
-                if latest_tool_event_has_user_summary_marker(all_tool_result_events):
-                    break
                 verdict = await self._evaluate_task_completion_verdict(
                     authoritative_message=authoritative_message,
                     final_content=full_content,

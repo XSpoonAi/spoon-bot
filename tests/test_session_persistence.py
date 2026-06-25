@@ -1144,6 +1144,60 @@ class _ContentStreamingInternalRecoveryRuntimeAgent:
         return type("RunResult", (), {"content": self.final_content})()
 
 
+class _MultiStepSummaryRuntimeAgent:
+    """Runtime agent that needs multiple same-request continuation runs."""
+
+    def __init__(self, target_steps: int = 5) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.target_steps = target_steps
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        step = len(self.run_calls)
+        command = f"run-step {step}"
+        call_id = f"call_step_{step}"
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": command}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "shell",
+            "delta": f"Read it aloud: Step {step} complete",
+            "metadata": {
+                "name": "shell",
+                "id": call_id,
+                "tool_call_id": call_id,
+                "arguments": json.dumps({"command": command}),
+            },
+        })
+        if step >= self.target_steps:
+            previous = "".join(
+                f"Step {index} complete. " for index in range(1, self.target_steps)
+            )
+            final_content = previous + f"All {self.target_steps} steps complete."
+        else:
+            final_content = f"Step {step} complete. "
+        await self.output_queue.put({"type": "content", "delta": final_content})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": final_content})()
+
+
 class _MemoryOnlyInternalRecoveryRuntimeAgent:
     """Runtime agent whose recovery tool result is only visible in memory."""
 
@@ -2051,6 +2105,66 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == final_summary
         assert loop._session.messages[-1]["content"] == final_summary
+
+    @pytest.mark.asyncio
+    async def test_stream_continues_multistep_request_after_tool_summary_marker(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        target_steps = 5
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _MultiStepSummaryRuntimeAgent(target_steps=target_steps)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_multistep_summary_marker")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        async def _completion_verdict(*, tool_result_events, **_kwargs):
+            if len(tool_result_events) < target_steps:
+                return {
+                    "status": "needs_continuation",
+                    "reason": "More tool-backed steps are required.",
+                    "next_focus": "Run the next step.",
+                }
+            return {"status": "complete", "reason": "All steps have tool evidence.", "next_focus": ""}
+
+        loop._evaluate_task_completion_verdict = AsyncMock(side_effect=_completion_verdict)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run five sequential steps"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        tool_call_chunks = [c for c in chunks if c["type"] == "tool_call"]
+        tool_result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        expected_final = (
+            "".join(f"Step {index} complete. " for index in range(1, target_steps))
+            + f"All {target_steps} steps complete."
+        )
+
+        assert len(loop._agent.run_calls) == target_steps
+        assert len(tool_call_chunks) == target_steps
+        assert len(tool_result_chunks) == target_steps
+        assert [c["delta"] for c in content_chunks] == [
+            "Step 1 complete. ",
+            "Step 2 complete. ",
+            "Step 3 complete. ",
+            "Step 4 complete. ",
+            f"All {target_steps} steps complete.",
+        ]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == expected_final
+        assert loop._session.messages[-1]["content"] == expected_final
 
     @pytest.mark.asyncio
     async def test_stream_persists_original_user_text_instead_of_attachment_prose(self, tmp_dir: Path):

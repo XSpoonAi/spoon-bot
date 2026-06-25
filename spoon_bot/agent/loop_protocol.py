@@ -3677,12 +3677,6 @@ class LoopProtocolMixin:
                 "reason": "Tool guardrail produced a blocker to report.",
                 "next_focus": "",
             }
-        if latest_tool_event_has_user_summary_marker(tool_result_events):
-            return {
-                "status": "complete",
-                "reason": "Latest tool evidence contains a user-facing terminal summary.",
-                "next_focus": "",
-            }
         if latest_tool_event_has_active_background_job(tool_result_events):
             return {
                 "status": "complete",
@@ -3717,6 +3711,15 @@ class LoopProtocolMixin:
         chat = getattr(manager, "chat", None)
         ask = getattr(chatbot, "ask", None)
         if not callable(chat) and not callable(ask):
+            if latest_tool_event_has_user_summary_marker(tool_result_events):
+                return {
+                    "status": "complete",
+                    "reason": (
+                        "Latest tool evidence contains a user-facing summary and "
+                        "no verifier model is available."
+                    ),
+                    "next_focus": "",
+                }
             return {
                 "status": "complete",
                 "reason": "No verifier model available.",
@@ -3824,8 +3827,6 @@ class LoopProtocolMixin:
         attempts = 0
         limit = AgentLoop._task_completion_continuation_attempt_limit()
         while attempts < limit and tool_result_events:
-            if latest_tool_event_has_user_summary_marker(tool_result_events):
-                break
             verdict = await self._evaluate_task_completion_verdict(
                 authoritative_message=authoritative_message,
                 final_content=final_content,
