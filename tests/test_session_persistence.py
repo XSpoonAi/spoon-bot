@@ -1147,11 +1147,16 @@ class _ContentStreamingInternalRecoveryRuntimeAgent:
 class _MultiStepSummaryRuntimeAgent:
     """Runtime agent that needs multiple same-request continuation runs."""
 
-    def __init__(self, target_steps: int = 5) -> None:
+    def __init__(
+        self,
+        target_steps: int = 5,
+        command_template: str = "run-step {step}",
+    ) -> None:
         self.task_done = asyncio.Event()
         self.output_queue: asyncio.Queue = asyncio.Queue()
         self.state = "IDLE"
         self.target_steps = target_steps
+        self.command_template = command_template
         self.add_message_calls: list[tuple[str, Any, dict]] = []
         self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
@@ -1161,7 +1166,7 @@ class _MultiStepSummaryRuntimeAgent:
     async def run(self, *args, **kwargs):
         self.run_calls.append((args, kwargs))
         step = len(self.run_calls)
-        command = f"run-step {step}"
+        command = self.command_template.format(step=step)
         call_id = f"call_step_{step}"
         await self.output_queue.put({
             "tool_calls": [
@@ -2141,6 +2146,97 @@ class TestAgentLoopStreamFallback:
 
         chunks = []
         async for chunk in AgentLoop.stream(loop, message="run five sequential steps"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        tool_call_chunks = [c for c in chunks if c["type"] == "tool_call"]
+        tool_result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        expected_final = (
+            "".join(f"Step {index} complete. " for index in range(1, target_steps))
+            + f"All {target_steps} steps complete."
+        )
+
+        assert len(loop._agent.run_calls) == target_steps
+        assert len(tool_call_chunks) == target_steps
+        assert len(tool_result_chunks) == target_steps
+        assert [c["delta"] for c in content_chunks] == [
+            "Step 1 complete. ",
+            "Step 2 complete. ",
+            "Step 3 complete. ",
+            "Step 4 complete. ",
+            f"All {target_steps} steps complete.",
+        ]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == expected_final
+        assert loop._session.messages[-1]["content"] == expected_final
+
+    @pytest.mark.asyncio
+    async def test_skill_summary_marker_without_progress_still_needs_continuation(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        tool_text = (
+            "[SKILL.md execution contract]\n"
+            "Read it aloud: Loaded the skill instructions."
+        )
+        verdict = await loop._evaluate_skill_completion_verdict(
+            authoritative_message="complete the requested workflow",
+            final_content="Loaded the skill instructions.",
+            tool_result_events=[
+                {
+                    "type": "tool_result",
+                    "delta": tool_text,
+                    "metadata": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "skills/example/SKILL.md"}),
+                        "result": tool_text,
+                        "content": tool_text,
+                    },
+                }
+            ],
+        )
+
+        assert verdict["status"] == "needs_continuation"
+
+    @pytest.mark.asyncio
+    async def test_stream_continues_skill_multistep_request_after_tool_summary_marker(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        target_steps = 5
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _MultiStepSummaryRuntimeAgent(
+            target_steps=target_steps,
+            command_template="node skills/example/cli/index.js play {step}",
+        )
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_skill_multistep_summary_marker")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        async def _completion_verdict(*, tool_result_events, **_kwargs):
+            if len(tool_result_events) < target_steps:
+                return {
+                    "status": "needs_continuation",
+                    "reason": "Requested repeated outcome is not fully evidenced yet.",
+                    "next_focus": "Run the next requested step.",
+                }
+            return {"status": "complete", "reason": "All requested steps have tool evidence.", "next_focus": ""}
+
+        loop._evaluate_task_completion_verdict = AsyncMock(side_effect=_completion_verdict)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run five skill-backed steps"):
             chunks.append(chunk)
 
         content_chunks = [c for c in chunks if c["type"] == "content"]

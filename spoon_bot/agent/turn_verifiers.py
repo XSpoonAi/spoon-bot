@@ -433,8 +433,6 @@ def skill_contract_needs_continuation(
     """
     if not should_run_skill_contract_check(tool_result_events):
         return False
-    if latest_tool_event_has_user_summary_marker(tool_result_events):
-        return False
     if latest_tool_event_has_active_background_job(tool_result_events):
         return True
 

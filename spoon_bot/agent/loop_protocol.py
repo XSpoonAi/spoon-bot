@@ -111,7 +111,10 @@ _TASK_COMPLETION_VERDICT_SYSTEM_PROMPT = (
     "evidence satisfies the request, or when the evidence shows a real blocker "
     "that should be reported instead of retried. Do not use product-specific "
     "rules, route names, repository names, game names, or natural-language "
-    "phrase matching. The user request is intent, not proof."
+    "phrase matching. The user request is intent, not proof. For countable or "
+    "repeated outcomes, compare the requested count and scope against concrete "
+    "tool evidence; a stage summary is evidence for that stage only, not proof "
+    "that the remaining requested repetitions are complete."
 )
 
 
@@ -3782,12 +3785,6 @@ class LoopProtocolMixin:
         """Use only structured event state to decide if another model step is needed."""
         if not should_run_skill_contract_check(tool_result_events):
             return {"status": "complete", "reason": "No skill contract evidence.", "next_focus": ""}
-        if latest_tool_event_has_user_summary_marker(tool_result_events):
-            return {
-                "status": "complete",
-                "reason": "Latest tool evidence contains a user-facing terminal summary.",
-                "next_focus": "",
-            }
         active_ledger = getattr(self, "_active_execution_ledger", None)
         if (
             isinstance(active_ledger, ExecutionLedger)
@@ -3895,8 +3892,6 @@ class LoopProtocolMixin:
             and tool_result_events
             and should_run_skill_contract_check(tool_result_events)
         ):
-            if latest_tool_event_has_user_summary_marker(tool_result_events):
-                break
             verdict = await self._evaluate_skill_completion_verdict(
                 authoritative_message=authoritative_message,
                 final_content=final_content,
@@ -4238,6 +4233,12 @@ class LoopProtocolMixin:
             "already terminal or evidence shows a real blocker, answer now. "
             "Otherwise call the next appropriate tool. Do not repeat completed "
             "tool calls; use existing files and tool evidence as the current state."
+        )
+        lines.append(
+            "For countable or repeated requests, continue until the concrete tool "
+            "evidence satisfies the requested count and scope, or until tool "
+            "evidence shows a real blocker. Treat stage summaries as progress "
+            "for the stage they describe, not as proof of the remaining stages."
         )
         lines.append(
             "If the request asks to create, update, build, deploy, start, or verify "
