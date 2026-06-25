@@ -427,6 +427,69 @@ class TestToolFailureLoopGuard:
             assert suppress_after_consecutive_tool_failures("shell") is None
 
 
+class TestRepeatedToolGuards:
+    @pytest.mark.asyncio
+    async def test_repeated_shell_invocations_do_not_stop_tool_loop(self, tmp_path):
+        tool = ShellTool(working_dir=str(tmp_path))
+
+        with track_tool_invocations(max_repeats=1):
+            first = await tool(command="printf exact-duplicate")
+            second = await tool(command="printf exact-duplicate")
+            third = await tool(command="printf exact-duplicate")
+
+        assert first == "exact-duplicate"
+        assert second == "exact-duplicate"
+        assert third == "exact-duplicate"
+        assert "STOP_TOOL_LOOP" not in second
+        assert "STOP_TOOL_LOOP" not in third
+
+    @pytest.mark.asyncio
+    async def test_repeated_read_only_shell_inspections_do_not_stop_tool_loop(self, tmp_path):
+        tool = ShellTool(working_dir=str(tmp_path))
+
+        with track_tool_invocations(max_repeats=1):
+            first = await tool(command="pwd")
+            second = await tool(command="pwd")
+            third = await tool(command="pwd")
+
+        assert str(tmp_path) in first
+        assert str(tmp_path) in second
+        assert str(tmp_path) in third
+        assert "STOP_TOOL_LOOP" not in second
+        assert "duplicate shell inspection" not in second.lower()
+        assert "STOP_TOOL_LOOP" not in third
+        assert "duplicate shell inspection" not in third.lower()
+
+    @pytest.mark.asyncio
+    async def test_repeated_skill_cli_series_do_not_stop_tool_loop(self, tmp_path):
+        skill_dir = tmp_path / "skills" / "example" / "cli"
+        skill_dir.mkdir(parents=True)
+        script = skill_dir / "index.sh"
+        script.write_text("#!/bin/sh\nprintf played\n", encoding="utf-8")
+        script.chmod(0o755)
+        (tmp_path / "skills" / "example" / "SKILL.md").write_text(
+            "# Example\n\n"
+            "CLI = skills/example/cli/index.sh\n\n"
+            "## Commands\n"
+            "- $CLI play\n",
+            encoding="utf-8",
+        )
+        tool = ShellTool(working_dir=str(tmp_path))
+
+        with track_tool_invocations(max_repeats=100, max_series_repeats=1):
+            first = await tool(command="skills/example/cli/index.sh play")
+            second = await tool(command="skills/example/cli/index.sh play")
+            third = await tool(command="skills/example/cli/index.sh play")
+
+        assert first == "played"
+        assert second == "played"
+        assert third == "played"
+        assert "STOP_TOOL_LOOP" not in second
+        assert "repeated side-effecting tool series" not in second.lower()
+        assert "STOP_TOOL_LOOP" not in third
+        assert "repeated side-effecting tool series" not in third.lower()
+
+
 # ---------------------------------------------------------------------------
 # Config loading from env vars
 # ---------------------------------------------------------------------------

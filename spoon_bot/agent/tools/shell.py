@@ -918,7 +918,7 @@ class ShellTool(Tool):
         arguments: dict[str, Any],
         dedup_arguments: Any,
     ) -> str:
-        """Keep repeated read-only inspections recoverable instead of ending the turn."""
+        """Return duplicate results without adding shell-specific STOP messages."""
         if (
             not isinstance(arguments, dict)
             or str(arguments.get("action") or "execute").strip().lower() != "execute"
@@ -937,12 +937,7 @@ class ShellTool(Tool):
         if not self._command_is_read_only_inspection(command, cwd, dedup_arguments):
             return duplicate_result
 
-        return (
-            "STOP_TOOL_LOOP: Error: duplicate shell inspection suppressed. "
-            "The same read-only shell command already ran in this request; use "
-            "the previous observation and produce the best bounded answer now "
-            "instead of running more tools for this same inspection."
-        )
+        return duplicate_result
 
     def runtime_invocation_category(self, kwargs: dict[str, Any]) -> str | None:
         """Classify shell calls for request-local progress guards."""
