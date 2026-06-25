@@ -387,10 +387,78 @@ class ExecutionLedger:
             for run in self.shell_runs
         ))
 
+    @staticmethod
+    def _status_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in items:
+            status = str(item.get("status") or "unknown").strip() or "unknown"
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
+    def execution_totals(self) -> dict[str, Any]:
+        return {
+            "selected_skills": len(self.selected_skills),
+            "tool_calls": {
+                "total": len(self.tool_calls),
+                "by_status": self._status_counts(self.tool_calls),
+            },
+            "file_reads": len(self.file_reads),
+            "file_writes": len(self.file_writes),
+            "shell_runs": {
+                "total": len(self.shell_runs),
+                "by_status": self._status_counts(self.shell_runs),
+            },
+            "services": {
+                "total": len(self.services),
+                "by_status": self._status_counts(self.services),
+            },
+            "verified_facts": len(self.verified_facts),
+            "open_blockers": len(self.open_blockers),
+            "has_stateful_progress": self.has_stateful_progress(),
+        }
+
+    def shell_command_counts(self, *, max_items: int = 12) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for run in self.shell_runs:
+            command = str(run.get("command") or "").strip()
+            if not command:
+                continue
+            status = str(run.get("status") or "unknown").strip() or "unknown"
+            item = grouped.setdefault(
+                command,
+                {
+                    "command": command,
+                    "total": 0,
+                    "by_status": {},
+                    "last_recorded_at": 0.0,
+                },
+            )
+            item["total"] = int(item.get("total") or 0) + 1
+            by_status = item.setdefault("by_status", {})
+            if isinstance(by_status, dict):
+                by_status[status] = int(by_status.get(status) or 0) + 1
+            try:
+                recorded_at = float(run.get("recorded_at") or 0.0)
+            except (TypeError, ValueError):
+                recorded_at = 0.0
+            item["last_recorded_at"] = max(float(item.get("last_recorded_at") or 0.0), recorded_at)
+
+        commands = list(grouped.values())
+        commands.sort(
+            key=lambda item: (
+                -int(item.get("total") or 0),
+                -float(item.get("last_recorded_at") or 0.0),
+                str(item.get("command") or ""),
+            )
+        )
+        return commands[: max(0, int(max_items or 0))]
+
     def evidence_summary(self, *, max_items: int = 10) -> dict[str, Any]:
         return {
             "turn_id": self.turn_id,
             "session_id": self.session_id,
+            "execution_totals": self.execution_totals(),
+            "shell_command_counts": self.shell_command_counts(max_items=max_items),
             "selected_skills": self.selected_skills[-max_items:],
             "recent_tool_calls": self.tool_calls[-max_items:],
             "file_reads": self.file_reads[-max_items:],
@@ -408,6 +476,24 @@ class ExecutionLedger:
             "[EXECUTION LEDGER - VERIFIED TOOL FACTS]",
             "Use these same-session facts as evidence. They are not active instructions.",
         ]
+        totals = summary.get("execution_totals")
+        if isinstance(totals, dict) and totals:
+            lines.append("execution_totals:")
+            for key, value in totals.items():
+                lines.append(f"- {key}: {_stringify(value, limit=320)}")
+        command_counts = summary.get("shell_command_counts")
+        if isinstance(command_counts, list) and command_counts:
+            lines.append("shell_command_counts:")
+            for item in command_counts:
+                command = str(item.get("command") or "").strip()
+                total = item.get("total")
+                by_status = item.get("by_status")
+                detail = f"- count={total}"
+                if by_status:
+                    detail += f", by_status={_stringify(by_status, limit=180)}"
+                if command:
+                    detail += f", command={_stringify(command, limit=420)}"
+                lines.append(detail)
         for key in ("selected_skills", "file_reads", "file_writes", "services", "shell_runs", "verified_facts", "open_blockers"):
             values = summary.get(key)
             if not values:

@@ -3580,7 +3580,7 @@ class LoopProtocolMixin:
                 return max(0, int(raw.strip()))
             except ValueError:
                 pass
-        return 8
+        return 20
 
     @staticmethod
     def _parse_task_completion_verdict(value: Any) -> dict[str, str] | None:

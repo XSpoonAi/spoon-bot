@@ -931,11 +931,7 @@ def track_tool_invocations(
     max_consecutive_failures: int = 3,
     initial_state: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Track exact tool invocations for the current request.
-
-    This is a data-plane guard: it suppresses identical tool+argument executions
-    inside one request without routing based on user prompt wording.
-    """
+    """Track exact tool invocations for diagnostics without blocking execution."""
     if isinstance(initial_state, dict):
         state = _ensure_tool_invocation_state_shape(
             initial_state,

@@ -2199,6 +2199,38 @@ class TestAgentLoopStreamFallback:
 
         assert verdict["status"] == "needs_continuation"
 
+    def test_skill_progress_with_terminal_text_defers_to_task_verifier(self):
+        from spoon_bot.agent.turn_verifiers import skill_contract_needs_continuation
+
+        tool_text = "stateful action complete"
+        needs_continuation = skill_contract_needs_continuation(
+            "Finished this step.",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "[SKILL.md execution contract]",
+                    "metadata": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "skills/example/SKILL.md"}),
+                        "result": "[SKILL.md execution contract]",
+                    },
+                },
+                {
+                    "type": "tool_result",
+                    "delta": tool_text,
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({
+                            "command": "node skills/example/cli/index.js action",
+                        }),
+                        "result": tool_text,
+                    },
+                },
+            ],
+        )
+
+        assert needs_continuation is False
+
     @pytest.mark.asyncio
     async def test_stream_continues_skill_multistep_request_after_tool_summary_marker(
         self,
@@ -2261,6 +2293,75 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == expected_final
         assert loop._session.messages[-1]["content"] == expected_final
+
+    @pytest.mark.asyncio
+    async def test_stream_has_enough_continuation_budget_for_ten_countable_steps(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        target_steps = 10
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _MultiStepSummaryRuntimeAgent(
+            target_steps=target_steps,
+            command_template="node skills/example/cli/index.js action {step}",
+        )
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_ten_countable_steps")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        async def _completion_verdict(*, tool_result_events, **_kwargs):
+            if len(tool_result_events) < target_steps:
+                return {
+                    "status": "needs_continuation",
+                    "reason": "Requested count is not fully evidenced yet.",
+                    "next_focus": "Run the next requested action.",
+                }
+            return {"status": "complete", "reason": "Requested count is evidenced.", "next_focus": ""}
+
+        loop._evaluate_task_completion_verdict = AsyncMock(side_effect=_completion_verdict)
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run ten countable actions"):
+            chunks.append(chunk)
+
+        tool_result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert len(loop._agent.run_calls) == target_steps
+        assert len(tool_result_chunks) == target_steps
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"].endswith(
+            f"All {target_steps} steps complete."
+        )
+
+    def test_execution_ledger_context_keeps_aggregate_shell_counts(self):
+        from spoon_bot.agent.execution_ledger import ExecutionLedger
+
+        ledger = ExecutionLedger(owner="test", user_request="run repeated actions")
+        for index in range(12):
+            ledger.record_tool(
+                "shell",
+                {"command": "node skills/example/cli/index.js action"},
+                f"action {index + 1} complete",
+                f"action {index + 1} complete",
+            )
+
+        context = ledger.render_context(max_chars=8000)
+
+        assert "execution_totals:" in context
+        assert "shell_command_counts:" in context
+        assert "count=12" in context
+        assert "node skills/example/cli/index.js action" in context
 
     @pytest.mark.asyncio
     async def test_stream_persists_original_user_text_instead_of_attachment_prose(self, tmp_dir: Path):

@@ -449,9 +449,9 @@ def skill_contract_needs_continuation(
         return True
     if latest_tool_event_from_skill_continuation(tool_result_events):
         return False
-    if not latest_tool_event_has_user_summary_marker(tool_result_events):
-        return True
-    return skill_contract_inspection_stalled_after_progress(tool_result_events)
+    if latest_tool_event_has_user_summary_marker(tool_result_events):
+        return skill_contract_inspection_stalled_after_progress(tool_result_events)
+    return False
 
 
 def latest_tool_event_has_next_command(tool_result_events: list[dict[str, Any]]) -> bool:
