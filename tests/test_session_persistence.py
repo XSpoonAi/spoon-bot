@@ -1093,6 +1093,57 @@ class _DelayedInternalRecoveryRuntimeAgent:
         return type("RunResult", (), {"content": "Recovered final answer"})()
 
 
+class _ContentStreamingInternalRecoveryRuntimeAgent:
+    """Runtime agent whose recovery run streams content before it finishes."""
+
+    def __init__(self) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.recovery_progress_emitted = asyncio.Event()
+        self.release_recovery = asyncio.Event()
+        self.progress = "Round 1 complete. "
+        self.final_content = "Round 1 complete. All 5 rounds complete."
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        if len(self.run_calls) == 1:
+            return type("RunResult", (), {"content": "No results"})()
+
+        await self.output_queue.put({"type": "content", "delta": self.progress})
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": "call_recovery_content",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "python long_task.py"}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "shell",
+            "delta": "round 2 complete",
+            "metadata": {
+                "name": "shell",
+                "id": "call_recovery_content",
+                "tool_call_id": "call_recovery_content",
+            },
+        })
+        self.recovery_progress_emitted.set()
+        await self.release_recovery.wait()
+        await self.output_queue.put({"type": "content", "delta": self.final_content})
+        return type("RunResult", (), {"content": self.final_content})()
+
+
 class _MemoryOnlyInternalRecoveryRuntimeAgent:
     """Runtime agent whose recovery tool result is only visible in memory."""
 
@@ -1641,6 +1692,76 @@ class TestAgentLoopStreamFallback:
         done_chunks = [chunk for chunk in chunks if chunk["type"] == "done"]
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Recovered final answer"
+
+    @pytest.mark.asyncio
+    async def test_stream_forwards_internal_recovery_content_before_repair_finishes(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import spoon_bot.agent.loop as loop_module
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _ContentStreamingInternalRecoveryRuntimeAgent()
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_internal_recovery_content")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        monkeypatch.setattr(
+            loop_module,
+            "skill_contract_needs_continuation",
+            lambda *_args, **_kwargs: len(loop._agent.run_calls) < 2,
+        )
+
+        stream = AgentLoop.stream(loop, message="continue the long task")
+        chunks: list[dict[str, Any]] = []
+        try:
+            while True:
+                chunk = await asyncio.wait_for(anext(stream), timeout=1)
+                chunks.append(chunk)
+                if chunk["type"] == "tool_result":
+                    break
+
+            assert loop._agent.recovery_progress_emitted.is_set()
+            assert not loop._agent.release_recovery.is_set()
+            assert len(loop._agent.run_calls) == 2
+            assert [chunk["type"] for chunk in chunks] == [
+                "content",
+                "tool_call",
+                "tool_result",
+            ]
+            assert chunks[0]["delta"] == loop._agent.progress
+            assert chunks[0]["metadata"]["repair"] == "skill_contract_continuation"
+            assert chunks[1]["metadata"]["repair"] == "skill_contract_continuation"
+            assert chunks[2]["metadata"]["repair"] == "skill_contract_continuation"
+
+            loop._agent.release_recovery.set()
+            while chunks[-1]["type"] != "done":
+                chunks.append(await asyncio.wait_for(anext(stream), timeout=1))
+        finally:
+            await stream.aclose()
+
+        content_chunks = [chunk for chunk in chunks if chunk["type"] == "content"]
+        assert [chunk["delta"] for chunk in content_chunks] == [
+            loop._agent.progress,
+            "All 5 rounds complete.",
+        ]
+        assert "".join(chunk["delta"] for chunk in content_chunks) == loop._agent.final_content
+        done_chunks = [chunk for chunk in chunks if chunk["type"] == "done"]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == loop._agent.final_content
 
     @pytest.mark.asyncio
     async def test_stream_flushes_internal_recovery_memory_tool_results_before_finish(

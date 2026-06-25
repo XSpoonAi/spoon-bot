@@ -2416,14 +2416,28 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     )
                     return events
 
+                metadata: dict[str, Any] = {}
+                event_type = "content"
                 if isinstance(queued, dict):
+                    metadata = dict(queued.get("metadata") or {})
+                    if str(queued.get("type") or "").strip() == "thinking":
+                        event_type = "thinking"
                     text = queued.get("content") or queued.get("delta") or ""
                 else:
                     text = getattr(queued, "content", None) or (
                         queued if isinstance(queued, str) else ""
                     )
                 if text:
-                    queued_content_parts.append(str(text))
+                    text = str(text)
+                    queued_content_parts.append(text)
+                    metadata.setdefault("repair", repair_reason)
+                    events.append(
+                        {
+                            "type": event_type,
+                            "delta": text,
+                            "metadata": metadata,
+                        }
+                    )
                 return events
 
             async def _stream_internal_recovery_run(
@@ -2694,8 +2708,20 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 visible_tool_result_delta: bool = False,
                 collected_events: list[dict[str, Any]] | None = None,
             ) -> AsyncGenerator[dict[str, Any], None]:
+                nonlocal emitted_content_text, full_content
+                nonlocal last_tool_progress_at, last_tool_progress_kind
+                nonlocal saw_tool_call, saw_content_after_tool_call
+                nonlocal streamed_content_after_latest_tool_call
+
                 async for event in repair_stream:
-                    if event.get("type") == "tool_result":
+                    event_type = str(event.get("type") or "")
+                    if event_type == "tool_call":
+                        saw_tool_call = True
+                        saw_content_after_tool_call = False
+                        streamed_content_after_latest_tool_call = False
+                        last_tool_progress_at = time.monotonic()
+                        last_tool_progress_kind = "tool_call"
+                    if event_type == "tool_result":
                         if visible_tool_result_delta:
                             metadata = dict(event.get("metadata") or {})
                             event = {
@@ -2707,6 +2733,26 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 "metadata": metadata,
                             }
                         _record_tool_result_events([event])
+                    if event_type == "content":
+                        delta = str(event.get("delta") or "")
+                        if not delta or AgentLoop._is_internal_completion_sentinel(delta):
+                            continue
+                        delta = AgentLoop._trim_repeated_stream_prefix(
+                            delta,
+                            emitted_content_text,
+                        )
+                        delta = AgentLoop._mask_user_visible_text(delta)
+                        if not delta:
+                            continue
+                        metadata = dict(event.get("metadata") or {})
+                        metadata.setdefault("validated", True)
+                        event = {**event, "delta": delta, "metadata": metadata}
+                        full_content += delta
+                        emitted_content_text += delta
+                        saw_content_after_tool_call = True
+                        streamed_content_after_latest_tool_call = True
+                    elif event_type == "thinking" and not thinking:
+                        continue
                     if collected_events is not None:
                         collected_events.append(event)
                     yield _decorate_stream_event(event)

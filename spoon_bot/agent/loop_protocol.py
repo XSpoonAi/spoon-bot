@@ -2078,8 +2078,16 @@ class LoopProtocolMixin:
     ) -> str:
         """Remove a repeated prefix that has already been streamed to the user."""
         incoming = str(incoming_text or "")
+        if not incoming:
+            return incoming
+
+        emitted = str(already_emitted_text or "")
+        for prefix in (emitted, emitted.rstrip()):
+            if prefix and incoming.startswith(prefix):
+                return incoming[len(prefix) :].lstrip()
+
         emitted_normalized = AgentLoop._normalize_comparable_text(already_emitted_text)
-        if not incoming or len(emitted_normalized) < 24:
+        if len(emitted_normalized) < 24:
             return incoming
 
         incoming_normalized, incoming_source_ends = (
@@ -3559,7 +3567,7 @@ class LoopProtocolMixin:
                 return max(0, int(raw.strip()))
             except ValueError:
                 pass
-        return 3
+        return 12
 
     @staticmethod
     def _task_completion_continuation_attempt_limit() -> int:
@@ -3569,7 +3577,7 @@ class LoopProtocolMixin:
                 return max(0, int(raw.strip()))
             except ValueError:
                 pass
-        return 2
+        return 8
 
     @staticmethod
     def _parse_task_completion_verdict(value: Any) -> dict[str, str] | None:
