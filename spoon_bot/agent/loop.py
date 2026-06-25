@@ -2446,6 +2446,25 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 )
 
                 task = asyncio.create_task(run_factory())
+
+                def _collect_repair_tool_result_events() -> list[dict[str, Any]]:
+                    nonlocal stream_tool_result_index
+                    tool_result_events, stream_tool_result_index = (
+                        AgentLoop._collect_stream_tool_result_events(
+                            self,
+                            stream_tool_result_index,
+                            emitted_tool_result_ids,
+                            tool_output_capture_scope=tool_output_capture_scope,
+                            tool_call_arguments_by_id=tool_call_arguments_by_id,
+                        )
+                    )
+                    repaired_events: list[dict[str, Any]] = []
+                    for event in tool_result_events:
+                        metadata = dict(event.get("metadata") or {})
+                        metadata["repair"] = repair_reason
+                        repaired_events.append({**event, "metadata": metadata})
+                    return repaired_events
+
                 try:
                     while True:
                         if task.done() and self._agent.output_queue.empty():
@@ -2466,9 +2485,13 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 timeout=timeout,
                             )
                         except asyncio.TimeoutError:
+                            for event in _collect_repair_tool_result_events():
+                                yield event
                             continue
                         except Exception as exc:
                             logger.debug(f"{label} output queue polling failed: {exc}")
+                            for event in _collect_repair_tool_result_events():
+                                yield event
                             continue
 
                         for event in _repair_events_from_queued_item(
@@ -2476,6 +2499,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             repair_reason=repair_reason,
                             queued_content_parts=queued_content_parts,
                         ):
+                            yield event
+                        for event in _collect_repair_tool_result_events():
                             yield event
 
                     if timed_out:
@@ -2503,6 +2528,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             queued_content_parts=queued_content_parts,
                         ):
                             yield event
+                        for event in _collect_repair_tool_result_events():
+                            yield event
                 except asyncio.CancelledError:
                     if not task.done():
                         task.cancel()
@@ -2523,19 +2550,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     repair_text = "".join(queued_content_parts)
                 result_holder["text"] = repair_text
 
-                tool_result_events, stream_tool_result_index = (
-                    AgentLoop._collect_stream_tool_result_events(
-                        self,
-                        stream_tool_result_index,
-                        emitted_tool_result_ids,
-                        tool_output_capture_scope=tool_output_capture_scope,
-                        tool_call_arguments_by_id=tool_call_arguments_by_id,
-                    )
-                )
-                for event in tool_result_events:
-                    metadata = dict(event.get("metadata") or {})
-                    metadata["repair"] = repair_reason
-                    yield {**event, "metadata": metadata}
+                for event in _collect_repair_tool_result_events():
+                    yield event
 
             async def _stream_pseudo_tool_call_repair(
                 pseudo_content: str,
