@@ -141,11 +141,7 @@ class LoopProtocolMixin:
                 text = getattr(msg, "text_content", None) or getattr(msg, "content", None)
                 if text and isinstance(text, str) and text.strip():
                     # Skip internal sentinel messages
-                    if text.strip() in (
-                        "Task completed",
-                        "Task completed based on finish_reason signal",
-                        "Thinking completed. No action needed. Task finished.",
-                    ):
+                    if AgentLoop._is_internal_completion_sentinel(text):
                         continue
                     logger.info(f"Extracted fallback content from memory (len={len(text)})")
                     return text.strip()
@@ -2215,9 +2211,73 @@ class LoopProtocolMixin:
         return saw_tool_call and not saw_content_after_tool_call
 
     @staticmethod
+    def _is_internal_completion_sentinel(content: Any) -> bool:
+        """Return True for provider/runtime completion markers that are not answers."""
+        text = str(content or "").strip()
+        return text in {
+            "Task completed",
+            "Task completed based on finish_reason signal",
+            "Thinking completed. No action needed. Task finished.",
+        }
+
+    @staticmethod
+    def _looks_like_tool_call_protocol_text(content: str) -> bool:
+        """Return True when plain text contains model/tool protocol markup.
+
+        Some OpenAI-compatible providers can surface their tool-call control
+        language as reasoning text instead of structured ``tool_calls``. That
+        markup is not user-visible content and, more importantly, it means the
+        runtime did not execute the intended tool call.
+        """
+        text = str(content or "")
+        if not text.strip():
+            return False
+        compact = re.sub(r"\s+", "", text)
+        lower = compact.casefold()
+        if "dsml" in lower:
+            return any(
+                marker in lower
+                for marker in (
+                    "tool_call",
+                    "toolcalls",
+                    "invoke",
+                    "parameter",
+                    "name=",
+                )
+            )
+        if "<tool_call" in lower or "<toolcalls" in lower or "<tool_calls" in lower:
+            return any(marker in lower for marker in ("name=", "function", "arguments", "invoke"))
+        if "<invoke" in lower and "name=" in lower:
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_tool_call_protocol_fragment(content: str) -> bool:
+        """Return True for partial streamed protocol tags that must not leak."""
+        text = str(content or "")
+        if not text.strip():
+            return False
+        compact = re.sub(r"\s+", "", text)
+        lower = compact.casefold()
+        if "dsml" in lower and "<" in lower:
+            return True
+        return any(
+            marker in lower
+            for marker in (
+                "<tool_call",
+                "<toolcalls",
+                "<tool_calls",
+                "<invoke",
+                "<|tool",
+            )
+        )
+
+    @staticmethod
     def _looks_like_pseudo_tool_call_text(content: str) -> bool:
         """Return True when plain text is pretending that tools were called."""
         text = str(content or "")
+        if AgentLoop._looks_like_tool_call_protocol_text(text):
+            return True
         if "Observed output of cmd" not in text or "execution:" not in text:
             return False
         return bool(
@@ -2236,15 +2296,15 @@ class LoopProtocolMixin:
         """Build an internal retry prompt after the model emitted fake tool text."""
         return (
             "[INTERNAL TOOL-CALL REPAIR]\n"
-            "Your previous assistant output wrote tool-call-shaped Markdown as plain text. "
-            "Those actions were NOT executed by the runtime, and any claimed outputs in that "
-            "text are invalid.\n\n"
+            "Your previous assistant output wrote tool-call protocol markup or "
+            "tool-call-shaped text as plain text. Those actions were NOT executed by "
+            "the runtime, and any claimed outputs in that text are invalid.\n\n"
             "The invalid text is intentionally omitted from this repair context so it cannot "
             "be mistaken for evidence. Continue the latest user request from the real tool "
             "messages already in memory by calling tools through the tool-call API. Do not "
-            "describe a tool call, do not write `tool_name(...)` in Markdown, and do not "
-            "claim success until actual tool results have been returned. If the needed tool "
-            "is unavailable or fails, report that concrete blocker.\n\n"
+            "describe a tool call, do not write protocol tags or `tool_name(...)` in text, "
+            "and do not claim success until actual tool results have been returned. If the "
+            "needed tool is unavailable or fails, report that concrete blocker.\n\n"
             f"Latest user request:\n{user_request}"
         )
 
@@ -2480,7 +2540,11 @@ class LoopProtocolMixin:
     ) -> bool:
         """Return True when current terminal text is absent or unsafe to preserve."""
         text = str(content or "").strip()
-        if not text or text in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}:
+        if (
+            not text
+            or text in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}
+            or AgentLoop._is_internal_completion_sentinel(text)
+        ):
             return True
         if AgentLoop._looks_like_internal_scratchpad_text(text):
             return True
@@ -2521,6 +2585,8 @@ class LoopProtocolMixin:
         if not text:
             return True
         if text in {"NO_CONCISE_TOOL_EVIDENCE", "No results"}:
+            return True
+        if AgentLoop._is_internal_completion_sentinel(text):
             return True
         if AgentLoop._looks_like_internal_scratchpad_text(text):
             return True

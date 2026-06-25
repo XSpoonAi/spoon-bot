@@ -1901,6 +1901,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         execution_ledger: ExecutionLedger | None = None
         ledger_manager = None
         _pre_turn_memory_index: int | None = None
+        leaked_tool_protocol_buffer = ""
+        leaked_tool_protocol_detected = False
+        leaked_tool_protocol_probe = ""
 
         def _persist_interrupted_stream_reply(reason: str = "task_cancelled") -> None:
             nonlocal interrupted_assistant_reply_persisted
@@ -2815,6 +2818,14 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 except Exception:
                     pass
 
+            def _stop_current_run_for_tool_protocol_leak() -> None:
+                if bg_task is not None and not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    td.set()
+                except Exception:
+                    pass
+
             def _can_run_skill_contract_continuation() -> bool:
                 return (
                     skill_contract_continuation_attempts
@@ -3144,6 +3155,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         continue
 
                     if "tool_calls" in chunk and chunk["tool_calls"]:
+                        leaked_tool_protocol_buffer = ""
+                        leaked_tool_protocol_detected = False
+                        leaked_tool_protocol_probe = ""
                         if self._should_disable_parallel_tool_calls() and isinstance(
                             chunk.get("tool_calls"), (list, tuple)
                         ):
@@ -3317,6 +3331,23 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 elif isinstance(chunk, str):
                     delta = chunk
 
+                if delta and chunk_type in {"thinking", "content"}:
+                    leaked_tool_protocol_probe = (leaked_tool_protocol_probe + str(delta))[-1200:]
+                    if leaked_tool_protocol_detected or AgentLoop._looks_like_tool_call_protocol_fragment(
+                        leaked_tool_protocol_probe
+                    ):
+                        leaked_tool_protocol_detected = True
+                        leaked_tool_protocol_buffer = (
+                            leaked_tool_protocol_buffer + str(delta)
+                        )[-12_000:]
+                        logger.warning(
+                            "Provider streamed tool-call protocol markup as {} text; "
+                            "suppressing it and retrying through the tool-call API.",
+                            chunk_type,
+                        )
+                        _stop_current_run_for_tool_protocol_leak()
+                        continue
+
                 if chunk_type == "tool_result":
                     delta = AgentLoop._stream_tool_result_visible_delta(delta, metadata)
                     tool_result_event = {
@@ -3382,6 +3413,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         )
                         if _stop_if_total_timeout():
                             break
+                    continue
+
+                if chunk_type == "content" and AgentLoop._is_internal_completion_sentinel(delta):
+                    logger.debug("Suppressing internal completion sentinel from stream content")
                     continue
 
                 if delta:
@@ -3494,6 +3529,31 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
+
+            if leaked_tool_protocol_detected and not pseudo_tool_repair_attempted:
+                logger.warning(
+                    "Stream contained leaked tool-call protocol text; running "
+                    "internal tool-call repair."
+                )
+                pseudo_tool_repair_attempted = True
+                repair_state = {}
+                async for event in _emit_repair_event_stream(
+                    _stream_pseudo_tool_call_repair(
+                        leaked_tool_protocol_buffer
+                        or "Leaked tool-call protocol text was suppressed.",
+                        result_holder=repair_state,
+                        repair_reason="tool_call_protocol_leak",
+                    ),
+                    visible_tool_result_delta=True,
+                ):
+                    yield event
+                repair_text = str(repair_state.get("text") or "")
+                run_result_text = repair_text
+                post_tool_content_buffer = repair_text
+                post_tool_content_events = []
+                leaked_tool_protocol_buffer = ""
+                leaked_tool_protocol_detected = False
+                leaked_tool_protocol_probe = ""
 
             if history_search_budget_seen and not history_search_budget_recovery_attempted:
                 logger.warning(
@@ -3632,6 +3692,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 )
                 post_tool_content_events = []
                 post_tool_content_buffer = ""
+                if AgentLoop._is_internal_completion_sentinel(pending_content):
+                    pending_content = ""
                 if (
                     pending_content.strip()
                     and AgentLoop._looks_like_pseudo_tool_call_text(pending_content)
@@ -3735,6 +3797,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             # Fallback: if run() completed but no stream chunks were emitted,
             # or only a pre-tool preamble was emitted, use the final run result
             # to avoid ending the stream without the actual answer text.
+            if AgentLoop._is_internal_completion_sentinel(run_result_text):
+                run_result_text = ""
             if run_result_text and (not full_content or fallback_after_tool_only_preamble):
                 logger.warning(
                     "Stream produced no content chunks; falling back to run() result text."

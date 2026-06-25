@@ -879,6 +879,128 @@ class _InterleavedToolContentRuntimeAgent:
         return type("RunResult", (), {"content": "".join(self._content_segments)})()
 
 
+class _SentinelThenContinuationRuntimeAgent:
+    """Runtime agent that emits an internal sentinel before continuing tools."""
+
+    def __init__(self, final_content: str) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._final_content = final_content
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": "call_first",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "step 1"}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({"type": "content", "delta": "Task completed"})
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": "call_second",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "step 2"}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({"type": "content", "delta": self._final_content})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": self._final_content})()
+
+
+class _LeakedProtocolThinkingRuntimeAgent:
+    """Runtime agent that leaks tool-call protocol text before repair succeeds."""
+
+    def __init__(self, final_content: str) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self._final_content = final_content
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        if len(self.run_calls) == 1:
+            await self.output_queue.put({
+                "tool_calls": [
+                    {
+                        "id": "call_initial",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": json.dumps({"command": "step 1"}),
+                        },
+                    }
+                ],
+            })
+            await self.output_queue.put({
+                "type": "tool_result",
+                "name": "shell",
+                "delta": "step 1 done",
+                "metadata": {
+                    "id": "call_initial",
+                    "tool_call_id": "call_initial",
+                    "name": "shell",
+                },
+            })
+            await self.output_queue.put({"type": "content", "delta": "第一步完成。"})
+            await self.output_queue.put({"type": "thinking", "delta": "<｜DSML｜tool_calls>\n"})
+            await self.output_queue.put({
+                "type": "thinking",
+                "delta": '<｜DSML｜invoke name="shell"><｜DSML｜parameter name="command">',
+            })
+            await asyncio.sleep(10)
+            await self.output_queue.put({"type": "content", "delta": "想继续下一步吗？"})
+            return type("RunResult", (), {"content": "想继续下一步吗？"})()
+
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": "call_repair",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "step 2"}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "shell",
+            "delta": "step 2 done",
+            "metadata": {
+                "id": "call_repair",
+                "tool_call_id": "call_repair",
+                "name": "shell",
+            },
+        })
+        await self.output_queue.put({"type": "content", "delta": self._final_content})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": self._final_content})()
+
+
 class _SkillSummaryThenContentRuntimeAgent:
     """Runtime agent that emits terminal skill evidence followed by final text."""
 
@@ -1500,6 +1622,92 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == segments[-1]
         assert loop._session.messages[-1]["content"] == segments[-1]
+
+    @pytest.mark.asyncio
+    async def test_stream_suppresses_internal_completion_sentinel_before_continuation(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        final_answer = "真正的最终结果：第二步也已经执行完成。"
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _SentinelThenContinuationRuntimeAgent(final_answer)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_sentinel_then_continuation")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run a long task"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        tool_call_chunks = [c for c in chunks if c["type"] == "tool_call"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert [c["delta"] for c in content_chunks] == [final_answer]
+        assert len(tool_call_chunks) == 2
+        assert "Task completed" not in "".join(c["delta"] for c in content_chunks)
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == final_answer
+        assert loop._session.messages[-1]["content"] == final_answer
+
+    @pytest.mark.asyncio
+    async def test_stream_repairs_tool_protocol_leaked_as_thinking(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        final_answer = "第二步也已经通过真实工具执行完成。"
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _LeakedProtocolThinkingRuntimeAgent(final_answer)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_protocol_leak_repair")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run a long task", thinking=True):
+            chunks.append(chunk)
+
+        rendered = "".join(str(c.get("delta") or "") for c in chunks)
+        tool_call_chunks = [c for c in chunks if c["type"] == "tool_call"]
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert len(loop._agent.run_calls) == 2
+        assert "<｜DSML｜" not in rendered
+        assert "想继续下一步吗" not in rendered
+        assert [c["metadata"]["id"] for c in tool_call_chunks] == [
+            "call_initial",
+            "call_repair",
+        ]
+        assert content_chunks[-1]["delta"] == final_answer
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"].endswith(final_answer)
+        assert loop._session.messages[-1]["content"].endswith(final_answer)
 
     @pytest.mark.asyncio
     async def test_stream_trims_repeated_progress_prefix_from_final_content(self, tmp_dir: Path):
