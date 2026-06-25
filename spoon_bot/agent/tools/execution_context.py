@@ -110,16 +110,6 @@ _REPEATED_SHELL_FILE_READ_MESSAGE = (
     "content and continue with the next write, edit, test, or final-answer "
     "action instead of running another shell file read."
 )
-_CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "
-    "has failed repeatedly in this request without producing progress; report "
-    "the blocker now instead of trying more alternate commands."
-)
-_REPEATED_TOOL_FAILURE_PATTERN_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: repeated tool failure pattern suppressed. The same "
-    "tool produced the same class of failure repeatedly in this request; report "
-    "the blocker now instead of trying more alternate commands."
-)
 _REPEATED_TOOL_FAILURE_STRATEGY_WARNING = (
     "TOOL_PROGRESS_HINT: The same tool failure pattern has repeated. Inspect the "
     "failure and change strategy instead of retrying it unchanged. If the failed "
@@ -1398,30 +1388,7 @@ def invalidate_file_read_tracking(*path_keys: Any) -> None:
 
 
 def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:
-    """Return a compact result when one tool keeps failing without progress."""
-    state = _current_tool_invocation_state()
-    if not isinstance(state, dict):
-        return None
-
-    failures = state.get("consecutive_failures")
-    if not isinstance(failures, list):
-        return None
-    current_name = str(tool_name or "")
-    max_failures = int(state.get("max_consecutive_failures") or 3)
-    if len(failures) >= max_failures:
-        recent = failures[-max_failures:]
-        if all(item.get("tool") == current_name for item in recent if isinstance(item, dict)):
-            return _CONSECUTIVE_TOOL_FAILURE_MESSAGE
-
-    pattern_counts = state.get("failure_pattern_counts")
-    if isinstance(pattern_counts, dict):
-        prefix = f"{current_name}\x1f"
-        if any(
-            int(value or 0) >= max_failures
-            for key, value in pattern_counts.items()
-            if isinstance(key, str) and key.startswith(prefix)
-        ):
-            return _REPEATED_TOOL_FAILURE_PATTERN_MESSAGE
+    """Keep failure history advisory; never short-circuit the next tool call."""
     return None
 
 

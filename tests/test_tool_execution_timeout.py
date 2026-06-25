@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spoon_bot.agent.tools.execution_context import track_tool_invocations
+from spoon_bot.agent.tools.execution_context import (
+    record_tool_invocation_result,
+    suppress_after_consecutive_tool_failures,
+    track_tool_invocations,
+)
 from spoon_bot.agent.tools.shell import (
     ShellTool,
     SafeShellTool,
@@ -402,6 +406,25 @@ class TestBackgroundJobSummary:
         )
         summary = tool._format_background_job_summary(job, timeout_seconds=120)
         assert "120s" in summary
+
+
+class TestToolFailureLoopGuard:
+    def test_consecutive_tool_failures_do_not_stop_next_call(self):
+        with track_tool_invocations(max_consecutive_failures=3):
+            for _ in range(3):
+                assert suppress_after_consecutive_tool_failures("shell") is None
+                record_tool_invocation_result("shell", "Error: transient failure")
+
+            assert suppress_after_consecutive_tool_failures("shell") is None
+
+    def test_repeated_failure_pattern_does_not_stop_after_successes(self):
+        with track_tool_invocations(max_consecutive_failures=3):
+            for _ in range(3):
+                assert suppress_after_consecutive_tool_failures("shell") is None
+                record_tool_invocation_result("shell", "Error: provider temporarily unavailable")
+                record_tool_invocation_result("read_file", "ok")
+
+            assert suppress_after_consecutive_tool_failures("shell") is None
 
 
 # ---------------------------------------------------------------------------
