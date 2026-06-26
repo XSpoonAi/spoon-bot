@@ -1203,6 +1203,119 @@ class _MultiStepSummaryRuntimeAgent:
         return type("RunResult", (), {"content": final_content})()
 
 
+class _BackgroundThenCompleteRuntimeAgent:
+    """Runtime agent that first exposes a running managed job, then completes it."""
+
+    def __init__(self) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        step = len(self.run_calls)
+        call_id = f"call_background_{step}"
+        if step == 1:
+            command = "run-long-workflow"
+            tool_delta = (
+                "Foreground timeout (600s) exceeded - command moved to background.\n"
+                "job_id: sh_running\n"
+                f"command: {command}\n"
+                "cwd: /workspace\n"
+                "status: running (elapsed 60s)\n"
+                "Recent output tail:\n"
+                "phase 1 started\n"
+            )
+            final_content = "The workflow is still running."
+        else:
+            command = "inspect-background-workflow"
+            tool_delta = (
+                "job_id: sh_running\n"
+                "status: completed\n"
+                "returncode: 0\n"
+                "Output:\n"
+                "all requested work completed\n"
+            )
+            final_content = "All requested work completed."
+
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": command}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "shell",
+            "delta": tool_delta,
+            "metadata": {
+                "name": "shell",
+                "id": call_id,
+                "tool_call_id": call_id,
+                "arguments": json.dumps({"command": command}),
+            },
+        })
+        await self.output_queue.put({"type": "content", "delta": final_content})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": final_content})()
+
+
+class _AwaitingUserAfterToolRuntimeAgent:
+    """Runtime agent that must stop after asking the user for the next choice."""
+
+    def __init__(self, final_content: str) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.final_content = final_content
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        call_id = f"call_bounded_step_{len(self.run_calls)}"
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "run-bounded-step"}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "shell",
+            "delta": "Read it aloud: bounded operation complete",
+            "metadata": {
+                "name": "shell",
+                "id": call_id,
+                "tool_call_id": call_id,
+                "arguments": json.dumps({"command": "run-bounded-step"}),
+            },
+        })
+        await self.output_queue.put({"type": "content", "delta": self.final_content})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": self.final_content})()
+
+
 class _MemoryOnlyInternalRecoveryRuntimeAgent:
     """Runtime agent whose recovery tool result is only visible in memory."""
 
@@ -1589,6 +1702,123 @@ class TestAgentLoopCurrentRequestMultimodal:
 
 
 class TestAgentLoopStreamFallback:
+    def test_task_completion_verdict_parser_accepts_awaiting_user(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        verdict = AgentLoop._parse_task_completion_verdict(
+            json.dumps({
+                "status": "awaiting_user",
+                "reason": "The draft is waiting for the user to choose the next action.",
+                "next_focus": "start another side effect",
+            })
+        )
+
+        assert verdict == {
+            "status": "awaiting_user",
+            "reason": "The draft is waiting for the user to choose the next action.",
+            "next_focus": "",
+        }
+
+    @pytest.mark.asyncio
+    async def test_task_completion_verdict_continues_active_background_job(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        event = {
+            "type": "tool_result",
+            "delta": (
+                "Foreground timeout (600s) exceeded - command moved to background.\n"
+                "job_id: sh_running\n"
+                "command: run-long-workflow\n"
+                "cwd: /workspace\n"
+                "status: running (elapsed 60s)\n"
+                "Recent output tail:\n"
+                "phase 1 started\n"
+            ),
+            "metadata": {
+                "name": "shell",
+                "arguments": json.dumps({"command": "run-long-workflow"}),
+            },
+        }
+
+        verdict = await loop._evaluate_task_completion_verdict(
+            authoritative_message="complete the requested multi-step workflow",
+            final_content="The workflow is still running.",
+            tool_result_events=[event],
+        )
+
+        assert verdict["status"] == "needs_continuation"
+        assert "background job" in verdict["reason"]
+        assert "rerun the same command" in verdict["next_focus"]
+
+    def test_tool_events_need_more_evidence_for_active_background_job(self):
+        from spoon_bot.agent.turn_verifiers import tool_events_need_more_evidence
+
+        assert tool_events_need_more_evidence([
+            {
+                "type": "tool_result",
+                "delta": "job_id: sh_running\nstatus: running\nreturncode: running\n",
+                "metadata": {"name": "shell"},
+            }
+        ])
+
+    def test_task_continuation_prompt_does_not_treat_draft_as_user_input(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_task_continuation_prompt(
+            "Continue one bounded operation.",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "Read it aloud: bounded operation complete",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "run-bounded-step"}),
+                    },
+                }
+            ],
+            previous_draft="The bounded operation is complete. Should I start another one?",
+            continuation_reason="Verifier requested another step.",
+        )
+
+        assert "[PREVIOUS ASSISTANT DRAFT - NOT USER INPUT]" in prompt
+        assert "Do not treat the previous assistant draft" in prompt
+        assert "latest user request already clearly authorized the exact next action" in prompt
+
+    @pytest.mark.asyncio
+    async def test_stream_continues_after_background_job_handoff(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _BackgroundThenCompleteRuntimeAgent()
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_background_job_continuation")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="complete the requested long workflow"):
+            chunks.append(chunk)
+
+        tool_result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert len(loop._agent.run_calls) == 2
+        assert len(tool_result_chunks) == 2
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"].endswith("All requested work completed.")
+        assert loop._session.messages[-1]["content"].endswith("All requested work completed.")
+
     @pytest.mark.asyncio
     async def test_stream_falls_back_to_run_result_when_no_chunks(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
@@ -2112,6 +2342,55 @@ class TestAgentLoopStreamFallback:
         assert loop._session.messages[-1]["content"] == final_summary
 
     @pytest.mark.asyncio
+    async def test_stream_stops_when_verifier_marks_draft_awaiting_user(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        final_content = (
+            "The bounded operation is complete and the result is confirmed. "
+            "Please confirm before I start another one."
+        )
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _AwaitingUserAfterToolRuntimeAgent(final_content)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_awaiting_user_terminal")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={
+                "status": "awaiting_user",
+                "reason": "The assistant draft is waiting for user confirmation.",
+                "next_focus": "",
+            }
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="continue one bounded operation"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        tool_call_chunks = [c for c in chunks if c["type"] == "tool_call"]
+        tool_result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert len(loop._agent.run_calls) == 1
+        assert len(tool_call_chunks) == 1
+        assert len(tool_result_chunks) == 1
+        assert [c["delta"] for c in content_chunks] == [final_content]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == final_content
+        assert loop._session.messages[-1]["content"] == final_content
+
+    @pytest.mark.asyncio
     async def test_stream_continues_multistep_request_after_tool_summary_marker(
         self,
         tmp_dir: Path,
@@ -2606,6 +2885,46 @@ class TestContextBuilderMediaPaths:
         assert "Recent completed turn summaries:" in recall
         assert "[PRE-LOADED SKILL:" not in recall
         assert "Outcome: Checked the current status and confirmed the job is paused at step 2." in recall
+
+    def test_short_counted_continuation_uses_latest_user_request_anchor(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="counted-continuation-anchor")
+        loop._session.add_message("user", "Install the uploaded workflow and join the latest run.")
+        loop._session.add_message("assistant", "Installed the workflow and joined run 370.")
+
+        recall = AgentLoop._build_session_recall_context(loop, "继续玩5把")
+
+        assert "Continuation anchor selected by the newest continuation-only request:" in recall
+        assert "Latest prior user request:" in recall
+        assert "Install the uploaded workflow and join the latest run." in recall
+        assert "If selected skills are shown, continue that skill family rather than another earlier skill." in recall
+
+    def test_request_context_anchor_precedes_ledger_for_short_continuation(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="request-context-anchor")
+        loop._session.add_message("user", "Install the uploaded workflow and join the latest run.")
+        loop._session.add_message("assistant", "Installed the workflow and joined run 370.")
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: (
+            "[EXECUTION LEDGER - VERIFIED TOOL FACTS]\n"
+            "- older unrelated workflow completed earlier\n"
+        )
+
+        context = AgentLoop._build_request_context_sections(loop, "继续玩5把")
+
+        assert "[CONTINUATION ANCHOR]" in context
+        assert "Selected prior user request:" in context
+        assert "Install the uploaded workflow and join the latest run." in context
+        assert "older unrelated workflow completed earlier" in context
+        assert context.index("[CONTINUATION ANCHOR]") < context.index("[EXECUTION LEDGER")
+        assert "do not switch to another earlier task" in context
 
 
 class TestAgentLoopRuntimeCompression:

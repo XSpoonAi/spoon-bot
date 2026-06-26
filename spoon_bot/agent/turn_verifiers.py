@@ -459,6 +459,14 @@ def latest_tool_event_has_next_command(tool_result_events: list[dict[str, Any]])
     return False
 
 
+def tool_events_need_more_evidence(tool_result_events: list[dict[str, Any]]) -> bool:
+    """Return True when the latest structured evidence is not terminal yet."""
+    return (
+        latest_tool_event_has_next_command(tool_result_events)
+        or latest_tool_event_has_active_background_job(tool_result_events)
+    )
+
+
 def _compact_tool_output(text: str, *, limit: int = 1200) -> str:
     compact = "\n".join(line.rstrip() for line in str(text or "").splitlines())
     compact = compact.strip()

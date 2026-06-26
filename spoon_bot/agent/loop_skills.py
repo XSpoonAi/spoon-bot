@@ -560,6 +560,7 @@ class LoopSkillsMixin:
         hints = self._build_request_execution_hints_from_text(hint_source)
         sections = [
             _BOUNDED_CONTINUATION_BOUNDARY if request_is_bare_continuation(message) else "",
+            self._format_continuation_anchor_context(message),
             format_explicit_request_urls_context(hint_source),
             format_explicit_request_values_context(hint_source),
             self._format_local_skill_execution_context(hints),
@@ -569,6 +570,40 @@ class LoopSkillsMixin:
             format_exact_shell_command_context(message),
         ]
         return "".join(section for section in sections if section)
+
+    def _format_continuation_anchor_context(self, message: str) -> str:
+        """Format the selected prior user request for short continuations."""
+        current = str(message or "")
+        if not request_is_bare_continuation(current):
+            return ""
+        previous = AgentLoop._previous_user_request_for_continuation(self, current)
+        lines = [
+            "[CONTINUATION ANCHOR]: The newest user message is a short "
+            "continuation, so it selects at most one prior task.",
+        ]
+        if not previous:
+            lines.append(
+                "No prior real user request is available in this session. Ask a "
+                "concise clarification instead of selecting an older task "
+                "from memory, ledger, or tool output."
+            )
+        else:
+            lines.extend(
+                [
+                    "Selected prior user request:",
+                    f"- {AgentLoop._compress_message_content(previous.strip(), 900)}",
+                    "Use this selected request as the primary task scope for "
+                    "task/tool choice. Treat older session compact and "
+                    "execution-ledger facts as evidence only; do not switch to "
+                    "another earlier task unless the newest user message "
+                    "explicitly names it. If live state shows the selected task "
+                    "is complete, blocked, or ambiguous, report that status or "
+                    "ask a concise clarification rather than starting a different "
+                    "external side effect.",
+                ]
+            )
+        lines.append("")
+        return "\n".join(lines)
 
     def _format_recent_execution_ledger_context(self) -> str:
         try:

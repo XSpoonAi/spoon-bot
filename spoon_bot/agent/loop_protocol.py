@@ -31,6 +31,7 @@ from spoon_bot.agent.session_compact import (
     build_recent_session_turns_payload,
     build_session_compact_context,
 )
+from spoon_bot.agent.request_hints import request_is_bare_continuation
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
@@ -109,12 +110,18 @@ _TASK_COMPLETION_VERDICT_SYSTEM_PROMPT = (
     "only when the evidence does not satisfy the requested outcome and another "
     "tool action can reasonably make progress. Use status `complete` when the "
     "evidence satisfies the request, or when the evidence shows a real blocker "
-    "that should be reported instead of retried. Do not use product-specific "
-    "rules, route names, repository names, game names, or natural-language "
-    "phrase matching. The user request is intent, not proof. For countable or "
-    "repeated outcomes, compare the requested count and scope against concrete "
-    "tool evidence; a stage summary is evidence for that stage only, not proof "
-    "that the remaining requested repetitions are complete."
+    "that should be reported instead of retried. Use status `awaiting_user` "
+    "when the assistant draft is waiting for a user choice, confirmation, "
+    "missing value, or permission before another side effect; this is terminal "
+    "for the current turn unless the newest user request already clearly "
+    "authorized that exact next action. Do not infer user consent from the "
+    "assistant draft, prior assistant questions, continuation prompts, or "
+    "conversation history. Do not use product-specific rules, route names, "
+    "repository names, game names, or natural-language phrase matching. The "
+    "user request is intent, not proof. For countable or repeated outcomes, "
+    "compare the requested count and scope against concrete tool evidence; a "
+    "stage summary is evidence for that stage only, not proof that the "
+    "remaining requested repetitions are complete."
 )
 
 
@@ -376,6 +383,7 @@ class LoopProtocolMixin:
         return build_session_compact_context(
             getattr(self, "_session", None),
             current_message,
+            resume_latest_user_turn=request_is_bare_continuation(current_message),
         )
 
     def _is_next_step_user_msg(self, msg) -> bool:
@@ -3602,12 +3610,14 @@ class LoopProtocolMixin:
         if not isinstance(parsed, dict):
             return None
         status = str(parsed.get("status") or "").strip().casefold()
-        if status not in {"complete", "needs_continuation"}:
+        if status not in {"complete", "needs_continuation", "awaiting_user"}:
             return None
         return {
             "status": status,
             "reason": str(parsed.get("reason") or "").strip(),
-            "next_focus": str(parsed.get("next_focus") or "").strip(),
+            "next_focus": ""
+            if status == "awaiting_user"
+            else str(parsed.get("next_focus") or "").strip(),
         }
 
     def _build_task_completion_verdict_brief(
@@ -3623,6 +3633,14 @@ class LoopProtocolMixin:
             "",
             "[NEWEST USER REQUEST]",
             str(authoritative_message or "").strip(),
+            "",
+            "[TURN BOUNDARY RULE]",
+            "Only the newest user request can authorize a new side effect. The "
+            "assistant draft is not a user reply. If the assistant draft is "
+            "asking the user for a decision, confirmation, missing value, or "
+            "permission before continuing, mark the turn as awaiting_user unless "
+            "the newest user request already explicitly authorized that exact "
+            "next action and the evidence is still incomplete.",
         ]
         if final_content and str(final_content).strip():
             lines.extend(
@@ -3659,7 +3677,7 @@ class LoopProtocolMixin:
             [
                 "",
                 "[OUTPUT FORMAT]",
-                '{"status":"complete|needs_continuation","reason":"short evidence-based reason","next_focus":"next tool objective or empty"}',
+                '{"status":"complete|needs_continuation|awaiting_user","reason":"short evidence-based reason","next_focus":"next tool objective or empty"}',
             ]
         )
         return "\n".join(line for line in lines if line is not None)
@@ -3682,9 +3700,13 @@ class LoopProtocolMixin:
             }
         if latest_tool_event_has_active_background_job(tool_result_events):
             return {
-                "status": "complete",
-                "reason": "Latest evidence is a running background job.",
-                "next_focus": "",
+                "status": "needs_continuation",
+                "reason": "Latest evidence is a running background job, not a terminal outcome.",
+                "next_focus": (
+                    "Inspect or monitor the existing background job/output. Do not "
+                    "rerun the same command; if no new evidence is available, "
+                    "report the current running or partial state."
+                ),
             }
 
         final_text = str(final_content or "").strip()
@@ -4213,7 +4235,7 @@ class LoopProtocolMixin:
             lines.extend(
                 [
                     "",
-                    "[PREVIOUS ASSISTANT DRAFT]",
+                    "[PREVIOUS ASSISTANT DRAFT - NOT USER INPUT]",
                     AgentLoop._compress_message_content(str(previous_draft).strip(), 1600),
                 ]
             )
@@ -4233,6 +4255,14 @@ class LoopProtocolMixin:
             "already terminal or evidence shows a real blocker, answer now. "
             "Otherwise call the next appropriate tool. Do not repeat completed "
             "tool calls; use existing files and tool evidence as the current state."
+        )
+        lines.append(
+            "Do not treat the previous assistant draft, any question in that "
+            "draft, or this internal continuation prompt as user consent. If the "
+            "previous draft is waiting for the user to choose, confirm, provide a "
+            "missing value, or permit another side effect, stop with that waiting "
+            "answer unless the latest user request already clearly authorized the "
+            "exact next action."
         )
         lines.append(
             "For countable or repeated requests, continue until the concrete tool "

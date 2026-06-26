@@ -99,13 +99,13 @@ from spoon_bot.agent.tools.execution_context import (
 )
 from spoon_bot.agent.turn_verifiers import (
     build_user_facing_tool_event_answer,
-    latest_tool_event_has_next_command,
     latest_tool_event_from_skill_continuation,
     latest_tool_event_has_user_summary_marker,
     should_run_skill_contract_check,
     skill_contract_has_progress,
     skill_contract_inspection_stalled_after_progress,
     skill_contract_needs_continuation,
+    tool_events_need_more_evidence,
 )
 from spoon_bot.agent.tools.self_config import (
     ActivateToolTool,
@@ -205,7 +205,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         "requested workflow, reaches a terminal outcome, or shows a concrete "
         "blocker, answer the user now. Do not start a new external workflow or "
         "repeat an external side effect unless the latest user request or the "
-        "active skill contract explicitly asks for that next action."
+        "active skill contract explicitly asks for that next action. Never "
+        "treat your own prior question, draft, or status message as the user's "
+        "approval to continue."
     )
 
     def __init__(
@@ -1666,11 +1668,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -1681,11 +1683,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -1700,11 +1702,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     synthesis_events,
-                    incomplete=latest_tool_event_has_next_command(synthesis_events),
+                    incomplete=tool_events_need_more_evidence(synthesis_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         synthesis_events,
-                        incomplete=latest_tool_event_has_next_command(synthesis_events),
+                        incomplete=tool_events_need_more_evidence(synthesis_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -1719,11 +1721,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     synthesis_events,
-                    incomplete=latest_tool_event_has_next_command(synthesis_events),
+                    incomplete=tool_events_need_more_evidence(synthesis_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         synthesis_events,
-                        incomplete=latest_tool_event_has_next_command(synthesis_events),
+                        incomplete=tool_events_need_more_evidence(synthesis_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -1736,11 +1738,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -3338,6 +3340,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             or chunk.get("content")
                             or chunk.get("response")
                             or chunk.get("output")
+                            or chunk.get("delta")
                         )
                         serialized_result = AgentLoop._stringify_stream_payload(tool_result)
                         tool_call_id = (
@@ -4216,11 +4219,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     all_tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                    incomplete=tool_events_need_more_evidence(all_tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         all_tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                        incomplete=tool_events_need_more_evidence(all_tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -4242,11 +4245,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     synthesis_events,
-                    incomplete=latest_tool_event_has_next_command(synthesis_events),
+                    incomplete=tool_events_need_more_evidence(synthesis_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         synthesis_events,
-                        incomplete=latest_tool_event_has_next_command(synthesis_events),
+                        incomplete=tool_events_need_more_evidence(synthesis_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -4262,11 +4265,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     all_tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                    incomplete=tool_events_need_more_evidence(all_tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         all_tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                        incomplete=tool_events_need_more_evidence(all_tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -4303,7 +4306,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     all_tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(all_tool_result_events),
+                    incomplete=tool_events_need_more_evidence(all_tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=ledger_final,
                 )
@@ -4810,11 +4813,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -4825,11 +4828,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -4841,11 +4844,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=build_user_facing_tool_event_answer(
                         tool_result_events,
-                        incomplete=latest_tool_event_has_next_command(tool_result_events),
+                        incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
                 )
@@ -4865,7 +4868,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
                     tool_result_events,
-                    incomplete=latest_tool_event_has_next_command(tool_result_events),
+                    incomplete=tool_events_need_more_evidence(tool_result_events),
                     user_message=authoritative_message,
                     fallback_text=ledger_final,
                 )
