@@ -74,25 +74,6 @@ _TOOL_OUTPUT_LOCK = Lock()
 _ACTIVE_TOOL_INVOCATIONS: dict[str, CapturedToolOutput] = {}
 _COMPLETED_TOOL_OUTPUTS: dict[str, list[CapturedToolOutput]] = defaultdict(list)
 _MAX_CAPTURED_TOOL_OUTPUTS_PER_SCOPE = 256
-_DUPLICATE_TOOL_INVOCATION_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: duplicate tool invocation suppressed. The same tool and arguments "
-    "already executed in this request; use the previous result or choose "
-    "different arguments. Do not repeat this same action. If the user's request "
-    "has remaining distinct steps, continue with the next step from the existing "
-    "tool evidence; otherwise report the previous result or blocker."
-)
-_REPEATED_TOOL_SERIES_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: repeated side-effecting tool series suppressed. This request has "
-    "already executed the same kind of external side effect; report the latest "
-    "result or ask for an explicit count before continuing. Do not call more "
-    "tools for this same action."
-)
-_REPEATED_BACKGROUND_JOB_POLL_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: repeated background job polling suppressed. "
-    "job_id={job_id}. The background job produced no new status or output "
-    "signal across repeated polls; report the current state instead of "
-    "polling again in this request."
-)
 _REDUNDANT_FILE_READ_MESSAGE = (
     "READ_FILE_CACHE_HIT: requested file range already available in this "
     "request. File content already available in this request. Treat this read "
@@ -103,22 +84,6 @@ _REPEATED_REDUNDANT_FILE_READ_MESSAGE = (
     "Repeated read skipped: the requested file range was already provided "
     "earlier in this request; use the previous file content and continue with "
     "the next non-read action."
-)
-_REPEATED_SHELL_FILE_READ_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: repeated shell file read suppressed. The requested "
-    "file range was already inspected in this request; use the previous file "
-    "content and continue with the next write, edit, test, or final-answer "
-    "action instead of running another shell file read."
-)
-_CONSECUTIVE_TOOL_FAILURE_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: consecutive tool failures suppressed. The same tool "
-    "has failed repeatedly in this request without producing progress; report "
-    "the blocker now instead of trying more alternate commands."
-)
-_REPEATED_TOOL_FAILURE_PATTERN_MESSAGE = (
-    "STOP_TOOL_LOOP: Error: repeated tool failure pattern suppressed. The same "
-    "tool produced the same class of failure repeatedly in this request; report "
-    "the blocker now instead of trying more alternate commands."
 )
 _REPEATED_TOOL_FAILURE_STRATEGY_WARNING = (
     "TOOL_PROGRESS_HINT: The same tool failure pattern has repeated. Inspect the "
@@ -966,11 +931,7 @@ def track_tool_invocations(
     max_consecutive_failures: int = 3,
     initial_state: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Track exact tool invocations for the current request.
-
-    This is a data-plane guard: it suppresses identical tool+argument executions
-    inside one request without routing based on user prompt wording.
-    """
+    """Track exact tool invocations for diagnostics without blocking execution."""
     if isinstance(initial_state, dict):
         state = _ensure_tool_invocation_state_shape(
             initial_state,
@@ -1111,7 +1072,7 @@ def suppress_repeated_tool_invocation(
     *,
     max_repeats: int | None = None,
 ) -> str | None:
-    """Return a compact duplicate result when the same call already ran."""
+    """Track duplicate invocations without short-circuiting tool execution."""
     state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
@@ -1128,20 +1089,11 @@ def suppress_repeated_tool_invocation(
         repeat_count = 1
     state["last_exact_key"] = key
     state["last_exact_repeats"] = repeat_count
-
-    effective_max_repeats = (
-        int(max_repeats)
-        if isinstance(max_repeats, int) and max_repeats > 0
-        else int(state.get("max_repeats") or 1)
-    )
-    effective_count = counts[key] if max_repeats is not None else repeat_count
-    if effective_count <= effective_max_repeats:
-        return None
-    return _DUPLICATE_TOOL_INVOCATION_MESSAGE
+    return None
 
 
 def suppress_repeated_tool_series(tool_name: str, series_key: str | None) -> str | None:
-    """Return a compact result when one request repeats the same side-effect series."""
+    """Track repeated side-effect series without blocking long workflows."""
     state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
@@ -1154,10 +1106,7 @@ def suppress_repeated_tool_series(tool_name: str, series_key: str | None) -> str
 
     key = f"{str(tool_name or '')}\x1f{series_key.strip()}"
     counts[key] += 1
-    max_repeats = int(state.get("max_series_repeats") or 1)
-    if counts[key] <= max_repeats:
-        return None
-    return _REPEATED_TOOL_SERIES_MESSAGE
+    return None
 
 
 def suppress_repeated_background_job_poll(
@@ -1166,7 +1115,7 @@ def suppress_repeated_background_job_poll(
     *,
     max_no_progress_polls: int = 2,
 ) -> str | None:
-    """Return a compact result when one request keeps polling an unchanged job."""
+    """Track unchanged background polls without turning them into hard stops."""
     state = _current_tool_invocation_state()
     if not isinstance(state, dict):
         return None
@@ -1193,9 +1142,7 @@ def suppress_repeated_background_job_poll(
         "progress_key": normalized_progress_key,
         "count": count,
     }
-    if count <= max(1, int(max_no_progress_polls or 1)):
-        return None
-    return _REPEATED_BACKGROUND_JOB_POLL_MESSAGE.format(job_id=normalized_job_id)
+    return None
 
 
 def suppress_redundant_file_read(
@@ -1282,11 +1229,12 @@ def suppress_redundant_shell_file_read(
     total_lines: int,
     content_fingerprint: str | None = None,
 ) -> str | None:
-    """Return a hard stop when shell re-reads file content already seen.
+    """Track shell file reads already seen without blocking execution.
 
     Shell reads such as ``cat file`` and ``sed -n 1,80p file`` bypass the
-    read_file tool's exact argument cache. This shares the same range coverage
-    map with read_file so a request cannot loop by switching read mechanisms.
+    read_file tool's exact argument cache. This still shares the same range
+    coverage map with read_file for diagnostics, but repeated reads are not a
+    control-flow signal that should end a long task.
     """
     state = _current_tool_invocation_state()
     if not isinstance(state, dict):
@@ -1322,7 +1270,7 @@ def suppress_redundant_shell_file_read(
 
     for existing_start, existing_end, _existing_fingerprint in ranges:
         if int(existing_start) <= start and end <= int(existing_end):
-            return _REPEATED_SHELL_FILE_READ_MESSAGE
+            return None
 
     ranges.append((start, end, fingerprint))
     ranges.sort(key=lambda item: (int(item[0]), int(item[1])))
@@ -1398,30 +1346,7 @@ def invalidate_file_read_tracking(*path_keys: Any) -> None:
 
 
 def suppress_after_consecutive_tool_failures(tool_name: str) -> str | None:
-    """Return a compact result when one tool keeps failing without progress."""
-    state = _current_tool_invocation_state()
-    if not isinstance(state, dict):
-        return None
-
-    failures = state.get("consecutive_failures")
-    if not isinstance(failures, list):
-        return None
-    current_name = str(tool_name or "")
-    max_failures = int(state.get("max_consecutive_failures") or 3)
-    if len(failures) >= max_failures:
-        recent = failures[-max_failures:]
-        if all(item.get("tool") == current_name for item in recent if isinstance(item, dict)):
-            return _CONSECUTIVE_TOOL_FAILURE_MESSAGE
-
-    pattern_counts = state.get("failure_pattern_counts")
-    if isinstance(pattern_counts, dict):
-        prefix = f"{current_name}\x1f"
-        if any(
-            int(value or 0) >= max_failures
-            for key, value in pattern_counts.items()
-            if isinstance(key, str) and key.startswith(prefix)
-        ):
-            return _REPEATED_TOOL_FAILURE_PATTERN_MESSAGE
+    """Keep failure history advisory; never short-circuit the next tool call."""
     return None
 
 

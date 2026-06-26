@@ -583,7 +583,8 @@ class ShellTool(Tool):
         "yarn",
     })
     _SHELL_FILE_READ_TRACKING_MAX_BYTES = 20 * 1024 * 1024
-    _DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT: int | None = None
+    _DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT = 60
+    _DEFAULT_BACKGROUND_JOB_POLL_WAIT_SECONDS = 30.0
 
     def __init__(
         self,
@@ -691,10 +692,11 @@ class ShellTool(Tool):
             "Do not install skills by cloning directly into workspace/skills; "
             "use the skill management tool for skill packages. "
             "For installed workspace skill CLI and skill dependency setup "
-            "commands, run the exact foreground command without pipes, "
+            "commands, run the exact command without pipes, "
             "output filters, file redirection, shell stderr/stdout merge, "
             "or shell timeout wrappers; this tool already captures stdout "
-            "and stderr. "
+            "and stderr, and hands silent long-running skill commands to a "
+            "managed background job. "
             f"Security mode: {mode}. "
             "Actions: execute, list_jobs, job_status, job_output, terminate_job. "
             "Dangerous commands and injection patterns are blocked."
@@ -718,8 +720,9 @@ class ShellTool(Tool):
                     "description": (
                         f"Optional foreground timeout override in seconds "
                         f"(max {self.max_timeout}). Usually omit this; the tool "
-                        f"uses a {self.timeout}s default and applies a longer "
-                        "workspace-skill budget for stateful skill CLI commands. "
+                        f"uses a {self.timeout}s default and applies a shorter "
+                        "managed-background handoff budget for stateful "
+                        "workspace skill CLI commands. "
                         "Only provide this when the newest user request or the "
                         "command's own contract requires a custom foreground budget."
                     ),
@@ -742,6 +745,17 @@ class ShellTool(Tool):
                     "default": 4000,
                     "minimum": 200,
                     "maximum": 50000,
+                },
+                "wait_seconds": {
+                    "type": "number",
+                    "description": (
+                        "For running background jobs, seconds to wait for "
+                        "completion or new output before returning status. "
+                        "Defaults to a short managed wait so long-running "
+                        "commands can make progress without ending the task early."
+                    ),
+                    "minimum": 0,
+                    "maximum": 120,
                 },
                 "force": {
                     "type": "boolean",
@@ -904,7 +918,7 @@ class ShellTool(Tool):
         arguments: dict[str, Any],
         dedup_arguments: Any,
     ) -> str:
-        """Keep repeated read-only inspections recoverable instead of ending the turn."""
+        """Return duplicate results without adding shell-specific STOP messages."""
         if (
             not isinstance(arguments, dict)
             or str(arguments.get("action") or "execute").strip().lower() != "execute"
@@ -923,12 +937,7 @@ class ShellTool(Tool):
         if not self._command_is_read_only_inspection(command, cwd, dedup_arguments):
             return duplicate_result
 
-        return (
-            "STOP_TOOL_LOOP: Error: duplicate shell inspection suppressed. "
-            "The same read-only shell command already ran in this request; use "
-            "the previous observation and produce the best bounded answer now "
-            "instead of running more tools for this same inspection."
-        )
+        return duplicate_result
 
     def runtime_invocation_category(self, kwargs: dict[str, Any]) -> str | None:
         """Classify shell calls for request-local progress guards."""
@@ -2283,6 +2292,21 @@ class ShellTool(Tool):
         except (TypeError, ValueError):
             return DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT
 
+    def _background_job_poll_wait_seconds(self, value: float | None = None) -> float:
+        if value is None:
+            raw = os.getenv("SPOON_BOT_BACKGROUND_JOB_POLL_WAIT_SECONDS", "").strip()
+            if raw:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    value = self._DEFAULT_BACKGROUND_JOB_POLL_WAIT_SECONDS
+            else:
+                value = self._DEFAULT_BACKGROUND_JOB_POLL_WAIT_SECONDS
+        try:
+            return max(0.0, min(float(value), 120.0))
+        except (TypeError, ValueError):
+            return self._DEFAULT_BACKGROUND_JOB_POLL_WAIT_SECONDS
+
     async def _wait_for_process(self, process: Any) -> int | None:
         wait = getattr(process, "wait")
         if asyncio.iscoroutinefunction(wait):
@@ -2305,6 +2329,28 @@ class ShellTool(Tool):
             pass
         await self._refresh_background_job(job)
         return self._is_terminal_status(job.status)
+
+    async def _wait_for_background_job_signal(
+        self,
+        job: _BackgroundShellJob,
+        progress_key: str,
+        *,
+        wait_seconds: float,
+    ) -> bool:
+        """Wait briefly for a running background job to finish or emit output."""
+        if wait_seconds <= 0 or self._is_terminal_status(job.status):
+            return False
+
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            await self._refresh_background_job(job)
+            if self._is_terminal_status(job.status):
+                return True
+            if self._background_job_progress_key(job) != progress_key:
+                return True
+        await self._refresh_background_job(job)
+        return self._background_job_progress_key(job) != progress_key
 
     def _build_completed_job_result(
         self,
@@ -2548,9 +2594,10 @@ class ShellTool(Tool):
             "this job exists. Quiet output can be normal for network, build, "
             "or waiting operations. If a first status check is still running, "
             "inspect job_output or the command's log/output artifact next; do "
-            "not repeatedly call job_status without new evidence. Terminate "
-            "only with force=true when the latest user request cancels the job "
-            "or separate evidence proves it is unrecoverably stuck."
+            "not repeatedly call job_status without new evidence. Use "
+            "action='terminate_job' only with force=true when the latest user "
+            "request cancels the job or separate evidence proves it is "
+            "unrecoverably stuck."
         )
 
     def _workspace_skill_foreground_timeout(self) -> int:
@@ -2562,7 +2609,7 @@ class ShellTool(Tool):
             except ValueError:
                 parsed = int(self.max_timeout)
         else:
-            parsed = max(int(self.timeout), min(int(self.max_timeout), 3600))
+            parsed = self._DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT
         return max(1, min(int(self.max_timeout), parsed))
 
     def _command_invokes_stateful_workspace_skill(self, command: str, cwd: str) -> bool:
@@ -2652,6 +2699,7 @@ class ShellTool(Tool):
         tail_chars: int,
         *,
         force: bool = False,
+        wait_seconds: float | None = None,
     ) -> str:
         owner_key = get_tool_owner()
         self._prune_background_jobs(owner_key=owner_key)
@@ -2687,14 +2735,32 @@ class ShellTool(Tool):
             )
 
         await self._refresh_background_job(job)
+        poll_wait_seconds = self._background_job_poll_wait_seconds(wait_seconds)
 
         if action == "job_status":
-            repeated_poll = suppress_repeated_background_job_poll(
-                job.job_id,
-                self._background_job_progress_key(job),
-            )
-            if repeated_poll is not None:
-                return repeated_poll
+            progress_key = self._background_job_progress_key(job)
+            if job.status == "running":
+                await self._wait_for_background_job_signal(
+                    job,
+                    progress_key,
+                    wait_seconds=poll_wait_seconds,
+                )
+            else:
+                repeated_poll = suppress_repeated_background_job_poll(
+                    job.job_id,
+                    progress_key,
+                )
+                if repeated_poll is not None:
+                    return repeated_poll
+            no_progress_suffix = ""
+            if job.status == "running" and self._background_job_progress_key(job) == progress_key:
+                no_progress_suffix = (
+                    f"\nStill running after waiting {poll_wait_seconds:.0f}s "
+                    "with no new output. This is not a completion signal. If "
+                    "the user's task depends on this job finishing, continue "
+                    "monitoring job_status/job_output instead of summarizing "
+                    "the task as done."
+                )
             return (
                 f"job_id: {job.job_id}\n"
                 f"status: {job.status}\n"
@@ -2708,15 +2774,33 @@ class ShellTool(Tool):
                 "without new evidence. Do not rerun the same command. Terminate "
                 "only when the caller explicitly wants to abandon it or you have "
                 "evidence that it is unrecoverably stuck."
+                f"{no_progress_suffix}"
             )
 
         if action == "job_output":
-            repeated_poll = suppress_repeated_background_job_poll(
-                job.job_id,
-                self._background_job_progress_key(job),
-            )
-            if repeated_poll is not None:
-                return repeated_poll
+            progress_key = self._background_job_progress_key(job)
+            if job.status == "running":
+                await self._wait_for_background_job_signal(
+                    job,
+                    progress_key,
+                    wait_seconds=poll_wait_seconds,
+                )
+            else:
+                repeated_poll = suppress_repeated_background_job_poll(
+                    job.job_id,
+                    progress_key,
+                )
+                if repeated_poll is not None:
+                    return repeated_poll
+            no_progress_suffix = ""
+            if job.status == "running" and self._background_job_progress_key(job) == progress_key:
+                no_progress_suffix = (
+                    f"\n\nStill running after waiting {poll_wait_seconds:.0f}s "
+                    "with no new output. This is not a completion signal. If "
+                    "the user's task depends on this job finishing, continue "
+                    "monitoring job_status/job_output instead of summarizing "
+                    "the task as done."
+                )
             full_result = self._build_output_result(
                 job.stdout_text,
                 job.stderr_text,
@@ -2732,6 +2816,8 @@ class ShellTool(Tool):
             )
             full_result = self._format_background_job_output(job, full_result)
             result = self._format_background_job_output(job, result)
+            full_result = f"{full_result}{no_progress_suffix}"
+            result = f"{result}{no_progress_suffix}"
             capture_tool_output(
                 result,
                 full_result,
@@ -2801,6 +2887,7 @@ class ShellTool(Tool):
         action: str = "execute",
         job_id: str | None = None,
         tail_chars: int = 4000,
+        wait_seconds: float | None = None,
         **kwargs: Any,
     ) -> str:
         """
@@ -2829,6 +2916,7 @@ class ShellTool(Tool):
                 job_id,
                 tail_chars,
                 force=bool(kwargs.get("force") or kwargs.get("force_terminate")),
+                wait_seconds=wait_seconds,
             )
 
         if not command or not str(command).strip():
@@ -2869,11 +2957,11 @@ class ShellTool(Tool):
             return f"Error: Working directory not found: {cwd}"
 
         # Resolve effective timeout: per-command override capped by max_timeout.
-        # For stateful workspace skill CLIs, a model-supplied short timeout must
-        # not shorten the foreground budget below the skill workflow budget:
-        # SKILL.md contracts often require one command to wait through external
-        # settlement. Read-only skill inspections and dependency setup keep the
-        # ordinary budget.
+        # Stateful workspace skill CLIs can be quiet while waiting on remote
+        # workflows. Keep their foreground budget short so a silent command is
+        # handed to a managed background job instead of leaving the UI pinned on
+        # a single tool_call. Read-only skill inspections and dependency setup
+        # keep the ordinary budget.
         effective_timeout = self.timeout
         if timeout is not None:
             effective_timeout = max(1, min(int(timeout), self.max_timeout))
@@ -2901,7 +2989,7 @@ class ShellTool(Tool):
             and not invokes_workspace_skill_setup
             and self._command_invokes_stateful_workspace_skill(command, cwd)
         ):
-            effective_timeout = max(
+            effective_timeout = min(
                 effective_timeout,
                 self._workspace_skill_foreground_timeout(),
             )

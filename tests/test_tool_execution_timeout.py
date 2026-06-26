@@ -8,7 +8,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spoon_bot.agent.tools.shell import ShellTool, SafeShellTool, _BackgroundShellJob
+from spoon_bot.agent.tools.execution_context import (
+    record_tool_invocation_result,
+    suppress_after_consecutive_tool_failures,
+    track_tool_invocations,
+)
+from spoon_bot.agent.tools.shell import (
+    ShellTool,
+    SafeShellTool,
+    _BackgroundShellJob,
+    _SHELL_BACKGROUND_JOBS,
+)
 from spoon_bot.agent.loop import AgentLoop
 from spoon_bot.config import (
     AgentLoopConfig,
@@ -105,6 +115,30 @@ class TestShellToolInit:
     def test_max_timeout_at_least_timeout(self):
         tool = ShellTool(timeout=1000, max_timeout=500)
         assert tool.max_timeout == 1000
+
+    def test_workspace_skill_foreground_timeout_defaults_to_short_handoff(self, monkeypatch):
+        monkeypatch.delenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", raising=False)
+        tool = ShellTool(timeout=3600, max_timeout=7200)
+
+        assert tool._workspace_skill_foreground_timeout() == 60
+
+    def test_workspace_skill_foreground_timeout_env_override(self, monkeypatch):
+        monkeypatch.setenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", "120")
+        tool = ShellTool(timeout=3600, max_timeout=7200)
+
+        assert tool._workspace_skill_foreground_timeout() == 120
+
+    def test_background_job_poll_wait_defaults_to_managed_wait(self, monkeypatch):
+        monkeypatch.delenv("SPOON_BOT_BACKGROUND_JOB_POLL_WAIT_SECONDS", raising=False)
+        tool = ShellTool()
+
+        assert tool._background_job_poll_wait_seconds() == 30.0
+
+    def test_background_job_poll_wait_env_override(self, monkeypatch):
+        monkeypatch.setenv("SPOON_BOT_BACKGROUND_JOB_POLL_WAIT_SECONDS", "12.5")
+        tool = ShellTool()
+
+        assert tool._background_job_poll_wait_seconds() == 12.5
 
 
 class TestSafeShellToolInit:
@@ -210,6 +244,55 @@ class TestPerCommandTimeout:
 
             await tool.execute(command="echo hello", timeout=120)
 
+    @pytest.mark.asyncio
+    async def test_stateful_workspace_skill_caps_long_default_foreground_timeout(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.delenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", raising=False)
+        tool = ShellTool(timeout=3600, max_timeout=7200, working_dir=str(tmp_path))
+        command = (
+            "node skills/joker-game-agent/cli/index.js challenge-answer "
+            "2889759959 chl_b24ac1fd0f1725a22de73f9e7fc985d4 1187"
+        )
+        wait_timeouts: list[float] = []
+
+        async def fake_wait_for(awaitable, timeout):
+            wait_timeouts.append(timeout)
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            if len(wait_timeouts) == 1:
+                raise asyncio.TimeoutError
+            return None
+
+        mock_job = _BackgroundShellJob(
+            job_id="sh_stateful",
+            command=command,
+            cwd=str(tmp_path),
+            process=MagicMock(),
+            stdout_task=MagicMock(),
+            stderr_task=MagicMock(),
+            buffer_limit=200000,
+            owner_key="test",
+            stdout_text="",
+            stderr_text="",
+            status="running",
+            created_at=time.time() - 60,
+        )
+
+        with patch.object(tool, "_start_background_job", return_value=mock_job), \
+             patch.object(tool, "_refresh_background_job"), \
+             patch("spoon_bot.agent.tools.shell.asyncio.wait_for", side_effect=fake_wait_for), \
+             patch("spoon_bot.agent.tools.shell.get_tool_owner", return_value="test"), \
+             patch("spoon_bot.agent.tools.shell.capture_tool_output"):
+            result = await tool.execute(command=command)
+
+        assert wait_timeouts[0] == 60
+        assert "Foreground timeout (60s) exceeded" in result
+        assert "job_id: sh_stateful" in result
+
 
 # ---------------------------------------------------------------------------
 # Background job summary message
@@ -257,6 +340,41 @@ class TestBackgroundJobSummary:
         assert "Quiet output can be normal" in summary
         assert "after two checks" not in summary
 
+    @pytest.mark.asyncio
+    async def test_repeated_running_job_output_does_not_stop_tool_loop(self, monkeypatch):
+        monkeypatch.setenv("SPOON_BOT_BACKGROUND_JOB_POLL_WAIT_SECONDS", "0")
+        tool = ShellTool()
+        process = MagicMock()
+        process.poll.return_value = None
+        job = _BackgroundShellJob(
+            job_id="sh_running",
+            command="node skills/example/cli/index.js wait",
+            cwd="/tmp",
+            process=process,
+            stdout_task=MagicMock(),
+            stderr_task=MagicMock(),
+            buffer_limit=200000,
+            owner_key="default",
+            stdout_text="waiting...",
+            stderr_text="",
+            status="running",
+            created_at=time.time() - 120,
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+        try:
+            with track_tool_invocations():
+                first = await tool.execute(action="job_output", job_id=job.job_id)
+                second = await tool.execute(action="job_status", job_id=job.job_id)
+                third = await tool.execute(action="job_output", job_id=job.job_id)
+        finally:
+            _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
+
+        assert "STOP_TOOL_LOOP" not in first
+        assert "STOP_TOOL_LOOP" not in second
+        assert "STOP_TOOL_LOOP" not in third
+        assert "status: running" in third
+        assert "not a completion signal" in third
+
     def test_summary_includes_elapsed_time(self):
         tool = ShellTool()
         job = _BackgroundShellJob(
@@ -288,6 +406,88 @@ class TestBackgroundJobSummary:
         )
         summary = tool._format_background_job_summary(job, timeout_seconds=120)
         assert "120s" in summary
+
+
+class TestToolFailureLoopGuard:
+    def test_consecutive_tool_failures_do_not_stop_next_call(self):
+        with track_tool_invocations(max_consecutive_failures=3):
+            for _ in range(3):
+                assert suppress_after_consecutive_tool_failures("shell") is None
+                record_tool_invocation_result("shell", "Error: transient failure")
+
+            assert suppress_after_consecutive_tool_failures("shell") is None
+
+    def test_repeated_failure_pattern_does_not_stop_after_successes(self):
+        with track_tool_invocations(max_consecutive_failures=3):
+            for _ in range(3):
+                assert suppress_after_consecutive_tool_failures("shell") is None
+                record_tool_invocation_result("shell", "Error: provider temporarily unavailable")
+                record_tool_invocation_result("read_file", "ok")
+
+            assert suppress_after_consecutive_tool_failures("shell") is None
+
+
+class TestRepeatedToolGuards:
+    @pytest.mark.asyncio
+    async def test_repeated_shell_invocations_do_not_stop_tool_loop(self, tmp_path):
+        tool = ShellTool(working_dir=str(tmp_path))
+
+        with track_tool_invocations(max_repeats=1):
+            first = await tool(command="printf exact-duplicate")
+            second = await tool(command="printf exact-duplicate")
+            third = await tool(command="printf exact-duplicate")
+
+        assert first == "exact-duplicate"
+        assert second == "exact-duplicate"
+        assert third == "exact-duplicate"
+        assert "STOP_TOOL_LOOP" not in second
+        assert "STOP_TOOL_LOOP" not in third
+
+    @pytest.mark.asyncio
+    async def test_repeated_read_only_shell_inspections_do_not_stop_tool_loop(self, tmp_path):
+        tool = ShellTool(working_dir=str(tmp_path))
+
+        with track_tool_invocations(max_repeats=1):
+            first = await tool(command="pwd")
+            second = await tool(command="pwd")
+            third = await tool(command="pwd")
+
+        assert str(tmp_path) in first
+        assert str(tmp_path) in second
+        assert str(tmp_path) in third
+        assert "STOP_TOOL_LOOP" not in second
+        assert "duplicate shell inspection" not in second.lower()
+        assert "STOP_TOOL_LOOP" not in third
+        assert "duplicate shell inspection" not in third.lower()
+
+    @pytest.mark.asyncio
+    async def test_repeated_skill_cli_series_do_not_stop_tool_loop(self, tmp_path):
+        skill_dir = tmp_path / "skills" / "example" / "cli"
+        skill_dir.mkdir(parents=True)
+        script = skill_dir / "index.sh"
+        script.write_text("#!/bin/sh\nprintf played\n", encoding="utf-8")
+        script.chmod(0o755)
+        (tmp_path / "skills" / "example" / "SKILL.md").write_text(
+            "# Example\n\n"
+            "CLI = skills/example/cli/index.sh\n\n"
+            "## Commands\n"
+            "- $CLI play\n",
+            encoding="utf-8",
+        )
+        tool = ShellTool(working_dir=str(tmp_path))
+
+        with track_tool_invocations(max_repeats=100, max_series_repeats=1):
+            first = await tool(command="skills/example/cli/index.sh play")
+            second = await tool(command="skills/example/cli/index.sh play")
+            third = await tool(command="skills/example/cli/index.sh play")
+
+        assert first == "played"
+        assert second == "played"
+        assert third == "played"
+        assert "STOP_TOOL_LOOP" not in second
+        assert "repeated side-effecting tool series" not in second.lower()
+        assert "STOP_TOOL_LOOP" not in third
+        assert "repeated side-effecting tool series" not in third.lower()
 
 
 # ---------------------------------------------------------------------------
