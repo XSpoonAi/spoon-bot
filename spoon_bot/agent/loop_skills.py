@@ -74,9 +74,10 @@ _BOUNDED_CONTINUATION_BOUNDARY = (
     "short continuation of earlier work, resume at most one verifier-visible "
     "unit only if same-session evidence shows a single unfinished workflow and "
     "a clear next documented step. Use prior request facts as checkpoints, not "
-    "completion evidence. If the evidence is completed, stale, read-only, or "
-    "ambiguous, ask a concise clarification or report current status instead "
-    "of starting a new external side effect.\n"
+    "completion evidence or renewed permission for older counts/repetition "
+    "targets. If the evidence is completed, stale, read-only, or ambiguous, "
+    "ask a concise clarification or report current status instead of starting "
+    "a new external side effect.\n"
 )
 
 
@@ -580,9 +581,11 @@ class LoopSkillsMixin:
         if not request_is_bare_continuation(current):
             return ""
         previous = AgentLoop._previous_user_request_for_continuation(self, current)
+        plain_continuation = request_is_plain_continuation_only(current)
         lines = [
             "[CONTINUATION ANCHOR]: The newest user message is a short "
-            "continuation, so it selects at most one prior task.",
+            "continuation, so it can use the nearest prior task only as a "
+            "state anchor.",
         ]
         if not previous:
             lines.append(
@@ -593,8 +596,26 @@ class LoopSkillsMixin:
         else:
             lines.extend(
                 [
-                    "Selected prior user request:",
+                    (
+                        "Nearest prior user request:"
+                        if plain_continuation
+                        else "Selected prior user request:"
+                    ),
                     f"- {AgentLoop._compress_message_content(previous.strip(), 900)}",
+                ]
+            )
+            if plain_continuation:
+                lines.append(
+                    "The newest message adds no new count, target, or scope. "
+                    "Do not treat the nearest prior request as renewed task "
+                    "scope. Use it only to locate the immediate unfinished "
+                    "checkpoint in current/live state. Ignore older numeric "
+                    "quotas or repeated-action targets as current permission; "
+                    "after at most one bounded action or status check, report "
+                    "the current state or ask for explicit scope."
+                )
+            else:
+                lines.append(
                     "Use this selected request as the primary task scope for "
                     "task/tool choice. Treat older session compact and "
                     "execution-ledger facts as evidence only; do not switch to "
@@ -602,16 +623,7 @@ class LoopSkillsMixin:
                     "explicitly names it. If live state shows the selected task "
                     "is complete, blocked, or ambiguous, report that status or "
                     "ask a concise clarification rather than starting a different "
-                    "external side effect.",
-                ]
-            )
-            if request_is_plain_continuation_only(current):
-                lines.append(
-                    "The newest message adds no new count, target, or scope. "
-                    "It authorizes at most the next bounded unit from the "
-                    "selected task; do not inherit an older repeated/countable "
-                    "goal as permission to perform multiple new units in this "
-                    "turn."
+                    "external side effect."
                 )
         lines.append("")
         return "\n".join(lines)

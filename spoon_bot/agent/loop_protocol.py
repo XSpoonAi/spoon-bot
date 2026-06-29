@@ -387,6 +387,7 @@ class LoopProtocolMixin:
             getattr(self, "_session", None),
             current_message,
             resume_latest_user_turn=request_is_bare_continuation(current_message),
+            plain_continuation_only=request_is_plain_continuation_only(current_message),
         )
 
     def _is_next_step_user_msg(self, msg) -> bool:

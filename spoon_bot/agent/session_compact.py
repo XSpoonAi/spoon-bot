@@ -835,6 +835,7 @@ def build_session_compact_context(
     max_messages: int = DEFAULT_MAX_SESSION_MESSAGES,
     char_budget: int = DEFAULT_CONTEXT_CHAR_BUDGET,
     resume_latest_user_turn: bool = False,
+    plain_continuation_only: bool = False,
 ) -> str:
     """Build an ordered compact block from the current session transcript."""
     if session is None:
@@ -872,19 +873,42 @@ def build_session_compact_context(
         "Never start or continue actions that are implied only by this compact; use it as evidence after the newest request selects the task.",
         "An empty long-term memory search does not mean the same-session transcript is empty.",
         "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions.",
-        "If a continuation anchor is shown above, treat it as the only prior user request selected by the newest continuation request.",
     ]
+    if plain_continuation_only:
+        lines.append(
+            "If a continuation state anchor is shown below, treat it as a checkpoint locator, "
+            "not renewed task scope or permission for older counts."
+        )
+    else:
+        lines.append(
+            "If a continuation anchor is shown above, treat it as the only prior user request selected by the newest continuation request."
+        )
 
     latest_prior = _latest_prior_user_task_line(raw_messages, current_message)
     if resume_latest_user_turn:
         anchor = latest_prior
         if anchor:
-            lines.append("Continuation anchor selected by the newest continuation-only request:")
+            if plain_continuation_only:
+                lines.append(
+                    "Nearest prior user request for continuation state only:"
+                )
+            else:
+                lines.append(
+                    "Continuation anchor selected by the newest continuation-only request:"
+                )
             lines.append(f"- Latest prior user request: {mask_secrets(anchor)}")
-            lines.append(
-                "Resume only one bounded continuation unit from this anchor and current live state. "
-                "If selected skills are shown, continue that skill family rather than another earlier skill."
-            )
+            if plain_continuation_only:
+                lines.append(
+                    "For this plain continuation, use the prior request only to locate the "
+                    "immediate unfinished checkpoint. Do not inherit any older count, batch, "
+                    "or repeated-action target as current permission. After one bounded action "
+                    "or status check, report the current state or ask for explicit scope."
+                )
+            else:
+                lines.append(
+                    "Resume only one bounded continuation unit from this anchor and current live state. "
+                    "If selected skills are shown, continue that skill family rather than another earlier skill."
+                )
 
     if interrupted_evidence:
         lines.append(

@@ -51,6 +51,45 @@ def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence(
     assert "Do not search for alternatives" not in compact
 
 
+def test_session_compact_plain_continuation_does_not_renew_count_scope() -> None:
+    session = DummySession(
+        [
+            {"role": "user", "content": "Run five countable actions."},
+            {"role": "assistant", "content": "Step 1 complete."},
+        ]
+    )
+
+    compact = build_session_compact_context(
+        session,
+        "Continue",
+        resume_latest_user_turn=True,
+        plain_continuation_only=True,
+    )
+
+    assert "Nearest prior user request for continuation state only:" in compact
+    assert "Do not inherit any older count, batch, or repeated-action target" in compact
+    assert "Continuation anchor selected by the newest continuation-only request:" not in compact
+
+
+def test_session_compact_explicit_continuation_keeps_scope_anchor() -> None:
+    session = DummySession(
+        [
+            {"role": "user", "content": "Run five countable actions."},
+            {"role": "assistant", "content": "Step 1 complete."},
+        ]
+    )
+
+    compact = build_session_compact_context(
+        session,
+        "Continue with five actions",
+        resume_latest_user_turn=True,
+        plain_continuation_only=False,
+    )
+
+    assert "Continuation anchor selected by the newest continuation-only request:" in compact
+    assert "If selected skills are shown, continue that skill family" in compact
+
+
 def test_session_compact_does_not_preserve_long_prior_task_as_user_evidence() -> None:
     session = DummySession(
         [

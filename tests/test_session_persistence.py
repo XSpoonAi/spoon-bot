@@ -2986,8 +2986,11 @@ class TestContextBuilderMediaPaths:
 
         assert "[BOUNDED CONTINUATION REQUEST]" in plain_context
         assert "adds no new count, target, or scope" in plain_context
+        assert "Do not treat the nearest prior request as renewed task scope" in plain_context
+        assert "Ignore older numeric quotas or repeated-action targets" in plain_context
         assert "[BOUNDED CONTINUATION REQUEST]" not in scoped_context
         assert "[CONTINUATION ANCHOR]" in scoped_context
+        assert "Use this selected request as the primary task scope" in scoped_context
 
 
 class TestAgentLoopRuntimeCompression:
