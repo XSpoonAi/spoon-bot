@@ -23,6 +23,7 @@ from spoon_bot.agent.request_hints import (
     format_explicit_request_urls_context,
     format_explicit_request_values_context,
     request_is_bare_continuation,
+    request_is_plain_continuation_only,
 )
 
 if TYPE_CHECKING:
@@ -559,7 +560,9 @@ class LoopSkillsMixin:
         hint_source = self._request_hint_source_text(message)
         hints = self._build_request_execution_hints_from_text(hint_source)
         sections = [
-            _BOUNDED_CONTINUATION_BOUNDARY if request_is_bare_continuation(message) else "",
+            _BOUNDED_CONTINUATION_BOUNDARY
+            if request_is_plain_continuation_only(message)
+            else "",
             self._format_continuation_anchor_context(message),
             format_explicit_request_urls_context(hint_source),
             format_explicit_request_values_context(hint_source),
@@ -602,6 +605,14 @@ class LoopSkillsMixin:
                     "external side effect.",
                 ]
             )
+            if request_is_plain_continuation_only(current):
+                lines.append(
+                    "The newest message adds no new count, target, or scope. "
+                    "It authorizes at most the next bounded unit from the "
+                    "selected task; do not inherit an older repeated/countable "
+                    "goal as permission to perform multiple new units in this "
+                    "turn."
+                )
         lines.append("")
         return "\n".join(lines)
 
@@ -835,6 +846,8 @@ class LoopSkillsMixin:
         hints = self._build_request_execution_hints_from_text(
             self._request_hint_source_text(message),
         )
+        hints["bare_continuation"] = request_is_bare_continuation(message)
+        hints["plain_continuation"] = request_is_plain_continuation_only(message)
         AgentLoop._configure_request_scoped_history_tool(self, hints)
         AgentLoop._bind_request_execution_hints_to_tools(self, hints)
         return hints

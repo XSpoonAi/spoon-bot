@@ -2890,10 +2890,23 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 except Exception:
                     pass
 
+            plain_continuation = AgentLoop._request_is_plain_bounded_continuation(
+                authoritative_message,
+                request_execution_hints,
+            )
+
+            def _can_auto_continue_for_current_request() -> bool:
+                if not plain_continuation:
+                    return True
+                return AgentLoop._plain_continuation_can_auto_continue_same_unit(
+                    all_tool_result_events,
+                )
+
             def _can_run_skill_contract_continuation() -> bool:
                 return (
                     skill_contract_continuation_attempts
                     < AgentLoop._skill_contract_continuation_attempt_limit()
+                    and _can_auto_continue_for_current_request()
                 )
 
             def _mark_skill_contract_continuation_attempt() -> None:
@@ -3987,6 +4000,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 all_tool_result_events
                 and task_continuation_attempts
                 < AgentLoop._task_completion_continuation_attempt_limit()
+                and _can_auto_continue_for_current_request()
             ):
                 verdict = await self._evaluate_task_completion_verdict(
                     authoritative_message=authoritative_message,

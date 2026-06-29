@@ -2623,6 +2623,49 @@ class TestAgentLoopStreamFallback:
             f"All {target_steps} steps complete."
         )
 
+    @pytest.mark.asyncio
+    async def test_stream_plain_continuation_does_not_complete_prior_repeated_scope(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _MultiStepSummaryRuntimeAgent(target_steps=5)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_plain_continuation_one_unit")
+        loop._session.add_message("user", "Run five countable actions.")
+        loop._session.add_message("assistant", "Step 1 complete. Continue?")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={
+                "status": "needs_continuation",
+                "reason": "Prior repeated scope is not fully evidenced.",
+                "next_focus": "Run the next repeated action.",
+            }
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="继续"):
+            chunks.append(chunk)
+
+        tool_result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+
+        assert len(loop._agent.run_calls) == 1
+        assert len(tool_result_chunks) == 1
+        loop._evaluate_task_completion_verdict.assert_not_called()
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "Step 1 complete"
+
     def test_execution_ledger_context_keeps_aggregate_shell_counts(self):
         from spoon_bot.agent.execution_ledger import ExecutionLedger
 
@@ -2925,6 +2968,26 @@ class TestContextBuilderMediaPaths:
         assert "older unrelated workflow completed earlier" in context
         assert context.index("[CONTINUATION ANCHOR]") < context.index("[EXECUTION LEDGER")
         assert "do not switch to another earlier task" in context
+
+    def test_plain_continuation_boundary_does_not_apply_to_explicit_scope(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="plain-continuation-boundary")
+        loop._session.add_message("user", "Run the next documented action until finished.")
+        loop._session.add_message("assistant", "One documented action completed.")
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: ""
+
+        plain_context = AgentLoop._build_request_context_sections(loop, "继续")
+        scoped_context = AgentLoop._build_request_context_sections(loop, "继续玩5把")
+
+        assert "[BOUNDED CONTINUATION REQUEST]" in plain_context
+        assert "adds no new count, target, or scope" in plain_context
+        assert "[BOUNDED CONTINUATION REQUEST]" not in scoped_context
+        assert "[CONTINUATION ANCHOR]" in scoped_context
 
 
 class TestAgentLoopRuntimeCompression:

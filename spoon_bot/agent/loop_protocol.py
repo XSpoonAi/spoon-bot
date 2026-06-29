@@ -31,7 +31,10 @@ from spoon_bot.agent.session_compact import (
     build_recent_session_turns_payload,
     build_session_compact_context,
 )
-from spoon_bot.agent.request_hints import request_is_bare_continuation
+from spoon_bot.agent.request_hints import (
+    request_is_bare_continuation,
+    request_is_plain_continuation_only,
+)
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
@@ -3591,6 +3594,25 @@ class LoopProtocolMixin:
         return 20
 
     @staticmethod
+    def _request_is_plain_bounded_continuation(
+        authoritative_message: str,
+        request_execution_hints: dict[str, Any] | None = None,
+    ) -> bool:
+        if (
+            isinstance(request_execution_hints, dict)
+            and "plain_continuation" in request_execution_hints
+        ):
+            return bool(request_execution_hints.get("plain_continuation"))
+        return request_is_plain_continuation_only(authoritative_message)
+
+    @staticmethod
+    def _plain_continuation_can_auto_continue_same_unit(
+        tool_result_events: list[dict[str, Any]],
+    ) -> bool:
+        """Allow only same-unit monitoring, not a new repeated side-effect unit."""
+        return latest_tool_event_has_active_background_job(tool_result_events)
+
+    @staticmethod
     def _parse_task_completion_verdict(value: Any) -> dict[str, str] | None:
         text = AgentLoop._stringify_stream_payload(value).strip()
         if not text:
@@ -3642,6 +3664,20 @@ class LoopProtocolMixin:
             "the newest user request already explicitly authorized that exact "
             "next action and the evidence is still incomplete.",
         ]
+        if request_is_plain_continuation_only(authoritative_message):
+            lines.extend(
+                [
+                    "",
+                    "[BOUNDED CONTINUATION RULE]",
+                    "The newest request is only a continuation acknowledgement; "
+                    "it adds no new count, target, or scope. Once this turn has "
+                    "produced a concrete tool result for the selected prior task, "
+                    "mark the turn complete or awaiting_user instead of using an "
+                    "older repeated/countable request as permission to start "
+                    "another similar side-effect unit. The only exception is "
+                    "same-unit monitoring of an already running background job.",
+                ]
+            )
         if final_content and str(final_content).strip():
             lines.extend(
                 [
@@ -3845,7 +3881,18 @@ class LoopProtocolMixin:
     ) -> tuple[str, list[dict[str, Any]]]:
         attempts = 0
         limit = AgentLoop._task_completion_continuation_attempt_limit()
+        plain_continuation = AgentLoop._request_is_plain_bounded_continuation(
+            authoritative_message,
+            request_execution_hints,
+        )
         while attempts < limit and tool_result_events:
+            if (
+                plain_continuation
+                and not AgentLoop._plain_continuation_can_auto_continue_same_unit(
+                    tool_result_events,
+                )
+            ):
+                break
             verdict = await self._evaluate_task_completion_verdict(
                 authoritative_message=authoritative_message,
                 final_content=final_content,
@@ -3909,11 +3956,22 @@ class LoopProtocolMixin:
     ) -> tuple[str, list[dict[str, Any]]]:
         attempts = 0
         limit = AgentLoop._skill_contract_continuation_attempt_limit()
+        plain_continuation = AgentLoop._request_is_plain_bounded_continuation(
+            authoritative_message,
+            request_execution_hints,
+        )
         while (
             attempts < limit
             and tool_result_events
             and should_run_skill_contract_check(tool_result_events)
         ):
+            if (
+                plain_continuation
+                and not AgentLoop._plain_continuation_can_auto_continue_same_unit(
+                    tool_result_events,
+                )
+            ):
+                break
             verdict = await self._evaluate_skill_completion_verdict(
                 authoritative_message=authoritative_message,
                 final_content=final_content,
@@ -4206,6 +4264,19 @@ class LoopProtocolMixin:
             evidence_lines.extend(AgentLoop._continuation_tool_event_brief(event, limit=1200))
         if evidence_lines:
             lines.extend(["", "[RECENT TOOL EVIDENCE]", *evidence_lines])
+        if request_is_plain_continuation_only(authoritative_message):
+            lines.extend(
+                [
+                    "",
+                    "[BOUNDED CONTINUATION LIMIT]",
+                    "The latest user message adds no new count, target, or "
+                    "scope. Continue only the same bounded unit already in "
+                    "progress. Do not start another repeated/countable unit "
+                    "from an older request; report current status or ask for "
+                    "explicit scope after this unit is no longer actively "
+                    "running.",
+                ]
+            )
         lines.append("")
         lines.append(
             "Continue from the evidence above. If the requested workflow is "
@@ -4249,6 +4320,20 @@ class LoopProtocolMixin:
             evidence_lines.extend(AgentLoop._continuation_tool_event_brief(event, limit=1200))
         if evidence_lines:
             lines.extend(["", "[RECENT TOOL EVIDENCE]", *evidence_lines])
+        plain_continuation = request_is_plain_continuation_only(authoritative_message)
+        if plain_continuation:
+            lines.extend(
+                [
+                    "",
+                    "[BOUNDED CONTINUATION LIMIT]",
+                    "The latest user message adds no new count, target, or "
+                    "scope. Continue only the same bounded unit already in "
+                    "progress. Do not start another repeated/countable unit "
+                    "from an older request; report current status or ask for "
+                    "explicit scope after this unit is no longer actively "
+                    "running.",
+                ]
+            )
         lines.append("")
         lines.append(
             "Continue from the evidence above. If the requested outcome is "
@@ -4264,12 +4349,20 @@ class LoopProtocolMixin:
             "answer unless the latest user request already clearly authorized the "
             "exact next action."
         )
-        lines.append(
-            "For countable or repeated requests, continue until the concrete tool "
-            "evidence satisfies the requested count and scope, or until tool "
-            "evidence shows a real blocker. Treat stage summaries as progress "
-            "for the stage they describe, not as proof of the remaining stages."
-        )
+        if plain_continuation:
+            lines.append(
+                "Do not inherit a count or repeated-action scope from the prior "
+                "request when the newest request is only a continuation "
+                "acknowledgement. The prior request is an anchor for state, not "
+                "permission to perform multiple new side-effect units."
+            )
+        else:
+            lines.append(
+                "For countable or repeated requests, continue until the concrete tool "
+                "evidence satisfies the requested count and scope, or until tool "
+                "evidence shows a real blocker. Treat stage summaries as progress "
+                "for the stage they describe, not as proof of the remaining stages."
+            )
         lines.append(
             "If the request asks to create, update, build, deploy, start, or verify "
             "a workspace artifact and the evidence so far is only read/list/search "
