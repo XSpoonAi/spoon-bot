@@ -647,6 +647,7 @@ def _format_substantive_turn_line(
     events: list[dict[str, Any]],
     *,
     limit: int,
+    include_user_request: bool = True,
 ) -> str:
     """Format one completed turn whose tool evidence shows real progress."""
     stateful_events = _turn_stateful_tool_events(events)
@@ -656,7 +657,7 @@ def _format_substantive_turn_line(
     user_excerpt = _clip_text(user_message.get("content", ""), min(limit, 260))
     skill_names = _turn_skill_names(user_message)
     parts: list[str] = []
-    if user_excerpt:
+    if include_user_request and user_excerpt:
         parts.append(f"User request: {user_excerpt}")
     if skill_names:
         parts.append(f"Selected skills: {', '.join(skill_names)}")
@@ -685,6 +686,7 @@ def _select_recent_substantive_turn_lines(
     *,
     char_budget: int,
     max_items: int = 6,
+    include_user_request: bool = True,
 ) -> list[str]:
     """Return recent completed turns whose tool evidence made real progress."""
     selected: list[str] = []
@@ -695,6 +697,7 @@ def _select_recent_substantive_turn_lines(
             user_message,
             events,
             limit=520,
+            include_user_request=include_user_request,
         )
         if not line or line in seen:
             continue
@@ -890,21 +893,21 @@ def build_session_compact_context(
         if anchor:
             if plain_continuation_only:
                 lines.append(
-                    "Nearest prior user request for continuation state only:"
+                    "Prior user request text omitted for plain continuation:"
                 )
             else:
                 lines.append(
                     "Continuation anchor selected by the newest continuation-only request:"
                 )
-            lines.append(f"- Latest prior user request: {mask_secrets(anchor)}")
             if plain_continuation_only:
                 lines.append(
-                    "For this plain continuation, use the prior request only to locate the "
-                    "immediate unfinished checkpoint. Do not inherit any older count, batch, "
-                    "or repeated-action target as current permission. After one bounded action "
-                    "or status check, report the current state or ask for explicit scope."
+                    "- The newest request has no count, target, or scope, so the "
+                    "prior user request is not repeated here and must not be "
+                    "renewed as current permission. Use assistant/tool state "
+                    "evidence below to locate one immediate unfinished checkpoint."
                 )
             else:
+                lines.append(f"- Latest prior user request: {mask_secrets(anchor)}")
                 lines.append(
                     "Resume only one bounded continuation unit from this anchor and current live state. "
                     "If selected skills are shown, continue that skill family rather than another earlier skill."
@@ -931,6 +934,7 @@ def build_session_compact_context(
     substantive_turns = _select_recent_substantive_turn_lines(
         completed_turns,
         char_budget=max(1_000, min(5_500, char_budget // 3)),
+        include_user_request=not plain_continuation_only,
     )
     if substantive_turns:
         lines.append(
@@ -985,7 +989,8 @@ def build_session_compact_context(
         if _message_visible_in_compact(message)
         if str(message.get("role") or "").lower() != "user"
         or (
-            id(message) not in task_scoped_user_ids
+            not plain_continuation_only
+            and id(message) not in task_scoped_user_ids
             and _is_bounded_user_evidence(message)
         )
     ]
