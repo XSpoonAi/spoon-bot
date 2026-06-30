@@ -76,6 +76,8 @@ name: sample-skill
 ```text
 PROCEDURE setup():
   IF account is missing:
+    IF no referral code is already present in the conversation context:
+      ask the user whether they have optional configuration first
     ask the user whether they have optional configuration first
     RUN cli setup
 ```
@@ -87,4 +89,5 @@ PROCEDURE setup():
     assert "default/no-extra path" in summary
     assert "Omitted `ask ...` directives" in summary
     assert "Do not emit optional-input questions as visible progress" in summary
+    assert "IF no referral code is already present" not in summary
     assert "ask the user whether they have optional configuration first" not in summary

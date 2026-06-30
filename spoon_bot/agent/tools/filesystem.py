@@ -305,6 +305,35 @@ class ReadFileTool(Tool):
                     break
             return out
 
+        def _is_optional_input_prompt_directive(value: str) -> bool:
+            lowered = str(value or "").casefold()
+            optional_markers = (
+                "optional",
+                "bonus",
+                "referral",
+                "invitation",
+                "invite",
+                "extra ",
+                "non-essential",
+            )
+            input_markers = (
+                "ask ",
+                "provide",
+                "present in",
+                "already present",
+                "conversation context",
+                "context",
+                "code",
+                "configuration",
+                "preference",
+                "naming",
+            )
+            if lowered.startswith("ask "):
+                return True
+            return any(marker in lowered for marker in optional_markers) and any(
+                marker in lowered for marker in input_markers
+            )
+
         frontmatter: list[str] = []
         if lines and lines[0].strip() == "---":
             for line in lines[1:40]:
@@ -465,7 +494,7 @@ class ReadFileTool(Tool):
                 or "$cli" in lowered
                 or stripped.startswith('"')
             ):
-                if lowered.startswith("ask "):
+                if _is_optional_input_prompt_directive(lowered):
                     continue
                 contract_lines.append(raw_line.rstrip()[:220])
 
