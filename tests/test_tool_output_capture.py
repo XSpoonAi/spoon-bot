@@ -60,3 +60,31 @@ async def test_capture_defaults_to_returned_result_when_tool_does_not_publish_fu
     assert captured is not None
     assert captured.summary_output == "plain result"
     assert captured.full_output == "plain result"
+
+
+def test_skill_execution_summary_marks_optional_input_as_non_blocking():
+    from spoon_bot.agent.tools.filesystem import ReadFileTool
+
+    summary = ReadFileTool._extract_skill_cli_content(
+        """
+---
+name: sample-skill
+---
+
+## Setup
+
+```text
+PROCEDURE setup():
+  IF account is missing:
+    ask the user whether they have optional configuration first
+    RUN cli setup
+```
+""",
+        budget=4000,
+    )
+
+    assert "Non-interactive optional-input precedence" in summary
+    assert "default/no-extra path" in summary
+    assert "Omitted `ask ...` directives" in summary
+    assert "Do not emit optional-input questions as visible progress" in summary
+    assert "ask the user whether they have optional configuration first" not in summary

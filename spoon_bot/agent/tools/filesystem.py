@@ -465,6 +465,8 @@ class ReadFileTool(Tool):
                 or "$cli" in lowered
                 or stripped.startswith('"')
             ):
+                if lowered.startswith("ask "):
+                    continue
                 contract_lines.append(raw_line.rstrip()[:220])
 
         contract_lines = _dedupe(contract_lines, limit=90)
@@ -487,6 +489,20 @@ class ReadFileTool(Tool):
             "arguments, unless SKILL.md documents them.\n"
             "- Replace only placeholders such as <value> or {value}; on argument "
             "or usage errors, check CLI help and retry the documented form."
+        )
+        sections.append(
+            "Non-interactive optional-input precedence:\n"
+            "- If a contract asks for optional configuration, preference, bonus, "
+            "referral, naming, or another non-essential enhancement during an "
+            "already selected workflow, do not ask the user and do not stop.\n"
+            "- Use the default/no-extra path and continue with the core requested "
+            "workflow unless the next core command cannot be formed without that "
+            "missing value.\n"
+            "- Omitted `ask ...` directives from this compact summary are governed "
+            "by this policy; inspect the full SKILL.md only if a core command "
+            "cannot be formed or a tool error proves required input is missing.\n"
+            "- Do not emit optional-input questions as visible progress before "
+            "continuing."
         )
         if cli_lines:
             sections.append("CLI entrypoint:\n" + "\n".join(cli_lines))

@@ -1807,6 +1807,35 @@ class TestAgentLoopStreamFallback:
         assert "explicit multi-stage requests" in prompt
         assert "already selected for this turn" in prompt
         assert "Do not pause between listed stages" in prompt
+        assert "default/no-extra path" in prompt
+        assert "[BOUNDED CONTINUATION LIMIT]" not in prompt
+
+    def test_task_continuation_prompt_skips_optional_input_for_explicit_workflow(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_task_continuation_prompt(
+            "Install the requested skill, prepare the account, register it, then join the latest run.",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "Wallet has no balance and no registered account.",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "check-account"}),
+                    },
+                }
+            ],
+            previous_draft=(
+                "Before I run the setup, do you have optional configuration? "
+                "If not, I can proceed without it."
+            ),
+            continuation_reason="A required listed stage is still incomplete.",
+        )
+
+        assert "Optional input" in prompt or "optional configuration" in prompt
+        assert "default/no-extra path" in prompt
+        assert "core action cannot be executed without a missing required value" in prompt
+        assert "Do not repeat the optional question to the user" in prompt
         assert "[BOUNDED CONTINUATION LIMIT]" not in prompt
 
     def test_task_completion_verdict_brief_keeps_explicit_multistage_scope(self):
@@ -1833,7 +1862,48 @@ class TestAgentLoopStreamFallback:
 
         assert "listed actions are current-turn authorization" in brief
         assert "request for feedback override" in brief
+        assert "Optional input inside an already selected workflow" in brief
         assert "use needs_continuation" in brief
+
+    def test_task_completion_verdict_brief_skips_optional_input_boundary(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        brief = loop._build_task_completion_verdict_brief(
+            authoritative_message=(
+                "Install the requested skill, prepare the account, register it, "
+                "then join the latest run."
+            ),
+            final_content=(
+                "The account is missing setup. Before I continue, do you have "
+                "optional configuration? If not, I can proceed without it."
+            ),
+            tool_result_events=[
+                {
+                    "type": "tool_result",
+                    "delta": "Wallet exists but setup is incomplete.",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "check-account"}),
+                    },
+                }
+            ],
+        )
+
+        assert "Optional input inside an already selected workflow is not a turn boundary" in brief
+        assert "default/no-extra path" in brief
+        assert "use needs_continuation instead of awaiting_user" in brief
+        assert "visible optional-input question is not a terminal" in brief
+
+    def test_context_prompt_skips_optional_user_input_in_non_interactive_mode(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_dir).build_system_prompt()
+
+        assert "optional configuration" in prompt
+        assert "choose the default/no-extra option" in prompt
+        assert "Do not surface the optional input as a question" in prompt
+        assert "core requested action cannot be executed without that value" in prompt
 
     @pytest.mark.asyncio
     async def test_stream_continues_after_background_job_handoff(

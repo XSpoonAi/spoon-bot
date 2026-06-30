@@ -130,7 +130,16 @@ _TASK_COMPLETION_VERDICT_SYSTEM_PROMPT = (
     "`awaiting_user` merely because the assistant draft asks for feedback, "
     "approval, or whether to proceed between listed stages; return "
     "`needs_continuation` when tool evidence has not completed the remaining "
-    "listed stages and another tool action can reasonably make progress."
+    "listed stages and another tool action can reasonably make progress. If "
+    "the draft is waiting for optional user input, configuration, preference, "
+    "bonus, referral, naming, or another non-essential enhancement, treat that "
+    "as skippable in non-interactive execution: choose the default/no-extra "
+    "path and use `needs_continuation` when the core requested workflow can "
+    "still proceed with tools. Do not treat a visible optional-input question "
+    "as a valid terminal answer. Use `awaiting_user` only when the next core "
+    "action cannot be formed without the missing value, or when proceeding "
+    "would be destructive, irreversible, materially ambiguous, or outside the "
+    "newest user's requested scope."
 )
 
 
@@ -3675,6 +3684,12 @@ class LoopProtocolMixin:
             "let an assistant draft phrased as a request for feedback override "
             "that authorization; if a listed stage remains incomplete and another "
             "tool action can progress it, use needs_continuation.",
+            "Optional input inside an already selected workflow is not a turn "
+            "boundary. If the draft waits for optional configuration, preference, "
+            "bonus, referral, naming, or other non-essential user input, and the "
+            "core requested workflow can proceed with a default/no-extra path, "
+            "use needs_continuation instead of awaiting_user. A visible optional-input "
+            "question is not a terminal user-facing answer for an authorized workflow.",
         ]
         if request_is_plain_continuation_only(authoritative_message):
             lines.extend(
@@ -4380,8 +4395,12 @@ class LoopProtocolMixin:
                 "user request are already selected for this turn. Do not pause "
                 "between listed stages just because the previous draft asked for "
                 "feedback or whether to proceed; continue with the next tool-backed "
-                "stage unless a required value is missing, the active tool/skill "
-                "contract requires user input, or evidence shows a concrete blocker."
+                "stage unless the core action cannot be executed without a missing "
+                "required value or evidence shows a concrete blocker. If a skill "
+                "asks for optional configuration, preference, bonus, referral, "
+                "naming, or another non-essential enhancement, choose the "
+                "default/no-extra path and continue. Do not repeat the optional "
+                "question to the user before proceeding."
             )
         lines.append(
             "If the request asks to create, update, build, deploy, start, or verify "

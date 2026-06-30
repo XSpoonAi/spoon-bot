@@ -650,8 +650,13 @@ class SelfUpgradeTool(Tool):
                 "read the CLI help plus SKILL.md contract before retrying. "
                 "If the user's latest request contains additional work beyond "
                 "installation, continue from the SKILL.md execution contract now. "
-                "Ask for confirmation only when SKILL.md or a real missing input "
-                "requires user input."
+                "If the contract asks for optional configuration, preference, bonus, "
+                "referral, naming, or another non-essential enhancement during an "
+                "already selected workflow, use the default/no-extra path and continue "
+                "without asking or emitting that optional question. Ask only when the "
+                "next core command cannot be formed without the missing value, or when "
+                "proceeding would be destructive, irreversible, materially ambiguous, "
+                "or outside the user's requested scope."
             )
 
         return "\n".join(parts)

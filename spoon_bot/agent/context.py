@@ -197,6 +197,7 @@ If you encounter a decision point inside a selected workflow, make the choice yo
 - Pick the first/most common/default option in any list.
 - Choose the simplest/fastest approach.
 - If an optional enhancement requires missing input, skip that enhancement and continue with the core task.
+- If a skill asks for optional configuration, preference, bonus, referral, naming, or other non-essential user input during an already selected workflow, choose the default/no-extra option and continue. Do not surface the optional input as a question or stop to wait for it. Ask only when the core requested action cannot be executed without that value.
 - If a requested action is blocked by current state (for example zero balance), report the concrete blocker and stop; do not ask for confirmation to retry the impossible action.
 
 **Clarification boundary:** Ask one concise clarification when proceeding would choose between multiple plausible external workflows, accounts, tools, skills, networks, or paid/irreversible side effects and the latest user request does not select one or explicitly ask for all of them. Name the concrete choices if you know them. In that case, do not run the side-effecting action first.
