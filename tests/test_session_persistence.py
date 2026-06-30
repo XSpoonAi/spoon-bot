@@ -1824,6 +1824,119 @@ class TestAgentLoopStreamFallback:
             }
         ])
 
+    @pytest.mark.asyncio
+    async def test_repeated_external_wait_text_is_not_a_hard_completion_signal(self):
+        from spoon_bot.agent.loop import AgentLoop
+        from spoon_bot.agent.turn_verifiers import (
+            skill_contract_needs_continuation,
+            tool_events_need_more_evidence,
+        )
+
+        contract = "[SKILL.md execution summary]\nAfter starting, wait until terminal state."
+        job_wait = (
+            "job_id: sh_running\n"
+            "status: running\n"
+            "returncode: running\n"
+            "Output:\n"
+            "(no output)\n\n"
+            "Still running after waiting 60s with no new output."
+        )
+        unchanged_state = "STATE resource=abc phase=Waiting ready=N\nNEXT: wait for terminal state"
+        events = [
+            {
+                "type": "tool_result",
+                "delta": contract,
+                "metadata": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "skills/example/SKILL.md"}),
+                    "result": contract,
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": "STARTED resource=abc",
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({"command": "node skills/example/cli/index.js start"}),
+                    "result": "STARTED resource=abc",
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": job_wait,
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({"action": "job_output", "job_id": "sh_running"}),
+                    "result": job_wait,
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": unchanged_state,
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({"command": "node skills/example/cli/index.js status abc"}),
+                    "result": unchanged_state,
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": job_wait,
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({"action": "job_output", "job_id": "sh_running"}),
+                    "result": job_wait,
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": unchanged_state,
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({"command": "node skills/example/cli/index.js status abc"}),
+                    "result": unchanged_state,
+                },
+            },
+        ]
+
+        running_job_latest_events = events[:-1] + [events[-2]]
+        assert tool_events_need_more_evidence(running_job_latest_events)
+        assert not skill_contract_needs_continuation("Still waiting on the external state.", events)
+
+        loop = AgentLoop.__new__(AgentLoop)
+        verdict = await loop._evaluate_task_completion_verdict(
+            authoritative_message="Start the workflow and wait until it reaches terminal state.",
+            final_content="",
+            tool_result_events=events,
+        )
+        assert verdict["status"] == "needs_continuation"
+
+    def test_running_background_job_still_needs_more_evidence(self):
+        from spoon_bot.agent.turn_verifiers import tool_events_need_more_evidence
+
+        job_wait = (
+            "job_id: sh_running\n"
+            "status: running\n"
+            "returncode: running\n"
+            "Output:\n"
+            "(no output)\n\n"
+            "Still running after waiting 60s with no new output."
+        )
+        events = [
+            {
+                "type": "tool_result",
+                "delta": job_wait,
+                "metadata": {"name": "shell", "result": job_wait},
+            },
+            {
+                "type": "tool_result",
+                "delta": job_wait,
+                "metadata": {"name": "shell", "result": job_wait},
+            },
+        ]
+
+        assert tool_events_need_more_evidence(events)
+
     def test_task_continuation_prompt_does_not_treat_draft_as_user_input(self):
         from spoon_bot.agent.loop import AgentLoop
 
@@ -1921,7 +2034,7 @@ class TestAgentLoopStreamFallback:
         assert "[BOUNDED CONTINUATION LIMIT]" not in prompt
         assert "contract-defined terminal outcome" in prompt
         assert "multiple repeated units" in prompt
-        assert "external state change" in prompt
+        assert "external evidence changing" in prompt
         assert "current blocker and resume condition" in prompt
 
     def test_skill_continuation_prompt_does_not_expand_from_tool_next_step(self):
@@ -1946,7 +2059,7 @@ class TestAgentLoopStreamFallback:
         assert "next-step suggestions as evidence only" in prompt
         assert "contract-defined terminal outcome" in prompt
         assert "multiple repeated units" in prompt
-        assert "same pending/waiting/not-ready state" in prompt
+        assert "unchanged external evidence" in prompt
         assert "resume condition" in prompt
 
     def test_task_continuation_prompt_skips_optional_input_for_explicit_workflow(self):
@@ -2060,8 +2173,8 @@ class TestAgentLoopStreamFallback:
         assert "selected workflow unit" in brief
         assert "contract-defined terminal outcome" in brief
         assert "use complete" in brief
-        assert "same pending/waiting/not-ready state" in brief
-        assert "what evidence would allow a later resume" in brief
+        assert "unchanged external evidence" in brief
+        assert "evidence needed for a later resume" in brief
 
     def test_context_prompt_treats_tool_next_as_evidence_not_scope(self, tmp_dir: Path):
         from spoon_bot.agent.context import ContextBuilder
@@ -2817,6 +2930,125 @@ class TestAgentLoopStreamFallback:
                     },
                 }
             ],
+        )
+
+        assert verdict["status"] == "needs_continuation"
+
+    def test_task_completion_verifier_brief_keeps_early_skill_contract_evidence(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        contract_text = (
+            "[SKILL.md execution summary]\n"
+            "Operational contract:\n"
+            "- after a selected stateful start succeeds, continue through the "
+            "contract-defined terminal receipt or a concrete blocker.\n"
+            "Execution rules:\n"
+            "RULE after_action: do not stop at a pending follow-up marker."
+        )
+        events = [
+            {
+                "type": "tool_result",
+                "delta": contract_text,
+                "metadata": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "skills/example/SKILL.md"}),
+                    "result": contract_text,
+                    "content": contract_text,
+                },
+            }
+        ]
+        for index in range(16):
+            status_text = f"STATUS check={index} state=pending\nNEXT: continue current unit"
+            events.append(
+                {
+                    "type": "tool_result",
+                    "delta": status_text,
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({
+                            "command": f"node skills/example/cli/index.js status {index}",
+                        }),
+                        "result": status_text,
+                    },
+                }
+            )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        brief = loop._build_task_completion_verdict_brief(
+            authoritative_message="start the selected workflow",
+            final_content="All requested setup is complete.",
+            tool_result_events=events,
+        )
+
+        assert "[ACTIVE SKILL CONTRACT EVIDENCE]" in brief
+        assert "contract-defined terminal receipt" in brief
+        assert "STATUS check=15" in brief
+
+    @pytest.mark.asyncio
+    async def test_skill_completion_verdict_does_not_fast_complete_raw_running_job_from_ledger_progress(self):
+        from spoon_bot.agent.execution_ledger import ExecutionLedger
+        from spoon_bot.agent.loop import AgentLoop
+
+        contract_text = (
+            "[SKILL.md execution summary]\n"
+            "Operational contract:\n"
+            "- after stateful progress, keep monitoring the current unit until "
+            "terminal evidence or a concrete blocker is reached."
+        )
+        running_job_text = (
+            "job_id: job_1\n"
+            "status: running\n"
+            "returncode: running\n"
+            "Output:\n"
+            "(no output)"
+        )
+        events = [
+            {
+                "type": "tool_result",
+                "delta": contract_text,
+                "metadata": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "skills/example/SKILL.md"}),
+                    "result": contract_text,
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": "STATEFUL STARTED",
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({
+                        "command": "node skills/example/cli/index.js start",
+                    }),
+                    "result": "STATEFUL STARTED",
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": running_job_text,
+                "metadata": {
+                    "name": "shell",
+                    "arguments": json.dumps({
+                        "command": "node skills/example/cli/index.js monitor",
+                    }),
+                    "result": running_job_text,
+                },
+            },
+        ]
+        ledger = ExecutionLedger(owner="test", user_request="start the selected workflow")
+        ledger.record_tool(
+            "shell",
+            {"command": "node skills/example/cli/index.js start"},
+            "STATEFUL STARTED",
+            "STATEFUL STARTED",
+        )
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._active_execution_ledger = ledger
+        verdict = await loop._evaluate_skill_completion_verdict(
+            authoritative_message="start the selected workflow",
+            final_content=running_job_text,
+            tool_result_events=events,
         )
 
         assert verdict["status"] == "needs_continuation"

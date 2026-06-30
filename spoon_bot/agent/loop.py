@@ -95,6 +95,8 @@ from spoon_bot.agent.tools.execution_context import (
     clear_captured_tool_outputs,
     capture_tool_outputs,
     consume_captured_tool_output,
+    consume_captured_tool_output_deltas,
+    has_active_captured_tool_invocation,
     track_tool_invocations,
 )
 from spoon_bot.agent.turn_verifiers import (
@@ -207,9 +209,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         "repeat an external side effect unless the latest user request or the "
         "active skill contract explicitly asks for that next action. Never "
         "treat your own prior question, draft, or status message as the user's "
-        "approval to continue. Do not poll unchanged external waiting states "
+        "approval to continue. Do not poll unchanged external evidence "
         "indefinitely; after bounded checks with no material progress, report "
-        "the blocker and how the user can resume."
+        "a blocker only when the evidence proves no in-scope tool step can "
+        "progress the selected workflow unit now."
     )
 
     def __init__(
@@ -721,10 +724,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             "you to run. Continue with the tool or skill contract. Ask only when the core action cannot "
             "be executed without a missing required value, or when the next action is destructive, "
             "irreversible, materially ambiguous, or outside the user's requested scope.\n\n"
-            "- Do not poll an external system indefinitely. If repeated checks show the same pending, "
-            "waiting, or not-ready state without material progress, report the current blocker and "
-            "the evidence needed to resume later instead of continuing to wait, poll, or ask for "
-            "generic feedback.\n\n"
+            "- Do not poll an external system indefinitely. If bounded checks show unchanged "
+            "external evidence and no in-scope tool step can progress the selected workflow "
+            "unit now, report the concrete blocker and the evidence needed to resume later "
+            "instead of continuing to wait, poll, or ask for generic feedback.\n\n"
             "### Rules\n"
             "- Do NOT re-read files already in context.\n"
             "- Memory, recent replies, and conversation history are stale hints. "
@@ -752,6 +755,12 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             "unit's contract-defined terminal outcome. If its output already proves "
             "that terminal outcome or blocker, answer from that evidence instead "
             "of monitoring solely because the process is active.\n"
+            "- When a skill contract provides commands or tools for checking current "
+            "workflow state, balances, registration, recovery, or lifecycle progress, "
+            "use those documented commands first. Do not bypass the active skill "
+            "contract with ad hoc scripts, raw API calls, or manual transaction/state "
+            "inspection unless the documented commands are unavailable or their "
+            "evidence is insufficient for the next required step.\n"
             "- A continuation-only user message may resume one bounded unit only when "
             "same-session evidence identifies a clear prior workflow unit. If that "
             "unit is unfinished, finish that unit through its contract-defined terminal "
@@ -2014,6 +2023,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             stream_tool_result_index = len(AgentLoop._get_runtime_memory_messages(self))
             emitted_tool_result_ids: set[str] = set()
             tool_call_arguments_by_id: dict[str, str] = {}
+            tool_capture_invocation_by_tool_call_id: dict[str, str] = {}
+            tool_call_id_by_capture_invocation: dict[str, str] = {}
             recent_tool_result_events: list[dict[str, Any]] = []
             all_tool_result_events: list[dict[str, Any]] = []
             stream_tool_result_count = 0
@@ -2284,12 +2295,27 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         or event.get("tool_call_id")
                         or event.get("id")
                     )
+                    if bool(metadata.get("progress")):
+                        continue
                     if tool_call_id:
-                        active_tool_call_names_by_id.pop(str(tool_call_id), None)
+                        normalized_tool_call_id = str(tool_call_id)
+                        active_tool_call_names_by_id.pop(normalized_tool_call_id, None)
+                        invocation_id = tool_capture_invocation_by_tool_call_id.pop(
+                            normalized_tool_call_id,
+                            "",
+                        )
+                        if invocation_id:
+                            tool_call_id_by_capture_invocation.pop(invocation_id, None)
                     elif result_tool_name:
                         for active_id, active_name in list(active_tool_call_names_by_id.items()):
                             if active_name == result_tool_name:
                                 active_tool_call_names_by_id.pop(active_id, None)
+                                invocation_id = tool_capture_invocation_by_tool_call_id.pop(
+                                    active_id,
+                                    "",
+                                )
+                                if invocation_id:
+                                    tool_call_id_by_capture_invocation.pop(invocation_id, None)
                                 break
                     if result_tool_name == "read_file":
                         arguments_key = AgentLoop._tool_call_arguments_key(
@@ -2300,6 +2326,80 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 read_file_result_argument_counts.get(arguments_key, 0) + 1
                             )
                             read_file_result_generations[arguments_key] = read_context_generation
+
+            def _active_tool_progress_events() -> list[dict[str, Any]]:
+                """Return UI-only output deltas from tools that are still running."""
+                nonlocal last_tool_progress_at, last_tool_progress_kind
+
+                captured_deltas = consume_captured_tool_output_deltas(
+                    tool_output_capture_scope,
+                )
+                if not captured_deltas:
+                    return []
+
+                events: list[dict[str, Any]] = []
+                for captured_delta in captured_deltas:
+                    delta_text = str(captured_delta.delta or "")
+                    if not delta_text:
+                        continue
+
+                    tool_name = str(captured_delta.tool_name or "").strip()
+                    capture_invocation_id = str(
+                        getattr(captured_delta, "invocation_id", "") or ""
+                    ).strip()
+                    tool_call_id = tool_call_id_by_capture_invocation.get(
+                        capture_invocation_id,
+                        "",
+                    )
+                    if tool_call_id and tool_call_id not in active_tool_call_names_by_id:
+                        tool_call_id_by_capture_invocation.pop(capture_invocation_id, None)
+                        tool_capture_invocation_by_tool_call_id.pop(tool_call_id, None)
+                        tool_call_id = ""
+
+                    for candidate_id, active_name in active_tool_call_names_by_id.items():
+                        if tool_call_id:
+                            break
+                        arguments_key = tool_call_arguments_by_id.get(candidate_id, "")
+                        if arguments_key != captured_delta.arguments_key:
+                            continue
+                        active_name = str(active_name or "").strip()
+                        if tool_name and active_name and active_name != tool_name:
+                            continue
+                        tool_call_id = str(candidate_id)
+                    if not tool_call_id:
+                        for candidate_id, active_name in active_tool_call_names_by_id.items():
+                            if tool_name and str(active_name or "").strip() != tool_name:
+                                continue
+                            tool_call_id = str(candidate_id)
+                            break
+                    if tool_call_id and capture_invocation_id:
+                        tool_call_id_by_capture_invocation[capture_invocation_id] = tool_call_id
+                        tool_capture_invocation_by_tool_call_id[tool_call_id] = (
+                            capture_invocation_id
+                        )
+
+                    metadata = dict(captured_delta.metadata or {})
+                    metadata.setdefault("name", tool_name)
+                    metadata["progress"] = True
+                    metadata["status"] = "running"
+                    if tool_call_id:
+                        metadata.setdefault("id", tool_call_id)
+                        metadata.setdefault("tool_call_id", tool_call_id)
+
+                    events.append(
+                        {
+                            "type": "tool_result",
+                            "delta": delta_text,
+                            "metadata": metadata,
+                        }
+                    )
+
+                if events:
+                    last_tool_progress_at = time.monotonic()
+                    # Keep the active-tool budget alive without treating these
+                    # UI progress chunks as model-visible tool results.
+                    last_tool_progress_kind = "tool_call"
+                return events
 
             def _stop_tool_loop(reason: str) -> None:
                 nonlocal run_result_text, pre_tool_scratchpad_events, pre_tool_scratchpad_buffer
@@ -2413,17 +2513,34 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         or metadata.get("tool_call_id")
                         or metadata.get("id")
                     )
+                    arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+                    invocation_id = ""
+                    if tool_call_id:
+                        invocation_id = str(
+                            tool_capture_invocation_by_tool_call_id.get(str(tool_call_id)) or ""
+                        )
                     captured_output = consume_captured_tool_output(
                         tool_output_capture_scope,
                         tool_name=tool_name,
-                        arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                        arguments=arguments,
+                        invocation_id=invocation_id,
                     )
+                    if (
+                        captured_output is None
+                        and not serialized_result
+                        and has_active_captured_tool_invocation(
+                            tool_output_capture_scope,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            invocation_id=invocation_id,
+                        )
+                    ):
+                        return events
                     if tool_name:
                         metadata.setdefault("name", tool_name)
                     if tool_call_id:
                         metadata.setdefault("tool_call_id", tool_call_id)
                         metadata.setdefault("id", tool_call_id)
-                        arguments = tool_call_arguments_by_id.get(tool_call_id, "")
                         if arguments:
                             metadata.setdefault(
                                 "arguments",
@@ -2500,6 +2617,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             emitted_tool_result_ids,
                             tool_output_capture_scope=tool_output_capture_scope,
                             tool_call_arguments_by_id=tool_call_arguments_by_id,
+                            tool_capture_invocation_by_tool_call_id=(
+                                tool_capture_invocation_by_tool_call_id
+                            ),
                         )
                     )
                     repaired_events: list[dict[str, Any]] = []
@@ -2529,11 +2649,15 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 timeout=timeout,
                             )
                         except asyncio.TimeoutError:
+                            for event in _active_tool_progress_events():
+                                yield event
                             for event in _collect_repair_tool_result_events():
                                 yield event
                             continue
                         except Exception as exc:
                             logger.debug(f"{label} output queue polling failed: {exc}")
+                            for event in _active_tool_progress_events():
+                                yield event
                             for event in _collect_repair_tool_result_events():
                                 yield event
                             continue
@@ -2543,6 +2667,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             repair_reason=repair_reason,
                             queued_content_parts=queued_content_parts,
                         ):
+                            yield event
+                        for event in _active_tool_progress_events():
                             yield event
                         for event in _collect_repair_tool_result_events():
                             yield event
@@ -2571,6 +2697,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             repair_reason=repair_reason,
                             queued_content_parts=queued_content_parts,
                         ):
+                            yield event
+                        for event in _active_tool_progress_events():
                             yield event
                         for event in _collect_repair_tool_result_events():
                             yield event
@@ -2759,8 +2887,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         last_tool_progress_at = time.monotonic()
                         last_tool_progress_kind = "tool_call"
                     if event_type == "tool_result":
-                        if visible_tool_result_delta:
-                            metadata = dict(event.get("metadata") or {})
+                        metadata = dict(event.get("metadata") or {})
+                        if bool(metadata.get("progress")):
+                            pass
+                        elif visible_tool_result_delta:
                             event = {
                                 **event,
                                 "delta": AgentLoop._stream_tool_result_visible_delta(
@@ -2769,7 +2899,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 ),
                                 "metadata": metadata,
                             }
-                        _record_tool_result_events([event])
+                            _record_tool_result_events([event])
+                        else:
+                            _record_tool_result_events([event])
                     if event_type == "content":
                         delta = str(event.get("delta") or "")
                         if not delta or AgentLoop._is_internal_completion_sentinel(delta):
@@ -3014,8 +3146,13 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         emitted_tool_result_ids,
                         tool_output_capture_scope=tool_output_capture_scope,
                         tool_call_arguments_by_id=tool_call_arguments_by_id,
+                        tool_capture_invocation_by_tool_call_id=(
+                            tool_capture_invocation_by_tool_call_id
+                        ),
                     )
                 )
+                for event in _active_tool_progress_events():
+                    yield _mark_stream_activity(_decorate_stream_event(event))
                 _record_tool_result_events(tool_result_events)
                 if _events_have_repeated_read_guardrail(tool_result_events):
                     repeated_read_guardrail_seen = True
@@ -3141,6 +3278,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         f"Got chunk #{chunk_count}: type={type(chunk).__name__}, repr={repr(chunk)[:200]}"
                     )
                 except asyncio.TimeoutError:
+                    for event in _active_tool_progress_events():
+                        yield _mark_stream_activity(_decorate_stream_event(event))
                     if (
                         saw_tool_call
                         and last_tool_progress_kind == "tool_call"
@@ -3397,17 +3536,37 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                             or metadata.get("tool_call_id")
                             or metadata.get("id")
                         )
+                        arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+                        invocation_id = ""
+                        if tool_call_id:
+                            invocation_id = str(
+                                tool_capture_invocation_by_tool_call_id.get(
+                                    str(tool_call_id)
+                                )
+                                or ""
+                            )
                         captured_output = consume_captured_tool_output(
                             tool_output_capture_scope,
                             tool_name=tool_name,
-                            arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                            arguments=arguments,
+                            invocation_id=invocation_id,
                         )
+                        if (
+                            captured_output is None
+                            and not serialized_result
+                            and has_active_captured_tool_invocation(
+                                tool_output_capture_scope,
+                                tool_name=tool_name,
+                                arguments=arguments,
+                                invocation_id=invocation_id,
+                            )
+                        ):
+                            continue
                         if tool_name:
                             metadata.setdefault("name", tool_name)
                         if tool_call_id:
                             metadata.setdefault("tool_call_id", tool_call_id)
                             metadata.setdefault("id", tool_call_id)
-                            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
                             if arguments:
                                 metadata.setdefault(
                                     "arguments",
@@ -3633,6 +3792,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     emitted_tool_result_ids,
                     tool_output_capture_scope=tool_output_capture_scope,
                     tool_call_arguments_by_id=tool_call_arguments_by_id,
+                    tool_capture_invocation_by_tool_call_id=(
+                        tool_capture_invocation_by_tool_call_id
+                    ),
                 )
             )
             _record_tool_result_events(tool_result_events)
@@ -3964,19 +4126,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 pending_fallback_reason = "pseudo_tool_call_repair"
                 pending_fallback_delta = repair_text
 
-            def _has_stateful_terminal_content(text: str | None) -> bool:
-                active_ledger = getattr(self, "_active_execution_ledger", None)
-                normalized = str(text or "").strip()
-                return (
-                    isinstance(active_ledger, ExecutionLedger)
-                    and active_ledger.has_stateful_progress()
-                    and bool(normalized)
-                    and normalized not in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}
-                )
-
             while (
-                not _has_stateful_terminal_content(full_content)
-                and _can_run_skill_contract_continuation()
+                _can_run_skill_contract_continuation()
                 and skill_contract_needs_continuation(
                     full_content,
                     all_tool_result_events,

@@ -40,6 +40,7 @@ from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
     consume_captured_tool_output,
     get_request_execution_hints,
+    has_active_captured_tool_invocation,
     normalize_tool_arguments,
     sanitize_tool_arguments_for_history,
     track_tool_invocations,
@@ -3009,6 +3010,92 @@ class LoopProtocolMixin:
         return f"Tool `{tool_name}` output:\n{text}"
 
     @staticmethod
+    def _compact_preserving_edges(text: str, *, limit: int) -> str:
+        value = str(text or "").strip()
+        limit = max(200, int(limit or 0))
+        if len(value) <= limit:
+            return value
+        head_limit = max(80, limit // 2)
+        tail_limit = max(80, limit - head_limit - 80)
+        omitted = len(value) - head_limit - tail_limit
+        return (
+            value[:head_limit].rstrip()
+            + f"\n... (omitted {omitted} chars from middle) ...\n"
+            + value[-tail_limit:].lstrip()
+        )
+
+    @staticmethod
+    def _tool_result_payload_text(event: dict[str, Any]) -> str:
+        metadata = dict(event.get("metadata") or {})
+        payload = (
+            metadata.get("model_result")
+            or metadata.get("model_output")
+            or metadata.get("model_content")
+            or metadata.get("output")
+            or metadata.get("result")
+            or metadata.get("content")
+            or metadata.get("full_output")
+            or metadata.get("full_result")
+            or event.get("delta")
+        )
+        return AgentLoop._stringify_stream_payload(payload).strip()
+
+    @staticmethod
+    def _tool_result_arguments_text(event: dict[str, Any]) -> str:
+        metadata = dict(event.get("metadata") or {})
+        return AgentLoop._stringify_stream_payload(
+            metadata.get("arguments") or metadata.get("input") or metadata.get("args") or ""
+        ).strip()
+
+    @staticmethod
+    def _tool_result_is_skill_contract_evidence(event: dict[str, Any]) -> bool:
+        metadata = dict(event.get("metadata") or {})
+        tool_name = str(metadata.get("name") or metadata.get("tool") or "").strip().lower()
+        text = AgentLoop._tool_result_payload_text(event)
+        arguments = AgentLoop._tool_result_arguments_text(event)
+        comparable = f"{arguments}\n{text}".replace("\\", "/").casefold()
+        if "[skill.md execution contract]" in comparable:
+            return True
+        if "[skill.md execution summary]" in comparable:
+            return True
+        if "skill.md execution contract" in comparable:
+            return True
+        if "skill.md execution summary" in comparable:
+            return True
+        if "skill-ref" in comparable:
+            return True
+        return tool_name == "read_file" and (
+            comparable.endswith("/skill.md") or "/skill.md" in comparable
+        )
+
+    @staticmethod
+    def _skill_contract_evidence_brief(
+        tool_result_events: list[dict[str, Any]],
+        *,
+        max_events: int = 3,
+        per_event_chars: int = 5000,
+    ) -> list[str]:
+        """Return current-turn skill contract evidence even after recent events roll over."""
+        selected: list[str] = []
+        seen: set[str] = set()
+        for event in tool_result_events:
+            if not isinstance(event, dict):
+                continue
+            if not AgentLoop._tool_result_is_skill_contract_evidence(event):
+                continue
+            summary = AgentLoop._stream_tool_result_event_summary(
+                event,
+                limit=max(per_event_chars * 2, per_event_chars + 1200),
+            )
+            summary = AgentLoop._compact_preserving_edges(summary, limit=per_event_chars)
+            key = AgentLoop._normalize_comparable_text(summary)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            selected.append(summary)
+        return selected[-max(1, int(max_events or 1)) :]
+
+    @staticmethod
     def _stream_tool_result_visible_delta(delta: Any, metadata: dict[str, Any]) -> str:
         """Return the user-visible WebSocket delta for a tool_result chunk."""
         text = AgentLoop._stringify_stream_payload(delta)
@@ -3713,11 +3800,10 @@ class LoopProtocolMixin:
             "process finishing. Do not use needs_continuation solely because "
             "job_status is running if the recent output proves the requested "
             "unit's terminal action, state, or blocker was reached.",
-            "Repeated external checks with the same pending/waiting/not-ready "
-            "state and no material progress are a concrete blocker, not a "
-            "reason for endless needs_continuation. Use complete when the "
-            "assistant draft reports that blocker and tells the user what "
-            "evidence would allow a later resume.",
+            "Repeated checks with unchanged external evidence and no material "
+            "progress can be a concrete blocker, but only when the current "
+            "tool evidence and assistant draft actually report that blocker "
+            "and the evidence needed for a later resume.",
         ]
         if request_is_plain_continuation_only(authoritative_message):
             lines.extend(
@@ -3747,6 +3833,10 @@ class LoopProtocolMixin:
             ledger_context = active_ledger.render_context(max_chars=5000)
             if ledger_context.strip():
                 lines.extend(["", "[STRUCTURED TOOL EVIDENCE]", ledger_context])
+
+        contract_lines = AgentLoop._skill_contract_evidence_brief(tool_result_events)
+        if contract_lines:
+            lines.extend(["", "[ACTIVE SKILL CONTRACT EVIDENCE]", *contract_lines])
 
         evidence_lines: list[str] = []
         for event in tool_result_events[-12:]:
@@ -3790,7 +3880,6 @@ class LoopProtocolMixin:
                 "reason": "Tool guardrail produced a blocker to report.",
                 "next_focus": "",
             }
-
         final_text = str(final_content or "").strip()
         if not final_text or final_text in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}:
             return {
@@ -3902,18 +3991,6 @@ class LoopProtocolMixin:
         """Use only structured event state to decide if another model step is needed."""
         if not should_run_skill_contract_check(tool_result_events):
             return {"status": "complete", "reason": "No skill contract evidence.", "next_focus": ""}
-        active_ledger = getattr(self, "_active_execution_ledger", None)
-        if (
-            isinstance(active_ledger, ExecutionLedger)
-            and active_ledger.has_stateful_progress()
-            and str(final_content or "").strip()
-            and str(final_content or "").strip() not in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}
-        ):
-            return {
-                "status": "complete",
-                "reason": "Ledger contains stateful tool evidence and terminal content.",
-                "next_focus": "",
-            }
         if skill_contract_needs_continuation(final_content, tool_result_events):
             return {
                 "status": "needs_continuation",
@@ -4319,6 +4396,9 @@ class LoopProtocolMixin:
             lines.extend(["", "[CONTINUATION FOCUS]", str(continuation_focus).strip()])
 
         evidence_lines = []
+        contract_lines = AgentLoop._skill_contract_evidence_brief(tool_result_events)
+        if contract_lines:
+            lines.extend(["", "[ACTIVE SKILL CONTRACT EVIDENCE]", *contract_lines])
         for event in tool_result_events[-10:]:
             evidence_lines.extend(AgentLoop._continuation_tool_event_brief(event, limit=1200))
         if evidence_lines:
@@ -4364,10 +4444,11 @@ class LoopProtocolMixin:
             "the job solely because it is active."
         )
         lines.append(
-            "If recent evidence shows an external dependency is still in the "
-            "same pending/waiting/not-ready state after bounded checks, stop "
-            "with that blocker and the resume condition instead of polling "
-            "again."
+            "If recent evidence shows an external dependency has not changed "
+            "after bounded checks, stop with that blocker and the resume "
+            "condition only when that evidence is a real blocker for the "
+            "selected workflow unit; otherwise continue with the next "
+            "contract-required tool step."
         )
         return "\n".join(line for line in lines if line is not None)
 
@@ -4402,6 +4483,9 @@ class LoopProtocolMixin:
             lines.extend(["", "[CONTINUATION FOCUS]", str(continuation_focus).strip()])
 
         evidence_lines = []
+        contract_lines = AgentLoop._skill_contract_evidence_brief(tool_result_events)
+        if contract_lines:
+            lines.extend(["", "[ACTIVE SKILL CONTRACT EVIDENCE]", *contract_lines])
         for event in tool_result_events[-10:]:
             evidence_lines.extend(AgentLoop._continuation_tool_event_brief(event, limit=1200))
         if evidence_lines:
@@ -4444,10 +4528,10 @@ class LoopProtocolMixin:
             "that unit's terminal outcome or blocker, answer from the evidence."
         )
         lines.append(
-            "If the only remaining step is waiting for an external state change "
-            "and recent checks show no material progress, answer with the "
-            "current blocker and resume condition instead of polling again or "
-            "asking for generic feedback."
+            "If the only remaining step depends on external evidence changing, "
+            "answer with the current blocker and resume condition only when "
+            "the tool evidence proves no in-scope tool step can progress the "
+            "selected workflow unit now."
         )
         lines.append(
             "Do not treat the previous assistant draft, any question in that "
@@ -4599,6 +4683,7 @@ class LoopProtocolMixin:
         *,
         tool_output_capture_scope: str | None,
         tool_call_arguments_by_id: dict[str, str],
+        tool_capture_invocation_by_tool_call_id: dict[str, str] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Collect newly-added tool result messages from runtime memory."""
         messages = AgentLoop._get_runtime_memory_messages(self)
@@ -4635,14 +4720,31 @@ class LoopProtocolMixin:
                 inferred_name, _ = tool_call_details.get(tool_call_id, ("", ""))
                 if inferred_name:
                     tool_name = inferred_name
+            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
+            invocation_id = ""
+            if tool_capture_invocation_by_tool_call_id is not None and tool_call_id:
+                invocation_id = str(
+                    tool_capture_invocation_by_tool_call_id.get(str(tool_call_id)) or ""
+                )
             captured_output = consume_captured_tool_output(
                 tool_output_capture_scope,
                 tool_name=tool_name,
-                arguments=tool_call_arguments_by_id.get(tool_call_id, ""),
+                arguments=arguments,
+                invocation_id=invocation_id,
             )
+            if (
+                captured_output is None
+                and not serialized_result
+                and has_active_captured_tool_invocation(
+                    tool_output_capture_scope,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    invocation_id=invocation_id,
+                )
+            ):
+                break
 
             metadata: dict[str, Any] = {"name": tool_name}
-            arguments = tool_call_arguments_by_id.get(tool_call_id, "")
             if arguments:
                 metadata["arguments"] = AgentLoop._tool_call_arguments_display(
                     tool_name,

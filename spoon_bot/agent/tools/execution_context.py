@@ -58,6 +58,7 @@ class CapturedToolOutput:
     """Full tool output captured for websocket streaming."""
 
     scope_id: str
+    invocation_id: str
     owner: str
     tool_name: str
     arguments_key: str
@@ -67,6 +68,19 @@ class CapturedToolOutput:
     guardrail_stop: bool = False
     guardrail_reason: str = ""
     guardrail_message: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    progress_deltas: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CapturedToolOutputDelta:
+    """Incremental output captured while a tool invocation is still running."""
+
+    invocation_id: str
+    owner: str
+    tool_name: str
+    arguments_key: str
+    delta: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1625,6 +1639,7 @@ def bind_tool_invocation(tool_name: str, arguments: Any) -> Iterator[str | None]
     invocation_id = uuid4().hex
     capture = CapturedToolOutput(
         scope_id=scope_id,
+        invocation_id=invocation_id,
         owner=get_tool_owner(),
         tool_name=str(tool_name or ""),
         arguments_key=normalize_tool_arguments(arguments),
@@ -1661,6 +1676,55 @@ def capture_tool_output(
         if isinstance(metadata, dict) and metadata:
             capture.metadata.update(metadata)
         record_shell_command_evidence(capture.tool_name, full_text)
+
+
+def capture_tool_output_delta(
+    delta: Any,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record incremental output for the active tool invocation.
+
+    This is intended for long-running foreground tools whose stdout/stderr is
+    available before the final tool result. The final completed capture remains
+    the authoritative model-visible output.
+    """
+    invocation_id = _CURRENT_TOOL_INVOCATION.get()
+    if not invocation_id:
+        return
+
+    delta_text = stringify_tool_output(delta)
+    if not delta_text:
+        return
+
+    with _TOOL_OUTPUT_LOCK:
+        capture = _ACTIVE_TOOL_INVOCATIONS.get(invocation_id)
+        if capture is None:
+            return
+        item_metadata = dict(metadata or {})
+        capture.progress_deltas.append(
+            {
+                "delta": delta_text,
+                "metadata": item_metadata,
+            }
+        )
+        if len(capture.progress_deltas) > 256:
+            # Keep bounded memory if a frontend disconnects while a noisy
+            # command is still producing output.
+            dropped = capture.progress_deltas[:-256]
+            dropped_chars = sum(len(str(item.get("delta") or "")) for item in dropped)
+            capture.progress_deltas = capture.progress_deltas[-256:]
+            if dropped_chars:
+                capture.progress_deltas.insert(
+                    0,
+                    {
+                        "delta": (
+                            f"\n[spoon-bot omitted {dropped_chars} chars of "
+                            "intermediate tool output]\n"
+                        ),
+                        "metadata": {"omitted": True},
+                    },
+                )
 
 
 def mark_current_tool_invocation_guardrail(
@@ -1746,19 +1810,28 @@ def consume_captured_tool_output(
     *,
     tool_name: str | None = None,
     arguments: Any = None,
+    invocation_id: str | None = None,
 ) -> CapturedToolOutput | None:
     """Consume the next captured tool output for a streamed tool_result event."""
     if not scope_id:
         return None
 
     arguments_key = normalize_tool_arguments(arguments)
+    exact_invocation_id = str(invocation_id or "").strip()
     with _TOOL_OUTPUT_LOCK:
         bucket = _COMPLETED_TOOL_OUTPUTS.get(scope_id)
         if not bucket:
             return None
 
         match_index: int | None = None
-        if arguments_key:
+        if exact_invocation_id:
+            for index, item in enumerate(bucket):
+                if item.invocation_id == exact_invocation_id:
+                    match_index = index
+                    break
+            if match_index is None:
+                return None
+        elif arguments_key:
             for index, item in enumerate(bucket):
                 if (
                     (not tool_name or item.tool_name == tool_name)
@@ -1780,6 +1853,69 @@ def consume_captured_tool_output(
         if not bucket:
             _COMPLETED_TOOL_OUTPUTS.pop(scope_id, None)
         return capture
+
+
+def has_active_captured_tool_invocation(
+    scope_id: str | None,
+    *,
+    tool_name: str | None = None,
+    arguments: Any = None,
+    invocation_id: str | None = None,
+) -> bool:
+    """Return whether a matching captured tool invocation is still running."""
+    if not scope_id:
+        return False
+
+    arguments_key = normalize_tool_arguments(arguments)
+    exact_invocation_id = str(invocation_id or "").strip()
+    expected_tool_name = str(tool_name or "").strip()
+    with _TOOL_OUTPUT_LOCK:
+        for capture in _ACTIVE_TOOL_INVOCATIONS.values():
+            if capture.scope_id != scope_id:
+                continue
+            if exact_invocation_id:
+                if capture.invocation_id == exact_invocation_id:
+                    return True
+                continue
+            if expected_tool_name and capture.tool_name != expected_tool_name:
+                continue
+            if arguments_key and capture.arguments_key != arguments_key:
+                continue
+            return True
+    return False
+
+
+def consume_captured_tool_output_deltas(
+    scope_id: str | None,
+    *,
+    limit: int = 32,
+) -> list[CapturedToolOutputDelta]:
+    """Consume pending incremental output for active tool invocations."""
+    if not scope_id:
+        return []
+
+    max_items = max(1, int(limit or 1))
+    deltas: list[CapturedToolOutputDelta] = []
+    with _TOOL_OUTPUT_LOCK:
+        for capture in list(_ACTIVE_TOOL_INVOCATIONS.values()):
+            if capture.scope_id != scope_id or not capture.progress_deltas:
+                continue
+            pending = capture.progress_deltas[:max_items - len(deltas)]
+            del capture.progress_deltas[: len(pending)]
+            for item in pending:
+                deltas.append(
+                    CapturedToolOutputDelta(
+                        invocation_id=capture.invocation_id,
+                        owner=capture.owner,
+                        tool_name=capture.tool_name,
+                        arguments_key=capture.arguments_key,
+                        delta=stringify_tool_output(item.get("delta")),
+                        metadata=dict(item.get("metadata") or {}),
+                    )
+                )
+            if len(deltas) >= max_items:
+                break
+    return deltas
 
 
 def clear_captured_tool_outputs(scope_id: str | None) -> None:

@@ -62,6 +62,94 @@ async def test_capture_defaults_to_returned_result_when_tool_does_not_publish_fu
     assert captured.full_output == "plain result"
 
 
+def test_active_tool_output_deltas_are_consumed_without_replacing_final_output():
+    from spoon_bot.agent.tools.execution_context import (
+        bind_tool_invocation,
+        capture_tool_output_delta,
+        capture_tool_outputs,
+        consume_captured_tool_output,
+        consume_captured_tool_output_deltas,
+        finalize_tool_invocation,
+        has_active_captured_tool_invocation,
+    )
+
+    arguments = {"command": "long-running-command"}
+    with capture_tool_outputs() as scope_id:
+        with bind_tool_invocation("shell", arguments) as invocation_id:
+            assert has_active_captured_tool_invocation(
+                scope_id,
+                tool_name="shell",
+                arguments=arguments,
+                invocation_id=invocation_id,
+            )
+            capture_tool_output_delta("step one\n", metadata={"stream": "stdout"})
+            capture_tool_output_delta("step two\n", metadata={"stream": "stdout"})
+
+            deltas = consume_captured_tool_output_deltas(scope_id)
+            assert [item.delta for item in deltas] == ["step one\n", "step two\n"]
+            assert [item.metadata["stream"] for item in deltas] == ["stdout", "stdout"]
+            assert {item.invocation_id for item in deltas} == {invocation_id}
+            assert consume_captured_tool_output_deltas(scope_id) == []
+
+            finalize_tool_invocation("final result")
+            assert not has_active_captured_tool_invocation(
+                scope_id,
+                tool_name="shell",
+                arguments=arguments,
+                invocation_id=invocation_id,
+            )
+
+        captured = consume_captured_tool_output(
+            scope_id,
+            tool_name="shell",
+            arguments=arguments,
+            invocation_id=invocation_id,
+        )
+
+    assert captured is not None
+    assert captured.summary_output == "final result"
+    assert captured.full_output == "final result"
+
+
+def test_captured_tool_outputs_with_same_arguments_can_be_consumed_by_invocation():
+    from spoon_bot.agent.tools.execution_context import (
+        bind_tool_invocation,
+        capture_tool_output,
+        capture_tool_outputs,
+        consume_captured_tool_output,
+        finalize_tool_invocation,
+    )
+
+    arguments = {"command": "repeatable-command"}
+    with capture_tool_outputs() as scope_id:
+        with bind_tool_invocation("shell", arguments) as first_invocation_id:
+            capture_tool_output("first result", "first full result")
+            finalize_tool_invocation("first fallback")
+        with bind_tool_invocation("shell", arguments) as second_invocation_id:
+            capture_tool_output("second result", "second full result")
+            finalize_tool_invocation("second fallback")
+
+        second = consume_captured_tool_output(
+            scope_id,
+            tool_name="shell",
+            arguments=arguments,
+            invocation_id=second_invocation_id,
+        )
+        first = consume_captured_tool_output(
+            scope_id,
+            tool_name="shell",
+            arguments=arguments,
+            invocation_id=first_invocation_id,
+        )
+
+    assert second is not None
+    assert first is not None
+    assert second.summary_output == "second result"
+    assert second.full_output == "second full result"
+    assert first.summary_output == "first result"
+    assert first.full_output == "first full result"
+
+
 def test_skill_execution_summary_marks_optional_input_as_non_blocking():
     from spoon_bot.agent.tools.filesystem import ReadFileTool
 

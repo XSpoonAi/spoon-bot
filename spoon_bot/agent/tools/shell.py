@@ -21,6 +21,7 @@ from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
+    capture_tool_output_delta,
     capture_tool_output,
     current_session_fact_check_blocker,
     explicit_unavailable_tool_request_blocker,
@@ -583,7 +584,8 @@ class ShellTool(Tool):
         "yarn",
     })
     _SHELL_FILE_READ_TRACKING_MAX_BYTES = 20 * 1024 * 1024
-    _DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT = 60
+    _DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT = None
+    _DEFAULT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT = 300
     _DEFAULT_BACKGROUND_JOB_POLL_WAIT_SECONDS = 30.0
 
     def __init__(
@@ -687,9 +689,10 @@ class ShellTool(Tool):
             "it is unrecoverably stuck. Silent running jobs are not stuck "
             "evidence; after one status check, use job_output/log evidence "
             "rather than repeating job_status with no new signal. "
-            "If job output shows the same external pending/waiting/not-ready "
-            "state after bounded checks and no material progress, report that "
-            "blocker and the resume condition instead of polling indefinitely. "
+            "If job output shows unchanged external evidence after bounded "
+            "checks and no in-scope tool step can progress the selected "
+            "workflow unit, report that blocker and the resume condition "
+            "instead of polling indefinitely. "
             "If a running background job has already emitted concrete evidence "
             "that satisfies the selected workflow unit's contract-defined "
             "terminal outcome or blocker, answer from that evidence instead of "
@@ -730,9 +733,9 @@ class ShellTool(Tool):
                     "description": (
                         f"Optional foreground timeout override in seconds "
                         f"(max {self.max_timeout}). Usually omit this; the tool "
-                        f"uses a {self.timeout}s default and applies a shorter "
-                        "managed-background handoff budget for stateful "
-                        "workspace skill CLI commands. "
+                        f"uses its configured foreground budget for workspace "
+                        "skill CLI commands and streams stdout/stderr progress "
+                        "while they run. "
                         "Only provide this when the newest user request or the "
                         "command's own contract requires a custom foreground budget."
                     ),
@@ -2131,6 +2134,8 @@ class ShellTool(Tool):
         self,
         stream: Any,
         append: Any,
+        *,
+        stream_name: str,
     ) -> None:
         if stream is None:
             return
@@ -2138,7 +2143,16 @@ class ShellTool(Tool):
             chunk = await asyncio.to_thread(self._read_process_stream_chunk, stream)
             if not chunk:
                 return
-            append(chunk.decode("utf-8", errors="replace"))
+            text = chunk.decode("utf-8", errors="replace")
+            append(text)
+            capture_tool_output_delta(
+                text,
+                metadata={
+                    "stream": stream_name,
+                    "status": "running",
+                    "progress": True,
+                },
+            )
 
     @staticmethod
     def _read_process_stream_chunk(stream: Any, size: int = 4096) -> bytes:
@@ -2362,6 +2376,83 @@ class ShellTool(Tool):
         await self._refresh_background_job(job)
         return self._background_job_progress_key(job) != progress_key
 
+    async def _wait_for_process_with_progress_timeout(
+        self,
+        job: _BackgroundShellJob,
+        *,
+        idle_timeout: float,
+        max_timeout: float,
+    ) -> None:
+        """Wait while a foreground job either finishes or keeps producing output.
+
+        Stateful skill CLIs can legitimately run for a long time while emitting
+        progress. A fixed total foreground timeout pushes healthy runs into
+        background management too early, which then forces the model to poll the
+        job. This helper treats the configured workspace-skill timeout as an
+        idle budget and keeps the original tool call open while stdout/stderr
+        changes.
+        """
+        idle_budget = max(0.0, float(idle_timeout or 0.0))
+        hard_budget = max(0.0, float(max_timeout or 0.0))
+        started_at = time.monotonic()
+        last_progress_at = started_at
+        last_heartbeat_at = started_at
+        progress_key = self._background_job_progress_key(job)
+        heartbeat_interval = self._foreground_tool_heartbeat_interval()
+
+        while True:
+            await self._refresh_background_job(job)
+            if self._is_terminal_status(job.status):
+                return
+
+            now = time.monotonic()
+            next_progress_key = self._background_job_progress_key(job)
+            if next_progress_key != progress_key:
+                progress_key = next_progress_key
+                last_progress_at = now
+                last_heartbeat_at = now
+
+            if heartbeat_interval > 0 and now - last_heartbeat_at >= heartbeat_interval:
+                idle_for = max(0, int(now - last_progress_at))
+                elapsed = max(0, int(now - started_at))
+                capture_tool_output_delta(
+                    (
+                        f"\n[command still running; no new output for "
+                        f"{idle_for}s, elapsed {elapsed}s]\n"
+                    ),
+                    metadata={
+                        "stream": "status",
+                        "status": "running",
+                        "progress": True,
+                        "heartbeat": True,
+                    },
+                )
+                last_heartbeat_at = now
+
+            if hard_budget > 0 and now - started_at >= hard_budget:
+                raise asyncio.TimeoutError
+            if idle_budget > 0 and now - last_progress_at >= idle_budget:
+                raise asyncio.TimeoutError
+
+            sleep_for = 1.0
+            if hard_budget > 0:
+                sleep_for = min(sleep_for, max(0.05, hard_budget - (now - started_at)))
+            if idle_budget > 0:
+                sleep_for = min(sleep_for, max(0.05, idle_budget - (now - last_progress_at)))
+            if heartbeat_interval > 0:
+                sleep_for = min(
+                    sleep_for,
+                    max(0.05, heartbeat_interval - (now - last_heartbeat_at)),
+                )
+            await asyncio.sleep(sleep_for)
+
+    @staticmethod
+    def _timeout_label(timeout_seconds: int | float) -> str:
+        value = float(timeout_seconds)
+        if value.is_integer():
+            return f"{int(value)}s"
+        return f"{value:.1f}s"
+
     def _build_completed_job_result(
         self,
         job: _BackgroundShellJob,
@@ -2519,10 +2610,18 @@ class ShellTool(Tool):
             buffer_limit=max(self.max_output * 20, 200_000),
         )
         job.stdout_task = asyncio.create_task(
-            self._consume_process_stream(process.stdout, job.append_stdout)
+            self._consume_process_stream(
+                process.stdout,
+                job.append_stdout,
+                stream_name="stdout",
+            )
         )
         job.stderr_task = asyncio.create_task(
-            self._consume_process_stream(process.stderr, job.append_stderr)
+            self._consume_process_stream(
+                process.stderr,
+                job.append_stderr,
+                stream_name="stderr",
+            )
         )
         _SHELL_BACKGROUND_JOBS[job.job_id] = job
         self._prune_background_jobs(owner_key=owner)
@@ -2581,6 +2680,7 @@ class ShellTool(Tool):
         *,
         timeout_seconds: int,
         tail_chars: int = 4000,
+        handoff_reason: str = "timeout",
     ) -> str:
         recent_output = self._build_output_result(
             job.stdout_text,
@@ -2589,8 +2689,19 @@ class ShellTool(Tool):
             max_chars=tail_chars,
         )
         elapsed = time.time() - job.created_at
+        timeout_label = self._timeout_label(timeout_seconds)
+        if handoff_reason == "silent_foreground":
+            header = (
+                f"Foreground no-output handoff ({timeout_label}) reached — "
+                "command moved to managed background."
+            )
+        else:
+            header = (
+                f"Foreground timeout ({timeout_label}) exceeded — command "
+                "moved to background."
+            )
         return (
-            f"Foreground timeout ({timeout_seconds}s) exceeded — command moved to background.\n"
+            f"{header}\n"
             f"job_id: {job.job_id}\n"
             f"command: {job.command}\n"
             f"cwd: {job.cwd}\n"
@@ -2613,10 +2724,10 @@ class ShellTool(Tool):
             "request cancels the job or separate evidence proves it is "
             "unrecoverably stuck. CLI NEXT/next-step lines in command output "
             "are evidence only; follow them only when still required by the "
-            "selected workflow unit. If output repeats the same "
-            "external pending/waiting/not-ready state with no material "
-            "progress after bounded checks, report that blocker and the "
-            "resume condition instead of polling indefinitely."
+            "selected workflow unit. If output shows unchanged external "
+            "evidence after bounded checks and no in-scope tool step can "
+            "progress the selected workflow unit, report that blocker and "
+            "the resume condition instead of polling indefinitely."
         )
 
     async def _find_running_background_job_for_command(
@@ -2631,6 +2742,35 @@ class ShellTool(Tool):
                 continue
             await self._refresh_background_job(job)
             if job.status == "running":
+                return job
+        return None
+
+    def _stateful_workspace_skill_names(self, command: str, cwd: str) -> set[str]:
+        names: set[str] = set()
+        for invocation in self._workspace_skill_stateful_invocations(command, cwd):
+            skill = str(invocation.get("skill") or "").strip().casefold()
+            if skill:
+                names.add(skill)
+        return names
+
+    async def _find_running_stateful_workspace_skill_job(
+        self,
+        *,
+        command: str,
+        cwd: str,
+        owner_key: str,
+    ) -> _BackgroundShellJob | None:
+        requested_skills = self._stateful_workspace_skill_names(command, cwd)
+        if not requested_skills:
+            return None
+
+        for job in list(_SHELL_BACKGROUND_JOBS.values()):
+            if job.owner_key != owner_key or job.cwd != cwd:
+                continue
+            await self._refresh_background_job(job)
+            if job.status != "running":
+                continue
+            if requested_skills & self._stateful_workspace_skill_names(job.command, job.cwd):
                 return job
         return None
 
@@ -2669,6 +2809,41 @@ class ShellTool(Tool):
             "still required by the selected workflow unit."
         )
 
+    def _format_existing_stateful_workspace_skill_job_command(
+        self,
+        job: _BackgroundShellJob,
+        *,
+        requested_command: str,
+        tail_chars: int = 4000,
+    ) -> str:
+        recent_output = self._build_output_result(
+            job.stdout_text,
+            job.stderr_text,
+            job.returncode,
+            max_chars=tail_chars,
+        )
+        elapsed = time.time() - job.created_at
+        return (
+            "ACTIVE_STATEFUL_WORKSPACE_SKILL_JOB_EXISTS: a stateful command "
+            "for the same workspace skill is already running as a managed "
+            "background job.\n"
+            f"job_id: {job.job_id}\n"
+            f"running_command: {job.command}\n"
+            f"requested_command: {requested_command}\n"
+            f"cwd: {job.cwd}\n"
+            f"status: running (elapsed {elapsed:.0f}s)\n"
+            "Recent output tail:\n"
+            f"{recent_output}\n\n"
+            "Do not start another stateful CLI command for this skill while "
+            "the existing job is active. Monitor the existing job with "
+            f"action='job_output', job_id='{job.job_id}' or "
+            f"action='job_status', job_id='{job.job_id}' only if job completion "
+            "is still required by the selected workflow unit. If recent output "
+            "already shows the requested state was reached or reveals a concrete "
+            "external blocker, answer from that evidence instead of launching a "
+            "parallel follow-up command."
+        )
+
     def _workspace_skill_foreground_timeout(self) -> int:
         """Return foreground budget before a workspace skill CLI becomes managed background."""
         raw = os.getenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", "").strip()
@@ -2678,8 +2853,52 @@ class ShellTool(Tool):
             except ValueError:
                 parsed = int(self.max_timeout)
         else:
-            parsed = self._DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT
+            parsed = (
+                int(self._DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT)
+                if self._DEFAULT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT is not None
+                else int(self.timeout)
+            )
         return max(1, min(int(self.max_timeout), parsed))
+
+    def _workspace_skill_foreground_silence_handoff_timeout(self) -> int:
+        """Return silent foreground budget for stateful workspace skill CLIs.
+
+        Long-running skill commands should stream real stdout/stderr while they
+        are making progress. If a stateful foreground command becomes silent for
+        a bounded period, hand it back as a managed background job so the model
+        can inspect current evidence and decide whether the workflow is blocked
+        on an external condition instead of waiting until a hard timeout.
+        """
+        raw = os.getenv(
+            "SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT",
+            "",
+        ).strip()
+        if raw:
+            try:
+                parsed = int(raw)
+            except ValueError:
+                parsed = int(
+                    self._DEFAULT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT
+                )
+        else:
+            parsed = int(
+                self._DEFAULT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT
+            )
+        return max(1, min(int(self.max_timeout), parsed))
+
+    @staticmethod
+    def _foreground_tool_heartbeat_interval() -> float:
+        raw = os.getenv("SPOON_BOT_FOREGROUND_TOOL_HEARTBEAT_INTERVAL", "").strip()
+        if raw:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = 20.0
+        else:
+            value = 20.0
+        if value <= 0:
+            return 0.0
+        return max(5.0, min(value, 120.0))
 
     def _command_invokes_stateful_workspace_skill(self, command: str, cwd: str) -> bool:
         """Return True for installed-skill CLI calls that can advance remote/workflow state."""
@@ -2833,10 +3052,10 @@ class ShellTool(Tool):
                     "solely because the process is active. If the user's task "
                     "depends on this job finishing and there is no blocker "
                     "evidence, continue monitoring job_status/job_output instead "
-                    "of summarizing the task as done. If recent output "
-                    "shows the same external pending/waiting/not-ready state "
-                    "without material progress after bounded checks, report that "
-                    "blocker and the resume condition. If command output includes NEXT/next-step "
+                    "of summarizing the task as done. If recent output shows "
+                    "unchanged external evidence after bounded checks and no "
+                    "in-scope tool step can progress the selected workflow unit, "
+                    "report that blocker and the resume condition. If command output includes NEXT/next-step "
                     "lines, treat them as evidence only and follow them only "
                     "when still required by the selected workflow unit."
                 )
@@ -2859,10 +3078,10 @@ class ShellTool(Tool):
                 "only when the caller explicitly wants to abandon it or you have "
                 "evidence that it is unrecoverably stuck. CLI NEXT/next-step "
                 "lines are evidence only; follow them only when still required "
-                "by the selected workflow unit. If output repeats the "
-                "same external pending/waiting/not-ready state with no material "
-                "progress after bounded checks, report that blocker and the "
-                "resume condition instead of polling indefinitely."
+                "by the selected workflow unit. If output shows unchanged "
+                "external evidence after bounded checks and no in-scope tool "
+                "step can progress the selected workflow unit, report that "
+                "blocker and the resume condition instead of polling indefinitely."
                 f"{no_progress_suffix}"
             )
 
@@ -2893,10 +3112,10 @@ class ShellTool(Tool):
                     "solely because the process is active. If the user's task "
                     "depends on this job finishing and there is no blocker "
                     "evidence, continue monitoring job_status/job_output instead "
-                    "of summarizing the task as done. If recent output "
-                    "shows the same external pending/waiting/not-ready state "
-                    "without material progress after bounded checks, report that "
-                    "blocker and the resume condition. If command output includes NEXT/next-step "
+                    "of summarizing the task as done. If recent output shows "
+                    "unchanged external evidence after bounded checks and no "
+                    "in-scope tool step can progress the selected workflow unit, "
+                    "report that blocker and the resume condition. If command output includes NEXT/next-step "
                     "lines, treat them as evidence only and follow them only "
                     "when still required by the selected workflow unit."
                 )
@@ -2971,12 +3190,32 @@ class ShellTool(Tool):
     @staticmethod
     def _background_job_progress_key(job: _BackgroundShellJob) -> str:
         """Build a compact progress signature for request-local poll guards."""
-        stdout_len = len(job.stdout_text or "")
-        stderr_len = len(job.stderr_text or "")
+        stdout_key = ShellTool._meaningful_output_progress_fingerprint(job.stdout_text)
+        stderr_key = ShellTool._meaningful_output_progress_fingerprint(job.stderr_text)
         return (
             f"status={job.status}|returncode={job.returncode}|"
-            f"stdout={stdout_len}|stderr={stderr_len}"
+            f"stdout={stdout_key}|stderr={stderr_key}"
         )
+
+    @staticmethod
+    def _meaningful_output_progress_fingerprint(text: str | None) -> str:
+        """Fingerprint output changes while ignoring consecutive duplicate lines."""
+        normalized_lines: list[str] = []
+        last_line: str | None = None
+        for raw_line in str(text or "").splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if not line:
+                continue
+            if line == last_line:
+                continue
+            normalized_lines.append(line)
+            last_line = line
+
+        if not normalized_lines:
+            return "0:"
+        tail = "\n".join(normalized_lines[-200:])
+        digest = hashlib.sha256(tail.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return f"{len(normalized_lines)}:{digest}"
 
     async def execute(
         self,
@@ -3056,14 +3295,16 @@ class ShellTool(Tool):
             return f"Error: Working directory not found: {cwd}"
 
         # Resolve effective timeout: per-command override capped by max_timeout.
-        # Stateful workspace skill CLIs can be quiet while waiting on remote
-        # workflows. Keep their foreground budget short so a silent command is
-        # handed to a managed background job instead of leaving the UI pinned on
-        # a single tool_call. Read-only skill inspections and dependency setup
-        # keep the ordinary budget.
+        # Stateful workspace skill CLIs can be long-running remote workflows, so
+        # their foreground budget is an idle/no-progress budget. Model-supplied
+        # short timeout overrides should not push healthy progress streams into
+        # background polling.
         effective_timeout = self.timeout
         if timeout is not None:
             effective_timeout = max(1, min(int(timeout), self.max_timeout))
+        progress_idle_timeout = False
+        foreground_handoff_timeout = effective_timeout
+        foreground_handoff_reason = "timeout"
 
         skill_clone_rejection = self._reject_workspace_skill_clone(command, cwd)
         if skill_clone_rejection is not None:
@@ -3083,15 +3324,20 @@ class ShellTool(Tool):
             command,
             cwd,
         )
-        if (
+        stateful_workspace_skill_command = (
             invokes_workspace_skill
             and not invokes_workspace_skill_setup
             and self._command_invokes_stateful_workspace_skill(command, cwd)
-        ):
-            effective_timeout = min(
+        )
+        if stateful_workspace_skill_command:
+            workspace_skill_timeout = self._workspace_skill_foreground_timeout()
+            effective_timeout = max(effective_timeout, workspace_skill_timeout)
+            foreground_handoff_timeout = min(
                 effective_timeout,
-                self._workspace_skill_foreground_timeout(),
+                self._workspace_skill_foreground_silence_handoff_timeout(),
             )
+            foreground_handoff_reason = "silent_foreground"
+            progress_idle_timeout = True
 
         command = self._augment_skill_cli_labeled_values(command, cwd)
 
@@ -3147,13 +3393,40 @@ class ShellTool(Tool):
                 capture_tool_output(result, result)
                 return result
 
+            if stateful_workspace_skill_command:
+                existing_stateful_job = (
+                    await self._find_running_stateful_workspace_skill_job(
+                        command=execution_command,
+                        cwd=cwd,
+                        owner_key=owner_key,
+                    )
+                )
+                if existing_stateful_job is not None:
+                    result = self._format_existing_stateful_workspace_skill_job_command(
+                        existing_stateful_job,
+                        requested_command=execution_command,
+                        tail_chars=tail_chars,
+                    )
+                    capture_tool_output(result, result)
+                    return result
+
             job = await self._start_background_job(
                 execution_command,
                 cwd,
                 owner_key=owner_key,
             )
             try:
-                await asyncio.wait_for(self._wait_for_process(job.process), timeout=effective_timeout)
+                if progress_idle_timeout:
+                    await self._wait_for_process_with_progress_timeout(
+                        job,
+                        idle_timeout=foreground_handoff_timeout,
+                        max_timeout=self.max_timeout,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self._wait_for_process(job.process),
+                        timeout=effective_timeout,
+                    )
                 await self._refresh_background_job(job)
                 result, full_result = self._build_completed_job_result(job)
                 result = self._maybe_explain_workspace_skill_no_output(
@@ -3230,8 +3503,9 @@ class ShellTool(Tool):
                 self._prune_background_jobs(owner_key=owner_key)
                 return self._format_background_job_summary(
                     job,
-                    timeout_seconds=effective_timeout,
+                    timeout_seconds=foreground_handoff_timeout,
                     tail_chars=tail_chars,
+                    handoff_reason=foreground_handoff_reason,
                 )
             except asyncio.CancelledError:
                 await self._terminate_background_job(job, status="cancelled")
