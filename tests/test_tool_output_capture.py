@@ -60,3 +60,192 @@ async def test_capture_defaults_to_returned_result_when_tool_does_not_publish_fu
     assert captured is not None
     assert captured.summary_output == "plain result"
     assert captured.full_output == "plain result"
+
+
+def test_active_tool_output_deltas_are_consumed_without_replacing_final_output():
+    from spoon_bot.agent.tools.execution_context import (
+        bind_tool_invocation,
+        capture_tool_output_delta,
+        capture_tool_outputs,
+        consume_captured_tool_output,
+        consume_captured_tool_output_deltas,
+        finalize_tool_invocation,
+        has_active_captured_tool_invocation,
+    )
+
+    arguments = {"command": "long-running-command"}
+    with capture_tool_outputs() as scope_id:
+        with bind_tool_invocation("shell", arguments) as invocation_id:
+            assert has_active_captured_tool_invocation(
+                scope_id,
+                tool_name="shell",
+                arguments=arguments,
+                invocation_id=invocation_id,
+            )
+            capture_tool_output_delta("step one\n", metadata={"stream": "stdout"})
+            capture_tool_output_delta("step two\n", metadata={"stream": "stdout"})
+
+            deltas = consume_captured_tool_output_deltas(scope_id)
+            assert [item.delta for item in deltas] == ["step one\n", "step two\n"]
+            assert [item.metadata["stream"] for item in deltas] == ["stdout", "stdout"]
+            assert {item.invocation_id for item in deltas} == {invocation_id}
+            assert consume_captured_tool_output_deltas(scope_id) == []
+
+            finalize_tool_invocation("final result")
+            assert not has_active_captured_tool_invocation(
+                scope_id,
+                tool_name="shell",
+                arguments=arguments,
+                invocation_id=invocation_id,
+            )
+
+        captured = consume_captured_tool_output(
+            scope_id,
+            tool_name="shell",
+            arguments=arguments,
+            invocation_id=invocation_id,
+        )
+
+    assert captured is not None
+    assert captured.summary_output == "final result"
+    assert captured.full_output == "final result"
+
+
+def test_captured_tool_outputs_with_same_arguments_can_be_consumed_by_invocation():
+    from spoon_bot.agent.tools.execution_context import (
+        bind_tool_invocation,
+        capture_tool_output,
+        capture_tool_outputs,
+        consume_captured_tool_output,
+        finalize_tool_invocation,
+    )
+
+    arguments = {"command": "repeatable-command"}
+    with capture_tool_outputs() as scope_id:
+        with bind_tool_invocation("shell", arguments) as first_invocation_id:
+            capture_tool_output("first result", "first full result")
+            finalize_tool_invocation("first fallback")
+        with bind_tool_invocation("shell", arguments) as second_invocation_id:
+            capture_tool_output("second result", "second full result")
+            finalize_tool_invocation("second fallback")
+
+        second = consume_captured_tool_output(
+            scope_id,
+            tool_name="shell",
+            arguments=arguments,
+            invocation_id=second_invocation_id,
+        )
+        first = consume_captured_tool_output(
+            scope_id,
+            tool_name="shell",
+            arguments=arguments,
+            invocation_id=first_invocation_id,
+        )
+
+    assert second is not None
+    assert first is not None
+    assert second.summary_output == "second result"
+    assert second.full_output == "second full result"
+    assert first.summary_output == "first result"
+    assert first.full_output == "first full result"
+
+
+def test_skill_execution_summary_marks_optional_input_as_non_blocking():
+    from spoon_bot.agent.tools.filesystem import ReadFileTool
+
+    summary = ReadFileTool._extract_skill_cli_content(
+        """
+---
+name: sample-skill
+---
+
+## Setup
+
+```text
+PROCEDURE setup():
+  IF account is missing:
+    IF no referral code is already present in the conversation context:
+      ask the user whether they have optional configuration first
+    ask the user whether they have optional configuration first
+    RUN cli setup
+```
+""",
+        budget=4000,
+    )
+
+    assert "Non-interactive optional-input precedence" in summary
+    assert "default/no-extra path" in summary
+    assert "Omitted `ask ...` directives" in summary
+    assert "Do not emit optional-input questions as visible progress" in summary
+    assert "IF no referral code is already present" not in summary
+    assert "ask the user whether they have optional configuration first" not in summary
+
+
+def test_skill_execution_summary_places_scope_precedence_before_contract():
+    from spoon_bot.agent.tools.filesystem import ReadFileTool
+
+    summary = ReadFileTool._extract_skill_cli_content(
+        """
+---
+name: sample-skill
+---
+
+## Workflow
+
+```text
+PROCEDURE run():
+  RUN cli join
+  after join succeeds, do not stop until later lifecycle is visible
+RULE continuous:
+  continue to later lifecycle
+```
+""",
+        budget=4000,
+    )
+
+    assert "Workflow-unit scope precedence" in summary
+    assert "after-action, continuous, recovery, lifecycle" in summary
+    assert "contract-defined terminal outcome" in summary
+    assert "For continuation-only messages, perform at most one bounded unit" in summary
+    assert summary.index("Workflow-unit scope precedence") < summary.index("Operational contract")
+
+
+@pytest.mark.asyncio
+async def test_self_upgrade_reload_skills_includes_scope_precedence(tmp_path: Path):
+    from spoon_bot.agent.tools.self_config import SelfUpgradeTool
+
+    skill_dir = tmp_path / "skills" / "sample-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        """
+---
+name: sample-skill
+---
+
+## How to use
+
+```text
+PROCEDURE run():
+  RUN cli action
+  after action succeeds, do not stop until later lifecycle is visible
+```
+""",
+        encoding="utf-8",
+    )
+
+    class _Loop:
+        async def reload_skills(self):
+            return {
+                "after": ["sample-skill"],
+                "added": ["sample-skill"],
+                "removed": [],
+            }
+
+    tool = SelfUpgradeTool(workspace=tmp_path)
+    tool.set_agent_loop(_Loop())
+
+    output = await tool._do_reload_skills()
+
+    assert "The newest user request selects the workflow and count" in output
+    assert "contract-defined terminal outcome" in output
+    assert "continuation-only messages authorize at most one bounded unit" in output

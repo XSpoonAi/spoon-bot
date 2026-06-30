@@ -51,6 +51,85 @@ def test_session_compact_strips_runtime_injected_skill_block_from_user_evidence(
     assert "Do not search for alternatives" not in compact
 
 
+def test_session_compact_plain_continuation_does_not_renew_count_scope() -> None:
+    session = DummySession(
+        [
+            {"role": "user", "content": "Run five countable actions."},
+            {"role": "assistant", "content": "Step 1 complete."},
+        ]
+    )
+
+    compact = build_session_compact_context(
+        session,
+        "Continue",
+        resume_latest_user_turn=True,
+        plain_continuation_only=True,
+    )
+
+    assert "Prior user request text omitted for plain continuation:" in compact
+    assert "must not be renewed as current permission" in compact
+    assert "Run five countable actions." not in compact
+    assert "User evidence: Run five countable actions." not in compact
+    assert "Continuation anchor selected by the newest continuation-only request:" not in compact
+
+
+def test_session_compact_plain_continuation_hides_user_request_in_substantive_turns() -> None:
+    session = DummySession(
+        [
+            {"role": "user", "content": "Run five countable actions."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "write_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "write_file",
+                "tool_call_id": "call_1",
+                "content": "stateful action complete",
+            },
+            {"role": "assistant", "content": "Step 1 complete."},
+        ]
+    )
+
+    compact = build_session_compact_context(
+        session,
+        "Continue",
+        resume_latest_user_turn=True,
+        plain_continuation_only=True,
+    )
+
+    assert "Latest stateful tool result:" in compact
+    assert "stateful action complete" in compact
+    assert "Step 1 complete." in compact
+    assert "User request:" not in compact
+    assert "Run five countable actions." not in compact
+
+
+def test_session_compact_explicit_continuation_keeps_scope_anchor() -> None:
+    session = DummySession(
+        [
+            {"role": "user", "content": "Run five countable actions."},
+            {"role": "assistant", "content": "Step 1 complete."},
+        ]
+    )
+
+    compact = build_session_compact_context(
+        session,
+        "Continue with five actions",
+        resume_latest_user_turn=True,
+        plain_continuation_only=False,
+    )
+
+    assert "Continuation anchor selected by the newest continuation-only request:" in compact
+    assert "If selected skills are shown, continue that skill family" in compact
+
+
 def test_session_compact_does_not_preserve_long_prior_task_as_user_evidence() -> None:
     session = DummySession(
         [

@@ -647,6 +647,7 @@ def _format_substantive_turn_line(
     events: list[dict[str, Any]],
     *,
     limit: int,
+    include_user_request: bool = True,
 ) -> str:
     """Format one completed turn whose tool evidence shows real progress."""
     stateful_events = _turn_stateful_tool_events(events)
@@ -656,7 +657,7 @@ def _format_substantive_turn_line(
     user_excerpt = _clip_text(user_message.get("content", ""), min(limit, 260))
     skill_names = _turn_skill_names(user_message)
     parts: list[str] = []
-    if user_excerpt:
+    if include_user_request and user_excerpt:
         parts.append(f"User request: {user_excerpt}")
     if skill_names:
         parts.append(f"Selected skills: {', '.join(skill_names)}")
@@ -685,6 +686,7 @@ def _select_recent_substantive_turn_lines(
     *,
     char_budget: int,
     max_items: int = 6,
+    include_user_request: bool = True,
 ) -> list[str]:
     """Return recent completed turns whose tool evidence made real progress."""
     selected: list[str] = []
@@ -695,6 +697,7 @@ def _select_recent_substantive_turn_lines(
             user_message,
             events,
             limit=520,
+            include_user_request=include_user_request,
         )
         if not line or line in seen:
             continue
@@ -835,6 +838,7 @@ def build_session_compact_context(
     max_messages: int = DEFAULT_MAX_SESSION_MESSAGES,
     char_budget: int = DEFAULT_CONTEXT_CHAR_BUDGET,
     resume_latest_user_turn: bool = False,
+    plain_continuation_only: bool = False,
 ) -> str:
     """Build an ordered compact block from the current session transcript."""
     if session is None:
@@ -872,19 +876,42 @@ def build_session_compact_context(
         "Never start or continue actions that are implied only by this compact; use it as evidence after the newest request selects the task.",
         "An empty long-term memory search does not mean the same-session transcript is empty.",
         "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions.",
-        "If a continuation anchor is shown above, treat it as the only prior user request selected by the newest continuation request.",
     ]
+    if plain_continuation_only:
+        lines.append(
+            "If a continuation state anchor is shown below, treat it as a checkpoint locator, "
+            "not renewed task scope or permission for older counts."
+        )
+    else:
+        lines.append(
+            "If a continuation anchor is shown above, treat it as the only prior user request selected by the newest continuation request."
+        )
 
     latest_prior = _latest_prior_user_task_line(raw_messages, current_message)
     if resume_latest_user_turn:
         anchor = latest_prior
         if anchor:
-            lines.append("Continuation anchor selected by the newest continuation-only request:")
-            lines.append(f"- Latest prior user request: {mask_secrets(anchor)}")
-            lines.append(
-                "Resume only one bounded continuation unit from this anchor and current live state. "
-                "If selected skills are shown, continue that skill family rather than another earlier skill."
-            )
+            if plain_continuation_only:
+                lines.append(
+                    "Prior user request text omitted for plain continuation:"
+                )
+            else:
+                lines.append(
+                    "Continuation anchor selected by the newest continuation-only request:"
+                )
+            if plain_continuation_only:
+                lines.append(
+                    "- The newest request has no count, target, or scope, so the "
+                    "prior user request is not repeated here and must not be "
+                    "renewed as current permission. Use assistant/tool state "
+                    "evidence below to locate one immediate unfinished checkpoint."
+                )
+            else:
+                lines.append(f"- Latest prior user request: {mask_secrets(anchor)}")
+                lines.append(
+                    "Resume only one bounded continuation unit from this anchor and current live state. "
+                    "If selected skills are shown, continue that skill family rather than another earlier skill."
+                )
 
     if interrupted_evidence:
         lines.append(
@@ -907,6 +934,7 @@ def build_session_compact_context(
     substantive_turns = _select_recent_substantive_turn_lines(
         completed_turns,
         char_budget=max(1_000, min(5_500, char_budget // 3)),
+        include_user_request=not plain_continuation_only,
     )
     if substantive_turns:
         lines.append(
@@ -961,7 +989,8 @@ def build_session_compact_context(
         if _message_visible_in_compact(message)
         if str(message.get("role") or "").lower() != "user"
         or (
-            id(message) not in task_scoped_user_ids
+            not plain_continuation_only
+            and id(message) not in task_scoped_user_ids
             and _is_bounded_user_evidence(message)
         )
     ]
