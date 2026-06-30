@@ -1720,10 +1720,23 @@ class TestAgentLoopStreamFallback:
         }
 
     @pytest.mark.asyncio
-    async def test_task_completion_verdict_continues_active_background_job(self):
+    async def test_task_completion_verdict_can_continue_active_background_job(self):
         from spoon_bot.agent.loop import AgentLoop
 
+        class _Chat:
+            def chat(self, *, messages, provider=None):
+                return json.dumps({
+                    "status": "needs_continuation",
+                    "reason": "The requested workflow still depends on the running job.",
+                    "next_focus": "Inspect the existing background job without rerunning it.",
+                })
+
+        class _Chatbot:
+            llm_manager = _Chat()
+
         loop = AgentLoop.__new__(AgentLoop)
+        loop._chatbot = _Chatbot()
+        loop.provider = None
         event = {
             "type": "tool_result",
             "delta": (
@@ -1748,8 +1761,57 @@ class TestAgentLoopStreamFallback:
         )
 
         assert verdict["status"] == "needs_continuation"
-        assert "background job" in verdict["reason"]
-        assert "rerun the same command" in verdict["next_focus"]
+        assert "running job" in verdict["reason"]
+        assert "without rerunning" in verdict["next_focus"]
+
+    @pytest.mark.asyncio
+    async def test_task_completion_verdict_can_complete_with_active_background_job(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        class _Chat:
+            def chat(self, *, messages, provider=None):
+                brief = messages[-1].content
+                assert "running process as non-terminal only when" in brief
+                assert "selected workflow unit" in brief
+                return json.dumps({
+                    "status": "complete",
+                    "reason": "The tool output already proves the requested terminal outcome.",
+                    "next_focus": "ignored for complete",
+                })
+
+        class _Chatbot:
+            llm_manager = _Chat()
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._chatbot = _Chatbot()
+        loop.provider = None
+        event = {
+            "type": "tool_result",
+            "delta": (
+                "job_id: sh_running\n"
+                "status: running\n"
+                "returncode: running\n"
+                "Recent output tail:\n"
+                "requested state-changing action completed\n"
+                "NEXT: optional later lifecycle command\n"
+            ),
+            "metadata": {
+                "name": "shell",
+                "arguments": json.dumps({"command": "run-requested-action"}),
+            },
+        }
+
+        verdict = await loop._evaluate_task_completion_verdict(
+            authoritative_message="run the setup and perform the final requested action",
+            final_content="The requested action completed.",
+            tool_result_events=[event],
+        )
+
+        assert verdict == {
+            "status": "complete",
+            "reason": "The tool output already proves the requested terminal outcome.",
+            "next_focus": "ignored for complete",
+        }
 
     def test_tool_events_need_more_evidence_for_active_background_job(self):
         from spoon_bot.agent.turn_verifiers import tool_events_need_more_evidence
@@ -1785,7 +1847,7 @@ class TestAgentLoopStreamFallback:
         assert "Do not treat the previous assistant draft" in prompt
         assert "latest user request already clearly authorized the exact next action" in prompt
 
-    def test_plain_task_continuation_does_not_authorize_new_side_effect_from_draft(self):
+    def test_plain_task_continuation_limits_new_side_effect_from_draft(self):
         from spoon_bot.agent.loop import AgentLoop
 
         prompt = AgentLoop._build_task_continuation_prompt(
@@ -1805,10 +1867,11 @@ class TestAgentLoopStreamFallback:
         )
 
         assert "[BOUNDED CONTINUATION LIMIT]" in prompt
-        assert "do not treat the continuation-only message as consent" in prompt
+        assert "at most one next unit only when it is the same clear workflow" in prompt
+        assert "multiple units or unrelated workflows" in prompt
         assert "paid, irreversible, externally visible, or repeated side-effect workflow" in prompt
 
-    def test_plain_skill_continuation_does_not_authorize_new_side_effect_from_draft(self):
+    def test_plain_skill_continuation_limits_new_side_effect_from_draft(self):
         from spoon_bot.agent.loop import AgentLoop
 
         prompt = AgentLoop._build_skill_contract_continuation_prompt(
@@ -1828,7 +1891,8 @@ class TestAgentLoopStreamFallback:
         )
 
         assert "[BOUNDED CONTINUATION LIMIT]" in prompt
-        assert "do not treat this continuation-only message as approval" in prompt
+        assert "at most one next unit only when it is the same clear workflow" in prompt
+        assert "never use it for multiple units or an unrelated workflow" in prompt
         assert "paid, irreversible, externally visible, or repeated side-effect" in prompt
 
     def test_task_continuation_prompt_keeps_explicit_multistage_scope(self):
@@ -1855,6 +1919,35 @@ class TestAgentLoopStreamFallback:
         assert "Do not pause between listed stages" in prompt
         assert "default/no-extra path" in prompt
         assert "[BOUNDED CONTINUATION LIMIT]" not in prompt
+        assert "contract-defined terminal outcome" in prompt
+        assert "multiple repeated units" in prompt
+        assert "external state change" in prompt
+        assert "current blocker and resume condition" in prompt
+
+    def test_skill_continuation_prompt_does_not_expand_from_tool_next_step(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_skill_contract_continuation_prompt(
+            "Install the requested workflow, fund the account, register it, then join the run.",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "requested action complete\nNEXT: run a later lifecycle command",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "run-requested-action"}),
+                    },
+                }
+            ],
+            previous_draft="Requested action complete. Should I keep going?",
+            continuation_reason="Verifier requested another step.",
+        )
+
+        assert "next-step suggestions as evidence only" in prompt
+        assert "contract-defined terminal outcome" in prompt
+        assert "multiple repeated units" in prompt
+        assert "same pending/waiting/not-ready state" in prompt
+        assert "resume condition" in prompt
 
     def test_task_continuation_prompt_skips_optional_input_for_explicit_workflow(self):
         from spoon_bot.agent.loop import AgentLoop
@@ -1940,6 +2033,47 @@ class TestAgentLoopStreamFallback:
         assert "default/no-extra path" in brief
         assert "use needs_continuation instead of awaiting_user" in brief
         assert "visible optional-input question is not a terminal" in brief
+
+    def test_task_completion_verdict_brief_treats_cli_next_as_advisory(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        brief = loop._build_task_completion_verdict_brief(
+            authoritative_message=(
+                "Install the requested skill, prepare the account, register it, "
+                "then join the latest run."
+            ),
+            final_content="Joined the latest run.",
+            tool_result_events=[
+                {
+                    "type": "tool_result",
+                    "delta": "JOINED run=123\nNEXT: wait for later lifecycle",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "join latest"}),
+                    },
+                }
+            ],
+        )
+
+        assert "CLI `NEXT` lines" in brief
+        assert "selected workflow unit" in brief
+        assert "contract-defined terminal outcome" in brief
+        assert "use complete" in brief
+        assert "same pending/waiting/not-ready state" in brief
+        assert "what evidence would allow a later resume" in brief
+
+    def test_context_prompt_treats_tool_next_as_evidence_not_scope(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+
+        prompt = ContextBuilder(tmp_dir).build_system_prompt()
+
+        assert "Requested-outcome boundary" in prompt
+        assert "CLI `NEXT`/next-step lines are evidence" in prompt
+        assert "workflow unit and count" in prompt
+        assert "If the selected SKILL.md contract defines lifecycle" in prompt
+        assert "No-progress wait boundary" in prompt
+        assert "Do not poll an external system indefinitely" in prompt
 
     def test_context_prompt_skips_optional_user_input_in_non_interactive_mode(self, tmp_dir: Path):
         from spoon_bot.agent.context import ContextBuilder
@@ -2712,6 +2846,48 @@ class TestAgentLoopStreamFallback:
                             "command": "node skills/example/cli/index.js action",
                         }),
                         "result": tool_text,
+                    },
+                },
+            ],
+        )
+
+        assert needs_continuation is False
+
+    def test_skill_progress_followed_by_status_text_defers_to_task_verifier(self):
+        from spoon_bot.agent.turn_verifiers import skill_contract_needs_continuation
+
+        needs_continuation = skill_contract_needs_continuation(
+            "The requested action is complete; current status was verified.",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "[SKILL.md execution contract]",
+                    "metadata": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "skills/example/SKILL.md"}),
+                        "result": "[SKILL.md execution contract]",
+                    },
+                },
+                {
+                    "type": "tool_result",
+                    "delta": "stateful action complete",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({
+                            "command": "node skills/example/cli/index.js action",
+                        }),
+                        "result": "stateful action complete",
+                    },
+                },
+                {
+                    "type": "tool_result",
+                    "delta": "STATUS phase=waiting\nNEXT: run later lifecycle",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({
+                            "command": "node skills/example/cli/index.js status",
+                        }),
+                        "result": "STATUS phase=waiting\nNEXT: run later lifecycle",
                     },
                 },
             ],

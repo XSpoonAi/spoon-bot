@@ -336,8 +336,12 @@ class TestBackgroundJobSummary:
         assert "job_status" in summary
         assert "job_output" in summary
         assert "terminate_job" in summary
-        assert "NEXT STEPS" in summary
+        assert "BACKGROUND JOB MANAGEMENT" in summary
+        assert "only if job completion is still required" in summary
         assert "Quiet output can be normal" in summary
+        assert "recent output can be completion evidence" in summary
+        assert "external pending/waiting/not-ready state" in summary
+        assert "resume condition" in summary
         assert "after two checks" not in summary
 
     @pytest.mark.asyncio
@@ -374,6 +378,8 @@ class TestBackgroundJobSummary:
         assert "STOP_TOOL_LOOP" not in third
         assert "status: running" in third
         assert "not a completion signal" in third
+        assert "external pending/waiting/not-ready state" in third
+        assert "resume condition" in third
 
     @pytest.mark.asyncio
     async def test_duplicate_running_background_command_is_not_started(self, tmp_path):

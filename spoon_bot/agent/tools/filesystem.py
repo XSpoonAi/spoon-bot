@@ -520,6 +520,20 @@ class ReadFileTool(Tool):
             "or usage errors, check CLI help and retry the documented form."
         )
         sections.append(
+            "Workflow-unit scope precedence:\n"
+            "- The newest user request selects the workflow and count for this "
+            "turn; SKILL.md after-action, continuous, recovery, lifecycle, "
+            "settlement, and post-action rules define how to finish each "
+            "selected workflow unit.\n"
+            "- Follow those rules when they are necessary to complete the "
+            "selected unit through its contract-defined terminal outcome or "
+            "concrete blocker.\n"
+            "- Do not use those rules to start another repeated unit, larger "
+            "count, or unrelated side effect unless the newest user request "
+            "explicitly asks for that larger scope. For continuation-only "
+            "messages, perform at most one bounded unit."
+        )
+        sections.append(
             "Non-interactive optional-input precedence:\n"
             "- If a contract asks for optional configuration, preference, bonus, "
             "referral, naming, or another non-essential enhancement during an "
