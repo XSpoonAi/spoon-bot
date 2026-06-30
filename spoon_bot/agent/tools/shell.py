@@ -2600,6 +2600,49 @@ class ShellTool(Tool):
             "unrecoverably stuck."
         )
 
+    async def _find_running_background_job_for_command(
+        self,
+        *,
+        command: str,
+        cwd: str,
+        owner_key: str,
+    ) -> _BackgroundShellJob | None:
+        for job in list(_SHELL_BACKGROUND_JOBS.values()):
+            if job.owner_key != owner_key or job.cwd != cwd or job.command != command:
+                continue
+            await self._refresh_background_job(job)
+            if job.status == "running":
+                return job
+        return None
+
+    def _format_existing_background_job_command(
+        self,
+        job: _BackgroundShellJob,
+        *,
+        tail_chars: int = 4000,
+    ) -> str:
+        recent_output = self._build_output_result(
+            job.stdout_text,
+            job.stderr_text,
+            job.returncode,
+            max_chars=tail_chars,
+        )
+        elapsed = time.time() - job.created_at
+        return (
+            "ACTIVE_BACKGROUND_JOB_EXISTS: this exact shell command is already "
+            "running as a managed background job.\n"
+            f"job_id: {job.job_id}\n"
+            f"command: {job.command}\n"
+            f"cwd: {job.cwd}\n"
+            f"status: running (elapsed {elapsed:.0f}s)\n"
+            "Recent output tail:\n"
+            f"{recent_output}\n\n"
+            "Do not start another copy of this command. Monitor the existing "
+            f"job with action='job_output', job_id='{job.job_id}' or "
+            f"action='job_status', job_id='{job.job_id}'. If the user explicitly "
+            "cancels this work, use action='terminate_job' with force=true."
+        )
+
     def _workspace_skill_foreground_timeout(self) -> int:
         """Return foreground budget before a workspace skill CLI becomes managed background."""
         raw = os.getenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", "").strip()
@@ -3035,6 +3078,19 @@ class ShellTool(Tool):
 
         try:
             owner_key = get_tool_owner()
+            existing_job = await self._find_running_background_job_for_command(
+                command=execution_command,
+                cwd=cwd,
+                owner_key=owner_key,
+            )
+            if existing_job is not None:
+                result = self._format_existing_background_job_command(
+                    existing_job,
+                    tail_chars=tail_chars,
+                )
+                capture_tool_output(result, result)
+                return result
+
             job = await self._start_background_job(
                 execution_command,
                 cwd,

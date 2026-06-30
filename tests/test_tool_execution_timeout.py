@@ -375,6 +375,40 @@ class TestBackgroundJobSummary:
         assert "status: running" in third
         assert "not a completion signal" in third
 
+    @pytest.mark.asyncio
+    async def test_duplicate_running_background_command_is_not_started(self, tmp_path):
+        tool = ShellTool(working_dir=str(tmp_path))
+        process = MagicMock()
+        process.poll.return_value = None
+        job = _BackgroundShellJob(
+            job_id="sh_existing",
+            command="sleep 999",
+            cwd=str(tmp_path),
+            process=process,
+            stdout_task=MagicMock(),
+            stderr_task=MagicMock(),
+            buffer_limit=200000,
+            owner_key="test",
+            stdout_text="waiting...",
+            stderr_text="",
+            status="running",
+            created_at=time.time() - 90,
+        )
+        _SHELL_BACKGROUND_JOBS[job.job_id] = job
+        try:
+            with patch.object(tool, "_start_background_job") as start_background_job, \
+                 patch("spoon_bot.agent.tools.shell.get_tool_owner", return_value="test"), \
+                 patch("spoon_bot.agent.tools.shell.capture_tool_output"):
+                result = await tool.execute(command="sleep 999")
+        finally:
+            _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
+
+        start_background_job.assert_not_called()
+        assert "ACTIVE_BACKGROUND_JOB_EXISTS" in result
+        assert "job_id: sh_existing" in result
+        assert "Do not start another copy" in result
+        assert "job_output" in result
+
     def test_summary_includes_elapsed_time(self):
         tool = ShellTool()
         job = _BackgroundShellJob(
