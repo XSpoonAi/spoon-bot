@@ -1785,6 +1785,56 @@ class TestAgentLoopStreamFallback:
         assert "Do not treat the previous assistant draft" in prompt
         assert "latest user request already clearly authorized the exact next action" in prompt
 
+    def test_task_continuation_prompt_keeps_explicit_multistage_scope(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_task_continuation_prompt(
+            "Install the requested skill, prepare the account, register it, then join the latest run.",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "Read it aloud: Skill installed. Should I prepare the account next?",
+                    "metadata": {
+                        "name": "skill_marketplace",
+                        "arguments": json.dumps({"action": "install_skill"}),
+                    },
+                }
+            ],
+            previous_draft="Skill installed. Should I prepare the account next?",
+            continuation_reason="A listed stage is still incomplete.",
+        )
+
+        assert "explicit multi-stage requests" in prompt
+        assert "already selected for this turn" in prompt
+        assert "Do not pause between listed stages" in prompt
+        assert "[BOUNDED CONTINUATION LIMIT]" not in prompt
+
+    def test_task_completion_verdict_brief_keeps_explicit_multistage_scope(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        brief = loop._build_task_completion_verdict_brief(
+            authoritative_message=(
+                "Install the requested skill, prepare the account, register it, "
+                "then join the latest run."
+            ),
+            final_content="Skill installed. Should I prepare the account next?",
+            tool_result_events=[
+                {
+                    "type": "tool_result",
+                    "delta": "SUCCESS: Skill installed. NEXT STEPS: reload and read instructions.",
+                    "metadata": {
+                        "name": "skill_marketplace",
+                        "arguments": json.dumps({"action": "install_skill"}),
+                    },
+                }
+            ],
+        )
+
+        assert "listed actions are current-turn authorization" in brief
+        assert "request for feedback override" in brief
+        assert "use needs_continuation" in brief
+
     @pytest.mark.asyncio
     async def test_stream_continues_after_background_job_handoff(
         self,
@@ -1981,6 +2031,49 @@ class TestAgentLoopStreamFallback:
         done_chunks = [chunk for chunk in chunks if chunk["type"] == "done"]
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "Recovered final answer"
+
+    @pytest.mark.asyncio
+    async def test_stream_internal_recovery_timeout_uses_captured_tool_evidence(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import spoon_bot.agent.loop as loop_module
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _DelayedInternalRecoveryRuntimeAgent()
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_internal_recovery_timeout")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop.internal_recovery_timeout = 0.05
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        monkeypatch.setattr(
+            loop_module,
+            "skill_contract_needs_continuation",
+            lambda *_args, **_kwargs: len(loop._agent.run_calls) < 2,
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="complete the long task"):
+            chunks.append(chunk)
+
+        done_chunks = [chunk for chunk in chunks if chunk["type"] == "done"]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == "Recovered final answer"
+        assert loop._session.messages[0]["turn_state"] == "completed"
+        assert not any(message.get("incomplete") for message in loop._session.messages)
 
     @pytest.mark.asyncio
     async def test_stream_forwards_internal_recovery_content_before_repair_finishes(

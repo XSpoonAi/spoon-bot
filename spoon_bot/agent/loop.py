@@ -701,6 +701,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             "- Do not stop after setup when the latest user request also asked for follow-on execution. "
             "Setup, installation, dependency checks, status checks, and readiness reports are intermediate "
             "states unless they fully satisfy the newest request.\n"
+            "- When the newest user request lists multiple ordered goals or follow-on actions, treat "
+            "those listed actions as one authorized workflow for the current turn. Do not pause between "
+            "listed stages just to ask for feedback, approval, or whether to proceed; continue until the "
+            "workflow reaches the requested terminal outcome or a concrete blocker.\n"
             "- If a tool result contains a blocking readiness/validation warning, treat it as an "
             "intermediate state and resolve it before giving a final answer.\n"
             "- Do not ask the user whether to run a safe next action that the newest request already asked "
@@ -2558,7 +2562,14 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
                 repair_text = ""
                 if result is None:
-                    if stream_error_reason is None:
+                    if timed_out:
+                        # Internal recovery timeouts are soft: the caller can
+                        # still synthesize a grounded answer from any queued
+                        # content/tool evidence collected above. Marking the
+                        # whole user turn as a stream error here makes a
+                        # partially successful long workflow look cancelled.
+                        pass
+                    elif stream_error_reason is None:
                         stream_error_reason = RuntimeError(f"{label} returned no result")
                 else:
                     repair_text = AgentLoop._extract_run_result_text(result)

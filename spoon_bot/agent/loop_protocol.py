@@ -124,7 +124,13 @@ _TASK_COMPLETION_VERDICT_SYSTEM_PROMPT = (
     "user request is intent, not proof. For countable or repeated outcomes, "
     "compare the requested count and scope against concrete tool evidence; a "
     "stage summary is evidence for that stage only, not proof that the "
-    "remaining requested repetitions are complete."
+    "remaining requested repetitions are complete. When the newest user "
+    "request itself lists multiple ordered goals or follow-on actions, treat "
+    "those listed actions as current-turn authorization. Do not return "
+    "`awaiting_user` merely because the assistant draft asks for feedback, "
+    "approval, or whether to proceed between listed stages; return "
+    "`needs_continuation` when tool evidence has not completed the remaining "
+    "listed stages and another tool action can reasonably make progress."
 )
 
 
@@ -3664,6 +3670,11 @@ class LoopProtocolMixin:
             "permission before continuing, mark the turn as awaiting_user unless "
             "the newest user request already explicitly authorized that exact "
             "next action and the evidence is still incomplete.",
+            "If the newest user request lists multiple ordered goals or follow-on "
+            "actions, those listed actions are current-turn authorization. Do not "
+            "let an assistant draft phrased as a request for feedback override "
+            "that authorization; if a listed stage remains incomplete and another "
+            "tool action can progress it, use needs_continuation.",
         ]
         if request_is_plain_continuation_only(authoritative_message):
             lines.extend(
@@ -4363,6 +4374,14 @@ class LoopProtocolMixin:
                 "evidence satisfies the requested count and scope, or until tool "
                 "evidence shows a real blocker. Treat stage summaries as progress "
                 "for the stage they describe, not as proof of the remaining stages."
+            )
+            lines.append(
+                "For explicit multi-stage requests, the stages listed in the newest "
+                "user request are already selected for this turn. Do not pause "
+                "between listed stages just because the previous draft asked for "
+                "feedback or whether to proceed; continue with the next tool-backed "
+                "stage unless a required value is missing, the active tool/skill "
+                "contract requires user input, or evidence shows a concrete blocker."
             )
         lines.append(
             "If the request asks to create, update, build, deploy, start, or verify "
