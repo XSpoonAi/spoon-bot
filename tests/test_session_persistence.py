@@ -1785,6 +1785,52 @@ class TestAgentLoopStreamFallback:
         assert "Do not treat the previous assistant draft" in prompt
         assert "latest user request already clearly authorized the exact next action" in prompt
 
+    def test_plain_task_continuation_does_not_authorize_new_side_effect_from_draft(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_task_continuation_prompt(
+            "继续",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "The requested external operation is complete.",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "run-external-operation"}),
+                    },
+                }
+            ],
+            previous_draft="Workflow complete. Want me to start another paid operation?",
+            continuation_reason="Verifier requested another step.",
+        )
+
+        assert "[BOUNDED CONTINUATION LIMIT]" in prompt
+        assert "do not treat the continuation-only message as consent" in prompt
+        assert "paid, irreversible, externally visible, or repeated side-effect workflow" in prompt
+
+    def test_plain_skill_continuation_does_not_authorize_new_side_effect_from_draft(self):
+        from spoon_bot.agent.loop import AgentLoop
+
+        prompt = AgentLoop._build_skill_contract_continuation_prompt(
+            "continue",
+            [
+                {
+                    "type": "tool_result",
+                    "delta": "Skill workflow reached terminal outcome.",
+                    "metadata": {
+                        "name": "shell",
+                        "arguments": json.dumps({"command": "skill-cli run"}),
+                    },
+                }
+            ],
+            previous_draft="Done. Should I run another externally visible operation?",
+            continuation_reason="Verifier requested another skill step.",
+        )
+
+        assert "[BOUNDED CONTINUATION LIMIT]" in prompt
+        assert "do not treat this continuation-only message as approval" in prompt
+        assert "paid, irreversible, externally visible, or repeated side-effect" in prompt
+
     def test_task_continuation_prompt_keeps_explicit_multistage_scope(self):
         from spoon_bot.agent.loop import AgentLoop
 

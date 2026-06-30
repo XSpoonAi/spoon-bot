@@ -4302,6 +4302,10 @@ class LoopProtocolMixin:
                     "from an older request; report current status or ask for "
                     "explicit scope after this unit is no longer actively "
                     "running.",
+                    "If the previous assistant draft proposed a new paid, "
+                    "irreversible, externally visible, or repeated side-effect "
+                    "workflow, do not treat this continuation-only message as "
+                    "approval for that new workflow.",
                 ]
             )
         lines.append("")
@@ -4382,6 +4386,12 @@ class LoopProtocolMixin:
                 "request when the newest request is only a continuation "
                 "acknowledgement. The prior request is an anchor for state, not "
                 "permission to perform multiple new side-effect units."
+            )
+            lines.append(
+                "If the previous assistant draft proposed starting another paid, "
+                "irreversible, externally visible, or repeated side-effect workflow, "
+                "do not treat the continuation-only message as consent for that new "
+                "workflow; report current status or ask for explicit scope instead."
             )
         else:
             lines.append(
