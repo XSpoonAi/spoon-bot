@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -197,6 +198,45 @@ class TestStreamWaitBehavior:
         assert done_chunks[0]["metadata"]["content"] == "late chunk"
 
     @pytest.mark.asyncio
+    async def test_stream_emits_heartbeat_during_silent_active_run(self):
+        """A live background run should emit agent-level progress during stream silence."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        async def mock_run(**kwargs):
+            await asyncio.sleep(0.12)
+            await oq.put({"type": "content", "delta": "finished", "metadata": {}})
+            result = MagicMock()
+            result.content = "finished"
+            return result
+
+        agent, oq, _ = _make_mock_stream_agent(mock_run)
+
+        chunks = []
+        with patch.dict(
+            os.environ,
+            {
+                "SPOON_BOT_STREAM_HEARTBEAT_INITIAL_DELAY": "0.05",
+                "SPOON_BOT_STREAM_HEARTBEAT_INTERVAL": "0.05",
+            },
+        ):
+            async for chunk in AgentLoop.stream(agent, message="test"):
+                chunks.append(chunk)
+
+        heartbeat_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.get("type") == "notice"
+            and chunk.get("metadata", {}).get("kind") == "agent_progress_heartbeat"
+        ]
+        assert heartbeat_chunks
+        assert heartbeat_chunks[0].get("part") == {
+            "type": "thinking",
+            "text": "Agent is still running.",
+        }
+        content_chunks = [chunk for chunk in chunks if chunk["type"] == "content"]
+        assert content_chunks[-1]["delta"] == "finished"
+
+    @pytest.mark.asyncio
     async def test_stream_restores_system_prompt_when_add_message_fails(self):
         """Temporary request context must be rolled back if stream setup fails."""
         from spoon_bot.agent.loop import AgentLoop
@@ -224,6 +264,33 @@ class TestStreamWaitBehavior:
         assert done_chunks[0]["metadata"]["error"] == "setup failed"
         assert agent._agent.system_prompt == "base system"
         assert agent._agent._original_system_prompt == "base original"
+
+    @pytest.mark.asyncio
+    async def test_stream_cancel_emits_structured_cancelled_chunk(self):
+        """A cancelled stream should expose a machine-readable cancellation reason."""
+        from spoon_bot.agent.loop import AgentLoop
+
+        started = asyncio.Event()
+
+        async def mock_run(**kwargs):
+            started.set()
+            await asyncio.sleep(60)
+
+        agent, _, _ = _make_mock_stream_agent(mock_run)
+
+        stream = AgentLoop.stream(agent, message="test")
+        next_chunk = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        next_chunk.cancel()
+        chunk = await asyncio.wait_for(next_chunk, timeout=1)
+        await stream.aclose()
+
+        assert chunk["type"] == "cancelled"
+        assert chunk["delta"] == "Task cancelled."
+        assert chunk["metadata"]["cancelled"] is True
+        assert chunk["metadata"]["code"] == "CANCELLED"
+        assert chunk["metadata"]["reason"] == "task_cancelled"
 
 
 # ============================================================
