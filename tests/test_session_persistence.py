@@ -845,6 +845,101 @@ class _ToolThenChunkedRuntimeAgent:
         return type("RunResult", (), {"content": "".join(self._chunks)})()
 
 
+class _ReadOnlySkillQARuntimeAgent:
+    """Runtime agent that answers after skill-backed read-only inspection."""
+
+    def __init__(self, final_content: str) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.final_content = final_content
+        self.repair_content = "This was already answered in the prior response."
+        self.add_message_calls: list[tuple[str, Any, dict]] = []
+        self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.add_message_calls.append((role, content, kwargs))
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        if len(self.run_calls) > 1:
+            await self.output_queue.put({
+                "type": "content",
+                "delta": self.repair_content,
+            })
+            await asyncio.sleep(0)
+            return type("RunResult", (), {"content": self.repair_content})()
+
+        contract = (
+            "[SKILL.md execution contract]\n"
+            "Inspect the faucet docs and answer endpoint questions directly."
+        )
+        docs = (
+            "FAUCET_BASE_URL=https://faucet.agentcypher.org\n"
+            "GET /api/health\n"
+            "POST /api/claim\n"
+            "GET /api/claim/{claim_id}\n"
+            "GET /api/balance/{address}\n"
+        )
+        read_call_id = "call_read_skill"
+        grep_call_id = "call_grep_faucet"
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": read_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "skills/faucet/SKILL.md"}),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "read_file",
+            "delta": contract,
+            "metadata": {
+                "name": "read_file",
+                "id": read_call_id,
+                "tool_call_id": read_call_id,
+                "arguments": json.dumps({"path": "skills/faucet/SKILL.md"}),
+            },
+        })
+        await self.output_queue.put({
+            "tool_calls": [
+                {
+                    "id": grep_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "grep",
+                        "arguments": json.dumps({
+                            "pattern": "faucet",
+                            "path": "skills/faucet",
+                        }),
+                    },
+                }
+            ],
+        })
+        await self.output_queue.put({
+            "type": "tool_result",
+            "name": "grep",
+            "delta": docs,
+            "metadata": {
+                "name": "grep",
+                "id": grep_call_id,
+                "tool_call_id": grep_call_id,
+                "arguments": json.dumps({
+                    "pattern": "faucet",
+                    "path": "skills/faucet",
+                }),
+            },
+        })
+        await self.output_queue.put({"type": "content", "delta": self.final_content})
+        await asyncio.sleep(0)
+        return type("RunResult", (), {"content": self.final_content})()
+
+
 class _InterleavedToolContentRuntimeAgent:
     """Runtime agent that emits progress text between tool calls."""
 
@@ -1824,6 +1919,74 @@ class TestAgentLoopStreamFallback:
             }
         ])
 
+    def test_read_only_skill_answer_does_not_need_contract_continuation(self):
+        from spoon_bot.agent.turn_verifiers import (
+            skill_contract_needs_continuation,
+            tool_events_are_read_only_inspection,
+        )
+
+        contract = (
+            "[SKILL.md execution contract]\n"
+            "Inspect the faucet docs and answer endpoint questions directly."
+        )
+        docs = (
+            "FAUCET_BASE_URL=https://faucet.agentcypher.org\n"
+            "POST /api/claim\n"
+            "GET /api/claim/{claim_id}\n"
+        )
+        events = [
+            {
+                "type": "tool_result",
+                "delta": contract,
+                "metadata": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "skills/faucet/SKILL.md"}),
+                    "result": contract,
+                },
+            },
+            {
+                "type": "tool_result",
+                "delta": docs,
+                "metadata": {
+                    "name": "grep",
+                    "arguments": json.dumps({
+                        "pattern": "faucet",
+                        "path": "skills/faucet",
+                    }),
+                    "result": docs,
+                },
+            },
+        ]
+        final_answer = (
+            "Faucet base URL: https://faucet.agentcypher.org. "
+            "Claim tokens with POST /api/claim and check the claim with "
+            "GET /api/claim/{claim_id}."
+        )
+
+        assert tool_events_are_read_only_inspection(events)
+        assert not skill_contract_needs_continuation(final_answer, events)
+        assert skill_contract_needs_continuation(contract, events)
+
+    def test_setup_skill_event_without_progress_still_needs_continuation(self):
+        from spoon_bot.agent.turn_verifiers import skill_contract_needs_continuation
+
+        setup_text = (
+            "[SKILL.md execution contract]\n"
+            "Installed skills/faucet/SKILL.md. Execute the requested workflow next."
+        )
+        events = [
+            {
+                "type": "tool_result",
+                "delta": setup_text,
+                "metadata": {
+                    "name": "skill_marketplace",
+                    "result": setup_text,
+                },
+            }
+        ]
+
+        assert skill_contract_needs_continuation("Skill installed.", events)
+
     @pytest.mark.asyncio
     async def test_repeated_external_wait_text_is_not_a_hard_completion_signal(self):
         from spoon_bot.agent.loop import AgentLoop
@@ -2336,6 +2499,57 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"] == "".join(answer_chunks)
         assert loop._session.messages[-1]["content"] == "".join(answer_chunks)
+
+    @pytest.mark.asyncio
+    async def test_stream_does_not_overwrite_read_only_skill_answer_with_continuation(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        final_answer = (
+            "Faucet base URL: https://faucet.agentcypher.org\n\n"
+            "Endpoints:\n"
+            "- GET /api/health\n"
+            "- POST /api/claim\n"
+            "- GET /api/claim/{claim_id}\n"
+            "- GET /api/balance/{address}"
+        )
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _ReadOnlySkillQARuntimeAgent(final_answer)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_read_only_skill_answer")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="What is the faucet endpoint?"):
+            chunks.append(chunk)
+
+        content_chunks = [c for c in chunks if c["type"] == "content"]
+        done_chunks = [c for c in chunks if c["type"] == "done"]
+        repair_chunks = [
+            c
+            for c in chunks
+            if dict(c.get("metadata") or {}).get("repair") == "skill_contract_continuation"
+        ]
+
+        assert len(loop._agent.run_calls) == 1
+        assert not repair_chunks
+        assert [c["delta"] for c in content_chunks] == [final_answer]
+        assert len(done_chunks) == 1
+        assert done_chunks[0]["metadata"]["content"] == final_answer
+        assert loop._session.messages[-1]["content"] == final_answer
 
     @pytest.mark.asyncio
     async def test_stream_forwards_internal_recovery_tool_events_before_repair_finishes(
