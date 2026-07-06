@@ -24,6 +24,11 @@ _SETUP_OR_READ_ONLY_TOOLS = frozenset({
     "search_history",
 })
 
+_SETUP_TOOLS = frozenset({
+    "skill_marketplace",
+    "self_upgrade",
+})
+
 _STATEFUL_PROGRESS_TOOLS = frozenset({
     "write_file",
     "edit_file",
@@ -210,6 +215,14 @@ def _tool_event_is_setup_or_read_only(event: dict[str, Any]) -> bool:
     return False
 
 
+def _tool_event_is_read_only_inspection(event: dict[str, Any]) -> bool:
+    """Return True for inspection-only evidence, excluding skill setup actions."""
+    tool_name = _stream_tool_event_name(event)
+    if tool_name in _SETUP_TOOLS:
+        return False
+    return _tool_event_is_setup_or_read_only(event)
+
+
 def _tool_event_has_stateful_progress(event: dict[str, Any]) -> bool:
     tool_name = _stream_tool_event_name(event)
     if not tool_name:
@@ -236,6 +249,16 @@ def tool_events_are_read_only(
     """Return True when every observed tool result is setup/inspection only."""
     return bool(tool_result_events) and all(
         _tool_event_is_setup_or_read_only(event)
+        for event in tool_result_events
+    )
+
+
+def tool_events_are_read_only_inspection(
+    tool_result_events: list[dict[str, Any]],
+) -> bool:
+    """Return True when every observed tool result is pure inspection evidence."""
+    return bool(tool_result_events) and all(
+        _tool_event_is_read_only_inspection(event)
         for event in tool_result_events
     )
 
@@ -443,6 +466,10 @@ def skill_contract_needs_continuation(
         return False
     has_progress = skill_contract_has_progress(tool_result_events)
     if not has_progress:
+        if tool_events_are_read_only_inspection(tool_result_events):
+            if latest_tool_event_has_user_summary_marker(tool_result_events):
+                return True
+            return final_answer_is_raw_tool_evidence(final_text, tool_result_events)
         return True
     latest = _latest_non_empty_tool_event(tool_result_events)
     if latest is not None and _tool_event_is_setup_or_read_only(latest):
