@@ -305,6 +305,35 @@ class ReadFileTool(Tool):
                     break
             return out
 
+        def _is_optional_input_prompt_directive(value: str) -> bool:
+            lowered = str(value or "").casefold()
+            optional_markers = (
+                "optional",
+                "bonus",
+                "referral",
+                "invitation",
+                "invite",
+                "extra ",
+                "non-essential",
+            )
+            input_markers = (
+                "ask ",
+                "provide",
+                "present in",
+                "already present",
+                "conversation context",
+                "context",
+                "code",
+                "configuration",
+                "preference",
+                "naming",
+            )
+            if lowered.startswith("ask "):
+                return True
+            return any(marker in lowered for marker in optional_markers) and any(
+                marker in lowered for marker in input_markers
+            )
+
         frontmatter: list[str] = []
         if lines and lines[0].strip() == "---":
             for line in lines[1:40]:
@@ -465,6 +494,8 @@ class ReadFileTool(Tool):
                 or "$cli" in lowered
                 or stripped.startswith('"')
             ):
+                if _is_optional_input_prompt_directive(lowered):
+                    continue
                 contract_lines.append(raw_line.rstrip()[:220])
 
         contract_lines = _dedupe(contract_lines, limit=90)
@@ -487,6 +518,34 @@ class ReadFileTool(Tool):
             "arguments, unless SKILL.md documents them.\n"
             "- Replace only placeholders such as <value> or {value}; on argument "
             "or usage errors, check CLI help and retry the documented form."
+        )
+        sections.append(
+            "Workflow-unit scope precedence:\n"
+            "- The newest user request selects the workflow and count for this "
+            "turn; SKILL.md after-action, continuous, recovery, lifecycle, "
+            "settlement, and post-action rules define how to finish each "
+            "selected workflow unit.\n"
+            "- Follow those rules when they are necessary to complete the "
+            "selected unit through its contract-defined terminal outcome or "
+            "concrete blocker.\n"
+            "- Do not use those rules to start another repeated unit, larger "
+            "count, or unrelated side effect unless the newest user request "
+            "explicitly asks for that larger scope. For continuation-only "
+            "messages, perform at most one bounded unit."
+        )
+        sections.append(
+            "Non-interactive optional-input precedence:\n"
+            "- If a contract asks for optional configuration, preference, bonus, "
+            "referral, naming, or another non-essential enhancement during an "
+            "already selected workflow, do not ask the user and do not stop.\n"
+            "- Use the default/no-extra path and continue with the core requested "
+            "workflow unless the next core command cannot be formed without that "
+            "missing value.\n"
+            "- Omitted `ask ...` directives from this compact summary are governed "
+            "by this policy; inspect the full SKILL.md only if a core command "
+            "cannot be formed or a tool error proves required input is missing.\n"
+            "- Do not emit optional-input questions as visible progress before "
+            "continuing."
         )
         if cli_lines:
             sections.append("CLI entrypoint:\n" + "\n".join(cli_lines))

@@ -433,14 +433,12 @@ def skill_contract_needs_continuation(
     """
     if not should_run_skill_contract_check(tool_result_events):
         return False
-    if latest_tool_event_has_user_summary_marker(tool_result_events):
-        return False
-    if latest_tool_event_has_active_background_job(tool_result_events):
-        return True
 
     final_text = str(final_content or "").strip()
     if not final_text or final_text in {"No results", "NO_CONCISE_TOOL_EVIDENCE"}:
         return True
+    if latest_tool_event_has_active_background_job(tool_result_events):
+        return final_answer_is_raw_tool_evidence(final_text, tool_result_events)
     if not _skill_contract_was_loaded(tool_result_events):
         return False
     has_progress = skill_contract_has_progress(tool_result_events)
@@ -448,17 +446,25 @@ def skill_contract_needs_continuation(
         return True
     latest = _latest_non_empty_tool_event(tool_result_events)
     if latest is not None and _tool_event_is_setup_or_read_only(latest):
-        return True
+        return final_answer_is_raw_tool_evidence(final_text, tool_result_events)
     if latest_tool_event_from_skill_continuation(tool_result_events):
         return False
-    if not latest_tool_event_has_user_summary_marker(tool_result_events):
-        return True
-    return skill_contract_inspection_stalled_after_progress(tool_result_events)
+    if latest_tool_event_has_user_summary_marker(tool_result_events):
+        return skill_contract_inspection_stalled_after_progress(tool_result_events)
+    return False
 
 
 def latest_tool_event_has_next_command(tool_result_events: list[dict[str, Any]]) -> bool:
     """Do not route from CLI ``NEXT`` text; leave it as model evidence."""
     return False
+
+
+def tool_events_need_more_evidence(tool_result_events: list[dict[str, Any]]) -> bool:
+    """Return True when the latest structured evidence is not terminal yet."""
+    return (
+        latest_tool_event_has_next_command(tool_result_events)
+        or latest_tool_event_has_active_background_job(tool_result_events)
+    )
 
 
 def _compact_tool_output(text: str, *, limit: int = 1200) -> str:

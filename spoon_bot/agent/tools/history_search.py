@@ -20,16 +20,16 @@ working context.
 
 from __future__ import annotations
 
-from datetime import datetime
 import re
-from typing import Any, Callable, Iterable, Optional, TYPE_CHECKING
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
+from spoon_bot.agent.session_compact import build_recent_session_turns_payload
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
     get_request_execution_hints,
     get_tracked_tool_invocation_counts,
 )
-from spoon_bot.agent.session_compact import build_recent_session_turns_payload
 
 if TYPE_CHECKING:  # pragma: no cover - import for typing only
     from spoon_bot.session.manager import SessionManager
@@ -118,6 +118,31 @@ class SearchHistoryTool(Tool):
             str(getattr(hit, "role", "")).lower() == "assistant"
             and not cls._is_tool_call_trace_hit(hit)
         )
+
+    @staticmethod
+    def _is_self_search_history_hit(hit: Any) -> bool:
+        """Return True for prior search_history calls/results.
+
+        Those hits are derivative views over earlier evidence. Returning them
+        for broad factual searches can create nested search-result echoes that
+        compete with the original user/tool evidence.
+        """
+        extras = getattr(hit, "extras", None) or {}
+        role = str(getattr(hit, "role", "") or "").lower()
+        if role == "tool" and str(extras.get("name") or "") == "search_history":
+            return True
+        if role != "assistant":
+            return False
+        tool_calls = extras.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return False
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            fn = tool_call.get("function")
+            if isinstance(fn, dict) and fn.get("name") == "search_history":
+                return True
+        return False
 
     @staticmethod
     def _parse_timestamp(value: Any) -> float:
@@ -295,8 +320,80 @@ class SearchHistoryTool(Tool):
                     "minimum": 1,
                     "maximum": 20000,
                 },
+                "include_assistant_summaries": {
+                    "type": "boolean",
+                    "description": (
+                        "Include prior assistant narrative summaries in "
+                        "mode='recent' payloads. Default false because "
+                        "assistant summaries are claims, not source evidence. "
+                        "Use only when the user asks for the exact earlier "
+                        "assistant wording."
+                    ),
+                },
             },
         }
+
+    @classmethod
+    def _hit_evidence_type(cls, hit: Any) -> str:
+        """Classify whether a search hit is source evidence or a model claim."""
+        role = str(getattr(hit, "role", "") or "").lower()
+        if role == "tool":
+            return "tool_result"
+        if role == "user":
+            return "user_message"
+        if cls._is_tool_call_trace_hit(hit):
+            return "tool_call_trace"
+        if role == "assistant":
+            return "assistant_claim"
+        return "message"
+
+    @classmethod
+    def _remove_assistant_summaries_from_recent_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        include_assistant_summaries: bool,
+    ) -> dict[str, Any]:
+        """Return a recent-turn payload that defaults to source evidence only."""
+        if include_assistant_summaries:
+            return payload
+
+        def scrub(value: Any) -> Any:
+            if isinstance(value, dict):
+                cleaned: dict[str, Any] = {}
+                omitted = False
+                for key, item in value.items():
+                    if key == "assistant_summary":
+                        if str(item or "").strip():
+                            omitted = True
+                        continue
+                    cleaned[key] = scrub(item)
+                if omitted:
+                    cleaned["assistant_summary_omitted"] = True
+                return cleaned
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
+        cleaned_payload = scrub(payload)
+        if isinstance(cleaned_payload, dict):
+            note = str(cleaned_payload.get("note") or "").strip()
+            evidence_note = (
+                "Assistant summaries are omitted by default because they are "
+                "model claims, not source evidence. Use user messages, "
+                "tool_call_trace, and tool_result fields for factual "
+                "reconstruction; pass include_assistant_summaries=true only "
+                "when the exact earlier assistant wording is needed. When this "
+                "payload answers the latest user request, provide the answer "
+                "directly in the current reply instead of saying the result was "
+                "already completed above."
+            )
+            cleaned_payload["note"] = (
+                f"{note} {evidence_note}".strip()
+                if note
+                else evidence_note
+            )
+        return cleaned_payload
 
     @staticmethod
     def _history_search_budget_response(
@@ -396,6 +493,7 @@ class SearchHistoryTool(Tool):
         limit: int = 20,
         offset: int = 0,
         max_content_length: int | None = 1000,
+        include_assistant_summaries: bool = False,
         **kwargs: Any,
     ) -> str:
         import json
@@ -422,7 +520,6 @@ class SearchHistoryTool(Tool):
                 mcl = max(1, min(20_000, int(max_content_length)))
             except (TypeError, ValueError):
                 mcl = 1000
-
         active_session_key = self._resolve_active_session_key()
         requested_scope = (
             str(scope).lower().strip() if isinstance(scope, str) else "current"
@@ -478,6 +575,10 @@ class SearchHistoryTool(Tool):
                 "limit": limit_int,
                 "offset": 0,
             })
+            payload = self._remove_assistant_summaries_from_recent_payload(
+                payload,
+                include_assistant_summaries=False,
+            )
             return json.dumps(payload, ensure_ascii=False, default=str)
 
         invocation_counts = get_tracked_tool_invocation_counts()
@@ -540,6 +641,7 @@ class SearchHistoryTool(Tool):
                     hit
                     for hit in probe_hits
                     if not self._is_plain_assistant_reply_hit(hit)
+                    and not self._is_self_search_history_hit(hit)
                 ]
             if probe_hits:
                 target_session_key = active_session_key
@@ -594,6 +696,8 @@ class SearchHistoryTool(Tool):
                 if self._is_plain_assistant_reply_hit(hit):
                     omitted_assistant_replies += 1
                     continue
+                if self._is_self_search_history_hit(hit):
+                    continue
                 filtered_hits.append(hit)
             hits = filtered_hits
 
@@ -611,6 +715,15 @@ class SearchHistoryTool(Tool):
             "total": len(hits),
             "limit": limit_int,
             "offset": offset_int,
+            "evidence_policy": (
+                "Treat user_message, tool_call_trace, and tool_result as source "
+                "evidence. Treat assistant_claim as prior model wording only; "
+                "do not use it to override or invent facts not present in tool "
+                "or user evidence. When this evidence answers the latest user "
+                "request, provide the answer directly from the evidence in the "
+                "current reply; do not replace the answer with a statement that "
+                "the summary or result was already completed above."
+            ),
             "hits": [
                 {
                     "session_key": h.session_key,
@@ -618,6 +731,7 @@ class SearchHistoryTool(Tool):
                     "role": h.role,
                     "snippet": h.snippet,
                     "content": h.content,
+                    "evidence_type": self._hit_evidence_type(h),
                     "timestamp": h.timestamp,
                     "matched_in": h.matched_in,
                     "tool_call_id": (
@@ -637,6 +751,10 @@ class SearchHistoryTool(Tool):
                 max_content_length=mcl or 1000,
             )
             if recent_payload is not None:
+                recent_payload = self._remove_assistant_summaries_from_recent_payload(
+                    recent_payload,
+                    include_assistant_summaries=False,
+                )
                 payload["same_session_recent"] = recent_payload
                 payload["same_session_recent_note"] = (
                     "For prior-result or continuation questions, choose the "
@@ -663,6 +781,11 @@ class SearchHistoryTool(Tool):
                 "Plain assistant replies are omitted by default to avoid reviving "
                 "stale plans; pass roles=['assistant'] if you need the literal "
                 "earlier assistant wording."
+            )
+        if any(self._hit_evidence_type(hit) == "assistant_claim" for hit in hits):
+            note_parts.append(
+                "Assistant hits are marked assistant_claim and are not factual "
+                "evidence unless supported by user or tool hits."
             )
         if note_parts:
             payload["note"] = " ".join(note_parts)

@@ -375,6 +375,21 @@ def _make_mock_agent(response="Hello!", stream_chunks=None):
     return agent
 
 
+class _FakeRuntime:
+    def __init__(self, agent):
+        self.agent = agent
+        self.lock = asyncio.Lock()
+        self.active_task_id = None
+
+
+class _FakeRuntimeRegistry:
+    def __init__(self, agent):
+        self._agent = agent
+
+    async def get_or_create(self, session_key):
+        return _FakeRuntime(self._agent)
+
+
 class TestWsTracingInStreamingEvents:
     """WS streaming / complete / error events should contain trace_id."""
 
@@ -410,16 +425,68 @@ class TestWsTracingInStreamingEvents:
 
         with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=agent):
             with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
-                with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
-                    from spoon_bot.gateway.config import GatewayConfig
-                    mc.return_value = GatewayConfig()
-                    with pytest.raises(asyncio.CancelledError):
-                        await handler._handle_chat({"message": "hi", "stream": True})
+                with patch(
+                    "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+                    return_value=_FakeRuntimeRegistry(agent),
+                ):
+                    with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                        from spoon_bot.gateway.config import GatewayConfig
+                        mc.return_value = GatewayConfig()
+                        with pytest.raises(asyncio.CancelledError):
+                            await handler._handle_chat({"message": "hi", "stream": True})
 
         responses = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("type") == "response"]
         completes = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("event") == "agent.complete"]
         assert responses == []
         assert completes == []
+
+    @pytest.mark.asyncio
+    async def test_stream_cancelled_chunk_emits_cancelled_event(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        handler = WebSocketHandler("conn_test")
+        fm = _FakeManager()
+
+        async def cancelled_stream(**kwargs):
+            yield {
+                "type": "cancelled",
+                "delta": "Stopped by request.",
+                "metadata": {
+                    "cancelled": True,
+                    "code": "CANCELLED",
+                    "message": "Stopped by request.",
+                    "reason": "client_cancelled",
+                },
+            }
+
+        agent = _make_mock_agent()
+        agent.stream = cancelled_stream
+
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=agent):
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch(
+                    "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+                    return_value=_FakeRuntimeRegistry(agent),
+                ):
+                    with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                        from spoon_bot.gateway.config import GatewayConfig
+                        mc.return_value = GatewayConfig()
+                        with pytest.raises(asyncio.CancelledError):
+                            await handler._handle_chat({"message": "hi", "stream": True})
+
+        cancelled = [
+            m for m in fm.sent_messages
+            if isinstance(m, dict) and m.get("event") == "agent.cancelled"
+        ]
+        completes = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("event") == "agent.complete"]
+        assert len(cancelled) == 1
+        assert completes == []
+        data = cancelled[0]["data"]
+        assert data["reason"] == "client_cancelled"
+        assert data["error"]["code"] == "CANCELLED"
+        assert data["error"]["message"] == "Stopped by request."
+        assert data["error"]["cancelled"] is True
+        assert data["trace_id"].startswith("trc_")
 
     @pytest.mark.asyncio
     async def test_streaming_chunk_events_contain_trace_id(self):
@@ -918,6 +985,49 @@ class TestWsTimeoutErrorCodes:
         assert len(errors) >= 1
         assert errors[0]["data"]["error"]["code"] == "TIMEOUT_TOTAL"
         assert errors[0]["data"]["error"]["budget_type"] == "stream"
+
+    @pytest.mark.asyncio
+    async def test_stream_error_event_preserves_reason_metadata(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        handler = WebSocketHandler("conn_test")
+        fm = _FakeManager()
+        agent = _make_mock_agent(stream_chunks=[
+            {
+                "type": "error",
+                "delta": "Provider failed.",
+                "metadata": {
+                    "code": "PROVIDER_ERROR",
+                    "message": "Provider failed.",
+                    "reason": "upstream_error",
+                    "retryable": True,
+                },
+            },
+            {"type": "done", "delta": "", "metadata": {}},
+        ])
+
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=agent):
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch(
+                    "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+                    return_value=_FakeRuntimeRegistry(agent),
+                ):
+                    with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                        from spoon_bot.gateway.config import GatewayConfig
+                        mc.return_value = GatewayConfig()
+                        await handler._handle_chat({"message": "hi", "stream": True})
+
+        errors = [
+            m for m in fm.sent_messages
+            if isinstance(m, dict) and m.get("event") == "agent.error"
+        ]
+        assert len(errors) == 1
+        error = errors[0]["data"]["error"]
+        assert error["code"] == "PROVIDER_ERROR"
+        assert error["message"] == "Provider failed."
+        assert error["reason"] == "upstream_error"
+        assert error["retryable"] is True
+        assert error["metadata"]["reason"] == "upstream_error"
 
     @pytest.mark.asyncio
     async def test_current_task_cleared_on_timeout(self):

@@ -162,6 +162,59 @@ def _fallback_empty_agent_response(*, had_error: bool, stream: bool) -> str:
     )
 
 
+def _stream_error_detail(
+    delta: Any,
+    metadata: dict[str, Any] | None,
+    *,
+    default_code: str,
+    default_message: str,
+) -> dict[str, Any]:
+    """Build a structured error payload from a stream chunk."""
+    meta = metadata if isinstance(metadata, dict) else {}
+    message = (
+        meta.get("message")
+        or meta.get("error")
+        or delta
+        or default_message
+    )
+    code = meta.get("code") or meta.get("error_code") or default_code
+    detail: dict[str, Any] = {
+        "code": str(code),
+        "message": str(message),
+    }
+    for key in (
+        "reason",
+        "retryable",
+        "budget_type",
+        "elapsed_ms",
+        "limit_ms",
+        "provider",
+        "details",
+    ):
+        if key in meta:
+            detail[key] = meta[key]
+    if meta:
+        detail["metadata"] = dict(meta)
+    return detail
+
+
+def _stream_cancel_detail(
+    delta: Any,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build a structured cancellation payload from a stream chunk."""
+    meta = metadata if isinstance(metadata, dict) else {}
+    detail = _stream_error_detail(
+        delta,
+        meta,
+        default_code="CANCELLED",
+        default_message="Task cancelled.",
+    )
+    detail["cancelled"] = True
+    detail["reason"] = str(meta.get("reason") or detail.get("reason") or "task_cancelled")
+    return detail
+
+
 def _validate_media_paths(media: list[str]) -> list[str]:
     """Reject media paths that are missing or outside the sandbox workspace."""
     invalid = [path for path in media if _resolve_workspace_file(path) is None]
@@ -811,6 +864,38 @@ class WebSocketHandler:
             connection_id=self.connection_id,
         )
         context_bound = False
+        cancel_event_emitted = False
+
+        async def _emit_cancelled_event(
+            *,
+            metadata: dict[str, Any] | None = None,
+            source: dict[str, Any] | None = None,
+            delta: Any = "",
+        ) -> None:
+            nonlocal cancel_event_emitted
+            if cancel_event_emitted:
+                return
+            cancel_event_emitted = True
+            span.stop()
+            cancel_detail = _stream_cancel_detail(delta, metadata)
+            reason = str(cancel_detail.get("reason") or "task_cancelled")
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AGENT_CANCELLED.value,
+                    data={
+                        "task_id": task_id,
+                        "request_id": request_id,
+                        "session_key": session_key,
+                        "status": "cancelled",
+                        "reason": reason,
+                        "trace_id": trace_id,
+                        "timing": build_timing_payload(span),
+                        "error": cancel_detail,
+                        "source": source or _get_agent_response_source(agent),
+                    },
+                ),
+            )
 
         try:
             request_context.__enter__()
@@ -874,8 +959,29 @@ class WebSocketHandler:
                                 if chunk_type == "thinking" and not thinking:
                                     continue
 
+                                if (
+                                    chunk_type in {"cancelled", "canceled"}
+                                    or (
+                                        chunk_type == "error"
+                                        and isinstance(metadata, dict)
+                                        and metadata.get("cancelled") is True
+                                    )
+                                ):
+                                    await _emit_cancelled_event(
+                                        metadata=metadata if isinstance(metadata, dict) else {},
+                                        source=source,
+                                        delta=delta,
+                                    )
+                                    raise asyncio.CancelledError
+
                                 if chunk_type == "error":
                                     had_error = True
+                                    error_detail = _stream_error_detail(
+                                        delta,
+                                        metadata if isinstance(metadata, dict) else {},
+                                        default_code="AGENT_RUNTIME_ERROR",
+                                        default_message="Agent runtime error.",
+                                    )
                                     await manager.send_message(
                                         self.connection_id,
                                         WSEvent(event=ServerEvent.AGENT_ERROR.value, data={
@@ -884,10 +990,7 @@ class WebSocketHandler:
                                             "session_key": session_key,
                                             "trace_id": trace_id,
                                             "timing": build_timing_payload(span),
-                                            "error": {
-                                                "code": metadata.get("error_code", "AGENT_RUNTIME_ERROR"),
-                                                "message": delta,
-                                            },
+                                            "error": error_detail,
                                             "source": source,
                                         }),
                                     )
@@ -1069,6 +1172,18 @@ class WebSocketHandler:
                 result["thinking_content"] = thinking_content
 
             return result
+        except asyncio.CancelledError:
+            await _emit_cancelled_event(
+                metadata={
+                    "cancelled": True,
+                    "code": "CANCELLED",
+                    "error_code": "CANCELLED",
+                    "reason": "task_cancelled",
+                    "message": "Task cancelled.",
+                },
+                source=_get_agent_response_source(agent),
+            )
+            raise
         except BudgetExhaustedError as exc:
             span.stop()
             await manager.send_message(

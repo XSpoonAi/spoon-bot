@@ -65,6 +65,12 @@ _ASCII_CONTINUATION_TOKENS = frozenset({
     "same",
     "that",
 })
+_NON_ASCII_PLAIN_CONTINUATION_TOKENS = frozenset({
+    "继续",
+    "继续吧",
+    "接着",
+    "接着吧",
+})
 
 
 def _safe_url_scheme(value: str) -> str:
@@ -147,6 +153,25 @@ def request_is_bare_continuation(text: str) -> bool:
     if ascii_tokens:
         return all(token in _ASCII_CONTINUATION_TOKENS for token in ascii_tokens)
     return len(value) <= 12
+
+
+def request_is_plain_continuation_only(text: str) -> bool:
+    """Return True when the newest message adds no count, target, or scope."""
+    value = str(text or "").strip()
+    if not request_is_bare_continuation(value):
+        return False
+    tokens = ordered_request_matching_tokens(value)
+    if not tokens:
+        return len(value) <= 4
+    if any(token.isascii() for token in tokens):
+        return all(
+            token in _ASCII_CONTINUATION_TOKENS for token in tokens if token.isascii()
+        ) and all(
+            token.isascii()
+            for token in tokens
+        )
+    compact = "".join(char for char in value if char.isalnum())
+    return compact.casefold() in _NON_ASCII_PLAIN_CONTINUATION_TOKENS
 
 
 def _normalize_tool_identifier(value: str) -> str:
@@ -1194,6 +1219,8 @@ def build_request_execution_hints(
     )
 
     return {
+        "bare_continuation": request_is_bare_continuation(message_text),
+        "plain_continuation": request_is_plain_continuation_only(message_text),
         "explicit_request_urls": explicit_urls,
         "explicit_request_values": explicit_request_values,
         "local_executable_skills": local_executable_skills,
