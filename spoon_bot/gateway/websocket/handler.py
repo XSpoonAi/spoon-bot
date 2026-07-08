@@ -442,6 +442,30 @@ async def websocket_endpoint(
             ),
         )
 
+        try:
+            agent = get_agent()
+            await manager.send_message(
+                conn_id,
+                WSEvent(
+                    event=ServerEvent.CONNECTION_READY.value,
+                    data={
+                        "status": "ready",
+                        "connection_id": conn_id,
+                        "session_key": session_key,
+                        "model": getattr(agent, "model", "unknown"),
+                        "provider": getattr(agent, "provider", "unknown"),
+                    },
+                ),
+            )
+        except RuntimeError as exc:
+            await manager.send_message(
+                conn_id,
+                WSEvent(
+                    event=ServerEvent.CONNECTION_ERROR.value,
+                    data={"status": "error", "message": str(exc)},
+                ),
+            )
+
         # Message loop
         while True:
             try:

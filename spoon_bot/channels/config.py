@@ -819,7 +819,11 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
         elif provider == "anthropic":
             resolved["base_url"] = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL")
         elif provider == "openrouter":
-            resolved["base_url"] = os.environ.get("OPENROUTER_BASE_URL") or os.environ.get("BASE_URL")
+            resolved["base_url"] = (
+                os.environ.get("OPENROUTER_BASE_URL")
+                or os.environ.get("SPOON_BOT_DEFAULT_BASE_URL")
+                or os.environ.get("BASE_URL")
+            )
         elif provider == "deepseek":
             resolved["base_url"] = os.environ.get("DEEPSEEK_BASE_URL") or os.environ.get("BASE_URL")
         elif provider == "gemini":
@@ -840,7 +844,16 @@ def load_agent_config(config_path: str | Path | None = None) -> dict[str, Any]:
             "gemini": "GEMINI_API_KEY",
         }
         env_var = api_key_map.get(provider)
-        if env_var:
+        proxy_enabled = os.environ.get("CYPHER_LLM_PROXY_ENABLED", "").lower() in (
+            "1", "true", "yes", "on"
+        )
+        proxy_token = (
+            os.environ.get("CYPHER_LLM_PROXY_TOKEN")
+            or os.environ.get("SPOON_BOT_LLM_PROXY_TOKEN")
+        )
+        if provider == "openrouter" and proxy_enabled and proxy_token:
+            resolved["api_key"] = proxy_token
+        elif env_var:
             resolved["api_key"] = os.environ.get(env_var)
         # Generic fallback: try common API key env vars
         if not resolved.get("api_key"):

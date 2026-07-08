@@ -181,6 +181,30 @@ class TestConfigPriority:
         result = load_agent_config(cfg_path)
         assert result["api_key"] == "sk-ant-key"
 
+    def test_cypher_proxy_env_resolves_openrouter_without_provider_key(self, tmp_path, monkeypatch):
+        """Cypher proxy mode should not require a real OpenRouter key in the sandbox."""
+        cfg_path = self._write_yaml(tmp_path, """\
+            agent: {}
+        """)
+        monkeypatch.setenv("CYPHER_LLM_PROXY_ENABLED", "true")
+        monkeypatch.setenv("CYPHER_LLM_PROXY_TOKEN", "cypher_sbx_v1_test")
+        monkeypatch.setenv("SPOON_BOT_DEFAULT_PROVIDER", "openrouter")
+        monkeypatch.setenv("SPOON_BOT_DEFAULT_MODEL", "anthropic/claude-sonnet-4")
+        monkeypatch.setenv(
+            "SPOON_BOT_DEFAULT_BASE_URL",
+            "https://api.cypher.local/api/v1/llm-proxy/openrouter/api/v1",
+        )
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-real-provider-key")
+        monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+
+        from spoon_bot.channels.config import load_agent_config
+
+        result = load_agent_config(cfg_path)
+        assert result["provider"] == "openrouter"
+        assert result["model"] == "anthropic/claude-sonnet-4"
+        assert result["base_url"] == "https://api.cypher.local/api/v1/llm-proxy/openrouter/api/v1"
+        assert result["api_key"] == "cypher_sbx_v1_test"
+
     def test_empty_yaml_returns_env_values(self, tmp_path, monkeypatch):
         """An empty agent section still picks up env vars."""
         cfg_path = self._write_yaml(tmp_path, """\
