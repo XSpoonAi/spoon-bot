@@ -572,6 +572,10 @@ class LoopSkillsMixin:
         """Build reusable request-derived context without changing user intent."""
         hint_source = self._request_hint_source_text(message)
         hints = self._build_request_execution_hints_from_text(hint_source)
+        include_session_evidence = bool(
+            request_is_bare_continuation(message)
+            or hints.get("current_session_fact_check_required")
+        )
         sections = [
             _BOUNDED_CONTINUATION_BOUNDARY
             if request_is_plain_continuation_only(message)
@@ -580,7 +584,9 @@ class LoopSkillsMixin:
             format_explicit_request_urls_context(hint_source),
             format_explicit_request_values_context(hint_source),
             self._format_local_skill_execution_context(hints),
-            self._format_recent_execution_ledger_context(),
+            self._format_recent_execution_ledger_context()
+            if include_session_evidence
+            else "",
             format_explicit_tool_request_context(hints),
             format_current_session_fact_check_context(message),
             format_exact_shell_command_context(message),

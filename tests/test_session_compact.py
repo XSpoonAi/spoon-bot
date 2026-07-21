@@ -153,7 +153,7 @@ def test_session_compact_does_not_preserve_long_prior_task_as_user_evidence() ->
     assert "OPS-42" in compact
 
 
-def test_session_compact_includes_interrupted_user_fact_as_non_executable_evidence() -> None:
+def test_session_compact_excludes_interrupted_turn_from_model_context() -> None:
     raw_key = "0x" + "ab" * 32
     session = DummySession(
         [
@@ -169,9 +169,34 @@ def test_session_compact_includes_interrupted_user_fact_as_non_executable_eviden
         ]
     )
 
-    compact = build_session_compact_context(session, "Didn't I give you the new-key wallet?")
+    compact = build_session_compact_context(session, "What is the current score now?")
 
-    assert "Interrupted/superseded user evidence" in compact
-    assert "do not execute unless the newest request explicitly resumes it" in compact
+    assert "Interrupted/superseded user evidence" not in compact
+    assert "Use this private key" not in compact
     assert raw_key not in compact
-    assert "***masked_private_key***" in compact
+    assert "The old wallet is currently 1 win and 12 losses." in compact
+
+
+def test_session_compact_is_empty_when_only_prior_turn_was_interrupted() -> None:
+    session = DummySession(
+        [
+            {
+                "role": "user",
+                "content": "Retry the failed deployment forever.",
+                "turn_state": "interrupted",
+            },
+            {
+                "role": "assistant",
+                "content": "I will keep retrying.",
+                "incomplete": True,
+            },
+            {
+                "role": "tool",
+                "name": "shell",
+                "tool_call_id": "call_failed",
+                "content": "connection timed out",
+            },
+        ]
+    )
+
+    assert build_session_compact_context(session, "Start a different task") == ""

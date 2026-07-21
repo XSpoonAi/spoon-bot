@@ -868,6 +868,17 @@ class LoopStateMixin:
 
         AgentLoop._normalize_runtime_tool_context(messages, finalized=True)
         existing_keys = AgentLoop._persisted_tool_trace_keys(self)
+        session_messages = getattr(getattr(self, "_session", None), "messages", None)
+        existing_tool_results: dict[str, dict[str, Any]] = {}
+        if isinstance(session_messages, list):
+            for existing in session_messages:
+                if not isinstance(existing, dict):
+                    continue
+                if str(existing.get("role") or "").strip().lower() != "tool":
+                    continue
+                tool_call_id = str(existing.get("tool_call_id") or "").strip()
+                if tool_call_id:
+                    existing_tool_results[tool_call_id] = existing
 
         persisted = 0
         for msg in messages:
@@ -889,8 +900,20 @@ class LoopStateMixin:
             if trace_key in existing_keys:
                 continue
             extras = {**extras, "trace_key": trace_key, "message_kind": "tool_trace"}
+            tool_call_id = str(extras.get("tool_call_id") or "").strip()
+            if role == "tool" and tool_call_id in existing_tool_results:
+                existing = existing_tool_results[tool_call_id]
+                existing["content"] = content
+                existing.update(extras)
+                existing_keys.add(trace_key)
+                persisted += 1
+                continue
             try:
                 self._session.add_message(role, content, **extras)
+                if role == "tool" and tool_call_id:
+                    stored_messages = getattr(self._session, "messages", None)
+                    if isinstance(stored_messages, list) and stored_messages:
+                        existing_tool_results[tool_call_id] = stored_messages[-1]
                 existing_keys.add(trace_key)
                 persisted += 1
             except Exception as exc:
