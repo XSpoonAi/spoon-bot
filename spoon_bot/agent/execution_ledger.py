@@ -122,6 +122,7 @@ class ExecutionLedger:
     session_id: str | None = None
     turn_id: str | None = None
     user_request: str = ""
+    outcome: str = "active"
     started_at: float = field(default_factory=_now)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     selected_skills: list[dict[str, Any]] = field(default_factory=list)
@@ -631,6 +632,7 @@ class ExecutionLedger:
             "session_id": self.session_id,
             "turn_id": self.turn_id,
             "user_request": self.user_request,
+            "outcome": self.outcome,
             "started_at": self.started_at,
             **self.evidence_summary(max_items=512),
         }
@@ -745,9 +747,15 @@ def persist_execution_ledger_snapshot(ledger: ExecutionLedger | None) -> Path | 
     return active
 
 
-def persist_execution_ledger(ledger: ExecutionLedger | None) -> Path | None:
+def persist_execution_ledger(
+    ledger: ExecutionLedger | None,
+    *,
+    outcome: str | None = None,
+) -> Path | None:
     if ledger is None:
         return None
+    if outcome:
+        ledger.outcome = str(outcome)
     target_dir, target, active = _execution_ledger_paths(ledger)
     target_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -774,15 +782,6 @@ def load_recent_execution_ledger_context(
     if not workspace or not owner:
         return ""
     target = Path(workspace).expanduser() / ".spoon-bot" / "execution_ledgers" / f"{_safe_owner_slug(owner)}.jsonl"
-    active = target.with_name(f"{_safe_owner_slug(owner)}.active.json")
-    active_record: dict[str, Any] | None = None
-    if active.exists():
-        try:
-            parsed_active = json.loads(active.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            parsed_active = None
-        if isinstance(parsed_active, dict):
-            active_record = parsed_active
     if not target.exists():
         records = []
     else:
@@ -796,11 +795,8 @@ def load_recent_execution_ledger_context(
                 parsed = json.loads(line)
             except Exception:
                 continue
-            if isinstance(parsed, dict):
+            if isinstance(parsed, dict) and parsed.get("outcome") == "completed":
                 records.append(parsed)
-    if active_record is not None:
-        records.append(active_record)
-        records = records[-max_turns:]
     if not records:
         return ""
 

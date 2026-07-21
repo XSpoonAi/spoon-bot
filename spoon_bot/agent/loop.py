@@ -1532,6 +1532,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         self._active_execution_ledger = execution_ledger
         ledger_manager = bind_execution_ledger(execution_ledger)
         ledger_manager.__enter__()
+        execution_outcome = "failed"
 
         try:
             run_kwargs: dict[str, Any] = {}
@@ -1789,7 +1790,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
+            execution_outcome = "completed" if final_content.strip() else "failed"
         except asyncio.CancelledError:
+            execution_outcome = "cancelled"
             self._persist_cancelled_turn_context(start_index=_pre_turn_memory_index)
             raise
         except Exception as e:
@@ -1805,7 +1808,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             raise
         finally:
             try:
-                persist_execution_ledger(execution_ledger)
+                persist_execution_ledger(execution_ledger, outcome=execution_outcome)
             except Exception as exc:
                 logger.debug(f"Execution ledger persistence skipped: {exc}")
             try:
@@ -4642,7 +4645,16 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         finally:
             if execution_ledger is not None:
                 try:
-                    persist_execution_ledger(execution_ledger)
+                    stream_outcome = (
+                        "cancelled"
+                        if stream_cancelled
+                        else "failed"
+                        if stream_error_reason is not None
+                        else "completed"
+                        if stream_completed and bool(full_content)
+                        else "interrupted"
+                    )
+                    persist_execution_ledger(execution_ledger, outcome=stream_outcome)
                 except Exception as exc:
                     logger.debug(f"Execution ledger persistence skipped: {exc}")
             if ledger_manager is not None:
@@ -4802,6 +4814,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         execution_ledger: ExecutionLedger | None = None
         ledger_manager = None
         _pre_turn_memory_index: int | None = None
+        execution_outcome = "failed"
 
         try:
             retry_runner = AgentLoop._resolve_retry_runner(self)
@@ -5098,8 +5111,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content,
                 turn_memory_start_index=_pre_turn_memory_index,
             )
+            execution_outcome = "completed" if final_content.strip() else "failed"
 
         except asyncio.CancelledError:
+            execution_outcome = "cancelled"
             self._persist_cancelled_turn_context(start_index=_pre_turn_memory_index)
             raise
         except Exception as e:
@@ -5114,7 +5129,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         finally:
             if execution_ledger is not None:
                 try:
-                    persist_execution_ledger(execution_ledger)
+                    persist_execution_ledger(execution_ledger, outcome=execution_outcome)
                 except Exception as exc:
                     logger.debug(f"Execution ledger persistence skipped: {exc}")
             if ledger_manager is not None:

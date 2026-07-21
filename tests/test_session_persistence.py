@@ -124,6 +124,46 @@ class TestSessionDataClass:
         assert s.updated_at >= t1
 
 
+def test_persisted_tool_trace_replaces_progress_result_for_same_call_id() -> None:
+    from spoon_bot.agent.loop import AgentLoop
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop._session = Session(session_key="tool-result-dedup")
+    loop._should_persist_tool_trace = lambda: True
+
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "extras": {
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {"name": "shell", "arguments": "{}"},
+                }
+            ]
+        },
+    }
+    progress = {
+        "role": "tool",
+        "content": "status=running",
+        "extras": {"tool_call_id": "call_1", "name": "shell"},
+    }
+    completed = {
+        "role": "tool",
+        "content": "status=completed returncode=0",
+        "extras": {"tool_call_id": "call_1", "name": "shell"},
+    }
+
+    AgentLoop._persist_tool_trace_entries(loop, [assistant, progress])
+    AgentLoop._persist_tool_trace_entries(loop, [assistant, completed])
+
+    tool_messages = [
+        message for message in loop._session.messages if message["role"] == "tool"
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["content"] == "status=completed returncode=0"
+
+
 # ============================================================================
 # §2  FileSessionStore
 # ============================================================================
@@ -3800,6 +3840,58 @@ class TestContextBuilderMediaPaths:
         assert context.index("[CONTINUATION ANCHOR]") < context.index("[EXECUTION LEDGER")
         assert "do not switch to another earlier task" in context
 
+    def test_new_request_excludes_session_compact_and_execution_ledger(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="new-request-isolation")
+        loop._session.add_message(
+            "user",
+            "Run a failing command.",
+            turn_state="completed",
+        )
+        loop._session.add_message(
+            "assistant",
+            "The old command failed with connection timeout.",
+        )
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: (
+            "[RECENT EXECUTION LEDGER - REFERENCE ONLY]\n"
+            "- old connection timeout\n"
+        )
+
+        message = "Reply with exactly CLEAN_NEW_REQUEST and nothing else."
+        context = AgentLoop._build_request_context_sections(loop, message)
+        recall = AgentLoop._build_session_recall_context(loop, message)
+
+        assert "RECENT EXECUTION LEDGER" not in context
+        assert "old connection timeout" not in context
+        assert recall == ""
+
+    def test_prior_result_question_includes_session_evidence(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="prior-result-lookup")
+        loop._session.add_message("user", "Run the status check.", turn_state="completed")
+        loop._session.add_message("assistant", "The status check returned ready.")
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: (
+            "[RECENT EXECUTION LEDGER - REFERENCE ONLY]\n- status=ready\n"
+        )
+
+        message = "What result did the previous status check return?"
+        context = AgentLoop._build_request_context_sections(loop, message)
+        recall = AgentLoop._build_session_recall_context(loop, message)
+
+        assert "RECENT EXECUTION LEDGER" in context
+        assert "Current Session Compact" in recall
+        assert "status check returned ready" in recall
+
     def test_plain_continuation_boundary_does_not_apply_to_explicit_scope(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
 
@@ -4143,11 +4235,10 @@ class TestAgentLoopSameSessionContext:
         captured_prompt = agent.captured_system_prompts[-1]
         assert "Summarize yesterday's meeting in two bullets. Do not continue any deployment work." in captured_prompt
         assert "Execute only the newest user request." in captured_prompt
-        assert "Completed turn summaries below contain only assistant/tool outcomes, not prior user instructions." in captured_prompt
-        assert "Recent completed turn summaries:" in captured_prompt
+        assert "## Current Session Compact" not in captured_prompt
         assert "Deploy service alpha. Run migration. Restart worker. Keep retrying until successful." not in captured_prompt
-        assert "OPS-42" in captured_prompt
-        assert "Deployment finished successfully. Migration applied and worker restarted." in captured_prompt
+        assert "OPS-42" not in captured_prompt
+        assert "Deployment finished successfully. Migration applied and worker restarted." not in captured_prompt
 
 
 # ============================================================================

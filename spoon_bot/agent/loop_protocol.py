@@ -34,6 +34,7 @@ from spoon_bot.agent.session_compact import (
 from spoon_bot.agent.request_hints import (
     request_is_bare_continuation,
     request_is_plain_continuation_only,
+    request_needs_current_session_fact_check,
 )
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.tools.execution_context import (
@@ -408,6 +409,11 @@ class LoopProtocolMixin:
 
     def _build_session_recall_context(self, current_message: str) -> str:
         """Build a compact same-session context block for follow-up questions."""
+        if not (
+            request_is_bare_continuation(current_message)
+            or request_needs_current_session_fact_check(current_message)
+        ):
+            return ""
         return build_session_compact_context(
             getattr(self, "_session", None),
             current_message,

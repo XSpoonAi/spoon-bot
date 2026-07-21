@@ -881,7 +881,7 @@ def request_needs_current_session_fact_check(message: str) -> bool:
     text = str(message or "").strip()
     if not text:
         return False
-    if len(text) > 120 or "\n" in text or "```" in text:
+    if len(text) > 500 or "\n" in text or "```" in text:
         return False
     if extract_urls_from_text(text):
         return False
@@ -890,9 +890,31 @@ def request_needs_current_session_fact_check(message: str) -> bool:
     if any(marker in text for marker in ("/", "\\", "./", "../")):
         return False
     tokens = tokenize_request_matching_text(text)
-    if len(tokens) > 8:
+    has_question = any(char in text for char in ("?", "？", "¿", "؟"))
+    if not has_question:
         return False
-    return any(char in text for char in ("?", "？", "¿", "؟"))
+    if len(tokens) <= 8:
+        return True
+    normalized = text.casefold()
+    prior_markers = (
+        "previous",
+        "prior",
+        "earlier",
+        "last time",
+        "asked you",
+        "told you",
+        "mentioned",
+        "remember",
+        "before",
+        "之前",
+        "刚才",
+        "上次",
+        "先前",
+        "记住",
+        "提到",
+        "告诉过",
+    )
+    return any(marker in normalized for marker in prior_markers)
 
 
 def request_prefers_session_evidence_synthesis(message: str) -> bool:

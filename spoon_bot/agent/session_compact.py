@@ -241,68 +241,6 @@ def _completed_session_messages_without_active_turn(raw_messages: Any) -> list[d
     return completed
 
 
-def _interrupted_user_evidence_lines(
-    raw_messages: Any,
-    current_message: str,
-    *,
-    max_items: int = 6,
-) -> list[str]:
-    """Keep short user-stated facts from aborted turns without making them executable."""
-    messages = _messages_before_current(raw_messages, current_message)
-
-    evidence: list[str] = []
-    for message in messages:
-        if str(message.get("role") or "").lower() != "user":
-            continue
-        state = str(message.get("turn_state") or message.get("state") or "").lower()
-        if state not in {"interrupted", "superseded", "cancelled", "canceled"}:
-            continue
-        if not _is_bounded_user_evidence(message):
-            continue
-        excerpt = _clip_text(message.get("content", ""), 220)
-        if excerpt:
-            evidence.append(f"{state}: {excerpt}")
-
-    return evidence[-max_items:]
-
-
-def _interrupted_turn_evidence_lines(
-    raw_messages: Any,
-    current_message: str,
-    *,
-    max_items: int = 10,
-) -> list[str]:
-    """Keep persisted evidence from aborted turns as historical context."""
-    messages = _messages_before_current(raw_messages, current_message)
-
-    evidence: list[str] = []
-    seen: set[str] = set()
-    include_current_turn = False
-    for message in messages:
-        role = str(message.get("role") or "").lower()
-        if role == "user":
-            state = str(message.get("turn_state") or message.get("state") or "").lower()
-            include_current_turn = state in {
-                "interrupted",
-                "superseded",
-                "cancelled",
-                "canceled",
-            }
-            continue
-        if not include_current_turn:
-            continue
-        is_incomplete_marker = role == "assistant" and message.get("incomplete") is True
-        if not is_incomplete_marker and not _message_is_tool_backed_evidence(message):
-            continue
-        event = _format_session_event(message, limit=360)
-        if not event or event in seen:
-            continue
-        evidence.append(event)
-        seen.add(event)
-
-    return evidence[-max_items:]
-
-
 def _latest_prior_user_task_line(
     raw_messages: Any,
     current_message: str,
@@ -858,9 +796,7 @@ def build_session_compact_context(
         if resume_latest_user_turn
         else _completed_session_messages(raw_messages, current_message)
     )
-    interrupted_evidence = _interrupted_user_evidence_lines(raw_messages, current_message)
-    interrupted_turn_evidence = _interrupted_turn_evidence_lines(raw_messages, current_message)
-    if not completed and not interrupted_evidence and not interrupted_turn_evidence:
+    if not completed:
         return ""
 
     try:
@@ -912,22 +848,6 @@ def build_session_compact_context(
                     "Resume only one bounded continuation unit from this anchor and current live state. "
                     "If selected skills are shown, continue that skill family rather than another earlier skill."
                 )
-
-    if interrupted_evidence:
-        lines.append(
-            "Interrupted/superseded user evidence "
-            "(facts only; do not execute unless the newest request explicitly resumes it):"
-        )
-        for item in interrupted_evidence:
-            lines.append(f"- {mask_secrets(item)}")
-
-    if interrupted_turn_evidence:
-        lines.append(
-            "Interrupted/superseded turn evidence "
-            "(historical only; verify live state before any new side effect):"
-        )
-        for item in interrupted_turn_evidence:
-            lines.append(f"- {mask_secrets(item)}")
 
     completed_turns = _group_completed_turns(completed)
 
