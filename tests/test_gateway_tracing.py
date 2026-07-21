@@ -1015,7 +1015,7 @@ class TestWsTimeoutErrorCodes:
                     with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
                         from spoon_bot.gateway.config import GatewayConfig
                         mc.return_value = GatewayConfig()
-                        await handler._handle_chat({"message": "hi", "stream": True})
+                        result = await handler._handle_chat({"message": "hi", "stream": True})
 
         errors = [
             m for m in fm.sent_messages
@@ -1028,6 +1028,62 @@ class TestWsTimeoutErrorCodes:
         assert error["reason"] == "upstream_error"
         assert error["retryable"] is True
         assert error["metadata"]["reason"] == "upstream_error"
+        completes = [
+            m for m in fm.sent_messages
+            if isinstance(m, dict) and m.get("event") == "agent.complete"
+        ]
+        assert completes[-1]["data"]["status"] == "error"
+        assert completes[-1]["data"]["workflow_outcome"] == "interrupted"
+        assert result["success"] is False
+        assert result["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_terminal_tool_recovery_emits_completed_with_warning(self):
+        from spoon_bot.gateway.websocket.handler import WebSocketHandler
+
+        handler = WebSocketHandler("conn_test")
+        fm = _FakeManager()
+        agent = _make_mock_agent(stream_chunks=[
+            {
+                "type": "error",
+                "delta": "Provider failed after terminal evidence.",
+                "metadata": {
+                    "code": "PROVIDER_ERROR",
+                    "workflow_outcome": "completed",
+                    "response_outcome": "degraded",
+                },
+            },
+            {
+                "type": "done",
+                "delta": "",
+                "metadata": {
+                    "content": "The verified workflow completed.",
+                    "workflow_outcome": "completed",
+                    "response_outcome": "degraded",
+                },
+            },
+        ])
+
+        with patch("spoon_bot.gateway.websocket.handler.get_agent", return_value=agent):
+            with patch("spoon_bot.gateway.websocket.handler.get_connection_manager", return_value=fm):
+                with patch(
+                    "spoon_bot.gateway.websocket.handler.get_session_runtime_registry",
+                    return_value=_FakeRuntimeRegistry(agent),
+                ):
+                    with patch("spoon_bot.gateway.websocket.handler.get_config") as mc:
+                        from spoon_bot.gateway.config import GatewayConfig
+                        mc.return_value = GatewayConfig()
+                        result = await handler._handle_chat({"message": "hi", "stream": True})
+
+        complete = next(
+            m for m in fm.sent_messages
+            if isinstance(m, dict) and m.get("event") == "agent.complete"
+        )
+        assert complete["data"]["status"] == "completed_with_warning"
+        assert complete["data"]["workflow_outcome"] == "completed"
+        assert complete["data"]["response_outcome"] == "degraded"
+        assert result["success"] is True
+        assert result["status"] == "completed_with_warning"
 
     @pytest.mark.asyncio
     async def test_current_task_cleared_on_timeout(self):

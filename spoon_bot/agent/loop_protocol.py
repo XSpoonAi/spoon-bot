@@ -3334,6 +3334,16 @@ class LoopProtocolMixin:
                     f"[STRUCTURED VERIFIED EVIDENCE]\n{ledger_context}\n{evidence_brief}"
                 )
             ledger_fallback = active_ledger.render_user_facing_summary(max_chars=5000)
+            numeric_summary = active_ledger.render_structured_numeric_summary(max_chars=5000)
+            if numeric_summary:
+                evidence_answer = build_user_facing_tool_event_answer(
+                    synthesis_events,
+                    incomplete=incomplete,
+                    user_message=user_message,
+                ).strip()
+                if evidence_answer and evidence_answer != "NO_CONCISE_TOOL_EVIDENCE":
+                    return f"{evidence_answer}\n\n{numeric_summary}"
+                return numeric_summary
         deterministic_fallback = (
             ledger_fallback
             or str(fallback_text or "").strip()

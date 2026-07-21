@@ -72,3 +72,70 @@ def test_recent_context_isolated_by_session_owner(tmp_path) -> None:
         workspace=tmp_path,
         owner=second_owner,
     ) == ""
+
+
+def test_structured_numeric_facts_are_derived_deterministically(tmp_path) -> None:
+    ledger = _ledger(
+        tmp_path,
+        owner="user:test|session:numeric",
+        turn_id="numeric-turn",
+        request="summarize verified totals",
+    )
+    ledger.record_tool(
+        "shell",
+        {"command": "structured-cli"},
+        "completed",
+        "completed",
+        metadata={
+            "verified_facts": [
+                {"id": "gross", "label": "Gross payout", "value": "160", "unit": "GLD"},
+                {"id": "cost", "label": "Total cost", "value": "60", "unit": "GLD"},
+            ],
+            "derived_facts": [
+                {
+                    "id": "net",
+                    "label": "Net result",
+                    "operation": "subtract",
+                    "inputs": ["gross", "cost"],
+                    "unit": "GLD",
+                }
+            ],
+        },
+    )
+
+    summary = ledger.render_structured_numeric_summary()
+
+    assert "Gross payout: 160 GLD" in summary
+    assert "Total cost: 60 GLD" in summary
+    assert "Net result: 100 GLD" in summary
+
+
+def test_structured_numeric_derivation_rejects_mixed_units(tmp_path) -> None:
+    ledger = _ledger(
+        tmp_path,
+        owner="user:test|session:mixed-units",
+        turn_id="mixed-unit-turn",
+        request="summarize verified totals",
+    )
+    ledger.record_tool(
+        "shell",
+        {"command": "structured-cli"},
+        "completed",
+        "completed",
+        metadata={
+            "verified_facts": [
+                {"id": "left", "value": "10", "unit": "USD"},
+                {"id": "right", "value": "2", "unit": "ETH"},
+            ],
+            "derived_facts": [
+                {
+                    "id": "invalid_total",
+                    "operation": "add",
+                    "inputs": ["left", "right"],
+                }
+            ],
+        },
+    )
+
+    fact_ids = {fact["fact_id"] for fact in ledger.structured_numeric_facts()}
+    assert fact_ids == {"left", "right"}

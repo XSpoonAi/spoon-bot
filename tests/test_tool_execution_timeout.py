@@ -104,6 +104,22 @@ class TestConfigDefaults:
 # ---------------------------------------------------------------------------
 
 class TestShellToolInit:
+    def test_workspace_skill_subprocess_enables_structured_tool_facts(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        tool = ShellTool(working_dir=str(tmp_path))
+        monkeypatch.setattr(tool, "_command_invokes_workspace_skill", lambda *_: True)
+
+        stdout, _stderr, exit_code = tool._run_sync(
+            'printf %s "$SPOON_TOOL_FACTS_ENABLED"',
+            str(tmp_path),
+        )
+
+        assert exit_code == 0
+        assert stdout == b"1"
+
     def test_default_timeout(self):
         tool = ShellTool()
         assert tool.timeout == 600

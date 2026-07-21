@@ -829,6 +829,214 @@ class _FailingToolTraceRuntimeAgent(_PromptCapturingRuntimeAgent):
         raise RuntimeError("openrouter network error")
 
 
+class _FailingTerminalToolTraceRuntimeAgent(_PromptCapturingRuntimeAgent):
+    """Runtime agent that reaches a tool-defined terminal result, then fails."""
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        self.memory.messages.append(
+            SimpleNamespace(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call_terminal",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"cmd": "run-workflow"}',
+                        },
+                    }
+                ],
+            )
+        )
+        self.memory.messages.append(
+            SimpleNamespace(
+                role="tool",
+                content=(
+                    "status=finished\n"
+                    "User summary: The requested workflow completed successfully."
+                ),
+                name="shell",
+                tool_call_id="call_terminal",
+            )
+        )
+        raise RuntimeError("provider disconnected after terminal tool result")
+
+
+class _DuplicateCompletedToolCallRuntimeAgent:
+    """Runtime agent that replays a tool call after its result was recorded."""
+
+    def __init__(self) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.memory = SimpleNamespace(messages=[])
+        self.run_calls = []
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        return None
+
+    async def run(self, *args, **kwargs):
+        self.run_calls.append((args, kwargs))
+        tool_call = {
+            "id": "call_once",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"notes.txt"}'},
+        }
+        await self.output_queue.put({"tool_calls": [tool_call]})
+        await asyncio.sleep(0.02)
+        self.memory.messages.extend([
+            SimpleNamespace(role="assistant", content="", tool_calls=[tool_call]),
+            SimpleNamespace(
+                role="tool",
+                content="file contents",
+                name="read_file",
+                tool_call_id="call_once",
+            ),
+        ])
+        await self.output_queue.put({
+            "type": "tool_result",
+            "delta": "file contents",
+            "metadata": {
+                "name": "read_file",
+                "id": "call_once",
+                "tool_call_id": "call_once",
+            },
+        })
+        await asyncio.sleep(0.02)
+        await self.output_queue.put({"tool_calls": [tool_call]})
+        await self.output_queue.put({"type": "content", "delta": "Finished from evidence."})
+        return type("RunResult", (), {"content": "Finished from evidence."})()
+
+
+class _ToolResultThenHungProviderRuntimeAgent:
+    """First run hangs after a tool result; recovery must wait for cancellation."""
+
+    def __init__(self) -> None:
+        self.task_done = asyncio.Event()
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+        self.state = "IDLE"
+        self.memory = SimpleNamespace(messages=[])
+        self.run_count = 0
+        self.first_run_exited = False
+        self.concurrent_recovery_started = False
+
+    async def add_message(self, role: str, content: Any, **kwargs) -> None:
+        self.memory.messages.append(
+            SimpleNamespace(
+                role=role,
+                content=content,
+                tool_calls=kwargs.get("tool_calls"),
+                tool_call_id=kwargs.get("tool_call_id"),
+            )
+        )
+
+    async def run(self, *args, **kwargs):
+        self.run_count += 1
+        if self.run_count == 1:
+            tool_call = {
+                "id": "call_skill_read",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"skills/example/SKILL.md"}',
+                },
+            }
+            await self.output_queue.put({"tool_calls": [tool_call]})
+            await asyncio.sleep(0.02)
+            self.memory.messages.extend([
+                SimpleNamespace(role="assistant", content="", tool_calls=[tool_call]),
+                SimpleNamespace(
+                    role="tool",
+                    content=(
+                        "[file: skills/example/SKILL.md | skill-ref]\n"
+                        "[SKILL.md execution contract]\n"
+                        "Run the next tool action and then summarize."
+                    ),
+                    name="read_file",
+                    tool_call_id="call_skill_read",
+                ),
+            ])
+            await self.output_queue.put({
+                "type": "tool_result",
+                "delta": "[SKILL.md execution contract] loaded",
+                "metadata": {
+                    "name": "read_file",
+                    "id": "call_skill_read",
+                    "tool_call_id": "call_skill_read",
+                },
+            })
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Simulate provider cleanup that is not instantaneous.
+                await asyncio.sleep(0.05)
+                self.first_run_exited = True
+                raise
+
+        if not self.first_run_exited:
+            self.concurrent_recovery_started = True
+        await self.output_queue.put({"type": "content", "delta": "Recovery continued safely."})
+        return type("RunResult", (), {"content": "Recovery continued safely."})()
+
+
+class _ToolResultThenCancellationSuppressingRuntimeAgent(
+    _ToolResultThenHungProviderRuntimeAgent
+):
+    """The first run outlives the cleanup budget after receiving cancellation."""
+
+    async def run(self, *args, **kwargs):
+        if self.run_count:
+            self.run_count += 1
+            self.concurrent_recovery_started = True
+            return type("RunResult", (), {"content": "unsafe concurrent recovery"})()
+
+        self.run_count = 1
+        tool_call = {
+            "id": "call_skill_read",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"skills/example/SKILL.md"}',
+            },
+        }
+        await self.output_queue.put({"tool_calls": [tool_call]})
+        await asyncio.sleep(0.02)
+        self.memory.messages.extend([
+            SimpleNamespace(role="assistant", content="", tool_calls=[tool_call]),
+            SimpleNamespace(
+                role="tool",
+                content="[SKILL.md execution contract] loaded",
+                name="read_file",
+                tool_call_id="call_skill_read",
+            ),
+        ])
+        await self.output_queue.put({
+            "type": "tool_result",
+            "delta": "[SKILL.md execution contract] loaded",
+            "metadata": {
+                "name": "read_file",
+                "id": "call_skill_read",
+                "tool_call_id": "call_skill_read",
+            },
+        })
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            loop = asyncio.get_running_loop()
+            cleanup_deadline = loop.time() + 0.15
+            while loop.time() < cleanup_deadline:
+                try:
+                    await asyncio.sleep(cleanup_deadline - loop.time())
+                except asyncio.CancelledError:
+                    # Simulate a provider that keeps unwinding even if cancel()
+                    # is requested more than once.
+                    continue
+            self.first_run_exited = True
+            return type("RunResult", (), {"content": "late first-run exit"})()
+
+
 class _ChunkedRuntimeAgent:
     """Runtime agent that emits real incremental chunks through output_queue."""
 
@@ -2006,6 +2214,53 @@ class TestAgentLoopStreamFallback:
         assert tool_events_are_read_only_inspection(events)
         assert not skill_contract_needs_continuation(final_answer, events)
         assert skill_contract_needs_continuation(contract, events)
+
+    @pytest.mark.asyncio
+    async def test_structured_numeric_facts_bypass_model_arithmetic(self):
+        from spoon_bot.agent.execution_ledger import ExecutionLedger
+        from spoon_bot.agent.loop import AgentLoop
+
+        chat = MagicMock(side_effect=AssertionError("model must not recompute verified facts"))
+        ledger = ExecutionLedger(owner="test", user_request="summarize totals")
+        ledger.record_tool(
+            "shell",
+            {"command": "structured-cli"},
+            "completed",
+            "completed",
+            metadata={
+                "verified_facts": [
+                    {"id": "gross", "label": "Gross", "value": "160", "unit": "GLD"},
+                    {"id": "cost", "label": "Cost", "value": "60", "unit": "GLD"},
+                ],
+                "derived_facts": [
+                    {
+                        "id": "net",
+                        "label": "Net",
+                        "operation": "subtract",
+                        "inputs": ["gross", "cost"],
+                        "unit": "GLD",
+                    }
+                ],
+            },
+        )
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._chatbot = SimpleNamespace(llm_manager=SimpleNamespace(chat=chat))
+        loop._active_execution_ledger = ledger
+
+        answer = await loop._synthesize_final_answer_from_tool_events(
+            [{
+                "type": "tool_result",
+                "delta": "Read it aloud: The workflow settled successfully.",
+                "metadata": {"name": "shell"},
+            }],
+            user_message="summarize totals",
+        )
+
+        assert "The workflow settled successfully." in answer
+        assert "Gross: 160 GLD" in answer
+        assert "Cost: 60 GLD" in answer
+        assert "Net: 100 GLD" in answer
+        chat.assert_not_called()
 
     def test_setup_skill_event_without_progress_still_needs_continuation(self):
         from spoon_bot.agent.turn_verifiers import skill_contract_needs_continuation
@@ -3653,6 +3908,151 @@ class TestAgentLoopStreamFallback:
         assert "Current Session Compact" in recall
         assert "task_runner.py" in recall
         assert "Previous request did not complete" in recall
+
+    @pytest.mark.asyncio
+    async def test_stream_terminal_tool_result_survives_provider_failure(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _FailingTerminalToolTraceRuntimeAgent("unused")
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="terminal_tool_provider_error")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="run the requested workflow"):
+            chunks.append(chunk)
+
+        error = next(chunk for chunk in chunks if chunk["type"] == "error")
+        done = next(chunk for chunk in chunks if chunk["type"] == "done")
+        assert error["metadata"]["workflow_outcome"] == "completed"
+        assert error["metadata"]["response_outcome"] == "degraded"
+        assert "workflow completed successfully" in done["metadata"]["content"]
+        assert loop._session.messages[0]["turn_state"] == "completed"
+        assistant = loop._session.messages[-1]
+        assert assistant["role"] == "assistant"
+        assert assistant["degraded"] is True
+        assert assistant["workflow_outcome"] == "completed"
+        assert assistant["response_outcome"] == "degraded"
+
+    @pytest.mark.asyncio
+    async def test_stream_ignores_duplicate_tool_call_after_result(self, tmp_dir: Path):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _DuplicateCompletedToolCallRuntimeAgent()
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="duplicate_completed_tool_call")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="inspect the file and answer"):
+            chunks.append(chunk)
+
+        tool_calls = [chunk for chunk in chunks if chunk["type"] == "tool_call"]
+        assert len(tool_calls) == 1
+        assert any(chunk["type"] == "done" for chunk in chunks)
+        assert not any(chunk["type"] == "error" for chunk in chunks)
+
+    @pytest.mark.asyncio
+    async def test_post_tool_recovery_waits_for_original_run_to_exit(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        monkeypatch.setenv("SPOON_BOT_POST_TOOL_RESULT_SILENCE_TIMEOUT", "0.05")
+        monkeypatch.setenv("SPOON_BOT_STREAM_HEARTBEAT_INITIAL_DELAY", "0.02")
+        monkeypatch.setenv("SPOON_BOT_STREAM_HEARTBEAT_INTERVAL", "0.02")
+
+        runtime = _ToolResultThenHungProviderRuntimeAgent()
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = runtime
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="post_tool_run_quiescence")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+        loop._evaluate_skill_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+        loop._evaluate_task_completion_verdict = AsyncMock(
+            return_value={"status": "complete", "reason": "", "next_focus": ""}
+        )
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="follow the loaded workflow"):
+            chunks.append(chunk)
+
+        assert runtime.run_count >= 2
+        assert runtime.first_run_exited is True
+        assert runtime.concurrent_recovery_started is False
+        assert any(
+            chunk["type"] == "done"
+            and "Recovery continued safely" in chunk["metadata"]["content"]
+            for chunk in chunks
+        )
+
+    @pytest.mark.asyncio
+    async def test_post_tool_recovery_refuses_concurrent_reuse_when_cancel_is_suppressed(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from spoon_bot.agent import loop as loop_module
+        from spoon_bot.agent.loop import AgentLoop
+
+        monkeypatch.setattr(loop_module, "_AGENT_RUN_QUIESCE_TIMEOUT", 0.05)
+        monkeypatch.setenv("SPOON_BOT_POST_TOOL_RESULT_SILENCE_TIMEOUT", "0.05")
+        monkeypatch.setenv("SPOON_BOT_STREAM_HEARTBEAT_INITIAL_DELAY", "0.02")
+        monkeypatch.setenv("SPOON_BOT_STREAM_HEARTBEAT_INTERVAL", "0.02")
+
+        runtime = _ToolResultThenCancellationSuppressingRuntimeAgent()
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = runtime
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="post_tool_run_non_quiescent")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="follow the loaded workflow"):
+            chunks.append(chunk)
+
+        assert runtime.run_count == 1
+        assert runtime.concurrent_recovery_started is False
+        assert runtime.first_run_exited is True
+        assert any(chunk["type"] == "error" for chunk in chunks)
 
 
 class TestContextBuilderMediaPaths:

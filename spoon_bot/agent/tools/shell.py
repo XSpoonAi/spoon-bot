@@ -1893,6 +1893,8 @@ class ShellTool(Tool):
     ) -> tuple[bytes, bytes, int]:
         """Synchronous subprocess execution (called via run_in_executor)."""
         env = _scrub_env(os.environ.copy())
+        if self._command_invokes_workspace_skill(command, cwd):
+            env["SPOON_TOOL_FACTS_ENABLED"] = "1"
         self._align_wallet_home_for_command(env, command, cwd)
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
@@ -2174,6 +2176,8 @@ class ShellTool(Tool):
         cwd: str,
     ) -> subprocess.Popen[bytes]:
         env = _scrub_env(os.environ.copy())
+        if self._command_invokes_workspace_skill(command, cwd):
+            env["SPOON_TOOL_FACTS_ENABLED"] = "1"
         self._align_wallet_home_for_command(env, command, cwd)
         userprofile = env.get("USERPROFILE", "").strip()
         if userprofile and env.get("HOME", "").strip() in {"", "/root"}:
@@ -2466,8 +2470,8 @@ class ShellTool(Tool):
         result = self._build_output_result(job.stdout_text, job.stderr_text, job.returncode)
         return result, full_result
 
-    @staticmethod
     def _completed_job_capture_metadata(
+        self,
         job: _BackgroundShellJob,
         result: str,
     ) -> dict[str, Any]:
@@ -2479,6 +2483,10 @@ class ShellTool(Tool):
         metadata: dict[str, Any] = {
             "status": status,
             "returncode": job.returncode,
+            "accept_structured_facts": self._command_invokes_workspace_skill(
+                job.command,
+                job.cwd,
+            ),
         }
         if outcome:
             metadata["tool_outcome"] = outcome
@@ -3136,11 +3144,13 @@ class ShellTool(Tool):
             result = self._format_background_job_output(job, result)
             full_result = f"{full_result}{no_progress_suffix}"
             result = f"{result}{no_progress_suffix}"
-            capture_tool_output(
+            captured_result = capture_tool_output(
                 result,
                 full_result,
                 metadata=self._completed_job_capture_metadata(job, result),
             )
+            if isinstance(captured_result, str):
+                result = captured_result
             return result
 
         if action == "terminate_job":
@@ -3178,11 +3188,13 @@ class ShellTool(Tool):
             )
             result = prefix + summary_body
             full_result = f"{prefix}{full_body}"
-            capture_tool_output(
+            captured_result = capture_tool_output(
                 result,
                 full_result,
                 metadata=self._completed_job_capture_metadata(job, result),
             )
+            if isinstance(captured_result, str):
+                result = captured_result
             return result
 
         return f"Error: Unknown action '{action}'"
@@ -3455,11 +3467,13 @@ class ShellTool(Tool):
                 )
                 result = self._maybe_stop_after_exact_command_failure(command, result)
                 full_result = self._maybe_stop_after_exact_command_failure(command, full_result)
-                capture_tool_output(
+                captured_result = capture_tool_output(
                     result,
                     full_result,
                     metadata=self._completed_job_capture_metadata(job, result),
                 )
+                if isinstance(captured_result, str):
+                    result = captured_result
                 _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
                 self._prune_background_jobs(owner_key=owner_key)
                 return result
@@ -3492,11 +3506,13 @@ class ShellTool(Tool):
                     )
                     result = self._maybe_stop_after_exact_command_failure(command, result)
                     full_result = self._maybe_stop_after_exact_command_failure(command, full_result)
-                    capture_tool_output(
+                    captured_result = capture_tool_output(
                         result,
                         full_result,
                         metadata=self._completed_job_capture_metadata(job, result),
                     )
+                    if isinstance(captured_result, str):
+                        result = captured_result
                     _SHELL_BACKGROUND_JOBS.pop(job.job_id, None)
                     self._prune_background_jobs(owner_key=owner_key)
                     return result

@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
@@ -115,6 +116,21 @@ def _nested_get(value: Any, path: tuple[str, ...]) -> Any:
     return current
 
 
+def _decimal_text(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite():
+        return None
+    normalized = format(number.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
 @dataclass
 class ExecutionLedger:
     owner: str
@@ -185,6 +201,122 @@ class ExecutionLedger:
             self._record_shell(arguments, full_text, event, metadata)
         elif normalized_tool in {"service_expose", "spawn"}:
             self._record_service_like(normalized_tool, arguments, full_text, metadata)
+        self._record_structured_facts(normalized_tool, metadata, event["recorded_at"])
+
+    def _record_structured_facts(
+        self,
+        tool_name: str,
+        metadata: dict[str, Any],
+        recorded_at: float,
+    ) -> None:
+        facts = metadata.get("verified_facts")
+        derived = metadata.get("derived_facts")
+        if not isinstance(facts, list) and not isinstance(derived, list):
+            return
+
+        known: dict[str, dict[str, Any]] = {
+            str(item.get("fact_id") or ""): item
+            for item in self.verified_facts
+            if isinstance(item, dict)
+            and item.get("kind") == "numeric"
+            and item.get("fact_id")
+        }
+
+        for raw in facts if isinstance(facts, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            fact_id = str(raw.get("id") or raw.get("fact_id") or "").strip()[:160]
+            value = _decimal_text(raw.get("value"))
+            if not fact_id or value is None:
+                continue
+            item = {
+                "kind": "numeric",
+                "fact_id": fact_id,
+                "key": str(raw.get("label") or fact_id).strip()[:240],
+                "value": value,
+                "unit": str(raw.get("unit") or "").strip()[:80],
+                "semantic": str(raw.get("semantic") or "").strip()[:120],
+                "source_tool": tool_name,
+                "derived": False,
+                "recorded_at": recorded_at,
+            }
+            known[fact_id] = item
+            self.verified_facts.append(item)
+
+        for raw in derived if isinstance(derived, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            fact_id = str(raw.get("id") or raw.get("fact_id") or "").strip()[:160]
+            operation = str(raw.get("operation") or "").strip().casefold()
+            inputs = raw.get("inputs") or raw.get("operands")
+            if not fact_id or operation not in {"add", "sum", "subtract"}:
+                continue
+            if not isinstance(inputs, list) or not inputs:
+                continue
+            operands = [known.get(str(input_id or "").strip()) for input_id in inputs]
+            if any(item is None for item in operands):
+                continue
+            resolved = [item for item in operands if isinstance(item, dict)]
+            if operation == "subtract" and len(resolved) != 2:
+                continue
+            units = {str(item.get("unit") or "") for item in resolved}
+            if len(units) != 1:
+                continue
+            try:
+                numbers = [Decimal(str(item["value"])) for item in resolved]
+            except (InvalidOperation, KeyError):
+                continue
+            result = numbers[0]
+            if operation in {"add", "sum"}:
+                result = sum(numbers, Decimal("0"))
+            else:
+                result = numbers[0] - numbers[1]
+            value = _decimal_text(result)
+            if value is None:
+                continue
+            unit = units.pop()
+            declared_unit = str(raw.get("unit") or unit).strip()[:80]
+            if declared_unit != unit:
+                continue
+            item = {
+                "kind": "numeric",
+                "fact_id": fact_id,
+                "key": str(raw.get("label") or fact_id).strip()[:240],
+                "value": value,
+                "unit": unit,
+                "semantic": str(raw.get("semantic") or "").strip()[:120],
+                "source_tool": tool_name,
+                "derived": True,
+                "operation": operation,
+                "source_fact_ids": [str(input_id) for input_id in inputs],
+                "recorded_at": recorded_at,
+            }
+            known[fact_id] = item
+            self.verified_facts.append(item)
+        del self.verified_facts[:-256]
+
+    def structured_numeric_facts(self) -> list[dict[str, Any]]:
+        return [
+            item for item in self.verified_facts
+            if isinstance(item, dict) and item.get("kind") == "numeric"
+        ]
+
+    def render_structured_numeric_summary(self, *, max_chars: int = 3000) -> str:
+        facts = self.structured_numeric_facts()
+        if not facts:
+            return ""
+        latest: dict[str, dict[str, Any]] = {}
+        for fact in facts:
+            fact_id = str(fact.get("fact_id") or "")
+            if fact_id:
+                latest[fact_id] = fact
+        lines = ["Verified numeric facts:"]
+        for fact in latest.values():
+            label = str(fact.get("key") or fact.get("fact_id") or "value")
+            value = str(fact.get("value") or "")
+            unit = str(fact.get("unit") or "")
+            lines.append(f"- {label}: {value}{(' ' + unit) if unit else ''}")
+        return _stringify("\n".join(lines), limit=max_chars)
 
     def _record_read_from_tool(self, arguments: Any, output: str, metadata: dict[str, Any]) -> None:
         args = _decode_jsonish(arguments)
@@ -512,6 +644,9 @@ class ExecutionLedger:
         business-specific workflow completion.
         """
         lines: list[str] = []
+        numeric_summary = self.render_structured_numeric_summary(max_chars=max_chars)
+        if numeric_summary:
+            lines.extend(numeric_summary.splitlines())
         if self.file_reads and not self.file_writes:
             lines.append("Verified file reads:")
             for item in self.file_reads[-max_items:]:
