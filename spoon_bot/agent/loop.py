@@ -185,6 +185,7 @@ from spoon_bot.agent.loop_state import (
 
 _DEFAULT_STREAM_HEARTBEAT_INITIAL_DELAY = 15.0
 _DEFAULT_STREAM_HEARTBEAT_INTERVAL = 30.0
+_AGENT_RUN_QUIESCE_TIMEOUT = 5.0
 
 
 class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
@@ -1939,6 +1940,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         post_tool_content_passthrough_started = False
         emitted_content_text = ""
         stream_error_reason: BaseException | str | None = None
+        workflow_completed_with_warning = False
         interrupted_assistant_reply_persisted = False
         execution_ledger: ExecutionLedger | None = None
         ledger_manager = None
@@ -2429,6 +2431,36 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 except Exception:
                     pass
 
+            async def _cancel_active_run_and_wait(
+                *,
+                timeout: float = _AGENT_RUN_QUIESCE_TIMEOUT,
+                reason: str,
+            ) -> bool:
+                """Cancel the active SDK run and verify it exited before reuse."""
+                if bg_task is None:
+                    return True
+                if not bg_task.done():
+                    bg_task.cancel()
+                try:
+                    # Shield makes this a strict wait budget. wait_for(task)
+                    # can exceed its timeout when the task suppresses cancellation.
+                    await asyncio.wait_for(asyncio.shield(bg_task), timeout=timeout)
+                except asyncio.CancelledError:
+                    if bg_task.done():
+                        return True
+                    raise
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Agent run did not quiesce after cancellation ({}); "
+                        "refusing to reuse shared agent state.",
+                        reason,
+                    )
+                    return False
+                except Exception as exc:
+                    # A failed task is still quiescent and safe to replace.
+                    logger.debug("Agent run ended during {} cleanup: {}", reason, exc)
+                return bg_task.done()
+
             def _stop_if_total_timeout() -> bool:
                 if provider_total_timeout <= 0:
                     return False
@@ -2609,6 +2641,31 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     else None
                 )
 
+                # A tool result can be visible while the original agent.run()
+                # is already blocked in its next provider step. Never reset and
+                # reuse the same agent until that run has actually unwound: the
+                # SDK owns shared state, memory, and output_queue per agent.
+                if not await _cancel_active_run_and_wait(reason=repair_reason):
+                    message = (
+                        "The previous agent run did not stop after its tool result; "
+                        "refusing to start a concurrent recovery run."
+                    )
+                    stream_error_reason = RuntimeError(message)
+                    result_holder["text"] = ""
+                    yield {
+                        "type": "error",
+                        "delta": message,
+                        "metadata": {
+                            "code": "AGENT_RUN_NOT_QUIESCENT",
+                            "reason": "agent_run_not_quiescent",
+                            "workflow_outcome": "interrupted",
+                            "response_outcome": "failed",
+                        },
+                    }
+                    return
+
+                AgentLoop._drain_agent_output_queue(self)
+                self._reset_agent_state_for_retry()
                 task = asyncio.create_task(run_factory())
 
                 def _collect_repair_tool_result_events() -> list[dict[str, Any]]:
@@ -2751,7 +2808,6 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     _pre_turn_memory_index,
                 )
                 AgentLoop._drain_agent_output_queue(self)
-                self._reset_agent_state_for_retry()
 
                 repair_prompt = (
                     repair_prompt_override
@@ -2822,8 +2878,6 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     )
                 except Exception as exc:
                     logger.debug(f"Repeated-read recovery memory normalization skipped: {exc}")
-                self._reset_agent_state_for_retry()
-
                 request_execution_hints = self._build_request_execution_hints(authoritative_message)
                 repair_prompt = AgentLoop._build_repeated_read_recovery_prompt(
                     authoritative_message,
@@ -3074,7 +3128,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
             def _can_run_skill_contract_continuation() -> bool:
                 return (
-                    skill_contract_continuation_attempts
+                    stream_error_reason is None
+                    and skill_contract_continuation_attempts
                     < AgentLoop._skill_contract_continuation_attempt_limit()
                     and _can_auto_continue_for_current_request()
                 )
@@ -3310,12 +3365,20 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 "Provider produced no stream output before silence "
                                 "timeout; retrying the same turn once."
                             )
-                            if bg_task is not None and not bg_task.done():
-                                bg_task.cancel()
+                            if not await _cancel_active_run_and_wait(
+                                timeout=2.0,
+                                reason="provider_silence_retry",
+                            ):
+                                run_result_text = (
+                                    "The previous model run did not stop cleanly, so "
+                                    "the agent did not start a concurrent retry."
+                                )
+                                stream_error_reason = RuntimeError(run_result_text)
                                 try:
-                                    await asyncio.wait_for(bg_task, timeout=2.0)
-                                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                                    td.set()
+                                except Exception:
                                     pass
+                                break
                             AgentLoop._drain_agent_output_queue(self)
                             run_result_text = ""
                             pre_tool_scratchpad_events = []
@@ -3387,6 +3450,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 # -- Dict chunks (tool_calls, structured events) --
                 elif isinstance(chunk, dict):
                     if chunk.get("type") == "error":
+                        if latest_tool_event_has_user_summary_marker(all_tool_result_events):
+                            workflow_completed_with_warning = True
                         if stream_error_reason is None:
                             error_text = (
                                 (
@@ -3398,11 +3463,22 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                                 or "stream_error"
                             )
                             stream_error_reason = RuntimeError(str(error_text))
+                        error_event_metadata = dict(chunk.get("metadata", {}))
+                        error_event_metadata.update({
+                            "workflow_outcome": (
+                                "completed"
+                                if workflow_completed_with_warning
+                                else "interrupted"
+                            ),
+                            "response_outcome": (
+                                "degraded" if workflow_completed_with_warning else "failed"
+                            ),
+                        })
                         yield _mark_stream_activity(
                             {
                                 "type": "error",
                                 "delta": chunk.get("delta", ""),
-                                "metadata": chunk.get("metadata", {}),
+                                "metadata": error_event_metadata,
                                 "source": current_source,
                             }
                         )
@@ -3412,6 +3488,24 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         leaked_tool_protocol_buffer = ""
                         leaked_tool_protocol_detected = False
                         leaked_tool_protocol_probe = ""
+                        raw_tool_calls = list(chunk.get("tool_calls") or [])
+                        unseen_tool_calls = []
+                        for tool_call in raw_tool_calls:
+                            if isinstance(tool_call, dict):
+                                tool_call_id = tool_call.get("id", "")
+                            else:
+                                tool_call_id = getattr(tool_call, "id", "")
+                            if tool_call_id and str(tool_call_id) in emitted_tool_result_ids:
+                                logger.debug(
+                                    "Ignoring duplicate tool-call event after its result "
+                                    f"was already observed: {tool_call_id}"
+                                )
+                                continue
+                            unseen_tool_calls.append(tool_call)
+                        if not unseen_tool_calls:
+                            continue
+                        chunk = dict(chunk)
+                        chunk["tool_calls"] = unseen_tool_calls
                         if self._should_disable_parallel_tool_calls() and isinstance(
                             chunk.get("tool_calls"), (list, tuple)
                         ):
@@ -3783,7 +3877,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
             # Ensure background task completes
             try:
-                await asyncio.wait_for(bg_task, timeout=5.0)
+                await asyncio.wait_for(
+                    asyncio.shield(bg_task),
+                    timeout=_AGENT_RUN_QUIESCE_TIMEOUT,
+                )
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
 
@@ -4187,6 +4284,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             task_continuation_attempts = 0
             while (
                 all_tool_result_events
+                and stream_error_reason is None
                 and task_continuation_attempts
                 < AgentLoop._task_completion_continuation_attempt_limit()
                 and _can_auto_continue_for_current_request()
@@ -4328,7 +4426,21 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 pending_fallback_delta = full_content
 
             if stream_error_reason is not None:
-                if all_tool_result_events and (
+                if latest_tool_event_has_user_summary_marker(all_tool_result_events):
+                    workflow_completed_with_warning = True
+                    full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
+                        self,
+                        all_tool_result_events,
+                        user_message=authoritative_message,
+                        fallback_text=build_user_facing_tool_event_answer(
+                            all_tool_result_events,
+                            user_message=authoritative_message,
+                        ),
+                    )
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "terminal_evidence_provider_error"
+                    pending_fallback_delta = full_content
+                elif all_tool_result_events and (
                     AgentLoop._should_replace_stream_error_preamble(
                         full_content,
                         saw_tool_call=saw_tool_call,
@@ -4589,7 +4701,21 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             yield {
                 "type": "done",
                 "delta": "",
-                "metadata": {"content": full_content},
+                "metadata": {
+                    "content": full_content,
+                    "workflow_outcome": (
+                        "completed"
+                        if workflow_completed_with_warning or stream_error_reason is None
+                        else "interrupted"
+                    ),
+                    "response_outcome": (
+                        "degraded"
+                        if workflow_completed_with_warning
+                        else "failed"
+                        if stream_error_reason is not None
+                        else "completed"
+                    ),
+                },
                 "source": current_source,
             }
 
@@ -4623,12 +4749,26 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             stream_error_reason = e
             stream_completed = True
             current_source = AgentLoop.get_last_response_source(self)
+            if latest_tool_event_has_user_summary_marker(all_tool_result_events):
+                recovered_content = build_user_facing_tool_event_answer(
+                    all_tool_result_events,
+                    user_message=authoritative_message,
+                ).strip()
+                if recovered_content:
+                    workflow_completed_with_warning = True
+                    full_content = recovered_content
             error_metadata = {
                 "error": str(e),
                 "message": str(e),
                 "code": type(e).__name__,
                 "error_code": type(e).__name__,
                 "reason": "stream_failed",
+                "workflow_outcome": (
+                    "completed" if workflow_completed_with_warning else "interrupted"
+                ),
+                "response_outcome": (
+                    "degraded" if workflow_completed_with_warning else "failed"
+                ),
             }
             yield {
                 "type": "error",
@@ -4639,7 +4779,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             yield {
                 "type": "done",
                 "delta": "",
-                "metadata": error_metadata,
+                "metadata": {
+                    **error_metadata,
+                    "content": full_content,
+                },
                 "source": current_source,
             }
         finally:
@@ -4648,6 +4791,8 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     stream_outcome = (
                         "cancelled"
                         if stream_cancelled
+                        else "completed_with_warning"
+                        if workflow_completed_with_warning
                         else "failed"
                         if stream_error_reason is not None
                         else "completed"
@@ -4682,7 +4827,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 bg_task.cancel()
                 try:
                     cleanup_timeout = 2.0 if stream_cancelled else 5.0
-                    await asyncio.wait_for(bg_task, timeout=cleanup_timeout)
+                    await asyncio.wait_for(
+                        asyncio.shield(bg_task),
+                        timeout=cleanup_timeout,
+                    )
                 except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
             if not stream_completed and not stream_cancelled:
@@ -4693,7 +4841,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     reason="task_cancelled",
                 )
 
-        if stream_error_reason is not None and not stream_cancelled:
+        if (
+            stream_error_reason is not None
+            and not stream_cancelled
+            and not workflow_completed_with_warning
+        ):
             AgentLoop._persist_failed_turn_context(
                 self,
                 label="stream",
@@ -4705,7 +4857,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             full_content
             and stream_completed
             and not stream_cancelled
-            and stream_error_reason is None
+            and (stream_error_reason is None or workflow_completed_with_warning)
         ):
             try:
                 self._merge_turn_invoked_skills_from_runtime(_pre_turn_memory_index)
@@ -4720,6 +4872,18 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 self._session.add_message(
                     "assistant",
                     full_content,
+                    **(
+                        {
+                            "degraded": True,
+                            "degraded_reason": AgentLoop._turn_failure_state_reason(
+                                "stream", stream_error_reason or "provider_error"
+                            ),
+                            "workflow_outcome": "completed",
+                            "response_outcome": "degraded",
+                        }
+                        if workflow_completed_with_warning
+                        else {}
+                    ),
                     **AgentLoop._assistant_session_save_kwargs(full_content),
                 )
                 AgentLoop._persist_session_if_possible(self)

@@ -33,6 +33,7 @@ _TOOL_INVOCATION_DEDUP_STATE: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 _TOOL_INVOCATION_STATE_BY_OWNER: dict[str, dict[str, Any]] = {}
 _TOOL_INVOCATION_STATE_FALLBACK: dict[str, Any] | None = None
+_TOOL_FACTS_PREFIX = "SPOON_TOOL_FACTS_JSON:"
 _TOOL_INVOCATION_STATE_LOCK = Lock()
 _REQUEST_EXECUTION_HINTS: ContextVar[dict[str, Any] | None] = ContextVar(
     "request_execution_hints",
@@ -1658,24 +1659,69 @@ def capture_tool_output(
     full_output: Any | None = None,
     *,
     metadata: dict[str, Any] | None = None,
-) -> None:
+) -> str:
     """Record summary/full tool output for the current invocation."""
     invocation_id = _CURRENT_TOOL_INVOCATION.get()
     if not invocation_id:
-        return
+        return stringify_tool_output(summary_output)
 
     summary_text = stringify_tool_output(summary_output)
     full_text = stringify_tool_output(full_output if full_output is not None else summary_output)
+    parsed_metadata: dict[str, Any] = {}
+    seen_envelopes: set[str] = set()
+    accept_fact_envelopes = bool(
+        isinstance(metadata, dict) and metadata.get("accept_structured_facts")
+    )
+
+    def _extract_fact_envelopes(text: str) -> str:
+        if not accept_fact_envelopes:
+            return text
+        cleaned: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(_TOOL_FACTS_PREFIX):
+                cleaned.append(line)
+                continue
+            payload_text = stripped[len(_TOOL_FACTS_PREFIX):].strip()
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                cleaned.append(line)
+                continue
+            if not isinstance(payload, dict):
+                cleaned.append(line)
+                continue
+            envelope_key = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            if envelope_key not in seen_envelopes:
+                seen_envelopes.add(envelope_key)
+                facts = payload.get("facts")
+                derived = payload.get("derived")
+                if isinstance(facts, list):
+                    parsed_metadata.setdefault("verified_facts", []).extend(facts[:128])
+                if isinstance(derived, list):
+                    parsed_metadata.setdefault("derived_facts", []).extend(derived[:128])
+        return "\n".join(cleaned).strip()
+
+    summary_text = _extract_fact_envelopes(summary_text)
+    full_text = _extract_fact_envelopes(full_text)
 
     with _TOOL_OUTPUT_LOCK:
         capture = _ACTIVE_TOOL_INVOCATIONS.get(invocation_id)
         if capture is None:
-            return
+            return summary_text
         capture.summary_output = summary_text
         capture.full_output = full_text
         if isinstance(metadata, dict) and metadata:
             capture.metadata.update(metadata)
+        if parsed_metadata:
+            for key, values in parsed_metadata.items():
+                existing = capture.metadata.get(key)
+                if isinstance(existing, list):
+                    capture.metadata[key] = [*existing, *values]
+                else:
+                    capture.metadata[key] = list(values)
         record_shell_command_evidence(capture.tool_name, full_text)
+    return summary_text
 
 
 def capture_tool_output_delta(

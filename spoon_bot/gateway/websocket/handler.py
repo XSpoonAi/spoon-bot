@@ -851,6 +851,9 @@ class WebSocketHandler:
         self._chat_task_ids[session_key] = task_id
         self._cancel_requested_by_session[session_key] = False
         had_error = False
+        terminal_status = "done"
+        workflow_outcome = "completed"
+        response_outcome = "completed"
         thinking_content = None
         request_id = self._chat_request_ids.get(session_key)
         request_context = bind_agent_request_context(
@@ -976,6 +979,13 @@ class WebSocketHandler:
 
                                 if chunk_type == "error":
                                     had_error = True
+                                    if isinstance(metadata, dict):
+                                        workflow_outcome = str(
+                                            metadata.get("workflow_outcome") or "interrupted"
+                                        )
+                                        response_outcome = str(
+                                            metadata.get("response_outcome") or "failed"
+                                        )
                                     error_detail = _stream_error_detail(
                                         delta,
                                         metadata if isinstance(metadata, dict) else {},
@@ -997,6 +1007,19 @@ class WebSocketHandler:
                                     continue
 
                                 if chunk_type == "done":
+                                    if isinstance(metadata, dict):
+                                        workflow_outcome = str(
+                                            metadata.get("workflow_outcome") or workflow_outcome
+                                        )
+                                        response_outcome = str(
+                                            metadata.get("response_outcome") or response_outcome
+                                        )
+                                    if had_error:
+                                        terminal_status = (
+                                            "completed_with_warning"
+                                            if workflow_outcome == "completed"
+                                            else "error"
+                                        )
                                     done_content = (
                                         metadata.get("content", "")
                                         if isinstance(metadata, dict)
@@ -1144,8 +1167,10 @@ class WebSocketHandler:
                 "task_id": task_id,
                 "request_id": request_id,
                 "session_key": session_key,
-                "status": "done",
+                "status": terminal_status,
                 "response": response if isinstance(response, str) else str(response),
+                "workflow_outcome": workflow_outcome,
+                "response_outcome": response_outcome,
                 "trace_id": trace_id,
                 "timing": timing,
                 "source": response_source,
@@ -1159,10 +1184,13 @@ class WebSocketHandler:
             )
 
             result: dict[str, Any] = {
-                "success": not had_error,
+                "success": terminal_status in {"done", "completed_with_warning"},
+                "status": terminal_status,
                 "task_id": task_id,
                 "request_id": request_id,
                 "content": response,
+                "workflow_outcome": workflow_outcome,
+                "response_outcome": response_outcome,
                 "session_key": session_key,
                 "trace_id": trace_id,
                 "timing": timing,
