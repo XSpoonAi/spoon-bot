@@ -11,8 +11,9 @@ import os
 import re
 import shlex
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 _EXECUTABLE_SUFFIXES = tuple(
@@ -71,6 +72,32 @@ _NON_ASCII_PLAIN_CONTINUATION_TOKENS = frozenset({
     "接着",
     "接着吧",
 })
+
+
+@dataclass(frozen=True)
+class ContinuationIntent:
+    """Lexical shape of a continuation request, without workflow routing.
+
+    ``plain`` means the newest message adds no explicit target or scope.
+    ``scoped`` means it still refers to prior work but adds some new text that
+    must remain authoritative. The classifier never selects a skill or grants
+    side-effect permission; workflow state resolves those separately.
+    """
+
+    kind: Literal["none", "plain", "scoped"]
+    is_continuation: bool
+    adds_scope: bool
+
+    @property
+    def is_plain(self) -> bool:
+        return self.kind == "plain"
+
+    def to_hints(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "is_continuation": self.is_continuation,
+            "adds_scope": self.adds_scope,
+        }
 
 
 def _safe_url_scheme(value: str) -> str:
@@ -135,43 +162,55 @@ def ordered_request_matching_tokens(text: str) -> list[str]:
     return tokens
 
 
-def request_is_bare_continuation(text: str) -> bool:
-    """Return True for short messages that only ask to continue prior work."""
+def classify_continuation_intent(text: str) -> ContinuationIntent:
+    """Classify continuation syntax without choosing what should continue."""
     value = str(text or "").strip()
     if not value:
-        return False
+        return ContinuationIntent("none", False, False)
     if extract_urls_from_text(value):
-        return False
+        return ContinuationIntent("none", False, False)
     if extract_exact_shell_commands_from_request(value):
-        return False
+        return ContinuationIntent("none", False, False)
     tokens = ordered_request_matching_tokens(value)
     if not tokens:
-        return len(value) <= 12
-    if len(tokens) > 3:
-        return False
-    ascii_tokens = [token for token in tokens if token.isascii()]
-    if ascii_tokens:
-        return all(token in _ASCII_CONTINUATION_TOKENS for token in ascii_tokens)
-    return len(value) <= 12
+        is_continuation = len(value) <= 12
+    elif len(tokens) > 3:
+        is_continuation = False
+    else:
+        ascii_tokens = [token for token in tokens if token.isascii()]
+        if ascii_tokens:
+            is_continuation = all(
+                token in _ASCII_CONTINUATION_TOKENS for token in ascii_tokens
+            )
+        else:
+            is_continuation = len(value) <= 12
+    if not is_continuation:
+        return ContinuationIntent("none", False, False)
+
+    if not tokens:
+        plain = len(value) <= 4
+    elif any(token.isascii() for token in tokens):
+        plain = all(token.isascii() for token in tokens) and all(
+            token in _ASCII_CONTINUATION_TOKENS for token in tokens
+        )
+    else:
+        compact = "".join(char for char in value if char.isalnum())
+        plain = compact.casefold() in _NON_ASCII_PLAIN_CONTINUATION_TOKENS
+    return ContinuationIntent(
+        "plain" if plain else "scoped",
+        True,
+        not plain,
+    )
+
+
+def request_is_bare_continuation(text: str) -> bool:
+    """Compatibility wrapper for callers that only need continuation syntax."""
+    return classify_continuation_intent(text).is_continuation
 
 
 def request_is_plain_continuation_only(text: str) -> bool:
-    """Return True when the newest message adds no count, target, or scope."""
-    value = str(text or "").strip()
-    if not request_is_bare_continuation(value):
-        return False
-    tokens = ordered_request_matching_tokens(value)
-    if not tokens:
-        return len(value) <= 4
-    if any(token.isascii() for token in tokens):
-        return all(
-            token in _ASCII_CONTINUATION_TOKENS for token in tokens if token.isascii()
-        ) and all(
-            token.isascii()
-            for token in tokens
-        )
-    compact = "".join(char for char in value if char.isalnum())
-    return compact.casefold() in _NON_ASCII_PLAIN_CONTINUATION_TOKENS
+    """Compatibility wrapper; this does not select or authorize a workflow."""
+    return classify_continuation_intent(text).is_plain
 
 
 def _normalize_tool_identifier(value: str) -> str:
@@ -1240,9 +1279,11 @@ def build_request_execution_hints(
         request_prefers_session_evidence_synthesis(message_text)
     )
 
+    continuation_intent = classify_continuation_intent(message_text)
     return {
-        "bare_continuation": request_is_bare_continuation(message_text),
-        "plain_continuation": request_is_plain_continuation_only(message_text),
+        "continuation_intent": continuation_intent.to_hints(),
+        "bare_continuation": continuation_intent.is_continuation,
+        "plain_continuation": continuation_intent.is_plain,
         "explicit_request_urls": explicit_urls,
         "explicit_request_values": explicit_request_values,
         "local_executable_skills": local_executable_skills,

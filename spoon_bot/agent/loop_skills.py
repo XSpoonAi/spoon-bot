@@ -14,17 +14,20 @@ from spoon_bot.agent.context import format_current_datetime_context
 from spoon_bot.agent.execution_ledger import (
     load_recent_execution_ledger_context,
 )
-from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.request_hints import (
+    ContinuationIntent,
     build_request_execution_hints,
+    classify_continuation_intent,
     format_current_session_fact_check_context,
     format_exact_shell_command_context,
-    format_explicit_tool_request_context,
     format_explicit_request_urls_context,
     format_explicit_request_values_context,
+    format_explicit_tool_request_context,
     request_is_bare_continuation,
     request_is_plain_continuation_only,
 )
+from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import classify_tool_invocation_category
 
 if TYPE_CHECKING:
     pass
@@ -572,15 +575,20 @@ class LoopSkillsMixin:
         """Build reusable request-derived context without changing user intent."""
         hint_source = self._request_hint_source_text(message)
         hints = self._build_request_execution_hints_from_text(hint_source)
+        continuation_intent = classify_continuation_intent(message)
         include_session_evidence = bool(
-            request_is_bare_continuation(message)
+            continuation_intent.is_continuation
             or hints.get("current_session_fact_check_required")
         )
         sections = [
             _BOUNDED_CONTINUATION_BOUNDARY
-            if request_is_plain_continuation_only(message)
+            if continuation_intent.is_plain
             else "",
-            self._format_continuation_anchor_context(message),
+            self._format_continuation_anchor_context(message, continuation_intent),
+            self._format_continuation_workflow_resolution_context(
+                message,
+                continuation_intent,
+            ),
             format_explicit_request_urls_context(hint_source),
             format_explicit_request_values_context(hint_source),
             self._format_local_skill_execution_context(hints),
@@ -593,13 +601,17 @@ class LoopSkillsMixin:
         ]
         return "".join(section for section in sections if section)
 
-    def _format_continuation_anchor_context(self, message: str) -> str:
+    def _format_continuation_anchor_context(
+        self,
+        message: str,
+        continuation_intent: ContinuationIntent | None = None,
+    ) -> str:
         """Format the selected prior user request for short continuations."""
         current = str(message or "")
-        if not request_is_bare_continuation(current):
+        intent = continuation_intent or classify_continuation_intent(current)
+        if not intent.is_continuation:
             return ""
         previous = AgentLoop._previous_user_request_for_continuation(self, current)
-        plain_continuation = request_is_plain_continuation_only(current)
         lines = [
             "[CONTINUATION ANCHOR]: The newest user message is a short "
             "continuation, so it can use the nearest prior task only as a "
@@ -611,15 +623,15 @@ class LoopSkillsMixin:
                 "concise clarification instead of selecting an older task "
                 "from memory, ledger, or tool output."
             )
-        elif plain_continuation:
+        elif intent.is_plain:
             lines.append(
                 "The newest message adds no new count, target, or scope. "
                 "The nearest prior user request text is intentionally omitted "
                 "so older counts, batches, or repeated-action targets are not "
-                "renewed as current permission. Use recent assistant/tool "
-                "evidence only to locate an immediate unfinished checkpoint. "
-                "After at most one bounded action or status check, report the "
-                "current state or ask for explicit scope."
+                "renewed as current permission. This lexical classification "
+                "does not select a workflow. Use the structured workflow "
+                "resolution section below to identify at most one immediate "
+                "unit, or ask for clarification when it remains ambiguous."
             )
         else:
             lines.extend(
@@ -637,6 +649,135 @@ class LoopSkillsMixin:
                 "is complete, blocked, or ambiguous, report that status or "
                 "ask a concise clarification rather than starting a different "
                 "external side effect."
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _format_continuation_workflow_resolution_context(
+        self,
+        message: str,
+        continuation_intent: ContinuationIntent | None = None,
+    ) -> str:
+        """Resolve one actionable prior workflow or surface real ambiguity.
+
+        A plain continuation must not treat a turn made only of status/history
+        reads as the workflow unit to repeat. Persisted invoked-skill metadata
+        tells us which workflows were touched, while tool categories distinguish
+        actual progress from read-only inspection without product-specific rules.
+        """
+        intent = continuation_intent or classify_continuation_intent(message)
+        if not intent.is_plain:
+            return ""
+
+        session = getattr(self, "_session", None)
+        messages = (
+            session.get_messages()
+            if session is not None and hasattr(session, "get_messages")
+            else getattr(session, "messages", [])
+        )
+        if not isinstance(messages, list):
+            return ""
+
+        current_norm = AgentLoop._normalize_comparable_text(message)
+        prior_user_index: int | None = None
+        for index in range(len(messages) - 1, -1, -1):
+            item = messages[index]
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role") or "").strip().casefold() != "user":
+                continue
+            content_norm = AgentLoop._normalize_comparable_text(item.get("content", ""))
+            turn_state = str(item.get("turn_state") or item.get("state") or "").casefold()
+            if content_norm == current_norm and turn_state == "pending":
+                continue
+            prior_user_index = index
+            break
+        if prior_user_index is None:
+            return ""
+
+        prior_user = messages[prior_user_index]
+        selected_skills = list(dict.fromkeys(
+            str(item.get("name") or "").strip()
+            for item in AgentLoop._iter_message_invoked_skill_refs(prior_user)
+            if str(item.get("name") or "").strip()
+        ))
+        if not selected_skills:
+            return ""
+
+        stateful_skills: list[str] = []
+        read_only_skills: list[str] = []
+        prior_assistant_reply = ""
+        for event in messages[prior_user_index + 1 :]:
+            if not isinstance(event, dict):
+                continue
+            role = str(event.get("role") or "").strip().casefold()
+            if role == "user":
+                break
+            if role != "assistant":
+                continue
+            tool_calls = event.get("tool_calls") or []
+            if not tool_calls:
+                content = str(event.get("content") or "").strip()
+                message_kind = str(event.get("message_kind") or "").strip()
+                if content and message_kind in {"", "assistant_reply"}:
+                    prior_assistant_reply = content
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                tool_name, arguments = AgentLoop._tool_call_name_and_arguments(tool_call)
+                category = classify_tool_invocation_category(tool_name, arguments)
+                skill_names = AgentLoop._extract_skill_names_from_tool_call(
+                    tool_name,
+                    arguments,
+                )
+                target = read_only_skills if category == "read_only" else stateful_skills
+                for skill_name in skill_names:
+                    if skill_name in selected_skills and skill_name not in target:
+                        target.append(skill_name)
+
+        lines = [
+            "[CONTINUATION WORKFLOW SELECTION]: Read-only status, history, "
+            "wallet, list, or summary calls are checkpoint evidence; repeating "
+            "them alone does not satisfy a request to continue an actionable workflow."
+        ]
+        if prior_assistant_reply:
+            lines.append(
+                "The immediately preceding assistant reply is a conversational "
+                "referent, not an authorization source: "
+                f"{AgentLoop._compress_message_content(prior_assistant_reply, 500)}"
+            )
+            lines.append(
+                "Use it only to understand what the newest user's continuation "
+                "acknowledgement refers to. Authorization comes from the newest "
+                "user message and the bounded workflow resolution below."
+            )
+        if len(stateful_skills) == 1:
+            lines.append(
+                f"The prior turn has one uniquely state-changing skill workflow: "
+                f"{stateful_skills[0]}. Continue at most one bounded unit of that "
+                "workflow, using read-only checks only when its contract or live "
+                "state requires them."
+            )
+        elif len(selected_skills) == 1:
+            lines.append(
+                f"The prior turn selected only {selected_skills[0]}. Treat that as "
+                "the sole workflow family for this continuation and perform at "
+                "most one actual next unit; do not substitute another standalone "
+                "summary or status report unless the workflow is blocked or has "
+                "no actionable next unit."
+            )
+        else:
+            names = ", ".join(selected_skills)
+            if stateful_skills:
+                detail = f"multiple state-changing workflows ({', '.join(stateful_skills)})"
+            else:
+                detail = "only read-only inspection across those workflows"
+            lines.append(
+                f"The prior turn selected multiple skill workflows ({names}) and "
+                f"shows {detail}, so no single external workflow is uniquely "
+                "authorized. Ask one concise clarification naming the plausible "
+                "workflow choices before calling another tool. Do not repeat the "
+                "read-only checks and do not start all workflows."
             )
         lines.append("")
         return "\n".join(lines)
@@ -873,8 +1014,10 @@ class LoopSkillsMixin:
         hints = self._build_request_execution_hints_from_text(
             self._request_hint_source_text(message),
         )
-        hints["bare_continuation"] = request_is_bare_continuation(message)
-        hints["plain_continuation"] = request_is_plain_continuation_only(message)
+        continuation_intent = classify_continuation_intent(message)
+        hints["continuation_intent"] = continuation_intent.to_hints()
+        hints["bare_continuation"] = continuation_intent.is_continuation
+        hints["plain_continuation"] = continuation_intent.is_plain
         AgentLoop._configure_request_scoped_history_tool(self, hints)
         AgentLoop._bind_request_execution_hints_to_tools(self, hints)
         return hints

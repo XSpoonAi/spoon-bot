@@ -121,7 +121,12 @@ _TASK_COMPLETION_VERDICT_SYSTEM_PROMPT = (
     "for the current turn unless the newest user request already clearly "
     "authorized that exact next action. Do not infer user consent from the "
     "assistant draft, prior assistant questions, continuation prompts, or "
-    "conversation history. Do not use product-specific rules, route names, "
+    "conversation history alone. A newest-user continuation acknowledgement "
+    "may authorize at most one bounded unit; the immediately preceding "
+    "assistant reply may identify what that acknowledgement refers to only "
+    "when structured workflow evidence resolves one clear workflow. If more "
+    "than one side-effecting workflow remains plausible, use awaiting_user. "
+    "Do not use product-specific rules, route names, "
     "repository names, game names, or natural-language phrase matching. The "
     "user request is intent, not proof. For countable or repeated outcomes, "
     "compare the requested count and scope against concrete tool evidence; a "
@@ -4551,11 +4556,16 @@ class LoopProtocolMixin:
         )
         lines.append(
             "Do not treat the previous assistant draft, any question in that "
-            "draft, or this internal continuation prompt as user consent. If the "
-            "previous draft is waiting for the user to choose, confirm, provide a "
-            "missing value, or permit another side effect, stop with that waiting "
-            "answer unless the latest user request already clearly authorized the "
-            "exact next action."
+            "draft, or this internal continuation prompt as user consent by "
+            "itself. A newest-user continuation acknowledgement supplies bounded "
+            "consent for at most one next unit; use the immediately preceding "
+            "assistant reply only as a conversational referent when structured "
+            "workflow evidence identifies one clear workflow. If that reply asks "
+            "the user to choose among multiple side-effecting workflows or provide "
+            "a required value, stop with that waiting answer until the newest user "
+            "selects the missing target or value. Do not proceed unless the "
+            "latest user request already clearly authorized the exact next action; "
+            "assistant wording cannot supply missing authorization."
         )
         if plain_continuation:
             lines.append(

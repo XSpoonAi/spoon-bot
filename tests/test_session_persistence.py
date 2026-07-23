@@ -4240,6 +4240,153 @@ class TestContextBuilderMediaPaths:
         assert context.index("[CONTINUATION ANCHOR]") < context.index("[EXECUTION LEDGER")
         assert "do not switch to another earlier task" in context
 
+    def test_plain_continuation_requires_clarification_after_multi_skill_read_only_turn(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="multi-skill-read-only-continuation")
+        loop._session.add_message(
+            "user",
+            "继续",
+            turn_state="completed",
+            invoked_skills=[
+                {"name": "joker-game-agent"},
+                {"name": "spot-agent-cypher"},
+            ],
+        )
+        loop._session.add_message(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "call_joker_summary",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":"node skills/joker-game-agent/cli/index.js summary"}',
+                    },
+                },
+                {
+                    "id": "call_spot_summary",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":"node skills/spot-agent-cypher/cli/index.js summary"}',
+                    },
+                },
+            ],
+        )
+        loop._session.add_message("assistant", "要继续玩哪一款？")
+        loop._session.add_message("user", "继续", turn_state="pending")
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: ""
+
+        context = AgentLoop._build_request_context_sections(loop, "继续")
+
+        assert "[CONTINUATION WORKFLOW SELECTION]" in context
+        assert "joker-game-agent, spot-agent-cypher" in context
+        assert "only read-only inspection" in context
+        assert "conversational referent, not an authorization source" in context
+        assert "要继续玩哪一款？" in context
+        assert "Ask one concise clarification" in context
+        assert "Do not repeat the read-only checks" in context
+
+    def test_plain_continuation_resumes_unique_stateful_skill_not_read_only_sidecar(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="unique-stateful-skill-continuation")
+        loop._session.add_message(
+            "user",
+            "play and inspect",
+            turn_state="completed",
+            invoked_skills=[
+                {"name": "primary-workflow"},
+                {"name": "diagnostic-workflow"},
+            ],
+        )
+        loop._session.add_message(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "call_primary_run",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":"node skills/primary-workflow/cli/index.js join"}',
+                    },
+                },
+                {
+                    "id": "call_diagnostic_summary",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":"node skills/diagnostic-workflow/cli/index.js summary"}',
+                    },
+                },
+            ],
+        )
+        loop._session.add_message("assistant", "Current state reported.")
+        loop._session.add_message("user", "continue", turn_state="pending")
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: ""
+
+        context = AgentLoop._build_request_context_sections(loop, "continue")
+
+        assert "one uniquely state-changing skill workflow: primary-workflow" in context
+        assert "Continue at most one bounded unit" in context
+        assert "Ask one concise clarification" not in context
+
+    def test_plain_continuation_single_skill_does_not_repeat_summary(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="single-skill-summary-continuation")
+        loop._session.add_message(
+            "user",
+            "继续",
+            turn_state="completed",
+            invoked_skills=[{"name": "spot-agent-cypher"}],
+        )
+        loop._session.add_message(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "call_spot_summary",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":"node skills/spot-agent-cypher/cli/index.js summary"}',
+                    },
+                },
+            ],
+        )
+        loop._session.add_message("assistant", "Spot 已结算。要继续玩吗？")
+        loop._session.add_message("user", "continue", turn_state="pending")
+        loop._collect_request_skill_candidates = lambda: []
+        loop._collect_available_tool_identifiers = lambda: []
+        loop._format_recent_execution_ledger_context = lambda: ""
+
+        context = AgentLoop._build_request_context_sections(loop, "continue")
+
+        assert "selected only spot-agent-cypher" in context
+        assert "Spot 已结算。要继续玩吗？" in context
+        assert "Use it only to understand what" in context
+        assert "perform at most one actual next unit" in context
+        assert "do not substitute another standalone summary" in context
+        assert "Ask one concise clarification" not in context
+
     def test_new_request_excludes_session_compact_and_execution_ledger(self, tmp_dir: Path):
         from spoon_bot.agent.loop import AgentLoop
 
