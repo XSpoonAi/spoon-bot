@@ -88,7 +88,7 @@ class ToolRegistry:
     - Execution error handling
     """
 
-    def __init__(self, validate_params: bool = True) -> None:
+    def __init__(self, validate_params: bool = True, *, strict_capabilities: bool = True) -> None:
         """
         Initialize the tool registry.
 
@@ -97,6 +97,7 @@ class ToolRegistry:
         """
         self._tools: dict[str, Tool] = {}
         self._validate_params = validate_params
+        self._strict_capabilities = bool(strict_capabilities)
         # Filtering
         self._enabled_tools: set[str] | None = None  # None = all tools
         # Schema cache
@@ -329,7 +330,7 @@ class ToolRegistry:
         if tool is None:
             available = ", ".join(sorted(self._tools.keys())[:10])
             return f"Error: Unknown tool '{name}'. Available tools: {available}..."
-        if name not in self.get_active_tools():
+        if self._strict_capabilities and name not in self.get_active_tools():
             return (
                 f"Error: Tool '{name}' is registered but not active for this request. "
                 "Use the active 'activate_tool' capability before calling it."

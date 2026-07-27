@@ -19,6 +19,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Iterator
 
+from spoon_bot.agent.evidence import SCHEMA_VERSION, evidence_from_tool_result
 
 _CURRENT_LEDGER: ContextVar["ExecutionLedger | None"] = ContextVar(
     "spoon_bot_execution_ledger",
@@ -148,6 +149,8 @@ class ExecutionLedger:
     services: list[dict[str, Any]] = field(default_factory=list)
     verified_facts: list[dict[str, Any]] = field(default_factory=list)
     open_blockers: list[dict[str, Any]] = field(default_factory=list)
+    evidence_records: list[dict[str, Any]] = field(default_factory=list)
+    schema_version: int = SCHEMA_VERSION
 
     def record_tool(
         self,
@@ -183,6 +186,18 @@ class ExecutionLedger:
         }
         self.tool_calls.append(event)
         del self.tool_calls[:-512]
+
+        evidence = evidence_from_tool_result(
+            tool_name=normalized_tool,
+            output=full_text,
+            turn_id=str(self.turn_id or ""),
+            status=event["status"],
+            category=event["category"],
+            observed_at=event["recorded_at"],
+            raw_reference=f"sha256:{event['output_sha256']}",
+        )
+        self.evidence_records.append(evidence.to_dict())
+        del self.evidence_records[:-512]
 
         if failed:
             self.open_blockers.append({
@@ -226,11 +241,14 @@ class ExecutionLedger:
             if not isinstance(raw, dict):
                 continue
             fact_id = str(raw.get("id") or raw.get("fact_id") or "").strip()[:160]
-            value = _decimal_text(raw.get("value"))
-            if not fact_id or value is None:
+            raw_value = raw.get("value")
+            numeric_value = _decimal_text(raw_value)
+            if not fact_id or raw_value is None:
                 continue
+            value = numeric_value if numeric_value is not None else _stringify(raw_value, limit=1200)
+            kind = "numeric" if numeric_value is not None else "fact"
             item = {
-                "kind": "numeric",
+                "kind": kind,
                 "fact_id": fact_id,
                 "key": str(raw.get("label") or fact_id).strip()[:240],
                 "value": value,
@@ -240,7 +258,8 @@ class ExecutionLedger:
                 "derived": False,
                 "recorded_at": recorded_at,
             }
-            known[fact_id] = item
+            if kind == "numeric":
+                known[fact_id] = item
             self.verified_facts.append(item)
 
         for raw in derived if isinstance(derived, list) else []:
@@ -762,6 +781,7 @@ class ExecutionLedger:
 
     def to_json(self) -> dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "owner": self.owner,
             "workspace": self.workspace,
             "session_id": self.session_id,
@@ -770,6 +790,7 @@ class ExecutionLedger:
             "outcome": self.outcome,
             "started_at": self.started_at,
             **self.evidence_summary(max_items=512),
+            "evidence_records": self.evidence_records[-512:],
         }
 
 
@@ -931,7 +952,7 @@ def load_recent_execution_ledger_context(
             except Exception:
                 continue
             if isinstance(parsed, dict) and parsed.get("outcome") == "completed":
-                records.append(parsed)
+                records.append(_upgrade_ledger_record(parsed))
     if not records:
         return ""
 
@@ -961,3 +982,27 @@ def load_recent_execution_ledger_context(
             for item in values[-6:]:
                 out.append("- " + _stringify(item, limit=360))
     return _stringify("\n".join(out).strip() + "\n", limit=max_chars)
+
+
+def _upgrade_ledger_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Read legacy JSONL records as schema v2 without rewriting the file."""
+    if int(record.get("schema_version") or 1) >= SCHEMA_VERSION:
+        return record
+    upgraded = dict(record)
+    upgraded["schema_version"] = SCHEMA_VERSION
+    evidence_records: list[dict[str, Any]] = []
+    for event in record.get("tool_calls") or []:
+        if not isinstance(event, dict):
+            continue
+        evidence = evidence_from_tool_result(
+            tool_name=str(event.get("tool_name") or "tool"),
+            output=event.get("summary") or "",
+            turn_id=str(record.get("turn_id") or ""),
+            status=str(event.get("status") or "succeeded"),
+            category=str(event.get("category") or ""),
+            observed_at=float(event.get("recorded_at") or record.get("started_at") or 0),
+            raw_reference=f"sha256:{event.get('output_sha256') or ''}",
+        )
+        evidence_records.append(evidence.to_dict())
+    upgraded["evidence_records"] = evidence_records
+    return upgraded

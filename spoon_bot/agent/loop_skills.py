@@ -11,6 +11,15 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from spoon_bot.agent.context import format_current_datetime_context
+from spoon_bot.agent.evidence import (
+    EvidenceRecord,
+    TurnContextEnvelope,
+    aggregate_settled_games,
+    apply_freshness_policy,
+    deduplicate_evidence,
+    evidence_from_tool_result,
+    game_settlement_from_evidence,
+)
 from spoon_bot.agent.execution_ledger import (
     load_recent_execution_ledger_context,
 )
@@ -97,6 +106,119 @@ _BOUNDED_CONTINUATION_BOUNDARY = (
 
 
 class LoopSkillsMixin:
+    def _structured_context_enabled(self) -> bool:
+        grounding = getattr(self, "grounding", None)
+        return bool(getattr(grounding, "structured_context", False))
+
+    def _build_turn_context_envelope(self, message: str) -> str:
+        """Build one deduplicated structured context payload for the turn."""
+        if not self._structured_context_enabled():
+            return ""
+
+        session = getattr(self, "_session", None)
+        raw_messages = (
+            session.get_messages()
+            if session is not None and hasattr(session, "get_messages")
+            else getattr(session, "messages", [])
+        )
+        if not isinstance(raw_messages, list):
+            raw_messages = []
+
+        recent_users: list[str] = []
+        active_ledger = getattr(self, "_active_execution_ledger", None)
+        turn_id = str(getattr(active_ledger, "turn_id", "") or "")
+        records: list[EvidenceRecord] = []
+        for item in reversed(raw_messages[-120:]):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").casefold()
+            if role == "user" and len(recent_users) < 2:
+                state = str(item.get("turn_state") or item.get("state") or "").casefold()
+                if state not in {"interrupted", "superseded", "cancelled", "canceled"}:
+                    content = str(item.get("content") or "").strip()
+                    if content and content != message:
+                        recent_users.append(content[:700])
+                if not turn_id and str(item.get("content") or "") == str(message):
+                    turn_id = str(item.get("turn_id") or "")
+            elif role == "tool":
+                state = str(item.get("turn_state") or item.get("state") or "").casefold()
+                if state in {"interrupted", "superseded", "cancelled", "canceled"}:
+                    continue
+                records.append(evidence_from_tool_result(
+                    tool_name=str(item.get("name") or item.get("tool_name") or "tool"),
+                    output=item.get("content") or "",
+                    turn_id=str(item.get("turn_id") or item.get("tool_call_id") or ""),
+                    status=(
+                        "failed"
+                        if state in {"failed", "error", "terminated"}
+                        or item.get("guardrail_stop") is True
+                        else "succeeded"
+                    ),
+                    category=str(item.get("category") or ""),
+                    raw_reference=f"session:{getattr(session, 'session_key', '')}",
+                ))
+
+        if active_ledger is not None:
+            for payload in getattr(active_ledger, "evidence_records", []) or []:
+                if isinstance(payload, dict):
+                    records.append(EvidenceRecord.from_dict(payload))
+
+        evidence = apply_freshness_policy(
+            deduplicate_evidence(records),
+            current_turn_id=turn_id,
+        )[:16]
+        settlements = game_settlement_from_evidence(evidence)
+        workflow_state: dict[str, Any] = {
+            "recent_user_messages": list(reversed(recent_users)),
+        }
+        terminal_evidence = next(
+            (
+                record.to_context_dict()
+                for record in evidence
+                if record.status == "succeeded" and record.freshness == "stable"
+            ),
+            None,
+        )
+        if terminal_evidence is not None:
+            workflow_state["latest_authoritative_terminal"] = terminal_evidence
+        if settlements:
+            workflow_state["game_settlements"] = [item.to_dict() for item in settlements[:6]]
+            workflow_state["settled_game_aggregate"] = aggregate_settled_games(evidence)
+
+        blockers = []
+        if active_ledger is not None:
+            blockers = list(getattr(active_ledger, "open_blockers", []) or [])[-8:]
+
+        intent = classify_continuation_intent(message)
+        selected_skills = [
+            str(context.get("name") or "")
+            for context in getattr(self, "_recent_invoked_skill_contexts", []) or []
+            if isinstance(context, dict) and str(context.get("name") or "")
+        ]
+        grounding = getattr(self, "grounding", None)
+        context_window = int(getattr(self, "context_window", 0) or 0)
+        envelope = TurnContextEnvelope(
+            session_id=str(getattr(self, "session_key", "") or ""),
+            turn_id=turn_id,
+            current_request=message,
+            continuation_intent=intent.kind,
+            selected_workflow=selected_skills[0] if len(selected_skills) == 1 else "",
+            active_capabilities=(
+                self.tools.list_tools()
+                if getattr(self, "tools", None) is not None
+                else []
+            ),
+            workflow_state=workflow_state,
+            evidence=evidence,
+            unresolved_blockers=blockers,
+            token_budget={
+                "context": int(context_window * float(getattr(grounding, "context_compaction_ratio", 0.75))),
+                "output_reserve": int(context_window * float(getattr(grounding, "output_reserve_ratio", 0.2))),
+            },
+        )
+        self._current_turn_context_envelope = envelope
+        return envelope.render()
+
     def _workspace_posix_path(self) -> str:
         """Return the workspace path in POSIX form for shell commands."""
         import re as _re
@@ -592,8 +714,9 @@ class LoopSkillsMixin:
             format_explicit_request_urls_context(hint_source),
             format_explicit_request_values_context(hint_source),
             self._format_local_skill_execution_context(hints),
+            self._build_turn_context_envelope(message),
             self._format_recent_execution_ledger_context()
-            if include_session_evidence
+            if include_session_evidence and not self._structured_context_enabled()
             else "",
             format_explicit_tool_request_context(hints),
             format_current_session_fact_check_context(message),
