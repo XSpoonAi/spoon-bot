@@ -8,6 +8,7 @@ LLM responsible for deciding the next real action from the current context.
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from typing import Any
 
@@ -48,6 +49,17 @@ _USER_SUMMARY_PREFIXES = (
     "final answer:",
     "user summary:",
 )
+
+_CAPABILITY_ERROR_MARKERS = (
+    "error: unknown tool",
+    "is registered but not active for this request",
+    "tool capability unavailable",
+)
+
+_NUMERIC_TOKEN_RE = re.compile(
+    r"(?<![0-9A-Za-z_])[-+]?\d+(?:[.,]\d+)?%?(?![0-9A-Za-z_])"
+)
+_NUMBERED_LIST_PREFIX_RE = re.compile(r"(?m)^\s*\d+[.)]\s+")
 
 
 def dominant_non_latin_scripts(text: str | None) -> list[str]:
@@ -149,6 +161,67 @@ def _stream_tool_event_text(event: dict[str, Any]) -> str:
         or event.get("delta")
     )
     return _stringify_payload(_unwrap_payload(payload))
+
+
+def latest_unresolved_tool_failure(
+    tool_result_events: list[dict[str, Any]],
+) -> str:
+    """Return the latest unresolved tool/capability failure, if any.
+
+    Only the latest non-empty event is considered unresolved. A later successful
+    tool result therefore supersedes an earlier recoverable failure, while a
+    final unknown/inactive/failed call cannot be rewritten into a success claim.
+    """
+    latest = _latest_non_empty_tool_event(tool_result_events)
+    if latest is None:
+        return ""
+
+    metadata = dict(latest.get("metadata") or {})
+    status = str(
+        metadata.get("status")
+        or latest.get("status")
+        or ""
+    ).strip().casefold()
+    text = _stream_tool_event_text(latest).strip()
+    normalized = " ".join(text.casefold().split())
+    failed = (
+        metadata.get("guardrail_stop") is True
+        or status in {"failed", "error", "terminated", "cancelled", "canceled"}
+        or any(marker in normalized for marker in _CAPABILITY_ERROR_MARKERS)
+        or normalized.startswith(("error:", "traceback ", "command failed"))
+    )
+    return _compact_tool_output(text, limit=700) if failed and text else ""
+
+
+def final_answer_has_unsupported_numeric_claims(
+    final_content: str | None,
+    evidence_text: str | None,
+) -> bool:
+    """Reject numeric claims that do not occur in the supplied evidence.
+
+    Numeric game results, balances, ranks, rewards, transaction amounts, ports,
+    and identifiers are especially easy for a synthesis model to invent. The
+    check is domain-neutral: after removing Markdown numbered-list prefixes,
+    every numeric token in the answer must also appear in the evidence brief.
+    Deterministic derived facts are safe because the ledger renders them into
+    that brief before synthesis.
+    """
+    final_text = _NUMBERED_LIST_PREFIX_RE.sub("", str(final_content or ""))
+    evidence = str(evidence_text or "")
+    if not final_text.strip():
+        return False
+
+    def _tokens(text: str) -> set[str]:
+        return {
+            match.group(0).replace(",", "").casefold()
+            for match in _NUMERIC_TOKEN_RE.finditer(text)
+        }
+
+    claimed = _tokens(final_text)
+    if not claimed:
+        return False
+    supported = _tokens(evidence)
+    return bool(claimed - supported)
 
 
 def _contains_workspace_skill_path(text: str) -> bool:
@@ -381,6 +454,15 @@ def latest_tool_event_has_user_summary_marker(
     return bool(latest and _iter_user_summary_lines([_stream_tool_event_text(latest)]))
 
 
+def latest_tool_user_summary(tool_result_events: list[dict[str, Any]]) -> str:
+    """Return the latest tool-designated user-facing terminal summary verbatim."""
+    latest = _latest_non_empty_tool_event(tool_result_events)
+    if latest is None:
+        return ""
+    summaries = _iter_user_summary_lines([_stream_tool_event_text(latest)])
+    return summaries[-1] if summaries else ""
+
+
 def _tool_event_shell_job_fields(event: dict[str, Any]) -> dict[str, str]:
     """Return simple key/value fields from the shell job text format."""
     if _stream_tool_event_name(event) != "shell":
@@ -492,6 +574,50 @@ def tool_events_need_more_evidence(tool_result_events: list[dict[str, Any]]) -> 
         latest_tool_event_has_next_command(tool_result_events)
         or latest_tool_event_has_active_background_job(tool_result_events)
     )
+
+
+def deterministic_completion_verdict(
+    final_content: str | None,
+    tool_result_events: list[dict[str, Any]],
+    *,
+    verifier_reason: str,
+) -> dict[str, str]:
+    """Fail closed when the optional completion model cannot be trusted."""
+    failure = latest_unresolved_tool_failure(tool_result_events)
+    if failure:
+        return {
+            "status": "awaiting_user",
+            "reason": f"{verifier_reason}; latest tool evidence is a blocker.",
+            "next_focus": "",
+        }
+    if latest_tool_event_has_active_background_job(tool_result_events):
+        return {
+            "status": "needs_continuation",
+            "reason": f"{verifier_reason}; latest tool evidence is still running.",
+            "next_focus": "Inspect the existing job without rerunning the action.",
+        }
+    if latest_tool_event_has_user_summary_marker(tool_result_events):
+        return {
+            "status": "complete",
+            "reason": f"{verifier_reason}; tool-designated terminal summary is present.",
+            "next_focus": "",
+        }
+    if tool_events_are_read_only(tool_result_events):
+        final_text = str(final_content or "").strip()
+        if final_text and not final_answer_is_raw_tool_evidence(
+            final_text,
+            tool_result_events,
+        ):
+            return {
+                "status": "complete",
+                "reason": f"{verifier_reason}; grounded read-only answer is available.",
+                "next_focus": "",
+            }
+    return {
+        "status": "awaiting_user",
+        "reason": f"{verifier_reason}; no deterministic terminal evidence is present.",
+        "next_focus": "",
+    }
 
 
 def _compact_tool_output(text: str, *, limit: int = 1200) -> str:
