@@ -21,7 +21,6 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings
 
-
 # ---------------------------------------------------------------------------
 # Shared default constants (single source of truth)
 # ---------------------------------------------------------------------------
@@ -547,6 +546,18 @@ class CronConfig(BaseModel):
             run_log=CronRunLogConfig(**run_log_raw),
             execution=CronExecutionConfig(**execution_raw),
         )
+class GroundingConfig(BaseModel):
+    """Feature flags for structured context and hallucination controls."""
+
+    strict_capabilities: bool = True
+    structured_context: bool = True
+    claim_validation: bool = True
+    fail_closed_completion: bool = True
+    shadow_mode: bool = False
+    context_compaction_ratio: float = Field(default=0.75, ge=0.5, le=0.9)
+    output_reserve_ratio: float = Field(default=0.2, ge=0.1, le=0.4)
+
+
 class AgentLoopConfig(BaseModel):
     """Configuration for AgentLoop with validation."""
 
@@ -651,6 +662,10 @@ class AgentLoopConfig(BaseModel):
     memsearch: MemSearchConfig = Field(
         default_factory=MemSearchConfig,
         description="Semantic memory search configuration"
+    )
+    grounding: GroundingConfig = Field(
+        default_factory=GroundingConfig,
+        description="Structured evidence and claim-grounding controls",
     )
 
     # Provider retry (exponential backoff for transient LLM errors)
@@ -948,6 +963,7 @@ def validate_agent_loop_params(
     provider_retry_base_delay: float = DEFAULT_PROVIDER_RETRY_BASE_DELAY,
     provider_retry_max_delay: float = DEFAULT_PROVIDER_RETRY_MAX_DELAY,
     provider_retry_backoff_factor: float = DEFAULT_PROVIDER_RETRY_BACKOFF_FACTOR,
+    grounding_config: GroundingConfig | dict[str, Any] | None = None,
 ) -> AgentLoopConfig:
     """
     Validate AgentLoop initialization parameters.
@@ -1000,4 +1016,9 @@ def validate_agent_loop_params(
         provider_retry_base_delay=provider_retry_base_delay,
         provider_retry_max_delay=provider_retry_max_delay,
         provider_retry_backoff_factor=provider_retry_backoff_factor,
+        grounding=(
+            grounding_config
+            if isinstance(grounding_config, GroundingConfig)
+            else GroundingConfig(**(grounding_config or {}))
+        ),
     )

@@ -24,6 +24,16 @@ except ImportError as e:
     ) from e
 
 from spoon_bot.agent.context_snapshot import write_llm_context_snapshot
+from spoon_bot.agent.evidence import (
+    EvidenceRecord,
+    conservative_fact_summary,
+    deduplicate_evidence,
+    evidence_from_tool_result,
+    game_settlement_from_evidence,
+    render_game_settlement_summary,
+    validate_claims,
+    write_claim_validation_audit,
+)
 from spoon_bot.agent.execution_ledger import (
     ExecutionLedger,
 )
@@ -411,13 +421,46 @@ class LoopProtocolMixin:
         return cls._message_content_char_count(getattr(msg, "content", None))
 
     def _estimate_runtime_tokens(self) -> int:
-        """Rough token estimate from the agent's runtime messages (~4 chars/token)."""
-        if not self._agent or not hasattr(self._agent, "memory"):
+        """Estimate the complete provider request, including prompt and tool schemas."""
+        chunks: list[str] = []
+        if self._agent is not None:
+            chunks.append(str(getattr(self._agent, "system_prompt", "") or ""))
+            if hasattr(self._agent, "memory"):
+                for message in getattr(self._agent.memory, "messages", []) or []:
+                    content = getattr(message, "content", None)
+                    if isinstance(content, str):
+                        chunks.append(content)
+                    else:
+                        chunks.append(json.dumps(content, ensure_ascii=False, default=str))
+        registry = getattr(self, "tools", None)
+        if registry is not None and hasattr(registry, "get_definitions"):
+            try:
+                chunks.append(json.dumps(
+                    registry.get_definitions(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ))
+            except Exception as exc:
+                logger.debug(f"Tool-schema token estimate skipped: {exc}")
+        text = "\n".join(chunks)
+        if not text:
             return 0
-        return sum(self._msg_char_count(m) for m in self._agent.memory.messages) // 4
+        try:
+            import tiktoken
+            try:
+                encoding = tiktoken.encoding_for_model(str(getattr(self, "model", "") or ""))
+            except KeyError:
+                encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text, disallowed_special=()))
+        except Exception:
+            return max(1, len(text) // 4)
 
     def _build_session_recall_context(self, current_message: str) -> str:
         """Build a compact same-session context block for follow-up questions."""
+        grounding = getattr(self, "grounding", None)
+        if bool(getattr(grounding, "structured_context", False)):
+            return ""
         if not (
             request_is_bare_continuation(current_message)
             or request_needs_current_session_fact_check(current_message)
@@ -3319,6 +3362,100 @@ class LoopProtocolMixin:
         final_scripts = set(dominant_non_latin_scripts(final_content))
         return not bool(user_scripts & final_scripts)
 
+    def _final_answer_evidence_records(
+        self,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        user_message: str | None,
+    ) -> list[EvidenceRecord]:
+        """Collect the closed evidence set allowed to support final claims."""
+        records: list[EvidenceRecord] = []
+        envelope = getattr(self, "_current_turn_context_envelope", None)
+        records.extend(getattr(envelope, "evidence", []) or [])
+
+        ledger = getattr(self, "_active_execution_ledger", None)
+        for payload in getattr(ledger, "evidence_records", []) or []:
+            if isinstance(payload, EvidenceRecord):
+                records.append(payload)
+            elif isinstance(payload, dict):
+                records.append(EvidenceRecord.from_dict(payload))
+
+        turn_id = str(getattr(ledger, "turn_id", "") or getattr(envelope, "turn_id", ""))
+        for event in tool_result_events:
+            if not isinstance(event, dict):
+                continue
+            tool_name = str(event.get("tool_name") or event.get("name") or "tool")
+            output = AgentLoop._stream_tool_result_event_summary(event, limit=80_000)
+            state = str(event.get("status") or event.get("state") or "").casefold()
+            failed = bool(
+                event.get("guardrail_stop") is True
+                or state in {"failed", "error", "terminated", "cancelled", "canceled"}
+            )
+            records.append(evidence_from_tool_result(
+                tool_name=tool_name,
+                output=output,
+                turn_id=turn_id,
+                status="failed" if failed else "succeeded",
+                category=str(event.get("category") or ""),
+                raw_reference="current_turn_tool_event",
+            ))
+
+        if user_message:
+            user_record = evidence_from_tool_result(
+                tool_name="current_user_request",
+                output=user_message,
+                turn_id=turn_id,
+                status="succeeded",
+                raw_reference="current_user_request",
+            )
+            user_record.source_type = "user"
+            user_record.capability_id = ""
+            records.append(user_record)
+        return deduplicate_evidence(records)
+
+    def _validate_grounded_final_answer(
+        self,
+        draft: str,
+        tool_result_events: list[dict[str, Any]],
+        *,
+        user_message: str | None,
+        deterministic_fallback: str,
+    ) -> str:
+        """Enforce claim grounding or return a deterministic evidence template."""
+        grounding = getattr(self, "grounding", None)
+        if not bool(getattr(grounding, "claim_validation", False)):
+            return draft
+        records = AgentLoop._final_answer_evidence_records(
+            self,
+            tool_result_events,
+            user_message=user_message,
+        )
+        ledger = getattr(self, "_active_execution_ledger", None)
+        blockers = list(getattr(ledger, "open_blockers", []) or [])
+        result = validate_claims(draft, records, unresolved_blockers=blockers)
+        shadow_mode = bool(getattr(grounding, "shadow_mode", False))
+        try:
+            write_claim_validation_audit(
+                getattr(self, "workspace", None),
+                session_id=str(getattr(self, "session_key", "") or ""),
+                turn_id=str(getattr(ledger, "turn_id", "") or ""),
+                result=result,
+                shadow_mode=shadow_mode,
+            )
+        except Exception as exc:
+            logger.debug(f"Claim-validation audit write skipped: {exc}")
+        if result.valid or shadow_mode:
+            if not result.valid:
+                logger.warning(
+                    "Claim validator shadow rejection: " + result.fallback_reason
+                )
+            return draft
+        logger.warning("Claim validator rejected final answer: " + result.fallback_reason)
+        successful = [record for record in records if record.status == "succeeded"]
+        if game_settlement_from_evidence(successful):
+            return render_game_settlement_summary(successful)
+        return deterministic_fallback or conservative_fact_summary(successful)
+
     async def _synthesize_final_answer_from_tool_events(
         self,
         tool_result_events: list[dict[str, Any]],
@@ -3520,7 +3657,13 @@ class LoopProtocolMixin:
                     "\n".join(numeric_evidence_parts),
                 )
             ):
-                return repaired
+                return AgentLoop._validate_grounded_final_answer(
+                    self,
+                    repaired,
+                    synthesis_events,
+                    user_message=user_message,
+                    deterministic_fallback=deterministic_fallback,
+                )
             logger.warning(
                 "Final-answer synthesis denied available tool evidence after repair; "
                 "using deterministic evidence summary."
@@ -3535,7 +3678,13 @@ class LoopProtocolMixin:
                 "verified evidence; using deterministic evidence summary."
             )
             return deterministic_fallback
-        return synthesized
+        return AgentLoop._validate_grounded_final_answer(
+            self,
+            synthesized,
+            synthesis_events,
+            user_message=user_message,
+            deterministic_fallback=deterministic_fallback,
+        )
 
     def _session_evidence_synthesis_events(
         self,
