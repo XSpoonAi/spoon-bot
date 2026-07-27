@@ -40,13 +40,13 @@ for _noisy in ("httpx", "httpcore", "urllib3", "hpack", "h2", "openai._base_clie
 
 # Import spoon-core SDK components (required)
 try:
-    from spoon_ai.chat import ChatBot
-    from spoon_ai.schema import Message, AgentState
-    from spoon_ai.llm.interface import LLMResponse
     from spoon_ai.agents.spoon_react_mcp import SpoonReactMCP
     from spoon_ai.agents.spoon_react_skill import SpoonReactSkill
-    from spoon_ai.tools import ToolManager
+    from spoon_ai.chat import ChatBot
+    from spoon_ai.llm.interface import LLMResponse
+    from spoon_ai.schema import AgentState, Message
     from spoon_ai.skills import SkillManager
+    from spoon_ai.tools import ToolManager
 
     SPOON_CORE_AVAILABLE = True
 except ImportError as e:
@@ -75,29 +75,44 @@ from spoon_bot.agent.execution_ledger import (
     bind_execution_ledger,
     persist_execution_ledger,
 )
-from spoon_bot.agent.tools.registry import (
-    CORE_TOOLS,
-    ToolRegistry,
-)
-from spoon_bot.agent.tools.shell import ShellTool
-from spoon_bot.agent.tools.filesystem import (
-    ReadFileTool,
-    WriteFileTool,
-    EditFileTool,
-    ListDirTool,
-)
-from spoon_bot.agent.tools.grep import GrepTool
-from spoon_bot.agent.tools.history_search import SearchHistoryTool
+from spoon_bot.agent.tools.cron import CronTool
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
     bind_tool_owner,
     bind_tool_workspace,
-    clear_captured_tool_outputs,
     capture_tool_outputs,
+    clear_captured_tool_outputs,
     consume_captured_tool_output,
     consume_captured_tool_output_deltas,
     has_active_captured_tool_invocation,
     track_tool_invocations,
+)
+from spoon_bot.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from spoon_bot.agent.tools.grep import GrepTool
+from spoon_bot.agent.tools.history_search import SearchHistoryTool
+from spoon_bot.agent.tools.registry import (
+    CORE_TOOLS,
+    ToolRegistry,
+)
+from spoon_bot.agent.tools.self_config import (
+    ActivateToolTool,
+    MemoryManagementTool,
+    SelfConfigTool,
+    SelfUpgradeTool,
+)
+from spoon_bot.agent.tools.shell import ShellTool
+from spoon_bot.agent.tools.wallet import WalletTool
+from spoon_bot.agent.tools.web import WebFetchTool, WebSearchTool
+from spoon_bot.agent.tools.web3 import (
+    BalanceCheckTool,
+    ContractCallTool,
+    SwapTool,
+    TransferTool,
 )
 from spoon_bot.agent.turn_verifiers import (
     build_user_facing_tool_event_answer,
@@ -109,24 +124,9 @@ from spoon_bot.agent.turn_verifiers import (
     skill_contract_needs_continuation,
     tool_events_need_more_evidence,
 )
-from spoon_bot.agent.tools.self_config import (
-    ActivateToolTool,
-    SelfConfigTool,
-    MemoryManagementTool,
-    SelfUpgradeTool,
-)
-from spoon_bot.agent.tools.cron import CronTool
-from spoon_bot.agent.tools.web import WebSearchTool, WebFetchTool
-from spoon_bot.agent.tools.wallet import WalletTool
-from spoon_bot.agent.tools.web3 import (
-    BalanceCheckTool,
-    ContractCallTool,
-    SwapTool,
-    TransferTool,
-)
 from spoon_bot.config import (
-    DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
     DEFAULT_MAX_OUTPUT,
+    DEFAULT_MAX_STREAM_TOOL_RESULTS_WITHOUT_CONTENT,
     DEFAULT_PROVIDER_MAX_RETRIES,
     DEFAULT_PROVIDER_SILENCE_TIMEOUT,
     DEFAULT_PROVIDER_TOTAL_TIMEOUT,
@@ -134,26 +134,27 @@ from spoon_bot.config import (
     DEFAULT_SHELL_MAX_TIMEOUT,
     DEFAULT_SHELL_TIMEOUT,
     DEFAULT_TOOL_FOLLOWUP_TIMEOUT,
+    GroundingConfig,
     MemSearchConfig,
     resolve_context_window,
     validate_agent_loop_params,
 )
-from spoon_bot.skills.zip_install import InstalledSkillZip
-from spoon_bot.services.hotreload import HotReloadService
-from spoon_bot.subagent.manager import SubagentManager
-from spoon_bot.subagent.tools import SubagentTool
-from spoon_bot.subagent.catalog import format_roles_for_prompt
-from spoon_bot.session.manager import SessionManager
-from spoon_bot.session.store import create_session_store
-from spoon_bot.memory.store import MemoryStore
-from spoon_bot.wallet import ensure_wallet_runtime
 from spoon_bot.exceptions import (
     user_friendly_error,
 )
+from spoon_bot.memory.store import MemoryStore
 from spoon_bot.services.git import GitManager
+from spoon_bot.services.hotreload import HotReloadService
+from spoon_bot.session.manager import SessionManager
+from spoon_bot.session.store import create_session_store
+from spoon_bot.skills.zip_install import InstalledSkillZip
+from spoon_bot.subagent.catalog import format_roles_for_prompt
+from spoon_bot.subagent.manager import SubagentManager
+from spoon_bot.subagent.tools import SubagentTool
 from spoon_bot.utils.retry import (
     RetryConfig,
 )
+from spoon_bot.wallet import ensure_wallet_runtime
 
 if TYPE_CHECKING:
     pass
@@ -163,14 +164,13 @@ from spoon_bot.agent import loop_protocol as _loop_protocol
 from spoon_bot.agent import loop_skills as _loop_skills
 from spoon_bot.agent import loop_state as _loop_state
 from spoon_bot.agent.loop_protocol import (
-    LoopProtocolMixin,
     _REPEATED_READ_RECOVERY_THRESHOLD,
+    LoopProtocolMixin,
 )
 from spoon_bot.agent.loop_skills import (
     LoopSkillsMixin,
 )
 from spoon_bot.agent.loop_state import (
-    LoopStateMixin,
     _DEFAULT_INTERNAL_RECOVERY_TIMEOUT,
     _DEFAULT_NON_SHELL_ACTIVE_TOOL_TIMEOUT,
     _DEFAULT_POST_TOOL_RESULT_SILENCE_TIMEOUT,
@@ -178,10 +178,10 @@ from spoon_bot.agent.loop_state import (
     _MISSING,
     _TURN_STATE_COMPLETED,
     _TURN_STATE_INTERRUPTED,
+    LoopStateMixin,
     _ensure_attachment_context,  # noqa: F401 - compatibility re-export
     _strip_attachment_context,  # noqa: F401 - compatibility re-export
 )
-
 
 _DEFAULT_STREAM_HEARTBEAT_INITIAL_DELAY = 15.0
 _DEFAULT_STREAM_HEARTBEAT_INTERVAL = 30.0
@@ -251,6 +251,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         provider_retry_max_delay: float = 60.0,
         provider_retry_backoff_factor: float = 2.0,
         reasoning_effort: str | None = None,
+        grounding_config: GroundingConfig | dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize the agent loop.
@@ -299,6 +300,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 provider_retry_base_delay=provider_retry_base_delay,
                 provider_retry_max_delay=provider_retry_max_delay,
                 provider_retry_backoff_factor=provider_retry_backoff_factor,
+                grounding_config=grounding_config,
             )
         except Exception as e:
             logger.error(f"Configuration validation failed: {e}")
@@ -312,6 +314,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         self.api_key = api_key
         self.base_url = base_url
         self.reasoning_effort = self._config.reasoning_effort
+        self.grounding = self._config.grounding
         self.max_iterations = self._config.max_iterations
         self.shell_timeout = self._config.shell_timeout
         self.shell_max_timeout = self._config.shell_max_timeout
@@ -378,7 +381,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
         # spoon-bot components
         self.context = ContextBuilder(self.workspace, yolo_mode=self.yolo_mode)
-        self.tools = ToolRegistry()
+        self.tools = ToolRegistry(
+            strict_capabilities=self.grounding.strict_capabilities,
+        )
         self._cron_service = None
 
         if getattr(self, "yolo_mode", False):
@@ -489,7 +494,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         self._session = self.sessions.get_or_create(self.session_key)
 
         # Inject memory context
-        memory_context = self.memory.get_memory_context()
+        memory_context = (
+            self.memory.get_prompt_memory_context()
+            if callable(getattr(type(self.memory), "get_prompt_memory_context", None))
+            else self.memory.get_memory_context()
+        )
         if memory_context:
             self.context.set_memory_context(memory_context)
 
@@ -1406,8 +1415,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
     def _runtime_compaction_trigger_budget(self) -> int:
         """Return the runtime token budget that should trigger preflight compaction."""
-        safety_margin = max(8_000, int(self.context_window * 0.05))
-        return max(8_000, self.context_window - safety_margin)
+        grounding = getattr(self, "grounding", None)
+        compaction_ratio = float(getattr(grounding, "context_compaction_ratio", 0.75))
+        output_reserve_ratio = float(getattr(grounding, "output_reserve_ratio", 0.2))
+        usable_ratio = min(compaction_ratio, 1.0 - output_reserve_ratio)
+        return max(8_000, int(self.context_window * usable_ratio))
 
     async def process(
         self,
@@ -1469,7 +1481,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
         # Refresh memory context
         try:
-            memory_context = self.memory.get_memory_context()
+            memory_context = (
+                self.memory.get_prompt_memory_context()
+                if callable(getattr(type(self.memory), "get_prompt_memory_context", None))
+                else self.memory.get_memory_context()
+            )
             if memory_context:
                 self.context.set_memory_context(memory_context)
         except Exception as e:
@@ -1910,7 +1926,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         bg_task: asyncio.Task | None = None
 
         try:
-            memory_context = self.memory.get_memory_context()
+            memory_context = (
+                self.memory.get_prompt_memory_context()
+                if callable(getattr(type(self.memory), "get_prompt_memory_context", None))
+                else self.memory.get_memory_context()
+            )
             if memory_context:
                 self.context.set_memory_context(memory_context)
         except Exception as e:
@@ -4946,7 +4966,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
         # Refresh memory context
         try:
-            memory_context = self.memory.get_memory_context()
+            memory_context = (
+                self.memory.get_prompt_memory_context()
+                if callable(getattr(type(self.memory), "get_prompt_memory_context", None))
+                else self.memory.get_memory_context()
+            )
             if memory_context:
                 self.context.set_memory_context(memory_context)
         except Exception as e:

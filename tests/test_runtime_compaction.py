@@ -70,7 +70,7 @@ async def test_prepare_request_context_proactively_compacts_near_context_limit()
 
     loop._compress_runtime_context.assert_called_once_with(
         force=True,
-        budget_tokens=380_000,
+        budget_tokens=300_000,
     )
     loop._force_compress_runtime_context.assert_not_called()
     notices = AgentLoop._drain_runtime_notices(loop)
@@ -95,8 +95,8 @@ async def test_prepare_request_context_skips_proactive_compaction_until_near_lim
     loop._trim_context_if_needed = MagicMock(return_value=0)
     loop._sync_runtime_history_from_session = AsyncMock(return_value=5)
     loop._normalize_runtime_tool_context = MagicMock(return_value=0)
-    loop._estimate_runtime_tokens = MagicMock(return_value=360_000)
-    loop._estimate_token_count = MagicMock(return_value=360_000)
+    loop._estimate_runtime_tokens = MagicMock(return_value=299_000)
+    loop._estimate_token_count = MagicMock(return_value=299_000)
     loop._compress_runtime_context = MagicMock(return_value=0)
     loop._force_compress_runtime_context = MagicMock(return_value=0)
 
@@ -110,6 +110,7 @@ async def test_prepare_request_context_skips_proactive_compaction_until_near_lim
 def test_trim_context_if_needed_is_noop():
     """``_trim_context_if_needed`` must never mutate the session store."""
     from spoon_ai.schema import Message
+
     from spoon_bot.agent.loop import AgentLoop
 
     loop = _make_loop([Message(role="user", content=f"m{i}") for i in range(100)])
@@ -123,6 +124,7 @@ def test_trim_context_if_needed_is_noop():
 def test_snap_drop_end_never_splits_tool_pair():
     """Snapping must land on a user boundary when a tool pair would split."""
     from spoon_ai.schema import Function, Message, ToolCall
+
     from spoon_bot.agent.loop import AgentLoop
 
     tc = ToolCall(id="call_a", function=Function(name="shell", arguments="{}"))
@@ -150,6 +152,7 @@ def test_snap_drop_end_never_splits_tool_pair():
 def test_snap_drop_end_stops_on_settled_assistant_turn():
     """An assistant without tool_calls, not followed by tool, is a safe cut."""
     from spoon_ai.schema import Message
+
     from spoon_bot.agent.loop import AgentLoop
 
     messages = [
@@ -174,6 +177,7 @@ def test_snap_drop_end_stops_on_settled_assistant_turn():
 def test_insert_compaction_marker_is_runtime_only():
     """The marker lands in runtime memory with role=user and references search_history."""
     from spoon_ai.schema import Message
+
     from spoon_bot.agent.loop import AgentLoop
 
     messages = [Message(role="system", content="sys"), Message(role="user", content="u")]
@@ -195,6 +199,7 @@ def test_insert_compaction_marker_is_runtime_only():
 @pytest.mark.requires_spoon_core
 def test_compress_runtime_context_neutralizes_old_assistant_conclusions_but_keeps_latest_user_request():
     from spoon_ai.schema import Message
+
     from spoon_bot.agent.loop import AgentLoop
 
     latest_request = (
@@ -231,6 +236,7 @@ def test_compress_runtime_context_neutralizes_old_assistant_conclusions_but_keep
 def test_force_compress_drops_segment_aware_and_inserts_marker():
     """Force-compression must not split tool pairs and must insert the marker."""
     from spoon_ai.schema import Function, Message, ToolCall
+
     from spoon_bot.agent.loop import AgentLoop
 
     def tool_pair(i: int) -> list:
@@ -288,6 +294,7 @@ def test_force_compress_drops_segment_aware_and_inserts_marker():
 def test_compress_runtime_context_keeps_tool_pairs_atomic():
     """Phase-3 drops in ``_compress_runtime_context`` must not orphan tools."""
     from spoon_ai.schema import Function, Message, ToolCall
+
     from spoon_bot.agent.loop import AgentLoop
 
     def tool_pair(i: int) -> list:

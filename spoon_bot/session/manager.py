@@ -7,12 +7,12 @@ postgres) while keeping an in-memory LRU cache for hot sessions.
 
 from __future__ import annotations
 
-import json
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
-from threading import RLock
 from pathlib import Path
-from typing import Any, Iterable, Optional, TYPE_CHECKING
+from threading import RLock
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from loguru import logger
 
@@ -34,6 +34,7 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     messages: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    revision: int = 0
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -70,6 +71,7 @@ class Session:
             "updated_at": self.updated_at.isoformat(),
             "messages": self.messages,
             "metadata": self.metadata,
+            "revision": self.revision,
         }
 
     @classmethod
@@ -81,7 +83,12 @@ class Session:
             updated_at=datetime.fromisoformat(data["updated_at"]),
             messages=data.get("messages", []),
             metadata=data.get("metadata", {}),
+            revision=int(data.get("revision", 0) or 0),
         )
+
+
+class SessionRevisionConflictError(RuntimeError):
+    """Raised when a stale session instance attempts to overwrite newer state."""
 
 
 # ============================================================================
@@ -145,7 +152,7 @@ class SessionManager:
             self._store = FileSessionStore(sessions_dir)
 
         # In-memory cache for fast repeated access
-        self._sessions: dict[str, Session] = {}
+        self._sessions: OrderedDict[str, Session] = OrderedDict()
         self._lock = RLock()
         self._max_cached_sessions = max(1, int(max_cached_sessions))
 
@@ -161,6 +168,7 @@ class SessionManager:
         """Get an existing session or create a new one."""
         with self._lock:
             if session_key in self._sessions:
+                self._sessions.move_to_end(session_key)
                 return self._sessions[session_key]
 
             session = self._store.load_session(session_key)
@@ -178,6 +186,7 @@ class SessionManager:
         """Get an existing session without creating a new one."""
         with self._lock:
             if session_key in self._sessions:
+                self._sessions.move_to_end(session_key)
                 return self._sessions[session_key]
 
             session = self._store.load_session(session_key)
@@ -189,9 +198,10 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Persist a session to the configured backend."""
         with self._lock:
-            self._sessions[session.session_key] = session
-            self._evict_if_needed()
             self._store.save_session(session)
+            self._sessions[session.session_key] = session
+            self._sessions.move_to_end(session.session_key)
+            self._evict_if_needed()
 
     def delete(self, session_key: str) -> bool:
         """Delete a session from cache and backend."""
@@ -302,7 +312,6 @@ class SessionManager:
         )
 
     def _evict_if_needed(self) -> None:
-        """Bound in-memory cache size by evicting oldest inserted sessions."""
+        """Bound the true LRU cache by evicting the least recently accessed session."""
         while len(self._sessions) > self._max_cached_sessions:
-            oldest_key = next(iter(self._sessions))
-            self._sessions.pop(oldest_key, None)
+            self._sessions.popitem(last=False)

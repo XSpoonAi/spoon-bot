@@ -18,7 +18,6 @@ import json
 import os
 import shutil
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Generator
@@ -26,14 +25,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from spoon_bot.session.manager import Session, SessionManager
+from spoon_bot.session.manager import (
+    Session,
+    SessionManager,
+    SessionRevisionConflictError,
+)
 from spoon_bot.session.store import (
     FileSessionStore,
-    SQLiteSessionStore,
     SessionStore,
+    SQLiteSessionStore,
     create_session_store,
 )
-
 
 # ============================================================================
 # Fixtures
@@ -64,6 +66,38 @@ def _sample_session(key: str = "test-session") -> Session:
     s.add_message("assistant", "Hi there, how can I help you?")
     s.metadata = {"language": "en", "topic": "greeting"}
     return s
+
+
+@pytest.mark.parametrize("backend", ["file", "sqlite"])
+def test_session_store_rejects_stale_revision(tmp_dir: Path, backend: str) -> None:
+    store: SessionStore
+    if backend == "file":
+        store = FileSessionStore(tmp_dir / "revision-file")
+    else:
+        store = SQLiteSessionStore(str(tmp_dir / "revision.sqlite"))
+    original = Session(session_key="shared")
+    original.add_message("user", "first")
+    store.save_session(original)
+    stale = store.load_session("shared")
+    current = store.load_session("shared")
+    assert stale is not None and current is not None
+    current.add_message("assistant", "newer")
+    store.save_session(current)
+    stale.add_message("assistant", "stale overwrite")
+    with pytest.raises(SessionRevisionConflictError):
+        store.save_session(stale)
+    persisted = store.load_session("shared")
+    assert persisted is not None
+    assert persisted.messages[-1]["content"] == "newer"
+
+
+def test_session_manager_cache_is_access_ordered_lru(tmp_dir: Path) -> None:
+    manager = SessionManager(tmp_dir, max_cached_sessions=2)
+    manager.get_or_create("a")
+    manager.get_or_create("b")
+    assert manager.get("a") is not None
+    manager.get_or_create("c")
+    assert list(manager._sessions) == ["a", "c"]
 
 
 # ============================================================================
@@ -111,6 +145,7 @@ class TestSessionDataClass:
         assert s2.session_key == s1.session_key
         assert len(s2.messages) == len(s1.messages)
         assert s2.metadata == s1.metadata
+        assert s2.revision == s1.revision
 
     def test_add_message_extra_kwargs(self):
         s = Session(session_key="s1")
@@ -450,8 +485,8 @@ def _assert_multimodal_user_call(
 class TestAgentLoopSessionHydration:
     @pytest.mark.asyncio
     async def test_runtime_history_skips_plain_assistant_replies_by_default(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         uploads = workspace / "uploads"
@@ -488,8 +523,8 @@ class TestAgentLoopSessionHydration:
 
     @pytest.mark.asyncio
     async def test_runtime_history_skips_stale_assistant_prose_by_default(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         workspace.mkdir(parents=True)
@@ -512,8 +547,8 @@ class TestAgentLoopSessionHydration:
         assert loop._agent.calls == [("user", "What can you do next?", {})]
     @pytest.mark.asyncio
     async def test_runtime_history_accepts_sandbox_alias_and_relative_refs(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         uploads = workspace / "uploads"
@@ -548,8 +583,8 @@ class TestAgentLoopSessionHydration:
 
     @pytest.mark.asyncio
     async def test_runtime_history_skips_interrupted_user_turns(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         workspace.mkdir(parents=True)
@@ -576,8 +611,8 @@ class TestAgentLoopSessionHydration:
 
     @pytest.mark.asyncio
     async def test_runtime_history_does_not_rehydrate_recent_skill_turn_for_new_request(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         workspace.mkdir(parents=True)
@@ -609,8 +644,8 @@ class TestAgentLoopSessionHydration:
 
     @pytest.mark.asyncio
     async def test_runtime_history_keeps_recent_plain_replies_out_of_runtime_memory(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         workspace.mkdir(parents=True)
@@ -641,8 +676,8 @@ class TestAgentLoopSessionHydration:
 
     @pytest.mark.asyncio
     async def test_runtime_history_recent_followup_skips_prior_tool_trace(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         workspace.mkdir(parents=True)
@@ -694,8 +729,8 @@ class TestAgentLoopSessionHydration:
 
     @pytest.mark.asyncio
     async def test_runtime_history_keeps_long_standalone_request_isolated(self, tmp_dir: Path):
-        from spoon_bot.agent.loop import AgentLoop
         from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
 
         workspace = tmp_dir / "workspace"
         workspace.mkdir(parents=True)
@@ -2039,7 +2074,7 @@ class TestAgentLoopCurrentRequestMultimodal:
         assert loop._agent.run_calls == [((), {}), ((), {})]
         loop._compress_runtime_context.assert_called_once_with(
             force=True,
-            budget_tokens=380_000,
+            budget_tokens=300_000,
         )
         loop._force_compress_runtime_context.assert_not_called()
 
