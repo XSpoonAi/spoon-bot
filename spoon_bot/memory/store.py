@@ -1,8 +1,8 @@
 """File-based memory store for persistent facts and daily notes."""
 
-from datetime import datetime, date
+import re
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any
 
 from loguru import logger
 
@@ -66,6 +66,40 @@ class MemoryStore:
                 parts.append(f"## Today's Notes\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    _DYNAMIC_PROMPT_FACT_RE = re.compile(
+        r"(?i)(?:\b(?:balance|wallet balance|game[_ ]?id|game result|outcome|"
+        r"reward|prize|rank|score|net[_ ]?pnl|transaction hash|tx hash|"
+        r"job status|service status|current phase)\b|"
+        r"(?:余额|局号|游戏结果|奖金|排名|得分|净盈亏|交易哈希|任务状态|当前阶段))"
+    )
+
+    @classmethod
+    def _prompt_safe_memory(cls, content: str) -> str:
+        """Remove dynamic observations while preserving headings and stable facts."""
+        return "\n".join(
+            line for line in content.splitlines()
+            if not cls._DYNAMIC_PROMPT_FACT_RE.search(line)
+        ).strip()
+
+    def get_prompt_memory_context(self) -> str:
+        """Return only stable preferences and identity facts for prompt injection.
+
+        The complete files remain available to semantic retrieval and auditing.
+        """
+        parts: list[str] = []
+        if self.memory_file.exists():
+            content = self._prompt_safe_memory(
+                self.memory_file.read_text(encoding="utf-8")
+            )
+            if content:
+                parts.append(f"## Long-term Memory\n\n{content}")
+        today_file = self._get_daily_file(date.today())
+        if today_file.exists():
+            content = self._prompt_safe_memory(today_file.read_text(encoding="utf-8"))
+            if content:
+                parts.append(f"## Today's Stable Notes\n\n{content}")
+        return "\n\n".join(parts)
 
     def add_memory(self, content: str, category: str = "Facts") -> None:
         """

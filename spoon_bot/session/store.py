@@ -13,9 +13,11 @@ All backends implement the ``SessionStore`` protocol.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +29,28 @@ from loguru import logger
 # Session data-class is imported from the sibling module so that both
 # store.py and manager.py share the same type.
 # ---------------------------------------------------------------------------
-from spoon_bot.session.manager import Session
+from spoon_bot.session.manager import Session, SessionRevisionConflictError
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Serialize file-store revisions across worker processes on supported hosts."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        yield
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except ImportError:
+            pass
+        handle.close()
 
 
 # ---------------------------------------------------------------------------
@@ -301,23 +324,42 @@ class FileSessionStore(SessionStore):
         path = self._path(session.session_key)
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                for msg in session.messages:
-                    fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
             meta = path.with_suffix(".meta.json")
-            with open(meta, "w", encoding="utf-8") as fh:
-                json.dump(
-                    {
-                        "session_key": session.session_key,
-                        "created_at": session.created_at.isoformat(),
-                        "updated_at": session.updated_at.isoformat(),
-                        "metadata": session.metadata,
-                        "message_count": len(session.messages),
-                    },
-                    fh,
-                    indent=2,
-                )
+            with _exclusive_file_lock(path.with_suffix(".lock")):
+                stored_revision = 0
+                if meta.exists():
+                    with meta.open("r", encoding="utf-8") as fh:
+                        stored_revision = int((json.load(fh) or {}).get("revision", 0) or 0)
+                if stored_revision != session.revision:
+                    raise SessionRevisionConflictError(
+                        f"Stale session {session.session_key}: expected revision "
+                        f"{session.revision}, stored revision is {stored_revision}"
+                    )
+                next_revision = stored_revision + 1
+                tmp_path = path.with_suffix(f".jsonl.tmp.{os.getpid()}")
+                tmp_meta = meta.with_suffix(f".json.tmp.{os.getpid()}")
+                with tmp_path.open("w", encoding="utf-8") as fh:
+                    for msg in session.messages:
+                        fh.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                with tmp_meta.open("w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "session_key": session.session_key,
+                            "created_at": session.created_at.isoformat(),
+                            "updated_at": session.updated_at.isoformat(),
+                            "metadata": session.metadata,
+                            "message_count": len(session.messages),
+                            "revision": next_revision,
+                        },
+                        fh,
+                        indent=2,
+                    )
+                os.replace(tmp_path, path)
+                os.replace(tmp_meta, meta)
+                session.revision = next_revision
             logger.debug(f"FileStore: saved session {session.session_key}")
+        except SessionRevisionConflictError:
+            raise
         except Exception as exc:
             logger.error(f"FileStore: save failed for {session.session_key}: {exc}")
 
@@ -333,6 +375,7 @@ class FileSessionStore(SessionStore):
                     if line:
                         messages.append(json.loads(line))
             metadata: dict = {}
+            revision = 0
             created_at = datetime.now()
             updated_at = datetime.now()
             meta_path = path.with_suffix(".meta.json")
@@ -342,12 +385,14 @@ class FileSessionStore(SessionStore):
                     metadata = meta.get("metadata", {})
                     created_at = datetime.fromisoformat(meta.get("created_at", created_at.isoformat()))
                     updated_at = datetime.fromisoformat(meta.get("updated_at", updated_at.isoformat()))
+                    revision = int(meta.get("revision", 0) or 0)
             return Session(
                 session_key=session_key,
                 created_at=created_at,
                 updated_at=updated_at,
                 messages=messages,
                 metadata=metadata,
+                revision=revision,
             )
         except Exception as exc:
             logger.error(f"FileStore: load failed for {session_key}: {exc}")
@@ -440,7 +485,8 @@ class SQLiteSessionStore(SessionStore):
                     session_key  TEXT PRIMARY KEY,
                     created_at   TEXT NOT NULL,
                     updated_at   TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    revision     INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -454,6 +500,11 @@ class SQLiteSessionStore(SessionStore):
                 );
                 CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_key, seq);
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "revision" not in columns:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
         finally:
             conn.close()
 
@@ -461,19 +512,43 @@ class SQLiteSessionStore(SessionStore):
 
     def save_session(self, session: Session) -> None:
         def _do(conn):
-            conn.execute(
-                """INSERT INTO sessions (session_key, created_at, updated_at, metadata_json)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(session_key)
-                   DO UPDATE SET updated_at=excluded.updated_at,
-                                 metadata_json=excluded.metadata_json""",
-                (
-                    session.session_key,
-                    session.created_at.isoformat(),
-                    session.updated_at.isoformat(),
-                    json.dumps(session.metadata, ensure_ascii=False),
-                ),
-            )
+            row = conn.execute(
+                "SELECT revision FROM sessions WHERE session_key=?",
+                (session.session_key,),
+            ).fetchone()
+            stored_revision = int(row["revision"]) if row else 0
+            if stored_revision != session.revision:
+                raise SessionRevisionConflictError(
+                    f"Stale session {session.session_key}: expected revision "
+                    f"{session.revision}, stored revision is {stored_revision}"
+                )
+            next_revision = stored_revision + 1
+            if row:
+                conn.execute(
+                    """UPDATE sessions
+                       SET updated_at=?, metadata_json=?, revision=?
+                       WHERE session_key=? AND revision=?""",
+                    (
+                        session.updated_at.isoformat(),
+                        json.dumps(session.metadata, ensure_ascii=False),
+                        next_revision,
+                        session.session_key,
+                        stored_revision,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO sessions
+                       (session_key, created_at, updated_at, metadata_json, revision)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        session.session_key,
+                        session.created_at.isoformat(),
+                        session.updated_at.isoformat(),
+                        json.dumps(session.metadata, ensure_ascii=False),
+                        next_revision,
+                    ),
+                )
             conn.execute("DELETE FROM messages WHERE session_key=?", (session.session_key,))
             for seq, msg in enumerate(session.messages):
                 role = msg.get("role", "")
@@ -485,6 +560,7 @@ class SQLiteSessionStore(SessionStore):
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (session.session_key, seq, role, content, ts, json.dumps(extra, ensure_ascii=False)),
                 )
+            session.revision = next_revision
         self._exec(_do)
         logger.debug(f"SQLiteStore: saved session {session.session_key} ({len(session.messages)} msgs)")
 
@@ -510,6 +586,7 @@ class SQLiteSessionStore(SessionStore):
                 updated_at=datetime.fromisoformat(row["updated_at"]),
                 messages=messages,
                 metadata=json.loads(row["metadata_json"]) if row["metadata_json"] else {},
+                revision=int(row["revision"] or 0),
             )
         return self._exec(_do)
 
@@ -689,9 +766,13 @@ class PostgresSessionStore(SessionStore):
                         session_key  TEXT PRIMARY KEY,
                         created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        metadata_json JSONB NOT NULL DEFAULT '{}'
+                        metadata_json JSONB NOT NULL DEFAULT '{}',
+                        revision     BIGINT NOT NULL DEFAULT 0
                     )
                 """)
+                cur.execute(
+                    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0"
+                )
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
                         id           SERIAL PRIMARY KEY,
@@ -719,18 +800,43 @@ class PostgresSessionStore(SessionStore):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO sessions (session_key, created_at, updated_at, metadata_json)
-                       VALUES (%s, %s, %s, %s)
-                       ON CONFLICT (session_key)
-                       DO UPDATE SET updated_at=EXCLUDED.updated_at,
-                                     metadata_json=EXCLUDED.metadata_json""",
-                    (
-                        session.session_key,
-                        session.created_at.isoformat(),
-                        session.updated_at.isoformat(),
-                        json.dumps(session.metadata, ensure_ascii=False),
-                    ),
+                    "SELECT revision FROM sessions WHERE session_key=%s FOR UPDATE",
+                    (session.session_key,),
                 )
+                row = cur.fetchone()
+                stored_revision = int(row[0]) if row else 0
+                if stored_revision != session.revision:
+                    raise SessionRevisionConflictError(
+                        f"Stale session {session.session_key}: expected revision "
+                        f"{session.revision}, stored revision is {stored_revision}"
+                    )
+                next_revision = stored_revision + 1
+                if row:
+                    cur.execute(
+                        """UPDATE sessions
+                           SET updated_at=%s, metadata_json=%s, revision=%s
+                           WHERE session_key=%s AND revision=%s""",
+                        (
+                            session.updated_at.isoformat(),
+                            json.dumps(session.metadata, ensure_ascii=False),
+                            next_revision,
+                            session.session_key,
+                            stored_revision,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO sessions
+                           (session_key, created_at, updated_at, metadata_json, revision)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (
+                            session.session_key,
+                            session.created_at.isoformat(),
+                            session.updated_at.isoformat(),
+                            json.dumps(session.metadata, ensure_ascii=False),
+                            next_revision,
+                        ),
+                    )
                 cur.execute("DELETE FROM messages WHERE session_key=%s", (session.session_key,))
                 for seq, msg in enumerate(session.messages):
                     role = msg.get("role", "")
@@ -743,6 +849,7 @@ class PostgresSessionStore(SessionStore):
                         (session.session_key, seq, role, content, ts, json.dumps(extra, ensure_ascii=False)),
                     )
             conn.commit()
+            session.revision = next_revision
             logger.debug(f"PgStore: saved session {session.session_key} ({len(session.messages)} msgs)")
         except Exception:
             conn.rollback()
@@ -758,8 +865,8 @@ class PostgresSessionStore(SessionStore):
                 row = cur.fetchone()
                 if not row:
                     return None
-                # row: (session_key, created_at, updated_at, metadata_json)
                 s_key, created_at, updated_at, metadata_json = row[0], row[1], row[2], row[3]
+                revision = int(row[4] or 0)
 
                 cur.execute(
                     "SELECT role, content, timestamp, extra_json FROM messages WHERE session_key=%s ORDER BY seq",
@@ -785,6 +892,7 @@ class PostgresSessionStore(SessionStore):
                 updated_at=ua,
                 messages=messages,
                 metadata=md,
+                revision=revision,
             )
         finally:
             conn.close()
