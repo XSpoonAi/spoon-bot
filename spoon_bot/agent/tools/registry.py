@@ -313,8 +313,9 @@ class ToolRegistry:
         """
         Execute a tool by name.
 
-        Looks up in ALL registered tools (not filtered), because the LLM
-        may reference a tool that was active in an earlier turn.
+        Executes only tools in the current active capability set. A tool that
+        was active in an earlier turn must be activated again before use; old
+        conversation state must not silently expand current capabilities.
 
         Args:
             name: The tool name.
@@ -328,6 +329,11 @@ class ToolRegistry:
         if tool is None:
             available = ", ".join(sorted(self._tools.keys())[:10])
             return f"Error: Unknown tool '{name}'. Available tools: {available}..."
+        if name not in self.get_active_tools():
+            return (
+                f"Error: Tool '{name}' is registered but not active for this request. "
+                "Use the active 'activate_tool' capability before calling it."
+            )
 
         # Validate parameters if enabled
         should_validate = validate if validate is not None else self._validate_params

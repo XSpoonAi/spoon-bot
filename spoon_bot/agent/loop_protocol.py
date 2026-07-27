@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 try:
-    from spoon_ai.schema import Message, AgentState
+    from spoon_ai.schema import AgentState, Message
 except ImportError as e:
     logger.error(f"spoon-core SDK is required: {e}")
     raise ImportError(
@@ -27,16 +27,15 @@ from spoon_bot.agent.context_snapshot import write_llm_context_snapshot
 from spoon_bot.agent.execution_ledger import (
     ExecutionLedger,
 )
-from spoon_bot.agent.session_compact import (
-    build_recent_session_turns_payload,
-    build_session_compact_context,
-)
 from spoon_bot.agent.request_hints import (
     request_is_bare_continuation,
     request_is_plain_continuation_only,
     request_needs_current_session_fact_check,
 )
-from spoon_bot.agent.tools.shell import ShellTool
+from spoon_bot.agent.session_compact import (
+    build_recent_session_turns_payload,
+    build_session_compact_context,
+)
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
     consume_captured_tool_output,
@@ -46,14 +45,19 @@ from spoon_bot.agent.tools.execution_context import (
     sanitize_tool_arguments_for_history,
     track_tool_invocations,
 )
+from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.turn_verifiers import (
     build_tool_event_synthesis_brief,
     build_user_facing_tool_event_answer,
     build_user_facing_tool_evidence_answer,
+    deterministic_completion_verdict,
     dominant_non_latin_scripts,
     final_answer_denies_available_tool_evidence,
+    final_answer_has_unsupported_numeric_claims,
     latest_tool_event_has_active_background_job,
     latest_tool_event_has_user_summary_marker,
+    latest_tool_user_summary,
+    latest_unresolved_tool_failure,
     read_only_tool_turn_needs_continuation,
     should_run_skill_contract_check,
     skill_contract_needs_continuation,
@@ -3325,6 +3329,17 @@ class LoopProtocolMixin:
     ) -> str:
         """Ask the configured model to write the final user-facing answer from evidence."""
         synthesis_events = AgentLoop._select_final_answer_synthesis_events(tool_result_events)
+        unresolved_failure = latest_unresolved_tool_failure(synthesis_events)
+        if unresolved_failure:
+            return unresolved_failure
+        terminal_summary = latest_tool_user_summary(synthesis_events)
+        numeric_evidence_parts = [
+            str(user_message or ""),
+            *(
+                AgentLoop._stream_tool_result_event_summary(event, limit=8000)
+                for event in synthesis_events
+            ),
+        ]
         evidence_brief = build_tool_event_synthesis_brief(
             synthesis_events,
             incomplete=incomplete,
@@ -3338,10 +3353,11 @@ class LoopProtocolMixin:
                 evidence_brief = (
                     f"[STRUCTURED VERIFIED EVIDENCE]\n{ledger_context}\n{evidence_brief}"
                 )
+                numeric_evidence_parts.append(ledger_context)
             ledger_fallback = active_ledger.render_user_facing_summary(max_chars=5000)
             numeric_summary = active_ledger.render_structured_numeric_summary(max_chars=5000)
             if numeric_summary:
-                evidence_answer = build_user_facing_tool_event_answer(
+                evidence_answer = terminal_summary or build_user_facing_tool_event_answer(
                     synthesis_events,
                     incomplete=incomplete,
                     user_message=user_message,
@@ -3349,6 +3365,8 @@ class LoopProtocolMixin:
                 if evidence_answer and evidence_answer != "NO_CONCISE_TOOL_EVIDENCE":
                     return f"{evidence_answer}\n\n{numeric_summary}"
                 return numeric_summary
+        if terminal_summary:
+            return terminal_summary
         deterministic_fallback = (
             ledger_fallback
             or str(fallback_text or "").strip()
@@ -3497,11 +3515,24 @@ class LoopProtocolMixin:
                     repaired,
                     synthesis_events,
                 )
+                and not final_answer_has_unsupported_numeric_claims(
+                    repaired,
+                    "\n".join(numeric_evidence_parts),
+                )
             ):
                 return repaired
             logger.warning(
                 "Final-answer synthesis denied available tool evidence after repair; "
                 "using deterministic evidence summary."
+            )
+            return deterministic_fallback
+        if final_answer_has_unsupported_numeric_claims(
+            synthesized,
+            "\n".join(numeric_evidence_parts),
+        ):
+            logger.warning(
+                "Final-answer synthesis introduced numeric claims absent from "
+                "verified evidence; using deterministic evidence summary."
             )
             return deterministic_fallback
         return synthesized
@@ -3928,33 +3959,11 @@ class LoopProtocolMixin:
         chat = getattr(manager, "chat", None)
         ask = getattr(chatbot, "ask", None)
         if not callable(chat) and not callable(ask):
-            if latest_tool_event_has_active_background_job(tool_result_events):
-                return {
-                    "status": "needs_continuation",
-                    "reason": (
-                        "Verifier unavailable and latest evidence is an active "
-                        "background job."
-                    ),
-                    "next_focus": (
-                        "Inspect or monitor the existing background job/output "
-                        "only if its completion is still required by the newest "
-                        "request; otherwise answer from the verified evidence."
-                    ),
-                }
-            if latest_tool_event_has_user_summary_marker(tool_result_events):
-                return {
-                    "status": "complete",
-                    "reason": (
-                        "Latest tool evidence contains a user-facing summary and "
-                        "no verifier model is available."
-                    ),
-                    "next_focus": "",
-                }
-            return {
-                "status": "complete",
-                "reason": "No verifier model available.",
-                "next_focus": "",
-            }
+            return deterministic_completion_verdict(
+                final_content,
+                tool_result_events,
+                verifier_reason="No verifier model available",
+            )
 
         brief = self._build_task_completion_verdict_brief(
             authoritative_message=authoritative_message,
@@ -3989,7 +3998,11 @@ class LoopProtocolMixin:
             )
         except Exception as exc:
             logger.debug(f"Task completion verifier skipped: {exc}")
-            return {"status": "complete", "reason": "Verifier unavailable.", "next_focus": ""}
+            return deterministic_completion_verdict(
+                final_content,
+                tool_result_events,
+                verifier_reason="Verifier unavailable",
+            )
 
         response_text = AgentLoop._extract_run_result_text(response).strip()
         if not response_text:
@@ -3999,7 +4012,11 @@ class LoopProtocolMixin:
             logger.debug(
                 f"Task completion verifier returned unparsable output: {response_text[:300]}"
             )
-            return {"status": "complete", "reason": "Verifier output unparsable.", "next_focus": ""}
+            return deterministic_completion_verdict(
+                final_content,
+                tool_result_events,
+                verifier_reason="Verifier output unparsable",
+            )
         return parsed
 
     async def _evaluate_skill_completion_verdict(
