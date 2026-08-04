@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine
 from uuid import uuid4
 
-from fastapi import Query, WebSocket, WebSocketDisconnect
+from fastapi import Header, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
 
 from spoon_bot.gateway.app import (
@@ -375,13 +375,15 @@ async def websocket_endpoint(
     websocket: WebSocket,
     token: str | None = Query(default=None),
     api_key: str | None = Query(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> None:
     """
     WebSocket endpoint for real-time agent communication.
 
-    Authenticate via query parameter:
+    Authenticate via query parameter or API key header:
     - ?token=<jwt_access_token>
     - ?api_key=<api_key>
+    - X-API-Key: <api_key>
     """
     config = get_config()
     manager = get_connection_manager()
@@ -412,8 +414,9 @@ async def websocket_endpoint(
                 user_id = token_data.user_id
                 session_key = token_data.session_key
 
-        if not user_id and api_key:
-            api_key_data = verify_api_key(api_key, config)
+        effective_api_key = api_key or x_api_key
+        if not user_id and effective_api_key:
+            api_key_data = verify_api_key(effective_api_key, config)
             if api_key_data:
                 user_id = api_key_data.user_id
 

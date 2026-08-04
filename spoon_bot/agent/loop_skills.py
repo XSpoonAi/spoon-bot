@@ -239,6 +239,7 @@ class LoopSkillsMixin:
             "channels",
             "wallet",
             ".git",
+            "lost+found",
         }
     )
 
@@ -576,13 +577,23 @@ class LoopSkillsMixin:
         seen_realpaths: set[str] = set()
 
         for parent_dir, is_organized in scan_dirs:
-            for child in sorted(parent_dir.iterdir()):
-                if not (child.is_dir() or child.is_symlink()):
-                    continue
-                if not is_organized and child.name in self._WORKSPACE_INFRA_DIRS:
-                    continue
-                skill_md = child / "SKILL.md"
-                if not skill_md.exists():
+            try:
+                children = sorted(parent_dir.iterdir())
+            except OSError as exc:
+                logger.debug(f"Skipping inaccessible skill directory '{parent_dir}': {exc}")
+                continue
+
+            for child in children:
+                try:
+                    if not (child.is_dir() or child.is_symlink()):
+                        continue
+                    if not is_organized and child.name in self._WORKSPACE_INFRA_DIRS:
+                        continue
+                    skill_md = child / "SKILL.md"
+                    if not skill_md.exists():
+                        continue
+                except OSError as exc:
+                    logger.debug(f"Skipping inaccessible skill candidate '{child}': {exc}")
                     continue
                 name = child.name
                 if name in seen_names:
