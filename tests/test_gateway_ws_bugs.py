@@ -841,6 +841,16 @@ class TestWSAuthCloseCode:
         except Exception:
             pass  # Expected: connection closed during handshake
 
+    def test_auth_accepts_x_api_key_header(self, client_auth):
+        """WebSocket auth should accept X-API-Key header, matching HTTP auth."""
+        with client_auth.websocket_connect(
+            "/v1/ws",
+            headers={"X-API-Key": "sk_test_valid_key_12345678"},
+        ) as ws:
+            event = ws.receive_json()
+
+        assert event["event"] == "connection.established"
+
 
 # ===================================================================
 # #19 — Auth rate limiting
