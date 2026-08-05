@@ -858,6 +858,7 @@ class WebSocketHandler:
         workflow_outcome = "completed"
         response_outcome = "completed"
         thinking_content = None
+        full_content = ""
         request_id = self._chat_request_ids.get(session_key)
         request_context = bind_agent_request_context(
             agent,
@@ -902,6 +903,46 @@ class WebSocketHandler:
                     },
                 ),
             )
+            terminal_content = str(full_content or "")
+            timing = build_timing_payload(span)
+            if stream:
+                await manager.send_message(
+                    self.connection_id,
+                    WSEvent(
+                        event=ServerEvent.AGENT_STREAM_DONE.value,
+                        data={
+                            "task_id": task_id,
+                            "request_id": request_id,
+                            "session_key": session_key,
+                            "content": terminal_content,
+                            "status": "cancelled",
+                            "reason": reason,
+                            "trace_id": trace_id,
+                            "timing": timing,
+                            "source": source or _get_agent_response_source(agent),
+                        },
+                    ),
+                )
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AGENT_COMPLETE.value,
+                    data={
+                        "task_id": task_id,
+                        "request_id": request_id,
+                        "session_key": session_key,
+                        "status": "cancelled",
+                        "response": terminal_content,
+                        "workflow_outcome": "interrupted",
+                        "response_outcome": "cancelled",
+                        "cancelled": True,
+                        "reason": reason,
+                        "trace_id": trace_id,
+                        "timing": timing,
+                        "source": source or _get_agent_response_source(agent),
+                    },
+                ),
+            )
 
         try:
             request_context.__enter__()
@@ -923,7 +964,6 @@ class WebSocketHandler:
                     check_budget("request", config.budget.request_timeout_ms, span.elapsed_ms)
 
                     if stream:
-                        full_content = ""
                         stream_iter = agent.stream(
                             message=message,
                             media=media,

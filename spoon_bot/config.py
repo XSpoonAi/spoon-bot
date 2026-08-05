@@ -26,7 +26,7 @@ from pydantic_settings import BaseSettings
 # ---------------------------------------------------------------------------
 
 DEFAULT_SHELL_TIMEOUT: int = 600       # 10 min foreground budget
-DEFAULT_SHELL_MAX_TIMEOUT: int = 7200  # 2 hour per-command cap
+DEFAULT_SHELL_MAX_TIMEOUT: int = 1800  # 30 min per-command foreground cap
 DEFAULT_SHELL_BACKGROUND_HANDOFF_TIMEOUT: float = 10.0
 DEFAULT_PROVIDER_SILENCE_TIMEOUT: float = 0.0
 DEFAULT_PROVIDER_TOTAL_TIMEOUT: float = 0.0
@@ -594,15 +594,15 @@ class AgentLoopConfig(BaseModel):
     shell_timeout: int = Field(
         default=DEFAULT_SHELL_TIMEOUT,
         ge=1,
-        le=7200,
-        description="Default shell command foreground timeout in seconds (1-7200). "
+        le=1800,
+        description="Default shell command foreground timeout in seconds (1-1800). "
                     "Commands exceeding this are moved to background."
     )
     shell_max_timeout: int = Field(
         default=DEFAULT_SHELL_MAX_TIMEOUT,
         ge=60,
-        le=7200,
-        description="Maximum allowed per-command timeout override in seconds (60-7200)"
+        le=1800,
+        description="Maximum allowed per-command timeout override in seconds (60-1800)"
     )
     max_output: int = Field(
         default=DEFAULT_MAX_OUTPUT,
@@ -859,13 +859,13 @@ class SpoonBotSettings(BaseSettings):
     shell_timeout: int = Field(
         default=DEFAULT_SHELL_TIMEOUT,
         ge=1,
-        le=7200,
+        le=1800,
         description="Default shell foreground timeout in seconds"
     )
     shell_max_timeout: int = Field(
         default=DEFAULT_SHELL_MAX_TIMEOUT,
         ge=60,
-        le=7200,
+        le=1800,
         description="Maximum allowed per-command timeout override in seconds"
     )
     max_output: int = Field(

@@ -36,7 +36,7 @@ agent:
   #     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
   # shell_timeout: 600         # Default foreground timeout in seconds (10 min).
                                 # Commands exceeding this are moved to background.
-  # shell_max_timeout: 7200    # Max allowed per-command timeout override (2 hours).
+  # shell_max_timeout: 1800    # Max allowed per-command foreground timeout (30 minutes).
                                 # The agent can request longer timeouts up to this cap.
   # max_output: 10000
   # context_window: 400000      # Optional explicit cap in tokens.

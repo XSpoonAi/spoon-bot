@@ -8,6 +8,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_invocation,
@@ -46,24 +47,32 @@ class TestConfigDefaults:
 
     def test_agent_loop_config_default_shell_max_timeout(self):
         config = AgentLoopConfig()
-        assert config.shell_max_timeout == 7200
+        assert config.shell_max_timeout == 1800
 
     def test_validate_agent_loop_params_default(self):
         config = validate_agent_loop_params()
         assert config.shell_timeout == 600
-        assert config.shell_max_timeout == 7200
+        assert config.shell_max_timeout == 1800
 
     def test_validate_agent_loop_params_custom(self):
         config = validate_agent_loop_params(
             shell_timeout=120,
-            shell_max_timeout=3600,
+            shell_max_timeout=1200,
         )
         assert config.shell_timeout == 120
-        assert config.shell_max_timeout == 3600
+        assert config.shell_max_timeout == 1200
 
     def test_shell_timeout_upper_bound(self):
-        config = AgentLoopConfig(shell_timeout=7200)
-        assert config.shell_timeout == 7200
+        config = AgentLoopConfig(shell_timeout=1800)
+        assert config.shell_timeout == 1800
+
+    def test_shell_timeout_rejects_values_above_thirty_minutes(self):
+        with pytest.raises(ValidationError):
+            AgentLoopConfig(shell_timeout=1801)
+
+    def test_shell_max_timeout_rejects_values_above_thirty_minutes(self):
+        with pytest.raises(ValidationError):
+            AgentLoopConfig(shell_max_timeout=1801)
 
     def test_shell_max_timeout_lower_bound(self):
         config = AgentLoopConfig(shell_max_timeout=60)
@@ -126,12 +135,17 @@ class TestShellToolInit:
 
     def test_default_max_timeout(self):
         tool = ShellTool()
-        assert tool.max_timeout == 7200
+        assert tool.max_timeout == 1800
 
     def test_custom_timeout(self):
         tool = ShellTool(timeout=120, max_timeout=3600)
         assert tool.timeout == 120
-        assert tool.max_timeout == 3600
+        assert tool.max_timeout == 1800
+
+    def test_direct_shell_configuration_cannot_exceed_thirty_minutes(self):
+        tool = ShellTool(timeout=3600, max_timeout=7200)
+        assert tool.timeout == 1800
+        assert tool.max_timeout == 1800
 
     def test_max_timeout_at_least_timeout(self):
         tool = ShellTool(timeout=1000, max_timeout=500)
@@ -139,13 +153,13 @@ class TestShellToolInit:
 
     def test_workspace_skill_foreground_timeout_defaults_to_shell_timeout(self, monkeypatch):
         monkeypatch.delenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", raising=False)
-        tool = ShellTool(timeout=3600, max_timeout=7200)
+        tool = ShellTool(timeout=1800, max_timeout=1800)
 
-        assert tool._workspace_skill_foreground_timeout() == 3600
+        assert tool._workspace_skill_foreground_timeout() == 1800
 
     def test_workspace_skill_foreground_timeout_env_override(self, monkeypatch):
         monkeypatch.setenv("SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_TIMEOUT", "120")
-        tool = ShellTool(timeout=3600, max_timeout=7200)
+        tool = ShellTool(timeout=1800, max_timeout=1800)
 
         assert tool._workspace_skill_foreground_timeout() == 120
 
@@ -154,7 +168,7 @@ class TestShellToolInit:
             "SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT",
             raising=False,
         )
-        tool = ShellTool(timeout=3600, max_timeout=7200)
+        tool = ShellTool(timeout=1800, max_timeout=1800)
 
         assert tool._workspace_skill_foreground_silence_handoff_timeout() == 300
 
@@ -163,7 +177,7 @@ class TestShellToolInit:
             "SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT",
             "90",
         )
-        tool = ShellTool(timeout=3600, max_timeout=7200)
+        tool = ShellTool(timeout=1800, max_timeout=1800)
 
         assert tool._workspace_skill_foreground_silence_handoff_timeout() == 90
 
@@ -187,7 +201,7 @@ class TestSafeShellToolInit:
 
     def test_default_max_timeout(self):
         tool = SafeShellTool()
-        assert tool.max_timeout == 7200
+        assert tool.max_timeout == 1800
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +308,7 @@ class TestPerCommandTimeout:
             "SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT",
             raising=False,
         )
-        tool = ShellTool(timeout=3600, max_timeout=7200, working_dir=str(tmp_path))
+        tool = ShellTool(timeout=600, max_timeout=1800, working_dir=str(tmp_path))
         command = (
             "node skills/joker-game-agent/cli/index.js challenge-answer "
             "2889759959 chl_b24ac1fd0f1725a22de73f9e7fc985d4 1187"
@@ -329,7 +343,7 @@ class TestPerCommandTimeout:
         mock_wait_with_progress.assert_awaited_once()
         call_kwargs = mock_wait_with_progress.await_args.kwargs
         assert call_kwargs["idle_timeout"] == 300
-        assert call_kwargs["max_timeout"] == 7200
+        assert call_kwargs["max_timeout"] == 600
         assert "Foreground no-output handoff (300s) reached" in result
         assert "job_id: sh_stateful" in result
 
@@ -344,7 +358,7 @@ class TestPerCommandTimeout:
             "SPOON_BOT_WORKSPACE_SKILL_FOREGROUND_SILENCE_HANDOFF_TIMEOUT",
             "120",
         )
-        tool = ShellTool(timeout=3600, max_timeout=7200, working_dir=str(tmp_path))
+        tool = ShellTool(timeout=600, max_timeout=1800, working_dir=str(tmp_path))
         command = (
             "node skills/joker-game-agent/cli/index.js challenge-answer "
             "2889759959 chl_b24ac1fd0f1725a22de73f9e7fc985d4 1187"
@@ -381,7 +395,7 @@ class TestPerCommandTimeout:
         mock_wait_with_progress.assert_awaited_once()
         call_kwargs = mock_wait_with_progress.await_args.kwargs
         assert call_kwargs["idle_timeout"] == 120
-        assert call_kwargs["max_timeout"] == 7200
+        assert call_kwargs["max_timeout"] == 600
         assert "Foreground no-output handoff (120s) reached" in result
         assert "job_id: sh_stateful_timeout" in result
 
@@ -486,6 +500,8 @@ class TestBackgroundJobSummary:
         assert "terminate_job" in summary
         assert "BACKGROUND JOB MANAGEMENT" in summary
         assert "only if job completion is still required" in summary
+        assert "continue any other authorized work" in summary
+        assert "Do not block the turn" in summary
         assert "Quiet output can be normal" in summary
         assert "recent output can be completion evidence" in summary
         assert "unchanged external evidence" in summary

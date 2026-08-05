@@ -1584,10 +1584,11 @@ class _MultiStepSummaryRuntimeAgent:
 class _BackgroundThenCompleteRuntimeAgent:
     """Runtime agent that first exposes a running managed job, then completes it."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, complete_after_handoff: bool = True) -> None:
         self.task_done = asyncio.Event()
         self.output_queue: asyncio.Queue = asyncio.Queue()
         self.state = "IDLE"
+        self.complete_after_handoff = complete_after_handoff
         self.add_message_calls: list[tuple[str, Any, dict]] = []
         self.run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
@@ -1598,16 +1599,18 @@ class _BackgroundThenCompleteRuntimeAgent:
         self.run_calls.append((args, kwargs))
         step = len(self.run_calls)
         call_id = f"call_background_{step}"
-        if step == 1:
+        if step == 1 or not self.complete_after_handoff:
             command = "run-long-workflow"
+            elapsed = 60 if step == 1 else 90
+            phase = 1 if step == 1 else 2
             tool_delta = (
                 "Foreground timeout (600s) exceeded - command moved to background.\n"
                 "job_id: sh_running\n"
                 f"command: {command}\n"
                 "cwd: /workspace\n"
-                "status: running (elapsed 60s)\n"
+                f"status: running (elapsed {elapsed}s)\n"
                 "Recent output tail:\n"
-                "phase 1 started\n"
+                f"phase {phase} started\n"
             )
             final_content = "The workflow is still running."
         else:
@@ -2724,6 +2727,37 @@ class TestAgentLoopStreamFallback:
         assert len(done_chunks) == 1
         assert done_chunks[0]["metadata"]["content"].endswith("All requested work completed.")
         assert loop._session.messages[-1]["content"].endswith("All requested work completed.")
+
+    @pytest.mark.asyncio
+    async def test_stream_stops_for_pending_background_job_after_one_autonomous_continuation(
+        self,
+        tmp_dir: Path,
+    ):
+        from spoon_bot.agent.loop import AgentLoop
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._initialized = True
+        loop._agent = _BackgroundThenCompleteRuntimeAgent(complete_after_handoff=False)
+        loop.workspace = tmp_dir
+        loop._session = Session(session_key="stream_background_job_pending")
+        loop.sessions = MagicMock()
+        loop.sessions.save = MagicMock()
+        loop.memory = MagicMock()
+        loop.memory.get_memory_context = MagicMock(return_value=None)
+        loop.context = MagicMock()
+        loop._prepare_request_context = AsyncMock(return_value=None)
+        loop._build_step_prompt = lambda message: f"prompt::{message}"
+        loop._install_anti_loop_tracker = lambda prompt: None
+
+        chunks = []
+        async for chunk in AgentLoop.stream(loop, message="start the requested long workflow"):
+            chunks.append(chunk)
+
+        done_chunks = [chunk for chunk in chunks if chunk["type"] == "done"]
+
+        assert len(loop._agent.run_calls) == 2
+        assert len(done_chunks) == 1
+        assert "still running" in done_chunks[0]["metadata"]["content"]
 
     @pytest.mark.asyncio
     async def test_stream_falls_back_to_run_result_when_no_chunks(self, tmp_dir: Path):
