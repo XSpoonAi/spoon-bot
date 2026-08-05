@@ -4313,6 +4313,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     break
 
             task_continuation_attempts = 0
+            task_continuation_stopped_with_active_background_job = False
             while (
                 all_tool_result_events
                 and stream_error_reason is None
@@ -4320,17 +4321,6 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 < AgentLoop._task_completion_continuation_attempt_limit()
                 and _can_auto_continue_for_current_request()
             ):
-                if (
-                    task_continuation_attempts >= 1
-                    and latest_tool_event_has_active_background_job(
-                        all_tool_result_events
-                    )
-                ):
-                    logger.info(
-                        "Background job remains active after one autonomous stream "
-                        "continuation; ending with grounded pending status."
-                    )
-                    break
                 verdict = await self._evaluate_task_completion_verdict(
                     authoritative_message=authoritative_message,
                     final_content=full_content,
@@ -4383,6 +4373,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         "Generic task continuation produced no new tool evidence; "
                         "stopping continuation."
                     )
+                    task_continuation_stopped_with_active_background_job = (
+                        latest_tool_event_has_active_background_job(
+                            all_tool_result_events
+                        )
+                    )
                     existing_terminal_content = str(full_content or "").strip()
                     if (
                         existing_terminal_content
@@ -4427,6 +4422,13 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     pending_fallback_content_emit = True
                     pending_fallback_reason = pending_fallback_reason or "task_continuation"
                     pending_fallback_delta = repair_text
+
+            if (
+                task_continuation_attempts
+                >= AgentLoop._task_completion_continuation_attempt_limit()
+                and latest_tool_event_has_active_background_job(all_tool_result_events)
+            ):
+                task_continuation_stopped_with_active_background_job = True
 
             if (
                 should_run_skill_contract_check(all_tool_result_events)
@@ -4699,10 +4701,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     pending_fallback_reason = pending_fallback_reason or "execution_ledger"
                     pending_fallback_delta = full_content
 
-            if (
-                task_continuation_attempts >= 1
-                and latest_tool_event_has_active_background_job(all_tool_result_events)
-            ):
+            if task_continuation_stopped_with_active_background_job:
                 full_content = build_active_background_job_pending_answer(
                     all_tool_result_events
                 )
