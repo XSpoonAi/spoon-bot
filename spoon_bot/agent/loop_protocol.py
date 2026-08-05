@@ -4210,19 +4210,12 @@ class LoopProtocolMixin:
     ) -> tuple[str, list[dict[str, Any]], bool]:
         attempts = 0
         limit = AgentLoop._task_completion_continuation_attempt_limit()
+        stopped_with_active_background_job = False
         plain_continuation = AgentLoop._request_is_plain_bounded_continuation(
             authoritative_message,
             request_execution_hints,
         )
         while attempts < limit and tool_result_events:
-            if attempts >= 1 and latest_tool_event_has_active_background_job(
-                tool_result_events
-            ):
-                logger.info(
-                    "Background job remains active after one autonomous continuation; "
-                    "ending the current turn with grounded pending status."
-                )
-                break
             if (
                 plain_continuation
                 and not AgentLoop._plain_continuation_can_auto_continue_same_unit(
@@ -4261,6 +4254,9 @@ class LoopProtocolMixin:
             )
             if after_fingerprint == before_fingerprint:
                 logger.warning("Task continuation produced no new tool evidence; stopping.")
+                stopped_with_active_background_job = (
+                    latest_tool_event_has_active_background_job(tool_result_events)
+                )
                 active_ledger = getattr(self, "_active_execution_ledger", None)
                 if isinstance(active_ledger, ExecutionLedger):
                     if not (active_ledger.has_stateful_progress() or active_ledger.file_reads):
@@ -4277,10 +4273,12 @@ class LoopProtocolMixin:
                     if ledger_summary:
                         final_content = ledger_summary
                 break
-        background_job_pending = (
-            attempts >= 1
+        if (
+            attempts >= limit
             and latest_tool_event_has_active_background_job(tool_result_events)
-        )
+        ):
+            stopped_with_active_background_job = True
+        background_job_pending = stopped_with_active_background_job
         if background_job_pending:
             final_content = build_active_background_job_pending_answer(
                 tool_result_events
