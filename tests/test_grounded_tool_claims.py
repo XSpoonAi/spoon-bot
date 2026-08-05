@@ -8,9 +8,12 @@ import pytest
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.registry import ToolRegistry
 from spoon_bot.agent.turn_verifiers import (
+    build_active_background_job_pending_answer,
     deterministic_completion_verdict,
     final_answer_has_unsupported_numeric_claims,
+    latest_tool_event_has_active_background_job,
     latest_unresolved_tool_failure,
+    tool_events_need_more_evidence,
 )
 
 
@@ -119,6 +122,54 @@ def test_completion_verifier_accepts_tool_terminal_summary() -> None:
     )
 
     assert verdict["status"] == "complete"
+
+
+def test_completion_verifier_requests_one_background_handoff_continuation() -> None:
+    verdict = deterministic_completion_verdict(
+        "The command is still running as background job sh_123; resume by checking that job.",
+        [
+            _event(
+                "Foreground timeout (600s) exceeded - command moved to background.\n"
+                "job_id: sh_123\nstatus: running (elapsed 600s)"
+            )
+        ],
+        verifier_reason="Verifier unavailable",
+    )
+
+    assert verdict["status"] == "needs_continuation"
+    assert "still running" in verdict["reason"]
+
+
+def test_background_handoff_pending_answer_is_deterministic() -> None:
+    events = [
+        _event(
+            "job_id: sh_123\n"
+            "status: running\n"
+            "returncode: running\n"
+            "Output:\nclaim submitted"
+        )
+    ]
+
+    answer = build_active_background_job_pending_answer(events)
+
+    assert "still running" in answer
+    assert "`sh_123`" in answer
+    assert "turn is paused" in answer
+
+
+def test_later_authoritative_evidence_supersedes_stale_running_job() -> None:
+    events = [
+        _event(
+            "job_id: sh_123\nstatus: running\nreturncode: running",
+        ),
+        _event(
+            "Wallet=0xabc GAS=0.3 GLD=200.0 AgentID=none",
+            name="wallet",
+        ),
+    ]
+
+    assert not latest_tool_event_has_active_background_job(events)
+    assert not tool_events_need_more_evidence(events)
 
 
 @pytest.mark.asyncio

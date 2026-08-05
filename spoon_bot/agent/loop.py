@@ -115,8 +115,10 @@ from spoon_bot.agent.tools.web3 import (
     TransferTool,
 )
 from spoon_bot.agent.turn_verifiers import (
+    build_active_background_job_pending_answer,
     build_user_facing_tool_event_answer,
     latest_tool_event_from_skill_continuation,
+    latest_tool_event_has_active_background_job,
     latest_tool_event_has_user_summary_marker,
     should_run_skill_contract_check,
     skill_contract_has_progress,
@@ -1661,8 +1663,13 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     label="process_skill_contract_continuation",
                 )
 
+            background_job_pending = False
             if tool_result_events:
-                final_content, tool_result_events = await self._continue_task_until_terminal(
+                (
+                    final_content,
+                    tool_result_events,
+                    background_job_pending,
+                ) = await self._continue_task_until_terminal(
                     authoritative_message=authoritative_message,
                     request_execution_hints=request_execution_hints,
                     final_content=final_content,
@@ -1800,6 +1807,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         incomplete=tool_events_need_more_evidence(tool_result_events),
                         user_message=authoritative_message,
                     ),
+                )
+            if background_job_pending:
+                final_content = build_active_background_job_pending_answer(
+                    tool_result_events
                 )
             final_content = AgentLoop._finalize_response_content(
                 self,
@@ -4309,6 +4320,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 < AgentLoop._task_completion_continuation_attempt_limit()
                 and _can_auto_continue_for_current_request()
             ):
+                if (
+                    task_continuation_attempts >= 1
+                    and latest_tool_event_has_active_background_job(
+                        all_tool_result_events
+                    )
+                ):
+                    logger.info(
+                        "Background job remains active after one autonomous stream "
+                        "continuation; ending with grounded pending status."
+                    )
+                    break
                 verdict = await self._evaluate_task_completion_verdict(
                     authoritative_message=authoritative_message,
                     final_content=full_content,
@@ -4412,6 +4434,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
                 and not latest_tool_event_from_skill_continuation(all_tool_result_events)
                 and not streamed_content_after_latest_tool_call
+                and not (
+                    latest_tool_event_has_active_background_job(all_tool_result_events)
+                    and task_continuation_attempts >= 1
+                    and full_content.strip()
+                )
             ):
                 full_content = await AgentLoop._synthesize_final_answer_from_tool_events(
                     self,
@@ -4671,6 +4698,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     pending_fallback_content_emit = True
                     pending_fallback_reason = pending_fallback_reason or "execution_ledger"
                     pending_fallback_delta = full_content
+
+            if (
+                task_continuation_attempts >= 1
+                and latest_tool_event_has_active_background_job(all_tool_result_events)
+            ):
+                full_content = build_active_background_job_pending_answer(
+                    all_tool_result_events
+                )
+                pending_fallback_content_emit = True
+                pending_fallback_reason = "background_job_pending"
+                pending_fallback_delta = full_content
 
             pre_finalize_full_content = full_content
             final_content = AgentLoop._finalize_response_content(
@@ -5150,8 +5188,13 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 )
                 thinking_content = None
 
+            background_job_pending = False
             if tool_result_events:
-                final_content, tool_result_events = await self._continue_task_until_terminal(
+                (
+                    final_content,
+                    tool_result_events,
+                    background_job_pending,
+                ) = await self._continue_task_until_terminal(
                     authoritative_message=authoritative_message,
                     request_execution_hints=request_execution_hints,
                     final_content=final_content,
@@ -5291,6 +5334,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         user_message=authoritative_message,
                         fallback_text=ledger_fallback,
                     )
+            if background_job_pending:
+                final_content = build_active_background_job_pending_answer(
+                    tool_result_events
+                )
+                thinking_content = None
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
             final_content = AgentLoop._finalize_response_content(

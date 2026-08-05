@@ -1401,6 +1401,44 @@ class TestWSStreamingContent:
             assert old_error is not None
             assert old_error["error"]["code"] == "REQUEST_INTERRUPTED"
 
+            old_cancelled = next(
+                (
+                    m
+                    for m in events
+                    if m.get("type") == "event"
+                    and m.get("event") == "agent.cancelled"
+                    and m.get("data", {}).get("request_id") == "old_stream"
+                ),
+                None,
+            )
+            assert old_cancelled is not None
+
+            old_stream_done = next(
+                (
+                    m
+                    for m in events
+                    if m.get("type") == "event"
+                    and m.get("event") == "agent.stream.done"
+                    and m.get("data", {}).get("request_id") == "old_stream"
+                ),
+                None,
+            )
+            assert old_stream_done is not None
+            assert old_stream_done["data"]["status"] == "cancelled"
+
+            old_complete = next(
+                (
+                    m
+                    for m in events
+                    if m.get("type") == "event"
+                    and m.get("event") == "agent.complete"
+                    and m.get("data", {}).get("request_id") == "old_stream"
+                ),
+                None,
+            )
+            assert old_complete is not None
+            assert old_complete["data"]["status"] == "cancelled"
+
             new_response = next(
                 (m for m in events if m.get("type") == "response" and m.get("id") == "new_turn"),
                 None,

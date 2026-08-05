@@ -500,6 +500,23 @@ def latest_tool_event_has_active_background_job(
     )
 
 
+def build_active_background_job_pending_answer(
+    tool_result_events: list[dict[str, Any]],
+) -> str:
+    """Build a deterministic terminal response for a managed job handoff."""
+    latest = _latest_non_empty_tool_event(tool_result_events)
+    fields = _tool_event_shell_job_fields(latest) if latest else {}
+    job_id = fields.get("job_id", "").strip()
+    job_label = f" `{job_id}`" if job_id else ""
+    return (
+        f"The command is still running as managed background job{job_label}. "
+        "One autonomous continuation was attempted, but no terminal result is "
+        "available yet. This turn is paused rather than blocked; a later turn "
+        "can inspect the existing job or verify the current state with an "
+        "authoritative status command."
+    )
+
+
 def _skill_contract_was_loaded(tool_result_events: list[dict[str, Any]]) -> bool:
     """Return True once the model has received an actual skill contract."""
     for event in tool_result_events:

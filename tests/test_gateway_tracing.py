@@ -438,7 +438,8 @@ class TestWsTracingInStreamingEvents:
         responses = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("type") == "response"]
         completes = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("event") == "agent.complete"]
         assert responses == []
-        assert completes == []
+        assert len(completes) == 1
+        assert completes[0]["data"]["status"] == "cancelled"
 
     @pytest.mark.asyncio
     async def test_stream_cancelled_chunk_emits_cancelled_event(self):
@@ -479,8 +480,15 @@ class TestWsTracingInStreamingEvents:
             if isinstance(m, dict) and m.get("event") == "agent.cancelled"
         ]
         completes = [m for m in fm.sent_messages if isinstance(m, dict) and m.get("event") == "agent.complete"]
+        stream_done = [
+            m for m in fm.sent_messages
+            if isinstance(m, dict) and m.get("event") == "agent.stream.done"
+        ]
         assert len(cancelled) == 1
-        assert completes == []
+        assert len(stream_done) == 1
+        assert stream_done[0]["data"]["status"] == "cancelled"
+        assert len(completes) == 1
+        assert completes[0]["data"]["status"] == "cancelled"
         data = cancelled[0]["data"]
         assert data["reason"] == "client_cancelled"
         assert data["error"]["code"] == "CANCELLED"

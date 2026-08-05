@@ -630,8 +630,10 @@ class ShellTool(Tool):
                 guardrails; execute them and let the command output be the
                 source of truth. If None, read SPOON_BOT_YOLO_MODE.
         """
-        self.timeout = timeout
-        self.max_timeout = max(timeout, max_timeout)
+        requested_timeout = max(1, int(timeout))
+        requested_max_timeout = max(requested_timeout, int(max_timeout))
+        self.max_timeout = min(DEFAULT_SHELL_MAX_TIMEOUT, requested_max_timeout)
+        self.timeout = min(requested_timeout, self.max_timeout)
         self.max_output = max_output
         self.working_dir = working_dir
         self.use_shell = use_shell
@@ -2387,14 +2389,11 @@ class ShellTool(Tool):
         idle_timeout: float,
         max_timeout: float,
     ) -> None:
-        """Wait while a foreground job either finishes or keeps producing output.
+        """Wait until completion or a foreground handoff budget expires.
 
-        Stateful skill CLIs can legitimately run for a long time while emitting
-        progress. A fixed total foreground timeout pushes healthy runs into
-        background management too early, which then forces the model to poll the
-        job. This helper treats the configured workspace-skill timeout as an
-        idle budget and keeps the original tool call open while stdout/stderr
-        changes.
+        Output progress resets only the shorter no-progress budget. It never
+        extends the total foreground budget, so one healthy but long-running
+        command cannot block the agent from continuing with other work.
         """
         idle_budget = max(0.0, float(idle_timeout or 0.0))
         hard_budget = max(0.0, float(max_timeout or 0.0))
@@ -2720,6 +2719,9 @@ class ShellTool(Tool):
             "required by the selected workflow unit:\n"
             f"  1. Check progress: action='job_status', job_id='{job.job_id}'\n"
             f"  2. Read full output: action='job_output', job_id='{job.job_id}'\n"
+            "After handoff, continue any other authorized work that does not "
+            "depend on this job. Do not block the turn or repeatedly poll solely "
+            "because the process is still running. "
             "The command is still active. Do not rerun the same command while "
             "this job exists. Quiet output can be normal for network, build, "
             "or waiting operations. Running status alone is not proof that the "
@@ -3432,7 +3434,7 @@ class ShellTool(Tool):
                     await self._wait_for_process_with_progress_timeout(
                         job,
                         idle_timeout=foreground_handoff_timeout,
-                        max_timeout=self.max_timeout,
+                        max_timeout=effective_timeout,
                     )
                 else:
                     await asyncio.wait_for(

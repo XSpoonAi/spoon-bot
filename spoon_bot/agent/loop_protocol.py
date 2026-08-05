@@ -57,6 +57,7 @@ from spoon_bot.agent.tools.execution_context import (
 )
 from spoon_bot.agent.tools.shell import ShellTool
 from spoon_bot.agent.turn_verifiers import (
+    build_active_background_job_pending_answer,
     build_tool_event_synthesis_brief,
     build_user_facing_tool_event_answer,
     build_user_facing_tool_evidence_answer,
@@ -4001,6 +4002,11 @@ class LoopProtocolMixin:
             "process finishing. Do not use needs_continuation solely because "
             "job_status is running if the recent output proves the requested "
             "unit's terminal action, state, or blocker was reached.",
+            "A foreground-to-background handoff is also a valid current-turn "
+            "pause when the assistant draft clearly reports that verified "
+            "pending state. Do not force internal polling merely to keep the "
+            "same turn open. Continue other authorized, non-conflicting work "
+            "when available; otherwise return the job id and resume condition.",
             "Repeated checks with unchanged external evidence and no material "
             "progress can be a concrete blocker, but only when the current "
             "tool evidence and assistant draft actually report that blocker "
@@ -4201,7 +4207,7 @@ class LoopProtocolMixin:
         run_kwargs: dict[str, Any],
         memory_start_index: int,
         label: str,
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> tuple[str, list[dict[str, Any]], bool]:
         attempts = 0
         limit = AgentLoop._task_completion_continuation_attempt_limit()
         plain_continuation = AgentLoop._request_is_plain_bounded_continuation(
@@ -4209,6 +4215,14 @@ class LoopProtocolMixin:
             request_execution_hints,
         )
         while attempts < limit and tool_result_events:
+            if attempts >= 1 and latest_tool_event_has_active_background_job(
+                tool_result_events
+            ):
+                logger.info(
+                    "Background job remains active after one autonomous continuation; "
+                    "ending the current turn with grounded pending status."
+                )
+                break
             if (
                 plain_continuation
                 and not AgentLoop._plain_continuation_can_auto_continue_same_unit(
@@ -4263,7 +4277,15 @@ class LoopProtocolMixin:
                     if ledger_summary:
                         final_content = ledger_summary
                 break
-        return final_content, tool_result_events
+        background_job_pending = (
+            attempts >= 1
+            and latest_tool_event_has_active_background_job(tool_result_events)
+        )
+        if background_job_pending:
+            final_content = build_active_background_job_pending_answer(
+                tool_result_events
+            )
+        return final_content, tool_result_events, background_job_pending
 
     async def _continue_skill_contract_until_terminal(
         self,
