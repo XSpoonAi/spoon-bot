@@ -55,6 +55,8 @@ _TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
 
 _NON_RETRYABLE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\b401\b"),
+    re.compile(r"insufficient[_ ](?:funds|credit|credits)", re.IGNORECASE),
+    re.compile(r"insufficient available credit", re.IGNORECASE),
     re.compile(r"auth.*fail", re.IGNORECASE),
     re.compile(r"invalid.*api.?key", re.IGNORECASE),
     re.compile(r"context.*length.*exceeded", re.IGNORECASE),
@@ -90,6 +92,7 @@ _NON_RETRYABLE_EXCEPTION_NAMES: set[str] = {
     "AuthenticationError",
     "BadRequestError",
     "ContextLengthExceededError",
+    "InsufficientCreditsError",
     "InvalidRequestError",
     "NotFoundError",
     "PermissionDeniedError",
