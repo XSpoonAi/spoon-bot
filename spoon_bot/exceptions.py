@@ -457,9 +457,19 @@ def format_exception_chain(exc: Exception) -> str:
 
 def user_friendly_error(exc: Exception) -> str:
     """Get a user-friendly error message from any exception."""
+    error_text = str(exc or "").casefold()
+    if any(
+        marker in error_text
+        for marker in (
+            "insufficient_funds",
+            "insufficient_credit",
+            "insufficient credits",
+            "insufficient available credit",
+        )
+    ) or type(exc).__name__ == "InsufficientCreditsError":
+        return "Insufficient credits. Please top up your account and try again."
     if isinstance(exc, SpoonBotError):
         return exc.user_message()
-    error_text = str(exc or "").casefold()
     if any(
         marker in error_text
         for marker in (
