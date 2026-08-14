@@ -37,6 +37,42 @@ def _contains_key(value: object, key: str) -> bool:
     return False
 
 
+def test_history_search_budget_is_shared_by_search_and_recent(tmp_path: Path) -> None:
+    mgr = _build_manager(tmp_path)
+    _append_message(
+        mgr,
+        "current-session",
+        "tool",
+        "first result",
+        timestamp="2026-08-14T08:00:00",
+        name="shell",
+    )
+    tool = SearchHistoryTool(mgr, default_session_key="current-session")
+    hints: dict[str, object] = {
+        "current_session_fact_check_required": True,
+        "history_search_state": {
+            "calls": 0,
+            "max_calls": 3,
+            "exhausted": False,
+            "disabled": False,
+            "disabled_reason": "",
+        },
+    }
+
+    with bind_request_execution_hints(hints):
+        asyncio.run(tool.execute(query="first"))
+        asyncio.run(tool.execute(mode="recent"))
+        asyncio.run(tool.execute(query="result"))
+        fourth = json.loads(asyncio.run(tool.execute(mode="recent")))
+
+    state = hints["history_search_state"]
+    assert isinstance(state, dict)
+    assert state["calls"] == 4
+    assert state["disabled"] is True
+    assert fourth["budget_exhausted"] is True
+    assert fourth["guardrail_stop"] is True
+
+
 def test_scope_all_low_signal_query_prefers_current_session(tmp_path: Path) -> None:
     mgr = _build_manager(tmp_path)
     _append_message(

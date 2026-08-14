@@ -53,6 +53,62 @@ _REQUEST_EXECUTION_HINTS_LOCK = Lock()
 _CANCELLED_TOOL_RUNS: set[str] = set()
 _CANCELLED_TOOL_RUNS_LOCK = Lock()
 
+HISTORY_SEARCH_DEFAULT_MAX_CALLS = 3
+
+
+def history_search_state(hints: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the mutable request-local history-search budget state."""
+    target = hints if isinstance(hints, dict) else get_request_execution_hints()
+    if {"calls", "max_calls", "exhausted", "disabled"}.issubset(target):
+        state = target
+        state.setdefault("disabled_reason", "")
+        return state
+    state = target.get("history_search_state")
+    if not isinstance(state, dict):
+        state = {
+            "calls": 0,
+            "max_calls": HISTORY_SEARCH_DEFAULT_MAX_CALLS,
+            "exhausted": False,
+            "disabled": False,
+            "disabled_reason": "",
+        }
+        target["history_search_state"] = state
+    state.setdefault("calls", 0)
+    state.setdefault("max_calls", HISTORY_SEARCH_DEFAULT_MAX_CALLS)
+    state.setdefault("exhausted", False)
+    state.setdefault("disabled", False)
+    state.setdefault("disabled_reason", "")
+    return state
+
+
+def history_search_is_disabled(hints: dict[str, Any] | None = None) -> bool:
+    state = history_search_state(hints)
+    return bool(state.get("disabled") or state.get("exhausted"))
+
+
+def consume_history_search_call(hints: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Count one search-history attempt and permanently disable at the limit."""
+    state = history_search_state(hints)
+    if bool(state.get("disabled") or state.get("exhausted")):
+        return state
+    state["calls"] = int(state.get("calls") or 0) + 1
+    if state["calls"] > int(state.get("max_calls") or HISTORY_SEARCH_DEFAULT_MAX_CALLS):
+        state["exhausted"] = True
+        state["disabled"] = True
+        state["disabled_reason"] = "history_search_budget_exhausted"
+    return state
+
+
+def disable_history_search(
+    reason: str = "history_search_budget_exhausted",
+    hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = history_search_state(hints)
+    state["exhausted"] = True
+    state["disabled"] = True
+    state["disabled_reason"] = str(reason or "history_search_disabled")
+    return state
+
 
 @dataclass
 class CapturedToolOutput:

@@ -7,6 +7,10 @@ from typing import Any
 from loguru import logger
 
 from spoon_bot.agent.tools.base import Tool, ToolSchema
+from spoon_bot.agent.tools.execution_context import (
+    get_request_execution_hints,
+    history_search_is_disabled,
+)
 
 # ---------------------------------------------------------------------------
 # Core tools: the minimal set loaded into the agent by default.
@@ -298,9 +302,16 @@ class ToolRegistry:
             List of tool schemas in OpenAI function format.
         """
         key = self._current_cache_key()
-        if self._definitions_cache is not None and self._definitions_cache_key == key:
+        history_disabled = history_search_is_disabled(get_request_execution_hints())
+        if (
+            self._definitions_cache is not None
+            and self._definitions_cache_key == key
+            and not history_disabled
+        ):
             return self._definitions_cache
         active = self.get_active_tools()
+        if history_disabled:
+            active = {name: tool for name, tool in active.items() if name != "search_history"}
         self._definitions_cache = [tool.to_schema() for tool in active.values()]
         self._definitions_cache_key = key
         return self._definitions_cache
@@ -326,6 +337,11 @@ class ToolRegistry:
         Returns:
             The tool execution result.
         """
+        if name == "search_history" and history_search_is_disabled(get_request_execution_hints()):
+            return (
+                "STOP_TOOL_LOOP: search_history is disabled for this request "
+                "because its request-local budget is exhausted. Do not call it again."
+            )
         tool = self._tools.get(name)
         if tool is None:
             available = ", ".join(sorted(self._tools.keys())[:10])

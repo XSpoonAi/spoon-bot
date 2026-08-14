@@ -903,7 +903,7 @@ class WebSocketHandler:
                     },
                 ),
             )
-            terminal_content = str(full_content or "")
+            terminal_content = str(full_content or "Task cancelled.")
             timing = build_timing_payload(span)
             if stream:
                 await manager.send_message(
@@ -916,6 +916,7 @@ class WebSocketHandler:
                             "session_key": session_key,
                             "content": terminal_content,
                             "status": "cancelled",
+                            "terminal": True,
                             "reason": reason,
                             "trace_id": trace_id,
                             "timing": timing,
@@ -932,6 +933,7 @@ class WebSocketHandler:
                         "request_id": request_id,
                         "session_key": session_key,
                         "status": "cancelled",
+                        "terminal": True,
                         "response": terminal_content,
                         "workflow_outcome": "interrupted",
                         "response_outcome": "cancelled",
@@ -1110,6 +1112,7 @@ class WebSocketHandler:
                                             "request_id": request_id,
                                             "session_key": session_key,
                                             "content": full_content,
+                                            "terminal": True,
                                             "trace_id": trace_id,
                                             "timing": build_timing_payload(span),
                                             "source": source,
@@ -1211,6 +1214,7 @@ class WebSocketHandler:
                 "request_id": request_id,
                 "session_key": session_key,
                 "status": terminal_status,
+                "terminal": True,
                 "response": response if isinstance(response, str) else str(response),
                 "workflow_outcome": workflow_outcome,
                 "response_outcome": response_outcome,
@@ -1278,6 +1282,47 @@ class WebSocketHandler:
                     },
                 ),
             )
+            timeout_content = "Task timed out."
+            if stream:
+                await manager.send_message(
+                    self.connection_id,
+                    WSEvent(
+                        event=ServerEvent.AGENT_STREAM_DONE.value,
+                        data={
+                            "task_id": task_id,
+                            "request_id": request_id,
+                            "session_key": session_key,
+                            "content": timeout_content,
+                            "status": "timed_out",
+                            "terminal": True,
+                            "workflow_outcome": "timed_out",
+                            "response_outcome": "timed_out",
+                            "trace_id": trace_id,
+                            "timing": build_timing_payload(span),
+                            "source": _get_agent_response_source(agent),
+                        },
+                    ),
+                )
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AGENT_COMPLETE.value,
+                    data={
+                        "task_id": task_id,
+                        "request_id": request_id,
+                        "session_key": session_key,
+                        "content": timeout_content,
+                        "response": timeout_content,
+                        "status": "timed_out",
+                        "terminal": True,
+                        "workflow_outcome": "timed_out",
+                        "response_outcome": "timed_out",
+                        "trace_id": trace_id,
+                        "timing": build_timing_payload(span),
+                        "source": _get_agent_response_source(agent),
+                    },
+                ),
+            )
             raise
         except asyncio.TimeoutError:
             span.stop()
@@ -1297,6 +1342,47 @@ class WebSocketHandler:
                         "trace_id": trace_id,
                         "timing": build_timing_payload(span),
                         "error": timeout_detail.model_dump(),
+                        "source": _get_agent_response_source(agent),
+                    },
+                ),
+            )
+            timeout_content = "Task timed out."
+            if stream:
+                await manager.send_message(
+                    self.connection_id,
+                    WSEvent(
+                        event=ServerEvent.AGENT_STREAM_DONE.value,
+                        data={
+                            "task_id": task_id,
+                            "request_id": request_id,
+                            "session_key": session_key,
+                            "content": timeout_content,
+                            "status": "timed_out",
+                            "terminal": True,
+                            "workflow_outcome": "timed_out",
+                            "response_outcome": "timed_out",
+                            "trace_id": trace_id,
+                            "timing": build_timing_payload(span),
+                            "source": _get_agent_response_source(agent),
+                        },
+                    ),
+                )
+            await manager.send_message(
+                self.connection_id,
+                WSEvent(
+                    event=ServerEvent.AGENT_COMPLETE.value,
+                    data={
+                        "task_id": task_id,
+                        "request_id": request_id,
+                        "session_key": session_key,
+                        "content": timeout_content,
+                        "response": timeout_content,
+                        "status": "timed_out",
+                        "terminal": True,
+                        "workflow_outcome": "timed_out",
+                        "response_outcome": "timed_out",
+                        "trace_id": trace_id,
+                        "timing": build_timing_payload(span),
                         "source": _get_agent_response_source(agent),
                     },
                 ),

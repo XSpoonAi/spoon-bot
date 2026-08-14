@@ -172,7 +172,17 @@ def latest_unresolved_tool_failure(
     tool result therefore supersedes an earlier recoverable failure, while a
     final unknown/inactive/failed call cannot be rewritten into a success claim.
     """
-    latest = _latest_non_empty_tool_event(tool_result_events)
+    # Persisted/history evidence is advisory only. Once the current request
+    # has tool evidence, an older success or failure must not rewrite it.
+    current_events = [
+        event
+        for event in tool_result_events
+        if str((event.get("metadata") or {}).get("freshness") or "")
+        .strip()
+        .casefold()
+        != "historical"
+    ]
+    latest = _latest_non_empty_tool_event(current_events or tool_result_events)
     if latest is None:
         return ""
 
