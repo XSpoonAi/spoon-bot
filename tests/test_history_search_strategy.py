@@ -73,6 +73,48 @@ def test_history_search_budget_is_shared_by_search_and_recent(tmp_path: Path) ->
     assert fourth["guardrail_stop"] is True
 
 
+def test_history_search_guardrail_content_is_not_user_visible() -> None:
+    from spoon_bot.agent.loop import AgentLoop
+
+    raw = json.dumps(
+        {
+            "budget_exhausted": True,
+            "guardrail_stop": True,
+            "next_action": "continue_latest_request_without_history_search",
+        }
+    )
+
+    assert AgentLoop._is_history_search_budget_guardrail_content(raw) is True
+    assert (
+        AgentLoop._history_search_budget_fallback_response()
+        == "The request was stopped after the history-search limit was reached.\n"
+        "No further history search was performed."
+    )
+
+
+def test_history_search_guardrail_does_not_match_normal_answer() -> None:
+    from spoon_bot.agent.loop import AgentLoop
+
+    assert AgentLoop._is_history_search_budget_guardrail_content(
+        "I stopped searching old history and answered from the latest evidence."
+    ) is False
+
+
+def test_history_search_guardrail_event_is_detected_without_domain_terms() -> None:
+    from spoon_bot.agent.loop import AgentLoop
+
+    event = {
+        "metadata": {
+            "name": "search_history",
+            "full_output": json.dumps(
+                {"budget_exhausted": True, "guardrail_stop": True}
+            ),
+        }
+    }
+
+    assert AgentLoop._tool_events_have_history_search_budget([event]) is True
+
+
 def test_scope_all_low_signal_query_prefers_current_session(tmp_path: Path) -> None:
     mgr = _build_manager(tmp_path)
     _append_message(

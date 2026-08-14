@@ -1622,9 +1622,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             tool_result_events = self._collect_runtime_tool_result_events_from_memory(
                 _pre_turn_memory_index
             )
-            if should_run_skill_contract_check(
+            history_search_budget_seen = AgentLoop._tool_events_have_history_search_budget(
                 tool_result_events
-            ) and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events):
+            )
+            history_search_budget_original_content = final_content
+            if (
+                not history_search_budget_seen
+                and should_run_skill_contract_check(
+                    tool_result_events
+                )
+                and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
+            ):
                 final_content = await self._run_process_repeated_read_recovery(
                     authoritative_message=authoritative_message,
                     request_execution_hints=request_execution_hints,
@@ -1635,7 +1643,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     _pre_turn_memory_index
                 )
 
-            if should_run_skill_contract_check(tool_result_events):
+            if not history_search_budget_seen and should_run_skill_contract_check(
+                tool_result_events
+            ):
                 (
                     final_content,
                     tool_result_events,
@@ -1651,7 +1661,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 )
 
             background_job_pending = False
-            if tool_result_events:
+            if tool_result_events and not history_search_budget_seen:
                 (
                     final_content,
                     tool_result_events,
@@ -1799,6 +1809,16 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 final_content = build_active_background_job_pending_answer(
                     tool_result_events
                 )
+            if history_search_budget_seen:
+                if (
+                    AgentLoop._is_history_search_budget_guardrail_content(
+                        history_search_budget_original_content
+                    )
+                    or not history_search_budget_original_content.strip()
+                ):
+                    final_content = AgentLoop._history_search_budget_fallback_response()
+                else:
+                    final_content = history_search_budget_original_content
             final_content = AgentLoop._finalize_response_content(
                 self,
                 authoritative_message,
@@ -2064,6 +2084,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             repeated_read_recovery_attempted = False
             repeated_read_guardrail_seen = False
             history_search_budget_seen = False
+            history_search_budget_original_content = ""
             skill_contract_continuation_attempted = False
             skill_contract_continuation_attempts = 0
             post_tool_result_silence_recovery_seen = False
@@ -3906,12 +3927,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             _record_tool_result_events(tool_result_events)
             if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
                 history_search_budget_seen = True
+                history_search_budget_original_content = run_result_text or full_content
             for event in tool_result_events:
                 yield _decorate_stream_event(event)
             for event in _drain_runtime_notice_events():
                 yield event
 
-            if leaked_tool_protocol_detected and not pseudo_tool_repair_attempted:
+            if (
+                leaked_tool_protocol_detected
+                and not pseudo_tool_repair_attempted
+                and not history_search_budget_seen
+            ):
                 logger.warning(
                     "Stream contained leaked tool-call protocol text; running "
                     "internal tool-call repair."
@@ -3947,7 +3973,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 _repeated_read_storm_active()
                 or (not repeated_read_recovery_attempted and repeated_read_guardrail_seen)
             )
-            if repeated_read_storm:
+            if repeated_read_storm and not history_search_budget_seen:
                 logger.warning(
                     "Repeated read_file calls consumed the tool loop; "
                     "running internal continuation recovery."
@@ -4104,6 +4130,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
             if (
                 tool_loop_fallback_active
+                and not history_search_budget_seen
                 and not latest_tool_event_has_user_summary_marker(all_tool_result_events)
                 and _can_run_skill_contract_continuation()
                 and skill_contract_needs_continuation(
@@ -4657,6 +4684,22 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 pending_fallback_reason = "background_job_pending"
                 pending_fallback_delta = full_content
 
+            if history_search_budget_seen:
+                if not history_search_budget_original_content:
+                    history_search_budget_original_content = run_result_text or full_content
+                if (
+                    AgentLoop._is_history_search_budget_guardrail_content(
+                        history_search_budget_original_content
+                    )
+                    or not history_search_budget_original_content.strip()
+                ):
+                    full_content = AgentLoop._history_search_budget_fallback_response()
+                    pending_fallback_content_emit = True
+                    pending_fallback_reason = "history_search_budget_exhausted"
+                    pending_fallback_delta = full_content
+                else:
+                    full_content = history_search_budget_original_content
+
             pre_finalize_full_content = full_content
             final_content = AgentLoop._finalize_response_content(
                 self,
@@ -5091,9 +5134,17 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             tool_result_events = self._collect_runtime_tool_result_events_from_memory(
                 _pre_turn_memory_index
             )
-            if should_run_skill_contract_check(
+            history_search_budget_seen = AgentLoop._tool_events_have_history_search_budget(
                 tool_result_events
-            ) and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events):
+            )
+            history_search_budget_original_content = final_content
+            if (
+                not history_search_budget_seen
+                and should_run_skill_contract_check(
+                    tool_result_events
+                )
+                and AgentLoop._tool_events_have_repeated_read_guardrail(tool_result_events)
+            ):
                 final_content = await self._run_process_repeated_read_recovery(
                     authoritative_message=authoritative_message,
                     request_execution_hints=request_execution_hints,
@@ -5105,7 +5156,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 )
                 thinking_content = None
 
-            if should_run_skill_contract_check(tool_result_events):
+            if not history_search_budget_seen and should_run_skill_contract_check(
+                tool_result_events
+            ):
                 (
                     final_content,
                     tool_result_events,
@@ -5122,7 +5175,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 thinking_content = None
 
             background_job_pending = False
-            if tool_result_events:
+            if tool_result_events and not history_search_budget_seen:
                 (
                     final_content,
                     tool_result_events,
@@ -5272,6 +5325,16 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                     tool_result_events
                 )
                 thinking_content = None
+            if history_search_budget_seen:
+                if (
+                    AgentLoop._is_history_search_budget_guardrail_content(
+                        history_search_budget_original_content
+                    )
+                    or not history_search_budget_original_content.strip()
+                ):
+                    final_content = AgentLoop._history_search_budget_fallback_response()
+                else:
+                    final_content = history_search_budget_original_content
             if self._looks_like_duplicate_thinking(thinking_content, final_content):
                 thinking_content = None
             final_content = AgentLoop._finalize_response_content(
