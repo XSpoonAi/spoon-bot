@@ -1152,6 +1152,10 @@ class LoopSkillsMixin:
         hints["continuation_intent"] = continuation_intent.to_hints()
         hints["bare_continuation"] = continuation_intent.is_continuation
         hints["plain_continuation"] = continuation_intent.is_plain
+        hints.setdefault(
+            "history_search_state",
+            {"calls": 0, "max_calls": 3, "exhausted": False, "disabled": False, "disabled_reason": ""},
+        )
         AgentLoop._configure_request_scoped_history_tool(self, hints)
         AgentLoop._bind_request_execution_hints_to_tools(self, hints)
         return hints

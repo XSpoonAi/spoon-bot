@@ -487,8 +487,10 @@ class TestWsTracingInStreamingEvents:
         assert len(cancelled) == 1
         assert len(stream_done) == 1
         assert stream_done[0]["data"]["status"] == "cancelled"
+        assert stream_done[0]["data"]["terminal"] is True
         assert len(completes) == 1
         assert completes[0]["data"]["status"] == "cancelled"
+        assert completes[0]["data"]["terminal"] is True
         data = cancelled[0]["data"]
         assert data["reason"] == "client_cancelled"
         assert data["error"]["code"] == "CANCELLED"

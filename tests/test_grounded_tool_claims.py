@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from spoon_bot.agent.tools.base import Tool
+from spoon_bot.agent.tools.execution_context import bind_request_execution_hints
 from spoon_bot.agent.tools.registry import ToolRegistry
 from spoon_bot.agent.turn_verifiers import (
     build_active_background_job_pending_answer,
@@ -81,6 +82,50 @@ def test_later_success_supersedes_earlier_tool_failure() -> None:
     ])
 
     assert failure == ""
+
+
+def test_historical_success_cannot_replace_current_failure() -> None:
+    failure = latest_unresolved_tool_failure([
+        {
+            "metadata": {
+                "name": "shell",
+                "status": "failed",
+                "full_output": "Error: current request failed",
+            }
+        },
+        {
+            "metadata": {
+                "name": "shell",
+                "status": "succeeded",
+                "freshness": "historical",
+                "full_output": "previous request completed",
+            }
+        },
+    ])
+
+    assert "current request failed" in failure
+
+
+@pytest.mark.asyncio
+async def test_history_search_is_removed_from_schema_after_budget() -> None:
+    registry = ToolRegistry()
+    registry.register(_ResultTool())
+    hints = {
+        "history_search_state": {
+            "calls": 0,
+            "max_calls": 3,
+            "exhausted": True,
+            "disabled": True,
+            "disabled_reason": "history_search_budget_exhausted",
+        }
+    }
+
+    with bind_request_execution_hints(hints):
+        names = {item["function"]["name"] for item in registry.get_definitions()}
+        result = await registry.execute("search_history", {})
+
+    assert "search_history" not in names
+    assert "disabled for this request" in result
 
 
 def test_numeric_claims_must_exist_in_evidence() -> None:
