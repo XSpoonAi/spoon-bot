@@ -27,8 +27,10 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 from spoon_bot.agent.session_compact import build_recent_session_turns_payload
 from spoon_bot.agent.tools.base import Tool
 from spoon_bot.agent.tools.execution_context import (
+    consume_history_search_call,
+    disable_history_search,
     get_request_execution_hints,
-    get_tracked_tool_invocation_counts,
+    history_search_is_disabled,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import for typing only
@@ -418,6 +420,7 @@ class SearchHistoryTool(Tool):
             "query": query,
             "scope": "session" if target_session_key is not None else requested_scope,
             "session_key": target_session_key,
+            "freshness": "historical",
             "total": 0,
             "limit": limit,
             "offset": offset,
@@ -499,6 +502,30 @@ class SearchHistoryTool(Tool):
         import json
 
         selected_mode = str(mode or "search").strip().casefold()
+        request_hints = get_request_execution_hints()
+        # Check the request-local hard stop before validating mode or resolving
+        # a session. This prevents `recent` and recovery calls from bypassing
+        # the same budget.
+        if history_search_is_disabled(request_hints):
+            return self._history_search_budget_response(
+                query=query,
+                target_session_key=None,
+                requested_scope=str(scope or "current"),
+                limit=max(1, min(200, int(limit) if str(limit).isdigit() else 20)),
+                offset=max(0, int(offset) if str(offset).isdigit() else 0),
+                stop_loop=True,
+            )
+        state = consume_history_search_call(request_hints)
+        if bool(state.get("disabled")):
+            disable_history_search("history_search_budget_exhausted", request_hints)
+            return self._history_search_budget_response(
+                query=query,
+                target_session_key=None,
+                requested_scope=str(scope or "current"),
+                limit=20,
+                offset=0,
+                stop_loop=True,
+            )
         if selected_mode not in {"search", "recent"}:
             return "Error: mode must be 'search' or 'recent'."
         if selected_mode == "search" and (not isinstance(query, str) or not query.strip()):
@@ -580,24 +607,6 @@ class SearchHistoryTool(Tool):
                 include_assistant_summaries=False,
             )
             return json.dumps(payload, ensure_ascii=False, default=str)
-
-        invocation_counts = get_tracked_tool_invocation_counts()
-        request_hints = get_request_execution_hints()
-        if (
-            (
-                bool(request_hints.get("history_search_budget_exhausted"))
-                or int(invocation_counts.get(self.name, 0) or 0) >= 3
-            )
-            and not bool(request_hints.get("current_session_fact_check_required"))
-        ):
-            return self._history_search_budget_response(
-                query=query,
-                target_session_key=target_session_key,
-                requested_scope=requested_scope,
-                limit=limit_int,
-                offset=offset_int,
-                stop_loop=bool(request_hints.get("history_search_budget_exhausted")),
-            )
 
         roles_list: list[str] | None
         if roles is None:
@@ -732,6 +741,7 @@ class SearchHistoryTool(Tool):
                     "snippet": h.snippet,
                     "content": h.content,
                     "evidence_type": self._hit_evidence_type(h),
+                    "freshness": "historical",
                     "timestamp": h.timestamp,
                     "matched_in": h.matched_in,
                     "tool_call_id": (
@@ -756,6 +766,7 @@ class SearchHistoryTool(Tool):
                     include_assistant_summaries=False,
                 )
                 payload["same_session_recent"] = recent_payload
+                payload["same_session_recent_freshness"] = "historical"
                 payload["same_session_recent_note"] = (
                     "For prior-result or continuation questions, choose the "
                     "substantive turn or turns that are relevant to the newest "

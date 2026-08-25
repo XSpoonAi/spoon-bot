@@ -2425,16 +2425,6 @@ class LoopProtocolMixin:
         return AgentLoop.DEFAULT_NEXT_STEP_PROMPT
 
     @staticmethod
-    def _build_history_search_budget_recovery_prompt(
-        user_request: str,
-        tool_result_events: list[dict[str, Any]],
-        *,
-        request_context: str = "",
-    ) -> str:
-        """Return the neutral continuation token used by the core loop."""
-        return AgentLoop.DEFAULT_NEXT_STEP_PROMPT
-
-    @staticmethod
     def _drop_pseudo_tool_call_assistant_messages(self, start_index: int) -> int:
         """Remove runtime assistant messages that contain fake tool-call transcripts."""
         if not isinstance(start_index, int) or start_index < 0:
@@ -3466,6 +3456,8 @@ class LoopProtocolMixin:
         fallback_text: str = "",
     ) -> str:
         """Ask the configured model to write the final user-facing answer from evidence."""
+        if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
+            return AgentLoop._history_search_budget_fallback_response()
         synthesis_events = AgentLoop._select_final_answer_synthesis_events(tool_result_events)
         unresolved_failure = latest_unresolved_tool_failure(synthesis_events)
         if unresolved_failure:
@@ -4476,6 +4468,8 @@ class LoopProtocolMixin:
                 or metadata.get("output")
                 or metadata.get("result")
                 or metadata.get("content")
+                or metadata.get("full_output")
+                or metadata.get("full_result")
                 or event.get("delta")
             )
             text = AgentLoop._stringify_stream_payload(payload).strip()
@@ -4490,6 +4484,41 @@ class LoopProtocolMixin:
             if "history search budget reached for this request" in text.casefold():
                 return True
         return False
+
+    @staticmethod
+    def _is_history_search_budget_guardrail_content(value: Any) -> bool:
+        """Return True when content is only the history-search budget guardrail."""
+        text = AgentLoop._stringify_stream_payload(value).strip()
+        if not text:
+            return False
+
+        candidates = [text]
+        if text.startswith("```") and text.endswith("```"):
+            candidates.append(text.strip("`").removeprefix("json").strip())
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and (
+                parsed.get("budget_exhausted") is True
+                and parsed.get("guardrail_stop") is True
+            ):
+                return True
+
+        normalized = " ".join(text.casefold().split())
+        return (
+            "history search budget reached for this request" in normalized
+            and "guardrail_stop" in normalized
+        )
+
+    @staticmethod
+    def _history_search_budget_fallback_response() -> str:
+        """Return a domain-neutral terminal response for an exhausted search budget."""
+        return (
+            "The request was stopped after the history-search limit was reached.\n"
+            "No further history search was performed."
+        )
 
     async def _run_process_repeated_read_recovery(
         self,
@@ -4518,49 +4547,6 @@ class LoopProtocolMixin:
                 result = await AgentLoop._run_agent_with_context_overflow_recovery(
                     self,
                     label="process_repeated_read_recovery",
-                    retry_runner=retry_runner,
-                    **run_kwargs,
-                )
-        finally:
-            if previous_force_serial:
-                self._force_serial_tool_calls = True
-            elif hasattr(self, "_force_serial_tool_calls"):
-                delattr(self, "_force_serial_tool_calls")
-
-        return AgentLoop._extract_run_result_text(result)
-
-    async def _run_process_history_search_budget_recovery(
-        self,
-        *,
-        authoritative_message: str,
-        request_execution_hints: dict[str, Any],
-        tool_result_events: list[dict[str, Any]],
-        retry_runner: Callable[..., Awaitable[Any]],
-        run_kwargs: dict[str, Any],
-        label: str,
-    ) -> str:
-        """Retry once after unproductive history lookup consumes the turn."""
-        AgentLoop._drain_agent_output_queue(self)
-        self._reset_agent_state_for_retry()
-        repair_prompt = AgentLoop._build_history_search_budget_recovery_prompt(
-            authoritative_message,
-            tool_result_events,
-        )
-        await self._agent.add_message("user", repair_prompt)
-        self._agent.next_step_prompt = repair_prompt
-
-        recovery_hints = dict(request_execution_hints)
-        recovery_hints["history_search_budget_exhausted"] = True
-        previous_force_serial = bool(getattr(self, "_force_serial_tool_calls", False))
-        self._force_serial_tool_calls = True
-        try:
-            with (
-                bind_request_execution_hints(recovery_hints),
-                track_tool_invocations(max_repeats=1),
-            ):
-                result = await AgentLoop._run_agent_with_context_overflow_recovery(
-                    self,
-                    label=label,
                     retry_runner=retry_runner,
                     **run_kwargs,
                 )
