@@ -20,6 +20,8 @@ from uuid import uuid4
 from fastapi import Header, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
 
+from spoon_bot.agent.execution_options import AgentExecutionOptions
+from spoon_bot.config import resolve_context_window
 from spoon_bot.gateway.app import (
     get_agent,
     get_config,
@@ -843,6 +845,30 @@ class WebSocketHandler:
         conn.session_key = session_key
         user_id = getattr(conn, "user_id", "anonymous")
 
+        requested_context_window = params.get("context_window")
+        if requested_context_window is not None and (
+            isinstance(requested_context_window, bool)
+            or not isinstance(requested_context_window, int)
+        ):
+            raise ValueError("context_window must be a positive integer")
+        execution_options = AgentExecutionOptions.resolve(
+            default_model=getattr(agent, "model", None),
+            default_context_window=(
+                getattr(agent, "context_window", None)
+                or resolve_context_window(getattr(agent, "model", None))
+            ),
+            model=params.get("model"),
+            model_sku=params.get("model_sku"),
+            model_catalog_version=params.get("model_catalog_version"),
+            context_window=requested_context_window,
+        )
+        execution_kwargs = {
+            "model": params.get("model"),
+            "model_sku": params.get("model_sku"),
+            "model_catalog_version": params.get("model_catalog_version"),
+            "context_window": requested_context_window,
+        }
+
         stream = params.get("stream", False)
         thinking = params.get("thinking", False)
         reasoning_effort = params.get("reasoning_effort")
@@ -972,6 +998,7 @@ class WebSocketHandler:
                             attachments=attachments,
                             thinking=thinking,
                             reasoning_effort=reasoning_effort,
+                            **execution_kwargs,
                         )
                         try:
                             while True:
@@ -1177,6 +1204,7 @@ class WebSocketHandler:
                                     media=media,
                                     attachments=attachments,
                                     reasoning_effort=reasoning_effort,
+                                    **execution_kwargs,
                                 ),
                                 budget_type="request",
                                 limit_ms=config.budget.request_timeout_ms,
@@ -1189,6 +1217,7 @@ class WebSocketHandler:
                                     media=media,
                                     attachments=attachments,
                                     reasoning_effort=reasoning_effort,
+                                    **execution_kwargs,
                                 ),
                                 budget_type="request",
                                 limit_ms=config.budget.request_timeout_ms,
@@ -1224,6 +1253,12 @@ class WebSocketHandler:
             }
             if not stream and thinking and thinking_content:
                 complete_data["thinking_content"] = thinking_content
+            if execution_options.model_sku:
+                complete_data["model_sku"] = execution_options.model_sku
+            if execution_options.model_catalog_version:
+                complete_data["model_catalog_version"] = (
+                    execution_options.model_catalog_version
+                )
 
             await manager.send_message(
                 self.connection_id,
@@ -1245,6 +1280,10 @@ class WebSocketHandler:
             }
             if not stream and thinking and thinking_content:
                 result["thinking_content"] = thinking_content
+            if execution_options.model_sku:
+                result["model_sku"] = execution_options.model_sku
+            if execution_options.model_catalog_version:
+                result["model_catalog_version"] = execution_options.model_catalog_version
 
             return result
         except asyncio.CancelledError:
@@ -1620,6 +1659,9 @@ class WebSocketHandler:
             "status": "ready",
             "model": getattr(agent, 'model', 'unknown'),
             "provider": getattr(agent, 'provider', 'unknown'),
+            "capabilities": {
+                "request_model_override": True,
+            },
             "tools": tool_count,
             "skills": skill_count,
             "active_sessions": active_sessions,

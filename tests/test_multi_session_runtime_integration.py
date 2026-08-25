@@ -48,6 +48,7 @@ class FakeSessions:
 class RuntimeAgent:
     model = "test-model"
     provider = "test"
+    context_window = 100_000
     tools: list[str] = []
     skills: list[str] = []
 
@@ -65,6 +66,7 @@ class RuntimeAgent:
         self.on_process = on_process
         self.on_stream = on_stream
         self.cleanup_calls = 0
+        self.process_kwargs: list[dict[str, Any]] = []
 
     def build_creation_kwargs(self, **overrides: Any) -> dict[str, Any]:
         kwargs = {
@@ -77,6 +79,7 @@ class RuntimeAgent:
         return kwargs
 
     async def process(self, *, message: str, **kwargs: Any) -> str:
+        self.process_kwargs.append(dict(kwargs))
         self._session.messages.append({"role": "user", "content": message})
         if self.on_process is not None:
             await self.on_process(self.session_key)
@@ -293,3 +296,58 @@ def test_websocket_session_close_and_status_metrics() -> None:
         metrics = ws.receive_json()["result"]["runtime_metrics"]
         assert metrics["explicit_closed_total"] == 1
         assert metrics["closed_total"] == 1
+
+
+def test_websocket_forwards_request_model_metadata_and_reports_capability() -> None:
+    application, _sessions, created = _make_app_with_registry()
+    client = TestClient(application)
+
+    with client.websocket_connect("/v1/ws") as ws:
+        ws.receive_json()
+        ws.send_json(
+            {
+                "type": "request",
+                "id": "model-request",
+                "method": "agent.chat",
+                "params": {
+                    "message": "use selected model",
+                    "stream": False,
+                    "model": "provider/request-model",
+                    "model_sku": "request-model",
+                    "model_catalog_version": "v3",
+                    "context_window": 131_072,
+                },
+            }
+        )
+
+        response = None
+        for _ in range(5):
+            frame = ws.receive_json()
+            if frame.get("type") == "response" and frame.get("id") == "model-request":
+                response = frame
+                break
+
+        assert response is not None
+        assert response["result"]["model_sku"] == "request-model"
+        assert response["result"]["model_catalog_version"] == "v3"
+
+        ws.send_json(
+            {
+                "type": "request",
+                "id": "status",
+                "method": "agent.status",
+                "params": {},
+            }
+        )
+        status = ws.receive_json()
+        assert status["result"]["capabilities"]["request_model_override"] is True
+
+    assert created[0].process_kwargs[-1] == {
+        "media": [],
+        "attachments": [],
+        "reasoning_effort": None,
+        "model": "provider/request-model",
+        "model_sku": "request-model",
+        "model_catalog_version": "v3",
+        "context_window": 131_072,
+    }

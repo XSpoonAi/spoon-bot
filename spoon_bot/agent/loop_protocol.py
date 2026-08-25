@@ -975,7 +975,7 @@ class LoopProtocolMixin:
 
         logger.warning(
             f"Context compression triggered: ~{estimated:,} tokens "
-            f"(budget: {budget:,}, window: {self.context_window:,}). "
+            f"(budget: {budget:,}, window: {self._effective_context_window():,}). "
             f"Messages: {len(messages)}"
         )
 
@@ -3525,16 +3525,23 @@ class LoopProtocolMixin:
 
             async def _do_synthesis() -> Any:
                 async def _invoke() -> Any:
+                    effective_model = self._effective_model()
                     if callable(chat):
-                        result = chat(
-                            messages=messages,
-                            provider=getattr(self, "provider", None),
-                        )
+                        request_kwargs = {
+                            "messages": messages,
+                            "provider": getattr(self, "provider", None),
+                        }
+                        if effective_model:
+                            request_kwargs["model"] = effective_model
+                        result = chat(**request_kwargs)
                     else:
-                        result = ask(
-                            messages=[Message(role="user", content=brief)],
-                            system_msg=_FINAL_ANSWER_SYNTHESIS_SYSTEM_PROMPT,
-                        )
+                        request_kwargs = {
+                            "messages": [Message(role="user", content=brief)],
+                            "system_msg": _FINAL_ANSWER_SYNTHESIS_SYSTEM_PROMPT,
+                        }
+                        if effective_model:
+                            request_kwargs["model"] = effective_model
+                        result = ask(**request_kwargs)
                     if inspect.isawaitable(result):
                         return await result
                     return result
@@ -4125,16 +4132,23 @@ class LoopProtocolMixin:
         try:
 
             async def _invoke() -> Any:
+                effective_model = self._effective_model()
                 if callable(chat):
-                    result = chat(
-                        messages=messages,
-                        provider=getattr(self, "provider", None),
-                    )
+                    request_kwargs = {
+                        "messages": messages,
+                        "provider": getattr(self, "provider", None),
+                    }
+                    if effective_model:
+                        request_kwargs["model"] = effective_model
+                    result = chat(**request_kwargs)
                 else:
-                    result = ask(
-                        messages=[Message(role="user", content=brief)],
-                        system_msg=_TASK_COMPLETION_VERDICT_SYSTEM_PROMPT,
-                    )
+                    request_kwargs = {
+                        "messages": [Message(role="user", content=brief)],
+                        "system_msg": _TASK_COMPLETION_VERDICT_SYSTEM_PROMPT,
+                    }
+                    if effective_model:
+                        request_kwargs["model"] = effective_model
+                    result = ask(**request_kwargs)
                 if inspect.isawaitable(result):
                     return await result
                 return result
