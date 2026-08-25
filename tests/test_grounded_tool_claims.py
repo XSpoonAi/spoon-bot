@@ -260,18 +260,33 @@ async def test_tool_terminal_summary_cannot_be_rewritten_from_loss_to_win() -> N
 
 @pytest.mark.asyncio
 async def test_final_synthesis_rejects_invented_reward_amount() -> None:
+    from spoon_bot.agent.execution_options import (
+        AgentExecutionOptions,
+        bind_agent_execution_options,
+    )
     from spoon_bot.agent.loop import AgentLoop
 
     loop = AgentLoop.__new__(AgentLoop)
     chat = AsyncMock(return_value=SimpleNamespace(content="Rank 1/6, reward 175 GLD."))
     loop._chatbot = SimpleNamespace(llm_manager=SimpleNamespace(chat=chat))
     loop.provider = "test"
+    loop.model = "provider/startup-model"
+    loop.context_window = 100_000
 
-    result = await AgentLoop._synthesize_final_answer_from_tool_events(
-        loop,
-        [_event("SETTLEMENT rank=1/6 reward=75 GLD")],
-        user_message="Report the result",
-    )
+    with bind_agent_execution_options(
+        AgentExecutionOptions(
+            model="provider/request-model",
+            context_window=131_072,
+            explicit=True,
+        )
+    ):
+        result = await AgentLoop._synthesize_final_answer_from_tool_events(
+            loop,
+            [_event("SETTLEMENT rank=1/6 reward=75 GLD")],
+            user_message="Report the result",
+        )
 
     assert "175" not in result
     assert "reward=75 GLD" in result
+    chat.assert_awaited()
+    assert chat.await_args.kwargs["model"] == "provider/request-model"

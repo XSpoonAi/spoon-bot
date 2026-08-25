@@ -196,7 +196,12 @@ class LoopSkillsMixin:
             if isinstance(context, dict) and str(context.get("name") or "")
         ]
         grounding = getattr(self, "grounding", None)
-        context_window = int(getattr(self, "context_window", 0) or 0)
+        resolve_context_window = getattr(self, "_effective_context_window", None)
+        context_window = int(
+            resolve_context_window()
+            if callable(resolve_context_window)
+            else getattr(self, "context_window", 0) or 0
+        )
         envelope = TurnContextEnvelope(
             session_id=str(getattr(self, "session_key", "") or ""),
             turn_id=turn_id,
@@ -1250,8 +1255,29 @@ class LoopSkillsMixin:
         if not isinstance(current_prompt, str) or not current_prompt:
             return None, _MISSING
 
+        resolve_context_window = getattr(self, "_effective_context_window", None)
+        effective_context_window = int(
+            resolve_context_window()
+            if callable(resolve_context_window)
+            else getattr(self, "context_window", 0) or 0
+        )
+        configured_context_window = int(getattr(self, "context_window", 0) or 0)
+        configured_hint = (
+            f"[Context: {configured_context_window:,} tokens - be concise.]"
+        )
+        effective_hint = (
+            f"[Context: {effective_context_window:,} tokens - be concise.]"
+        )
+
         request_context = self._build_request_context_prompt(message)
-        augmented_prompt = f"{current_prompt}\n\n## Active Request Context\n{request_context}"
+        effective_prompt = current_prompt.replace(
+            configured_hint,
+            effective_hint,
+            1,
+        )
+        augmented_prompt = (
+            f"{effective_prompt}\n\n## Active Request Context\n{request_context}"
+        )
         self._active_request_base_system_prompt = current_prompt
         self._active_request_augmented_system_prompt = augmented_prompt
         self._agent.system_prompt = augmented_prompt
@@ -1260,8 +1286,13 @@ class LoopSkillsMixin:
         if hasattr(self._agent, "_original_system_prompt"):
             original_base_prompt = getattr(self._agent, "_original_system_prompt")
             if isinstance(original_base_prompt, str) and original_base_prompt:
+                effective_base_prompt = original_base_prompt.replace(
+                    configured_hint,
+                    effective_hint,
+                    1,
+                )
                 self._agent._original_system_prompt = (
-                    f"{original_base_prompt}\n\n## Active Request Context\n{request_context}"
+                    f"{effective_base_prompt}\n\n## Active Request Context\n{request_context}"
                 )
 
         return current_prompt, original_base_prompt

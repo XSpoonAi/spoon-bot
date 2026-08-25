@@ -6,12 +6,14 @@ import asyncio
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Awaitable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
 from loguru import logger
 
+from spoon_bot.agent.execution_options import current_agent_execution_options
 from spoon_bot.agent.tools.registry import TOOL_PROFILES
+from spoon_bot.bus.events import SubagentEvent
 from spoon_bot.subagent.models import (
     CleanupMode,
     PersistentSubagentProfile,
@@ -24,13 +26,12 @@ from spoon_bot.subagent.models import (
     TokenUsage,
     normalize_thinking_level,
 )
-from spoon_bot.subagent.registry import SubagentRegistry
 from spoon_bot.subagent.persistence import AgentDirectory, SubagentRunsFile, SubagentSweeper
-from spoon_bot.bus.events import SubagentEvent
+from spoon_bot.subagent.registry import SubagentRegistry
 
 if TYPE_CHECKING:
-    from spoon_bot.session.manager import SessionManager
     from spoon_bot.bus.queue import MessageBus
+    from spoon_bot.session.manager import SessionManager
 
 # Announce retry settings
 _ANNOUNCE_MAX_RETRIES = 3
@@ -216,12 +217,12 @@ class SubagentManager:
         default_tool_profile = str(self._default_tool_profile or "").strip()
         base_tool_profile = SubagentConfig.model_fields["tool_profile"].default
 
-        if (
-            self._default_model
-            and not self._config_field_explicit(effective, "model")
-            and not effective.model
-        ):
-            effective.model = self._default_model
+        if not self._config_field_explicit(effective, "model"):
+            request_options = current_agent_execution_options()
+            if request_options is not None:
+                effective.model = request_options.model
+            elif self._default_model and not effective.model:
+                effective.model = self._default_model
 
         if (
             default_tool_profile
@@ -234,6 +235,14 @@ class SubagentManager:
         effective.auto_route = False
 
         return effective
+
+    def _effective_parent_model(self, configured_model: str | None) -> str | None:
+        if configured_model:
+            return configured_model
+        request_options = current_agent_execution_options()
+        if request_options is not None:
+            return request_options.model
+        return self._parent_model
 
     @staticmethod
     def _config_allows_nested_subagents(cfg: SubagentConfig) -> bool:
@@ -744,7 +753,7 @@ class SubagentManager:
             agent_dir_path = str(agent_dir.root)
 
         # --- Resolve effective model name ---
-        effective_model = cfg.model or self._parent_model
+        effective_model = self._effective_parent_model(cfg.model)
         (
             resolved_spawner_session,
             resolved_spawner_channel,
@@ -1160,7 +1169,7 @@ class SubagentManager:
         )
         effective_config.spawn_mode = SpawnMode.SESSION
         effective_config.agent_name = agent_name
-        effective_model = effective_config.model or self._parent_model
+        effective_model = self._effective_parent_model(effective_config.model)
         next_run_id = self._new_run_id()
         (
             resolved_spawner_session,
@@ -1343,7 +1352,7 @@ class SubagentManager:
         effective_config.spawn_mode = self._record_spawn_mode(record)
         if record.agent_name and not effective_config.agent_name:
             effective_config.agent_name = record.agent_name
-        effective_model = effective_config.model or self._parent_model
+        effective_model = self._effective_parent_model(effective_config.model)
         next_run_id = self._new_run_id()
         (
             resolved_spawner_session,
@@ -1586,7 +1595,15 @@ class SubagentManager:
 
         try:
             cfg = self._apply_default_config(record.config)
-            effective_model = cfg.model or self._parent_model
+            effective_model = self._effective_parent_model(cfg.model)
+            request_options = current_agent_execution_options()
+            effective_context_window = cfg.context_window
+            if (
+                effective_context_window is None
+                and request_options is not None
+                and effective_model == request_options.model
+            ):
+                effective_context_window = request_options.context_window
             effective_enabled_tools = self._resolve_child_enabled_tools(cfg)
             effective_tool_profile = None if effective_enabled_tools is not None else cfg.tool_profile
             child_session_manager = self._session_manager_for_record(record)
@@ -1603,7 +1620,7 @@ class SubagentManager:
                 enable_skills=self._resolve_effective_enable_skills(cfg),
                 enabled_tools=effective_enabled_tools,
                 tool_profile=effective_tool_profile,
-                context_window=cfg.context_window,
+                context_window=effective_context_window,
                 auto_commit=False,
                 session_manager=child_session_manager,
                 subagent_manager=self,

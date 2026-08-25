@@ -75,6 +75,10 @@ from spoon_bot.agent.execution_ledger import (
     bind_execution_ledger,
     persist_execution_ledger,
 )
+from spoon_bot.agent.execution_options import (
+    current_agent_execution_options,
+    request_model_execution,
+)
 from spoon_bot.agent.tools.cron import CronTool
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
@@ -1415,14 +1419,23 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         self._initialized = False
         logger.info("AgentLoop cleanup complete")
 
+    def _effective_model(self) -> str:
+        options = current_agent_execution_options()
+        return options.model if options is not None else str(getattr(self, "model", "") or "")
+
+    def _effective_context_window(self) -> int:
+        options = current_agent_execution_options()
+        return options.context_window if options is not None else self.context_window
+
     def _runtime_compaction_trigger_budget(self) -> int:
         """Return the runtime token budget that should trigger preflight compaction."""
         grounding = getattr(self, "grounding", None)
         compaction_ratio = float(getattr(grounding, "context_compaction_ratio", 0.75))
         output_reserve_ratio = float(getattr(grounding, "output_reserve_ratio", 0.2))
         usable_ratio = min(compaction_ratio, 1.0 - output_reserve_ratio)
-        return max(8_000, int(self.context_window * usable_ratio))
+        return max(8_000, int(self._effective_context_window() * usable_ratio))
 
+    @request_model_execution
     async def process(
         self,
         message: str,
@@ -1433,6 +1446,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         metadata: dict[str, Any] | None = None,
         reply_to: str | None = None,
         reasoning_effort: str | None = None,
+        model: str | None = None,
+        model_sku: str | None = None,
+        model_catalog_version: str | None = None,
+        context_window: int | None = None,
     ) -> str:
         """
         Process a user message and return the agent's response.
@@ -1559,6 +1576,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 self._agent.run, "reasoning_effort"
             ):
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
+            effective_model = self._effective_model()
+            if effective_model and self._callable_accepts_kwarg(self._agent.run, "model"):
+                run_kwargs["model"] = effective_model
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
             with (
                 bind_request_execution_hints(request_execution_hints),
@@ -1894,6 +1914,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
 
         return final_content
 
+    @request_model_execution
     async def stream(
         self,
         message: str,
@@ -1904,6 +1925,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         metadata: dict[str, Any] | None = None,
         reply_to: str | None = None,
         reasoning_effort: str | None = None,
+        model: str | None = None,
+        model_sku: str | None = None,
+        model_catalog_version: str | None = None,
+        context_window: int | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Stream a response with typed chunks.
@@ -2111,6 +2136,12 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                         self._agent.run, "reasoning_effort"
                     ):
                         run_kwargs["reasoning_effort"] = run_reasoning_effort
+                    effective_model = self._effective_model()
+                    if effective_model and self._callable_accepts_kwarg(
+                        self._agent.run,
+                        "model",
+                    ):
+                        run_kwargs["model"] = effective_model
 
                     def _drain_queue() -> None:
                         while not self._agent.output_queue.empty():
@@ -2523,6 +2554,12 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 kwargs: dict[str, Any] = {}
                 if self._callable_accepts_kwarg(self._agent.run, "reasoning_effort"):
                     kwargs["reasoning_effort"] = "low"
+                effective_model = self._effective_model()
+                if effective_model and self._callable_accepts_kwarg(
+                    self._agent.run,
+                    "model",
+                ):
+                    kwargs["model"] = effective_model
                 return kwargs
 
             def _repair_events_from_queued_item(
@@ -4938,6 +4975,7 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
             except Exception as e:
                 logger.warning(f"Failed to save session after streaming: {e}")
 
+    @request_model_execution
     async def process_with_thinking(
         self,
         message: str,
@@ -4949,6 +4987,10 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         metadata: dict[str, Any] | None = None,
         reply_to: str | None = None,
         reasoning_effort: str | None = None,
+        model: str | None = None,
+        model_sku: str | None = None,
+        model_catalog_version: str | None = None,
+        context_window: int | None = None,
     ) -> tuple[str, str | None]:
         """
         Process a user message and return the agent's response with thinking content.
@@ -5068,6 +5110,9 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
                 self._agent.run, "reasoning_effort"
             ):
                 run_kwargs["reasoning_effort"] = effective_reasoning_effort
+            effective_model = self._effective_model()
+            if effective_model and self._callable_accepts_kwarg(self._agent.run, "model"):
+                run_kwargs["model"] = effective_model
             request_execution_hints = self._build_request_execution_hints(authoritative_message)
             with (
                 bind_request_execution_hints(request_execution_hints),
