@@ -80,6 +80,7 @@ from spoon_bot.agent.execution_options import (
     request_model_execution,
 )
 from spoon_bot.agent.tools.cron import CronTool
+from spoon_bot.agent.tools.document import DocumentParseTool
 from spoon_bot.agent.tools.execution_context import (
     bind_request_execution_hints,
     bind_tool_owner,
@@ -1057,6 +1058,11 @@ class AgentLoop(LoopStateMixin, LoopProtocolMixin, LoopSkillsMixin):
         for ft in _file_tools:
             ft._path_touch_callback = lambda p: self.record_touched_paths(p)
             self.tools.register(ft)
+
+        # Keep PDF parsing available as a structured capability. Without this
+        # registration, models fall back to guessing host package-manager and
+        # PDF-library commands even though the runtime ships PyMuPDF.
+        self.tools.register(DocumentParseTool(workspace=self.workspace))
 
         # Self-management tools
         self_config_tool = SelfConfigTool()

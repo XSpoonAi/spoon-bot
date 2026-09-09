@@ -22,6 +22,7 @@ CORE_TOOLS: frozenset[str] = frozenset({
     "self_config", "memory", "activate_tool", "self_upgrade", "cron",
     "web_search", "web_fetch", "wallet", "balance_check",
     "skill_marketplace", "search_history",
+    "document_parse",
 })
 
 AUTOMATION_TOOLS: frozenset[str] = frozenset({
@@ -29,7 +30,7 @@ AUTOMATION_TOOLS: frozenset[str] = frozenset({
     "self_config", "memory", "activate_tool", "self_upgrade",
     "search_history",
     "web_search", "web_fetch",
-    "skill_marketplace",
+    "skill_marketplace", "document_parse",
 })
 
 RISKY_LOCAL_TOOLS: frozenset[str] = frozenset({
@@ -59,10 +60,10 @@ TOOL_PROFILES: dict[str, frozenset[str]] = {
     "automation": AUTOMATION_TOOLS,
     "coding": frozenset({
         "shell", "read_file", "write_file", "edit_file", "list_dir",
-        "web_search", "web_fetch",
+        "web_search", "web_fetch", "document_parse",
     }),
     "research": frozenset({
-        "web_search", "web_fetch", "read_file", "list_dir",
+        "web_search", "web_fetch", "read_file", "list_dir", "document_parse",
     }),
     "group_safe": GROUP_SAFE_TOOLS,
     "chat_safe": GROUP_SAFE_TOOLS,
@@ -70,6 +71,7 @@ TOOL_PROFILES: dict[str, frozenset[str]] = {
         "shell", "read_file", "write_file", "edit_file", "list_dir",
         "self_config", "memory", "self_upgrade", "activate_tool", "spawn",
         "web_search", "web_fetch", "cron", "skill_marketplace",
+        "document_parse",
     }),
 }
 

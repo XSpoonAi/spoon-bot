@@ -205,9 +205,11 @@ class TestRegistryClean:
 
     def test_core_tools_still_exist(self):
         """CORE_TOOLS should still exist."""
-        from spoon_bot.agent.tools.registry import CORE_TOOLS
+        from spoon_bot.agent.tools.registry import CORE_TOOLS, TOOL_PROFILES
         assert "activate_tool" in CORE_TOOLS
         assert "web_search" in CORE_TOOLS
+        for profile in ("core", "automation", "coding", "research", "full"):
+            assert "document_parse" in TOOL_PROFILES[profile]
 
 
 if __name__ == "__main__":

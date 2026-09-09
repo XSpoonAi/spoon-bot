@@ -8,6 +8,7 @@ from typing import Any
 
 from spoon_bot.agent.tools.base import Tool, ToolParameterSchema
 from spoon_bot.agent.tools.execution_context import capture_tool_output
+from spoon_bot.agent.tools.path_validator import PathValidator
 
 
 class DocumentParseTool(Tool):
@@ -16,6 +17,7 @@ class DocumentParseTool(Tool):
     def __init__(self, workspace: str | Path = "./workspace") -> None:
         self.workspace = Path(workspace).resolve()
         self.images_dir = self.workspace / "extracted_images"
+        self._path_validator = PathValidator(workspace=self.workspace)
 
     @property
     def name(self) -> str:
@@ -25,7 +27,11 @@ class DocumentParseTool(Tool):
     @property
     def description(self) -> str:
         """Tool description for agent selection."""
-        return "Parse PDF documents and extract text, tables, and images with page controls."
+        return (
+            "Parse workspace PDF documents and extract text, tables, and images with page "
+            "controls. Use this structured tool before shell commands or package installation "
+            "for PDF attachments."
+        )
 
     @property
     def parameters(self) -> ToolParameterSchema:
@@ -100,9 +106,16 @@ class DocumentParseTool(Tool):
         try:
             import fitz  # type: ignore
         except ImportError:
-            return "Error: pymupdf is required for PDF parsing. Install with: pip install pymupdf"
+            return (
+                "STOP_TOOL_LOOP: PDF parsing is unavailable because this runtime is missing "
+                "PyMuPDF. This is a deployment configuration error; do not install packages "
+                "or retry PDF parsing through shell."
+            )
 
-        pdf_path = Path(file_path).expanduser().resolve()
+        validation = self._path_validator.validate_read_path(file_path)
+        if not validation.valid or validation.resolved_path is None:
+            return f"Error: Invalid PDF path: {validation.error or file_path}"
+        pdf_path = validation.resolved_path
         if not pdf_path.exists():
             return f"Error: File not found: {file_path}"
         if pdf_path.suffix.lower() != ".pdf":

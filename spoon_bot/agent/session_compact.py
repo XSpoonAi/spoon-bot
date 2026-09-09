@@ -241,6 +241,48 @@ def _completed_session_messages_without_active_turn(raw_messages: Any) -> list[d
     return completed
 
 
+def _recent_session_messages_without_active_turn(raw_messages: Any) -> list[dict[str, Any]]:
+    """Return recent turns for inspection without treating them as replayable.
+
+    Unlike model-context compaction, history inspection must retain interrupted
+    turns so callers can see their attachments and read-only diagnostics.
+    """
+    if not isinstance(raw_messages, list):
+        return []
+    messages = [msg for msg in raw_messages if isinstance(msg, dict)]
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if str(message.get("role") or "").lower() != "user":
+            continue
+        state = str(message.get("turn_state") or message.get("state") or "").lower()
+        if state == "pending":
+            return messages[:index]
+        break
+    return messages
+
+
+def _turn_attachment_refs(user_message: dict[str, Any]) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
+    for item in user_message.get("attachments") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("workspace_path") or item.get("uri") or "").strip()
+        if not path:
+            continue
+        refs.append({
+            "path": path,
+            "name": str(item.get("name") or "").strip(),
+            "mime_type": str(item.get("mime_type") or item.get("file_type") or "").strip(),
+        })
+    if refs:
+        return refs
+    return [
+        {"path": str(path), "name": "", "mime_type": ""}
+        for path in user_message.get("media") or []
+        if str(path).strip()
+    ]
+
+
 def _latest_prior_user_task_line(
     raw_messages: Any,
     current_message: str,
@@ -657,8 +699,8 @@ def build_recent_session_turns_payload(
     max_content_length: int = 1000,
 ) -> dict[str, Any]:
     """Build structured recent-turn evidence for history recovery tools."""
-    completed = _completed_session_messages_without_active_turn(raw_messages)
-    turns = _group_completed_turns(completed)
+    recent_messages = _recent_session_messages_without_active_turn(raw_messages)
+    turns = _group_completed_turns(recent_messages)
     selected: list[dict[str, Any]] = []
     substantive_turns: list[dict[str, Any]] = []
     latest_substantive: dict[str, Any] | None = None
@@ -689,6 +731,7 @@ def build_recent_session_turns_payload(
             ),
             "timestamp": user_message.get("timestamp"),
             "turn_state": user_message.get("turn_state") or user_message.get("state"),
+            "attachment_refs": _turn_attachment_refs(user_message),
             "invoked_skills": _turn_skill_names(user_message),
             "has_stateful_progress": bool(stateful_events),
             "latest_stateful_tool_result": (
@@ -707,7 +750,12 @@ def build_recent_session_turns_payload(
             "assistant_summary": assistant_summary,
         }
 
-        if stateful_events:
+        turn_state = str(
+            user_message.get("turn_state") or user_message.get("state") or ""
+        ).lower()
+        if stateful_events and turn_state not in {
+            "pending", "interrupted", "superseded", "cancelled", "canceled"
+        }:
             if latest_substantive is None:
                 latest_substantive = turn_payload
             if len(substantive_turns) < max(1, limit):
@@ -733,7 +781,8 @@ def build_recent_session_turns_payload(
             "Use substantive_turns as same-session prior-work evidence. "
             "Pick the turn or turns relevant to the newest request; read-only "
             "diagnostic turns and assistant summaries are secondary and should "
-            "not override stateful tool results."
+            "not override stateful tool results. Interrupted turns and their "
+            "attachment_refs are historical evidence only and must not be replayed."
         ),
     }
 

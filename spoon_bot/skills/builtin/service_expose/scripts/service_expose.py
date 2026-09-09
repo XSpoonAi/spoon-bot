@@ -14,9 +14,11 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 WINDOWS_DETACHED_PROCESS = 0x00000008
@@ -451,6 +453,64 @@ def _http_body(url: str, timeout: float = 5.0) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+class _CriticalAssetParser(HTMLParser):
+    """Collect browser-blocking script and stylesheet references."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {str(key).lower(): str(value or "") for key, value in attrs}
+        if tag.lower() == "script" and values.get("src"):
+            self.references.append(values["src"])
+            return
+        if tag.lower() == "link" and values.get("href"):
+            rel = {item.casefold() for item in values.get("rel", "").split()}
+            if "stylesheet" in rel:
+                self.references.append(values["href"])
+
+
+def _critical_same_origin_assets(url: str, body: str, *, limit: int = 32) -> list[str]:
+    """Return bounded same-origin assets required for initial page rendering."""
+    parser = _CriticalAssetParser()
+    try:
+        parser.feed(body)
+    except Exception:
+        return []
+
+    origin = urlparse(url)
+    assets: list[str] = []
+    for reference in parser.references:
+        candidate = str(reference or "").strip()
+        if not candidate or candidate.startswith(("data:", "blob:", "#")):
+            continue
+        resolved = urljoin(url, candidate)
+        parsed = urlparse(resolved)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc != origin.netloc:
+            continue
+        if resolved not in assets:
+            assets.append(resolved)
+        if len(assets) >= limit:
+            break
+    return assets
+
+
+def _verify_critical_assets(url: str, body: str) -> dict[str, Any]:
+    assets = _critical_same_origin_assets(url, body)
+    failures: list[dict[str, str]] = []
+    for asset_url in assets:
+        try:
+            _http_body(asset_url)
+        except (HTTPError, OSError, URLError, TimeoutError) as exc:
+            failures.append({"url": asset_url, "error": str(exc)})
+    return {
+        "checked": len(assets),
+        "ok": not failures,
+        "failures": failures,
+    }
+
+
 def _verify_url(
     url: str | None,
     *,
@@ -467,11 +527,32 @@ def _verify_url(
             body = _http_body(str(url))
             matched = bool(expected and expected in body)
             if not expected or matched:
+                assets = _verify_critical_assets(str(url), body)
+                if not assets["ok"]:
+                    failed_urls = ", ".join(
+                        str(item.get("url") or "")
+                        for item in assets["failures"][:3]
+                    )
+                    last_error = f"Critical page assets are unreachable: {failed_urls}"
+                    if time.monotonic() >= deadline:
+                        return {
+                            "url": url,
+                            "ok": False,
+                            "matched": matched,
+                            "expected_text": expected or None,
+                            "assets_checked": assets["checked"],
+                            "asset_failures": assets["failures"],
+                            "error": last_error,
+                        }
+                    time.sleep(0.25)
+                    continue
                 return {
                     "url": url,
                     "ok": True,
                     "matched": matched,
                     "expected_text": expected or None,
+                    "assets_checked": assets["checked"],
+                    "method": "http-html-critical-assets",
                 }
             last_error = f"Expected text not found: {expected!r}"
         except HTTPError as exc:
