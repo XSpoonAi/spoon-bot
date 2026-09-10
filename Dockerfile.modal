@@ -25,6 +25,7 @@ RUN uv sync --frozen --no-install-project --all-extras
 
 COPY . .
 RUN uv sync --frozen --all-extras
+RUN /app/.venv/bin/python -c "import fitz; assert fitz.open"
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1

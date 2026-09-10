@@ -215,6 +215,18 @@ class TestDocumentParseTool:
             assert r.startswith("STOP_TOOL_LOOP:")
             assert "do not install packages" in r
 
+    def test_missing_pymupdf_guardrail_has_user_facing_message(self) -> None:
+        raw = (
+            "STOP_TOOL_LOOP: PDF parsing is unavailable because this runtime is missing "
+            "PyMuPDF. This is a deployment configuration error."
+        )
+
+        message = AgentLoop._tool_loop_suppression_message_from_text(raw)
+
+        assert message is not None
+        assert "STOP_TOOL_LOOP" not in message
+        assert "PyMuPDF" in message
+
     @pytest.mark.asyncio
     async def test_rejects_pdf_outside_workspace(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
