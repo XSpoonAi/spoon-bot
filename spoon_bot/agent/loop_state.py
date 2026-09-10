@@ -24,6 +24,10 @@ except ImportError as e:
         "spoon-bot requires spoon-core SDK. Install with: pip install spoon-ai-sdk"
     ) from e
 
+from spoon_bot.agent.request_hints import (
+    classify_continuation_intent,
+    request_needs_current_session_fact_check,
+)
 from spoon_bot.agent.tools.execution_context import (
     bind_tool_owner,
     bind_tool_workspace,
@@ -359,6 +363,7 @@ class LoopStateMixin:
         )
         if not isinstance(history_messages, list):
             history_messages = []
+        raw_history_messages = list(history_messages)
         history_messages = AgentLoop._filter_rehydratable_history(history_messages)
 
         rehydrate_scope = AgentLoop._history_rehydrate_scope(
@@ -484,6 +489,46 @@ class LoopStateMixin:
                     f"Failed to inject session history message "
                     f"(role={role}, index={injected_count}): {exc}"
                 )
+
+        newest_request = str(upcoming_message or "")
+        continuation = classify_continuation_intent(newest_request)
+        if continuation.is_continuation or request_needs_current_session_fact_check(
+            newest_request
+        ):
+            for msg in reversed(raw_history_messages):
+                if not isinstance(msg, dict):
+                    continue
+                if str(msg.get("role") or "").strip().lower() != "user":
+                    continue
+                if AgentLoop._turn_state_of_message(msg) != _TURN_STATE_INTERRUPTED:
+                    break
+                media = _sanitize_media_list(msg.get("media"), self.workspace)
+                attachments = _sanitize_attachment_refs(
+                    _normalize_attachment_refs(msg.get("attachments")),
+                    self.workspace,
+                )
+                if media or attachments:
+                    reference_text = (
+                        "[INTERRUPTED TURN ATTACHMENT REFERENCE]\n"
+                        "These files came from the immediately previous interrupted turn. "
+                        "Use them only as evidence for the newest request; do not resume or "
+                        "repeat the interrupted operation unless the newest request asks you to."
+                    )
+                    reference_content = self._build_runtime_message_content(
+                        "user",
+                        reference_text,
+                        media=media,
+                        attachments=attachments,
+                    )
+                    try:
+                        await self._agent.add_message("user", reference_content)
+                        injected_count += 1
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to inject interrupted-turn attachment reference: "
+                            f"{exc}"
+                        )
+                break
 
         return injected_count
 

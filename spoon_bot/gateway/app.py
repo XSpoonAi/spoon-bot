@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +42,15 @@ _execution_coordinator: ExecutionCoordinator | None = None
 _session_runtime_registry: SessionRuntimeRegistry | None = None
 _channel_delivery_service: ChannelDeliveryService | None = None
 _cron_service: "CronService | None" = None
+_ws_session_chat_tasks: dict[str, "_WSSessionTaskHandle"] = {}
+_ws_session_chat_locks: dict[str, asyncio.Lock] = {}
+
+
+@dataclass
+class _WSSessionTaskHandle:
+    task: asyncio.Task
+    cancel_cb: Callable[[], None] | None = None
+    task_id_cb: Callable[[], str | None] | None = None
 
 
 def is_auth_required() -> bool:
@@ -103,6 +113,113 @@ def get_agent_execution_lock() -> asyncio.Lock:
 def get_session_execution_lock(session_key: str) -> asyncio.Lock:
     """Get/create a lock for a specific session key."""
     return get_execution_coordinator().get_session_lock(session_key)
+
+
+def _normalize_ws_owner(value: str | None, *, fallback: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _ws_session_chat_registry_key(session_key: str | None, user_id: str | None) -> str:
+    user = _normalize_ws_owner(user_id, fallback="anonymous")
+    session = _normalize_ws_owner(session_key, fallback="default")
+    return f"user:{user}|session:{session}"
+
+
+def get_ws_session_chat_lock(session_key: str, user_id: str | None = None) -> asyncio.Lock:
+    """Serialize task replacement for one websocket user and session."""
+    key = _ws_session_chat_registry_key(session_key, user_id)
+    lock = _ws_session_chat_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ws_session_chat_locks[key] = lock
+    return lock
+
+
+def register_ws_session_chat_task(
+    session_key: str,
+    task: asyncio.Task,
+    *,
+    user_id: str | None = None,
+    cancel_cb: Callable[[], None] | None = None,
+    task_id_cb: Callable[[], str | None] | None = None,
+) -> None:
+    """Keep a running chat reachable after its websocket disconnects."""
+    key = _ws_session_chat_registry_key(session_key, user_id)
+    _ws_session_chat_tasks[key] = _WSSessionTaskHandle(
+        task=task,
+        cancel_cb=cancel_cb,
+        task_id_cb=task_id_cb,
+    )
+
+
+def get_ws_session_chat_task_id(
+    session_key: str,
+    user_id: str | None = None,
+) -> str | None:
+    handle = _ws_session_chat_tasks.get(_ws_session_chat_registry_key(session_key, user_id))
+    if handle is None or handle.task_id_cb is None:
+        return None
+    try:
+        return handle.task_id_cb()
+    except Exception:
+        return None
+
+
+def has_active_ws_session_chat_task(
+    session_key: str,
+    user_id: str | None = None,
+) -> bool:
+    handle = _ws_session_chat_tasks.get(_ws_session_chat_registry_key(session_key, user_id))
+    return bool(handle is not None and not handle.task.done())
+
+
+def clear_ws_session_chat_task(
+    session_key: str,
+    *,
+    user_id: str | None = None,
+    task: asyncio.Task | None = None,
+) -> bool:
+    key = _ws_session_chat_registry_key(session_key, user_id)
+    handle = _ws_session_chat_tasks.get(key)
+    if handle is None or (task is not None and handle.task is not task):
+        return False
+    _ws_session_chat_tasks.pop(key, None)
+    return True
+
+
+async def cancel_ws_session_chat_task(
+    session_key: str,
+    timeout: float = 2.0,
+    *,
+    user_id: str | None = None,
+) -> bool:
+    """Cancel a running chat owned by the same websocket user and session."""
+    key = _ws_session_chat_registry_key(session_key, user_id)
+    handle = _ws_session_chat_tasks.get(key)
+    if handle is None:
+        return False
+
+    task = handle.task
+    if task.done():
+        clear_ws_session_chat_task(session_key, user_id=user_id, task=task)
+        return True
+    if handle.cancel_cb is not None:
+        try:
+            handle.cancel_cb()
+        except Exception:
+            pass
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        logger.warning(f"Timed out waiting for ws chat task cleanup: session={key}")
+        return False
+    if task.done():
+        clear_ws_session_chat_task(session_key, user_id=user_id, task=task)
+        return True
+    return False
 
 
 def set_agent(agent: SpoonCoreAgent | AgentLoop) -> None:
@@ -223,7 +340,15 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     Returns:
         Configured FastAPI application.
     """
-    global _config, _execution_coordinator, _session_runtime_registry, _channel_delivery_service, _cron_service, _channel_manager
+    global \
+        _config, \
+        _execution_coordinator, \
+        _session_runtime_registry, \
+        _channel_delivery_service, \
+        _cron_service, \
+        _channel_manager, \
+        _ws_session_chat_tasks, \
+        _ws_session_chat_locks
 
     _config = config or GatewayConfig.from_env()
     _execution_coordinator = ExecutionCoordinator()
@@ -231,6 +356,8 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     _channel_delivery_service = ChannelDeliveryService()
     _cron_service = None
     _channel_manager = None
+    _ws_session_chat_tasks = {}
+    _ws_session_chat_locks = {}
 
     app = FastAPI(
         title="spoon-bot Gateway",

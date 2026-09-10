@@ -36,6 +36,7 @@ dependencies = [
     "pyyaml>=6.0.0",  # For SKILL.md parsing
     "croniter>=6.0.0",
     "tzdata>=2025.2",
+    "pymupdf>=1.24.0",  # Required by the core document_parse tool
 ]
 
 [project.optional-dependencies]
@@ -49,7 +50,6 @@ web3 = [
     "web3>=6.0.0",
 ]
 document = [
-    "pymupdf>=1.24.0",      # PDF parsing (text, tables, images)
     "openpyxl>=3.1.0",      # Excel (.xlsx) generation
     "Pillow>=10.0.0",       # Image processing
     "python-pptx>=0.6.21",  # PowerPoint generation

@@ -78,6 +78,7 @@ RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
 
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
+RUN python -c "import fitz; assert fitz.open"
 # Ensure Python doesn't buffer output (important for Docker logs)
 ENV PYTHONUNBUFFERED=1
 # Don't write .pyc files

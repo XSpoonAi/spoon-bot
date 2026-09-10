@@ -236,6 +236,29 @@ async def test_final_synthesis_returns_capability_error_without_model_rewrite() 
 
 
 @pytest.mark.asyncio
+async def test_final_synthesis_hides_pdf_stop_tool_loop_marker() -> None:
+    from spoon_bot.agent.loop import AgentLoop
+
+    loop = AgentLoop.__new__(AgentLoop)
+    chat = AsyncMock(side_effect=AssertionError("guardrail must not reach the model"))
+    loop._chatbot = SimpleNamespace(llm_manager=SimpleNamespace(chat=chat))
+    raw = (
+        "STOP_TOOL_LOOP: PDF parsing is unavailable because this runtime is missing "
+        "PyMuPDF. This is a deployment configuration error."
+    )
+
+    result = await AgentLoop._synthesize_final_answer_from_tool_events(
+        loop,
+        [_event(raw, name="document_parse")],
+        user_message="Summarize the attached PDF",
+    )
+
+    assert "STOP_TOOL_LOOP" not in result
+    assert "PyMuPDF" in result
+    chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_tool_terminal_summary_cannot_be_rewritten_from_loss_to_win() -> None:
     from spoon_bot.agent.loop import AgentLoop
 

@@ -156,6 +156,7 @@ class TestRegistryClean:
         from spoon_bot.agent.tools.registry import CORE_TOOLS
         assert "activate_tool" in CORE_TOOLS
         assert "web_search" in CORE_TOOLS
+        assert "document_parse" in CORE_TOOLS
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -193,7 +194,7 @@ class TestDocumentParseTool:
     async def test_file_not_found(self) -> None:
         r = await self.tool.execute(file_path="/nonexistent/file.pdf")
         assert "Error" in r
-        assert "not found" in r or "pymupdf" in r
+        assert "outside workspace boundary" in r or "not found" in r or "pymupdf" in r
 
     @pytest.mark.asyncio
     async def test_not_pdf(self, tmp_path: Path) -> None:
@@ -211,7 +212,31 @@ class TestDocumentParseTool:
             importlib.reload(doc_mod)
             t = doc_mod.DocumentParseTool(workspace=str(tmp_path))
             r = await t.execute(file_path=str(pdf))
-            assert isinstance(r, str)
+            assert r.startswith("STOP_TOOL_LOOP:")
+            assert "do not install packages" in r
+
+    def test_missing_pymupdf_guardrail_has_user_facing_message(self) -> None:
+        raw = (
+            "STOP_TOOL_LOOP: PDF parsing is unavailable because this runtime is missing "
+            "PyMuPDF. This is a deployment configuration error."
+        )
+
+        message = AgentLoop._tool_loop_suppression_message_from_text(raw)
+
+        assert message is not None
+        assert "STOP_TOOL_LOOP" not in message
+        assert "PyMuPDF" in message
+
+    @pytest.mark.asyncio
+    async def test_rejects_pdf_outside_workspace(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        pdf = tmp_path / "outside.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        result = await DocumentParseTool(workspace=workspace).execute(file_path=str(pdf))
+
+        assert "outside workspace boundary" in result
 
     @pytest.mark.asyncio
     async def test_parse_basic_text(self, tmp_path: Path) -> None:
@@ -288,6 +313,7 @@ def test_native_tool_registration_time():
         loop.tools = _FakeTM()
         loop.add_tool = lambda name: False
         loop._register_native_tools()
+        assert "document_parse" in loop.tools.list_tools()
         times.append(time.perf_counter() - start)
 
     avg = statistics.mean(times)

@@ -3192,6 +3192,11 @@ class LoopProtocolMixin:
             return None
         if "history search budget" in text:
             return "I stopped searching old conversation history and continued from the latest request."
+        if "pdf parsing is unavailable" in text and "pymupdf" in text:
+            return (
+                "I couldn't read the attached PDF because PDF parsing is unavailable "
+                "in the current runtime. The runtime must be rebuilt with PyMuPDF installed."
+            )
         if "consecutive tool failures suppressed" in text:
             return "I stopped retrying after repeated failures."
         if "repeated tool failure pattern suppressed" in text:
@@ -3459,10 +3464,27 @@ class LoopProtocolMixin:
         if AgentLoop._tool_events_have_history_search_budget(tool_result_events):
             return AgentLoop._history_search_budget_fallback_response()
         synthesis_events = AgentLoop._select_final_answer_synthesis_events(tool_result_events)
+        if any(
+            AgentLoop._is_tool_loop_suppression_event(event)
+            for event in synthesis_events
+        ):
+            suppression_response = AgentLoop._extract_tool_suppression_user_response(
+                synthesis_events
+            )
+            if suppression_response:
+                return suppression_response
         unresolved_failure = latest_unresolved_tool_failure(synthesis_events)
         if unresolved_failure:
-            return unresolved_failure
+            return (
+                AgentLoop._tool_loop_suppression_message_from_text(unresolved_failure)
+                or unresolved_failure
+            )
         terminal_summary = latest_tool_user_summary(synthesis_events)
+        if terminal_summary:
+            terminal_summary = (
+                AgentLoop._tool_loop_suppression_message_from_text(terminal_summary)
+                or terminal_summary
+            )
         numeric_evidence_parts = [
             str(user_message or ""),
             *(

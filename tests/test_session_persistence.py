@@ -610,6 +610,80 @@ class TestAgentLoopSessionHydration:
         ]
 
     @pytest.mark.asyncio
+    async def test_followup_rehydrates_only_interrupted_attachment_reference(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "failure.png"
+        image_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="interrupted-attachment")
+        loop._session.add_message(
+            "user",
+            "Repeat this destructive operation",
+            turn_state="interrupted",
+            media=[str(image_path)],
+            attachments=[{"uri": str(image_path), "name": "failure.png"}],
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="刚才的截图怎么了？",
+        )
+
+        assert injected == 1
+        _assert_multimodal_user_call(
+            loop._agent.calls[0],
+            expected_text=(
+                "[INTERRUPTED TURN ATTACHMENT REFERENCE]\n"
+                "These files came from the immediately previous interrupted turn. "
+                "Use them only as evidence for the newest request; do not resume or "
+                "repeat the interrupted operation unless the newest request asks you to.\n\n"
+                "Attached workspace files (source of truth for this request):\n"
+                f"- {image_path} (name: failure.png)\n"
+                "Use these attached workspace files as the primary source of truth for this request."
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_request_does_not_rehydrate_interrupted_attachment(self, tmp_dir: Path):
+        from spoon_bot.agent.context import ContextBuilder
+        from spoon_bot.agent.loop import AgentLoop
+
+        workspace = tmp_dir / "workspace"
+        uploads = workspace / "uploads"
+        uploads.mkdir(parents=True)
+        image_path = uploads / "old.png"
+        image_path.write_bytes(b"png")
+
+        loop = AgentLoop.__new__(AgentLoop)
+        loop._agent = _FakeRuntimeAgent()
+        loop.workspace = workspace
+        loop.context = ContextBuilder(workspace)
+        loop._session = Session(session_key="isolated-new-request")
+        loop._session.add_message(
+            "user",
+            "Cancelled old operation",
+            turn_state="interrupted",
+            media=[str(image_path)],
+        )
+
+        injected = await AgentLoop._sync_runtime_history_from_session(
+            loop,
+            upcoming_message="Create a new quarterly report with current data",
+        )
+
+        assert injected == 0
+        assert loop._agent.calls == []
+
+    @pytest.mark.asyncio
     async def test_runtime_history_does_not_rehydrate_recent_skill_turn_for_new_request(self, tmp_dir: Path):
         from spoon_bot.agent.context import ContextBuilder
         from spoon_bot.agent.loop import AgentLoop

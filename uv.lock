@@ -4348,6 +4348,7 @@ dependencies = [
     { name = "loguru" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pymupdf" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -4366,7 +4367,6 @@ all = [
     { name = "openpyxl" },
     { name = "pillow" },
     { name = "pyjwt" },
-    { name = "pymupdf" },
     { name = "python-pptx" },
     { name = "python-telegram-bot", extra = ["all"] },
     { name = "spoon-toolkits" },
@@ -4392,7 +4392,6 @@ discord = [
 document = [
     { name = "openpyxl" },
     { name = "pillow" },
-    { name = "pymupdf" },
     { name = "python-pptx" },
 ]
 feishu = [
@@ -4433,7 +4432,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
     { name = "pyjwt", marker = "extra == 'gateway'", specifier = ">=2.8.0" },
-    { name = "pymupdf", marker = "extra == 'document'", specifier = ">=1.24.0" },
+    { name = "pymupdf", specifier = ">=1.24.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },

@@ -417,3 +417,41 @@ def test_search_history_omits_prior_search_history_echoes(tmp_path: Path) -> Non
     assert payload["hits"][0]["tool_call_id"] is None
     assert payload["hits"][0]["evidence_type"] == "tool_result"
     assert "JOINED game=415 wallet=0xabc" in payload["hits"][0]["content"]
+
+
+def test_recent_history_keeps_interrupted_attachment_and_diagnostics(tmp_path: Path) -> None:
+    mgr = _build_manager(tmp_path)
+    _append_message(
+        mgr,
+        "current-session",
+        "user",
+        "Inspect the attached failure",
+        timestamp="2026-07-02T06:40:00",
+        turn_state="interrupted",
+        attachments=[{
+            "uri": "/workspace/uploads/failure.png",
+            "name": "failure.png",
+            "mime_type": "image/png",
+        }],
+    )
+    _append_message(
+        mgr,
+        "current-session",
+        "tool",
+        'Observed output: {"success": true, "status": "stopped"}',
+        timestamp="2026-07-02T06:40:01",
+        name="service_expose",
+        tool_call_id="call_status",
+    )
+
+    tool = SearchHistoryTool(mgr, default_session_key="current-session")
+    payload = json.loads(asyncio.run(tool.execute(mode="recent", scope="current")))
+
+    assert payload["turns"][0]["turn_state"] == "interrupted"
+    assert payload["turns"][0]["attachment_refs"] == [{
+        "path": "/workspace/uploads/failure.png",
+        "name": "failure.png",
+        "mime_type": "image/png",
+    }]
+    assert "status" in payload["turns"][0]["recent_tool_results"][0]
+    assert payload["substantive_turns"] == []
